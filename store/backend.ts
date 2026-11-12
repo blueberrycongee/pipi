@@ -73,6 +73,20 @@ export interface Backend {
   pickImage?(prompt: string): Promise<string | undefined>;
 }
 
+/** Tries each `[command, args]` picker in order, returning its chosen path or `""`. */
+async function runDesktopPicker(candidates: Array<[string, string[]]>): Promise<string> {
+  for (const [command, args] of candidates) {
+    try {
+      const { code, stdout } = await process.run(command, args, { timeoutMs: 600_000 });
+      const path = stdout.trim().split(/\r?\n/).pop()?.trim() ?? "";
+      if (code === 0 && path) return path;
+    } catch {
+      // Picker binary not installed — try the next one.
+    }
+  }
+  return "";
+}
+
 const system: Backend = {
   home: () => {
     try {
@@ -204,22 +218,64 @@ const system: Backend = {
   saveApiKey,
   removeCredential,
   async pickFolder(prompt) {
-    if (process.platform !== "macos") return undefined;
     try {
-      const { code, stdout } = await process.run("osascript", ["-e", `POSIX path of (choose folder with prompt ${JSON.stringify(prompt)})`], { timeoutMs: 600_000 });
-      const path = stdout.trim().replace(/\/$/, "");
-      return code === 0 && path ? path : undefined;
+      if (process.platform === "macos") {
+        const { code, stdout } = await process.run("osascript", ["-e", `POSIX path of (choose folder with prompt ${JSON.stringify(prompt)})`], { timeoutMs: 600_000 });
+        const path = stdout.trim().replace(/\/$/, "");
+        return code === 0 && path ? path : undefined;
+      }
+      if (process.platform === "windows") {
+        const script = [
+          "Add-Type -AssemblyName System.Windows.Forms",
+          `$d = New-Object System.Windows.Forms.FolderBrowserDialog`,
+          `$d.Description = ${JSON.stringify(prompt)}`,
+          `$d.ShowNewFolderButton = $true`,
+          `if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }`,
+        ].join("; ");
+        const { code, stdout } = await process.run("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-Command", script], { timeoutMs: 600_000 });
+        const path = stdout.trim().split(/\r?\n/).pop()?.trim() ?? "";
+        return code === 0 && path ? path : undefined;
+      }
+      if (process.platform === "linux") {
+        const out = await runDesktopPicker([
+          ["zenity", ["--file-selection", "--directory", `--title=${prompt}`]],
+          ["kdialog", ["--getexistingdirectory", ".", "--title", prompt]],
+        ]);
+        return out || undefined;
+      }
+      return undefined;
     } catch {
       return undefined;
     }
   },
   async pickImage(prompt) {
-    if (process.platform !== "macos") return undefined;
     try {
-      const script = `POSIX path of (choose file of type {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "public.image"} with prompt ${JSON.stringify(prompt)})`;
-      const { code, stdout } = await process.run("osascript", ["-e", script], { timeoutMs: 600_000 });
-      const path = stdout.trim();
-      return code === 0 && path ? path : undefined;
+      if (process.platform === "macos") {
+        const script = `POSIX path of (choose file of type {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "public.image"} with prompt ${JSON.stringify(prompt)})`;
+        const { code, stdout } = await process.run("osascript", ["-e", script], { timeoutMs: 600_000 });
+        const path = stdout.trim();
+        return code === 0 && path ? path : undefined;
+      }
+      if (process.platform === "windows") {
+        const script = [
+          "Add-Type -AssemblyName System.Windows.Forms",
+          `$d = New-Object System.Windows.Forms.OpenFileDialog`,
+          `$d.Title = ${JSON.stringify(prompt)}`,
+          `$d.Filter = 'Images|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.tif;*.tiff|All files|*.*'`,
+          `if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }`,
+        ].join("; ");
+        const { code, stdout } = await process.run("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-Command", script], { timeoutMs: 600_000 });
+        const path = stdout.trim().split(/\r?\n/).pop()?.trim() ?? "";
+        return code === 0 && path ? path : undefined;
+      }
+      if (process.platform === "linux") {
+        const out = await runDesktopPicker([
+          ["zenity", ["--file-selection", `--title=${prompt}`, "--file-filter=Images | *.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff", "--file-filter=All files | *"]],
+          ["kdialog", ["--getopenfilename", ".", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff|Images", "--title", prompt]],
+        ]);
+        return out || undefined;
+      }
+      return undefined;
     } catch {
       return undefined;
     }

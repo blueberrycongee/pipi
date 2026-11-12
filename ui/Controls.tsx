@@ -53,7 +53,11 @@ export function Segmented<T extends string>(props: {
   );
 }
 
-/** A single-line text field in the app's look. */
+/** A single-line text field in the app's look. The placeholder is drawn by an
+ * overlay `Text`, not the host `Input`: host text re-rasterizes at integer
+ * offsets under ancestor transforms (section entrances, popover springs), so
+ * its glyphs visibly step or pop in a frame late — the overlay rides the
+ * composited layer like every other label. */
 export function TextField(props: {
   value: string;
   onChange: (value: string) => void;
@@ -64,22 +68,33 @@ export function TextField(props: {
   onSubmit?: () => void;
   label: string;
   ref?: (input: InputRef) => void;
+  /** Classes for the wrapper: the field's footprint in the layout (`flex-1`, `w-full`, …). */
   class?: string;
+  /** Extra classes for the `Input` itself (padding overrides like `pl-8`). */
+  inputClass?: string;
+  /** Left inset of the hint overlay when `inputClass` shifts the text start (`left-8` under a leading icon). */
+  hintClass?: string;
 }) {
   return (
-    <Input
-      ref={props.ref}
-      value={props.value}
-      onChange={({ value }) => props.onChange(value)}
-      onSubmit={props.onSubmit}
-      placeholder={props.placeholder}
-      masked={props.masked}
-      autoFocus={props.autoFocus}
-      autoCorrect={false}
-      autoCapitalize="none"
-      accessibilityLabel={props.label}
-      class={`h-8 rounded-lg px-2.5 text-base text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE} ${props.mono ? "font-mono text-sm" : ""} ${props.class ?? ""}`}
-    />
+    <View class={`relative ${props.class ?? ""}`}>
+      <Input
+        ref={props.ref}
+        value={props.value}
+        onChange={({ value }) => props.onChange(value)}
+        onSubmit={props.onSubmit}
+        masked={props.masked}
+        autoFocus={props.autoFocus}
+        autoCorrect={false}
+        autoCapitalize="none"
+        accessibilityLabel={props.label}
+        class={`h-8 w-full rounded-lg px-2.5 text-base text-foreground caret-brand ${FIELD_SURFACE} ${props.mono ? "font-mono text-sm" : ""} ${props.inputClass ?? ""}`}
+      />
+      <If when={props.placeholder !== undefined && props.value.length === 0}>
+        <View class={`pointer-events-none absolute inset-y-0 right-2.5 min-w-0 justify-center ${props.hintClass ?? "left-2.5"}`}>
+          <Text class={`truncate text-subtle ${props.mono ? "font-mono text-sm" : "text-base"}`}>{props.placeholder}</Text>
+        </View>
+      </If>
+    </View>
   );
 }
 

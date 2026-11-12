@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "package:macos": "./scripts/package-mac.sh",
+    "package:windows": "nsh package . --target windows",
+    "package:linux": "nsh package . --target linux",
     "release:macos": "node scripts/release-macos.mjs"
   }
 }

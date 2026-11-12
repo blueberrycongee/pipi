@@ -4,17 +4,15 @@
 //   node sidecar/worktree.mjs create <cwd> <label>
 //   node sidecar/worktree.mjs diff <worktreePath>
 //   node sidecar/worktree.mjs remove <cwd> <worktreePath>
-import { execFile } from "node:child_process";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
-import { childEnv, resolveBinary } from "./env-paths.mjs";
+import { childEnv, execBinary, resolveBinary } from "./env-paths.mjs";
 
-const execFileAsync = promisify(execFile);
-const gitBin = resolveBinary("git") || "/usr/bin/git";
+const gitBin = resolveBinary("git") || "git";
 
 async function git(cwd, args) {
-  const { stdout } = await execFileAsync(gitBin, args, { cwd, env: childEnv(), timeout: 20_000 });
+  const { stdout, stderr, code } = await execBinary(gitBin, args, { cwd, env: childEnv(), timeout: 20_000 });
+  if (code !== 0) throw new Error(stderr.trim() || `git ${args[0]} exited with ${code}`);
   return stdout.trim();
 }
 

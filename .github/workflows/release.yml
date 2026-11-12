@@ -47,7 +47,7 @@ jobs:
         with:
           name: pipi-mac-arm64
           path: |
-            release/pipi-*-mac-arm64.zip
+            release/pipi-*-mac-arm64.dmg
             release/verification.json
           if-no-files-found: error
           retention-days: 30
@@ -84,7 +84,7 @@ jobs:
             if ("v" + v.version !== process.env.RELEASE_TAG) throw Error("Artifact version does not match tag");
           '
           cat > release-notes.md <<'EOF'
-          Signed with an Apple Developer ID certificate and notarized by Apple; the app carries a stapled notarization ticket and passed Gatekeeper assessment before upload.
+          Signed with an Apple Developer ID certificate and notarized by Apple; the disk image and the app carry stapled notarization tickets and passed Gatekeeper assessment before upload.
           EOF
           gh release create "$RELEASE_TAG" --verify-tag --title "pipi $RELEASE_TAG" \
-            --notes-file release-notes.md dist/pipi-*-mac-arm64.zip dist/verification.json
+            --notes-file release-notes.md dist/pipi-*-mac-arm64.dmg dist/verification.json

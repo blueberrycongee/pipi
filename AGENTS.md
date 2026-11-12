@@ -63,7 +63,8 @@ multi-agent orchestration, and settings.
   `.nsh/shots/` (design review); `Gallery.test.tsx` does Pip and the icons
 - `nsh test E2E.test.tsx --target macos` — a real run through the real
   sidecar; needs a model (see below)
-- `nsh package .` — build an installable app package
+- `nsh package .` — build an installable app package (targets the host OS;
+  `npm run package:windows` / `package:linux` force a target)
 - `npm run release:macos` — signed and notarized release build (Developer ID +
   `notarytool`; needs the release signing credentials)
 - `npm install` — only regenerates the lockfile; there are no runtime
@@ -75,6 +76,25 @@ OpenAI-compatible provider, and `PI_CODING_AGENT_DIR=$PWD/dev/agent nsh dev .`
 points the real Pi at it (prompts containing "tools", "error" or "slow"
 exercise tool calls, failures and steering). If port 8790 is taken, pass
 `--port`.
+
+## Remotes and publishing
+
+- Two remotes: `dev` → `blueberrycongee/pipi-dev` (private; the dev
+  trunk — every branch and commit can be pushed there) and `public` →
+  `blueberrycongee/pipi` (the release face — `main`, tags and releases
+  only). Development never happens on the public repo: no feature
+  branches, no pull requests there (external PRs are closed by the
+  `close-prs` workflow; issues stay open).
+- Publishing is a squash snapshot, not a merge: from `main`, update the
+  local `public` branch with `git read-tree --reset -u main` and commit
+  once per milestone, then `git push public public:main`. The public
+  history is a curated sequence of snapshots; the full history stays in
+  pipi-dev.
+- Releases ride on tags pushed to `public` (`v*` triggers
+  `.github/workflows/release.yml`, which ships the signed, notarized
+  DMG). The repo needs the `PIPI_RELEASE_*` / `APPLE_API_*` secrets
+  configured for CI releases; `npm run release:macos` is the local
+  fallback.
 
 ## Layout
 

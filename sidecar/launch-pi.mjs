@@ -10,9 +10,8 @@
 // brings the user's own providers, auth.json, sessions, and extensions along.
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { childEnv, resolveBinary } from "./env-paths.mjs";
+import { childEnv, resolveBinary, spawnBinary } from "./env-paths.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const piExtension = path.join(__dirname, "pipi-orchestrator-extension.mjs");
@@ -42,7 +41,7 @@ if (Array.isArray(cfg.extraArgs)) {
   args.push(...cfg.extraArgs);
 }
 
-const child = spawn(piBin, args, { stdio: "inherit" });
+const child = spawnBinary(piBin, args, { stdio: "inherit" });
 child.on("error", (error) => {
   process.stderr.write(`Pi could not start (${piBin}): ${error.message}\n`);
   process.exit(1);

@@ -3,15 +3,11 @@
 //   node sidecar/probe-agents.mjs [json-payload]
 //
 // Follows t3code's rule: never triggers browser OAuth popups or project hooks.
-import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { agentDirPath, childEnv, readAuthStore, resolveAgentApiKey, resolveBinary } from "./env-paths.mjs";
-
-const execFileAsync = promisify(execFile);
+import { agentDirPath, childEnv, execBinary, readAuthStore, resolveAgentApiKey, resolveBinary } from "./env-paths.mjs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -36,7 +32,7 @@ function defaultModelEntry(provider, name) {
 
 async function readVersion(bin, args = ["--version"]) {
   try {
-    const { stdout, stderr } = await execFileAsync(bin, args, { env: childEnv(), timeout: 2500 });
+    const { stdout, stderr } = await execBinary(bin, args, { env: childEnv(), timeout: 2500 });
     const line = (stdout || stderr || "").trim().split("\n")[0]?.trim() || "";
     return line.slice(0, 80);
   } catch {

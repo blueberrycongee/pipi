@@ -25,8 +25,8 @@ const manifest = JSON.parse(readFileSync(join(root, "nsh.json"), "utf8"));
 const version = manifest.version;
 const app = join(root, ".nsh/out", `${manifest.name}.app`);
 const releaseDir = join(root, "release");
-const receiptPath = join(releaseDir, "notarization/app.json");
-const archiveName = `pipi-${version}-mac-arm64.zip`;
+const receiptPath = join(releaseDir, "notarization/submission.json");
+const archiveName = `pipi-${version}-mac-arm64.dmg`;
 
 const env = process.env;
 function credentials() {
@@ -76,10 +76,19 @@ function signApp(id) {
   }
 }
 
-function zipApp(destination) {
+function signDmg(id, dmg) {
+  const args = ["--force", "--sign", id, "--timestamp"];
+  if (env.PIPI_RELEASE_KEYCHAIN) args.push("--keychain", env.PIPI_RELEASE_KEYCHAIN);
+  args.push(dmg);
+  run("codesign", args);
+}
+
+// The DMG, not the .app inside it, is the outermost container users download,
+// so it is what Apple notarizes and what ships.
+function makeDmg(destination) {
   rmSync(destination, { force: true });
-  mkdirSync(dirname(destination), { recursive: true });
-  run("ditto", ["-c", "-k", "--keepParent", app, destination]);
+  run(join(root, "scripts/make-dmg.sh"), [app, destination], { stdio: "inherit" });
+  if (!existsSync(destination)) throw new Error(`make-dmg.sh did not produce ${destination}`);
 }
 
 function sha256(path) {
@@ -192,18 +201,22 @@ console.log("Signing with the pinned Developer ID (hardened runtime, timestamp)"
 signApp(identity);
 
 mkdirSync(releaseDir, { recursive: true });
-const uploadArchive = join(releaseDir, "submission.zip");
-zipApp(uploadArchive);
+console.log(`Building ${archiveName}`);
+const uploadArchive = join(releaseDir, "submission.dmg");
+makeDmg(uploadArchive);
+console.log("Signing the disk image");
+signDmg(identity, uploadArchive);
 const receipt = await notarize(uploadArchive);
 
-console.log("Stapling the notarization ticket to the app");
+console.log("Stapling the notarization ticket to the app and the disk image");
 await stapler("staple", app);
 await stapler("validate", app);
+await stapler("staple", uploadArchive);
+await stapler("validate", uploadArchive);
 
 console.log(`Writing ${archiveName}`);
 const artifact = join(releaseDir, archiveName);
-zipApp(artifact);
-rmSync(uploadArchive, { force: true });
+renameSync(uploadArchive, artifact);
 
 console.log("Gatekeeper assessment");
 const spctl = probe("spctl", ["-a", "-vv", "-t", "execute", app]);
@@ -211,6 +224,11 @@ if (!/accepted/.test(spctl) || !/source=Notarized Developer ID/.test(spctl)) {
   throw new Error(`Gatekeeper rejected the app:\n${spctl}`);
 }
 console.log(spctl.trimEnd());
+const spctlDmg = probe("spctl", ["-a", "-vv", "-t", "install", artifact]);
+if (!/accepted/.test(spctlDmg) || !/source=Notarized Developer ID/.test(spctlDmg)) {
+  throw new Error(`Gatekeeper rejected the disk image:\n${spctlDmg}`);
+}
+console.log(spctlDmg.trimEnd());
 
 const commit = run("git", ["rev-parse", "HEAD"], { cwd: root }).trim();
 writeFileSync(join(releaseDir, "verification.json"), JSON.stringify({
@@ -222,6 +240,11 @@ writeFileSync(join(releaseDir, "verification.json"), JSON.stringify({
   teamId: env.PIPI_RELEASE_TEAM_ID,
   notarization: receipt.id,
   artifact: { file: archiveName, sha256: sha256(artifact) },
-  checks: ["codesign --verify --deep --strict", "stapler validate", "spctl -a -vv -t execute"],
+  checks: [
+    "codesign --verify --deep --strict (app)",
+    "stapler validate (app, dmg)",
+    "spctl -a -vv -t execute (app)",
+    "spctl -a -vv -t install (dmg)",
+  ],
 }, null, 2) + "\n");
 console.log(`Release verified: release/${archiveName}`);

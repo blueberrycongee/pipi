@@ -39,8 +39,11 @@ async function read(): Promise<AuthFile> {
 async function write(auth: AuthFile) {
   await fs.mkdir(agentDir(), { recursive: true });
   await fs.writeFile(authPath(), `${JSON.stringify(auth, null, 2)}\n`);
-  // The file holds secrets: keep it private to the user, as Pi does.
-  await process.run("chmod", ["600", authPath()]).catch(() => undefined);
+  // The file holds secrets: keep it private to the user, as Pi does. POSIX only —
+  // Windows has no `chmod` and no POSIX mode bits.
+  if (process.platform !== "windows") {
+    await process.run("chmod", ["600", authPath()]).catch(() => undefined);
+  }
 }
 
 /** The providers that have a stored credential, and its kind. */

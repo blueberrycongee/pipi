@@ -1113,7 +1113,9 @@ function ArchivePage() {
               onChange={(v) => query.set(v)}
               placeholder={tr("Search archived items", "搜索归档内容")}
               label={tr("Search archived items", "搜索归档内容")}
-              class="w-full pl-8"
+              class="w-full"
+              inputClass="pl-8"
+              hintClass="left-8"
             />
             <View class="pointer-events-none absolute inset-y-0 left-2.5 justify-center">
               <Icon name="search" size={14} tone="subtle" />

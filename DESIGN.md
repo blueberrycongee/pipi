@@ -82,7 +82,8 @@ Only the eyes and the motion change; the silhouette never does.
 - Minimum size 16px wide. Below 24px use `still` (no loops) unless Pip *is*
   the status indicator (activity line, running session row).
 - Clear space: one leg-width (12 units) on every side.
-- One animated Pip per surface. Pip never overlaps text and never talks.
+- One animated Pip per surface; the sidebar carries one per working session.
+  Pip never overlaps text and never talks.
 - With reduced motion Pip holds the mood's pose and does not move.
 
 ### Where Pip lives
@@ -92,7 +93,8 @@ Only the eyes and the motion change; the silhouette never does.
 | App icon (`icon.png`) | 560 of 1024 | idle |
 | Welcome / connect / failure stage | 80–96 | from `pipMood` |
 | Activity line under the transcript | 22 | from `pipMood` |
-| Running session in the sidebar | 16 | work |
+| Running session in the sidebar — every row the run has, and a folded project row hiding one | 16 | work |
+| Sub-agents bar | 16 | work |
 | Empty session list, empty model list | 40–48, still | sleep |
 | About | 88 | idle |
 
@@ -228,7 +230,8 @@ need it.
   OpenCode, Pi) stay monochrome in `tone`; Pi keeps its fixed pixel colours.
 - **Session row**: two lines, because a transcript is worth knowing the origin
   of before you open it. The title takes the first line with the running mark
-  (Pip, or the brand dot for a background run); the second is the engine —
+  (the working Pip — a run kept going off screen marks every row the session
+  has, in the workspaces tree and Recent alike); the second is the engine —
   its `AgentLogo` at 14, its name in `2xs` `subtle` — with the relative time
   trailing. A row whose engine is gone keeps the name and greys the mark.
 - **tip()**: the tooltip.

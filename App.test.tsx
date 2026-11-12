@@ -326,6 +326,24 @@ test("configures external coding agents and adds a custom ACP agent in Settings"
   expect(app.texts()).toContain("Custom ACP");
 });
 
+test("the agents search hint is app-rendered text that clears on typing", async () => {
+  const app = await launch("welcome");
+  await app.waitFor("text:What are we building?");
+
+  await app.press("label:Settings");
+  await app.waitFor("text:Agents >> nth=0");
+  await app.press("text:Agents >> nth=0");
+  await app.waitFor("text:Coding Agent Harnesses");
+
+  // The hint sits in an overlay, not the host input, so it rides the page's
+  // entrance as composited texture instead of re-rasterizing host text.
+  expect(app.texts()).toContain("Filter engines (Devin, Gemini, Grok…)");
+  await app.type("label:Search coding agents", "claude");
+  expect(app.texts()).not.toContain("Filter engines (Devin, Gemini, Grok…)");
+  expect(app.texts()).toContain("Claude Code");
+  expect(app.texts()).not.toContain("Codex");
+});
+
 test("shows tool permission confirmation inline above the composer while keeping chat history visible", async () => {
   const app = await launch("history");
   await app.waitFor("text:Here is the plan.");

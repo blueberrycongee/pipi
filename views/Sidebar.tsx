@@ -357,13 +357,12 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
   const collapsed = () => isWorkspaceCollapsed(props.cwd);
   const label = () => projectLabel(props.cwd, props.allProjects);
   const sessions = () => (active() ? savedSessions() : (workspaceSessions()[props.cwd] ?? []));
-  const activeShownInRecents = () => {
-    if (isGroupCollapsed("recents")) return false;
-    if (isDraftSession()) return hasRecentDraft();
-    const file = openFile();
-    return Boolean(file && recents().some((item) => item.session.path === file));
-  };
-  const activeCollapsedRunning = () => active() && collapsed() && isRunning() && !activeShownInRecents();
+  const shownInRecents = (path: string | undefined) =>
+    !isGroupCollapsed("recents") && Boolean(path && recents().some((item) => item.session.path === path));
+  const activeShownInRecents = () => (isDraftSession() ? hasRecentDraft() : shownInRecents(openFile()));
+  /** A folded folder still says so when a run inside it keeps working off screen — active or parked, any project. */
+  const hiddenRunningInside = () => sessions().some((s) => isSessionRunning(s.path) && !shownInRecents(s.path));
+  const collapsedRunning = () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents()));
   const startingHere = () => active() && sidecarPhase().name === "starting";
   const canRemove = () => props.allProjects.length > 1;
 
@@ -431,14 +430,14 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
             </View>
           </If>
           <Presence
-            show={!startingHere() && activeCollapsedRunning()}
+            show={!startingHere() && collapsedRunning()}
             testID="sidebar-project-running"
             accessibilityLabel={tr("Running in the background", "后台运行中")}
             class="absolute inset-0 items-center justify-center"
           >
             <Pip size={16} mood="work" />
           </Presence>
-          <If when={!startingHere() && !activeCollapsedRunning() && collapsed() && sessions().length > 0}>
+          <If when={!startingHere() && !collapsedRunning() && collapsed() && sessions().length > 0}>
             <View class="absolute inset-0 items-center justify-center">
               <Text class="text-xs tabular-nums text-subtle">{String(sessions().length)}</Text>
             </View>
@@ -542,7 +541,8 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
   const active = () => !isDraftSession() && props.cwd === workspacePath() && props.session.path === openFile();
   const owns = () => ownsActiveSession(props.group, props.session.path, props.cwd);
   const primary = () => active() && owns();
-  const backgroundRunning = () => !active() && owns() && isSessionRunning(props.session.path);
+  /** A run kept going off screen marks every row the session has — whichever group the reader is looking at. */
+  const backgroundRunning = () => !active() && isSessionRunning(props.session.path);
   const running = () => (primary() && isRunning()) || backgroundRunning();
   const archived = () => isSessionArchived(props.session.path);
   const engine = () => engineOf(props.session.agentId);

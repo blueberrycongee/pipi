@@ -220,3 +220,56 @@ test("only the running session row shows Pip unless both its folder and Recent a
   await app.press("label:Collapse Recent");
   expect(app.count("id:sidebar-project-running")).toBe(1);
 });
+
+test("a run parked by a session switch keeps its mark on every row the session has", async () => {
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: { "harness.scenario": "multi-slow" },
+  });
+  await app.waitFor("text:What are we building?");
+
+  // Open a session from Recent and set it working.
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+  await app.type("label:Message", "keep working in the background");
+  await app.submit("label:Message");
+  await app.waitUntil(() => app.count("id:sidebar-recents >> id:sidebar-session-running") === 1);
+
+  // Switching away through the folder parks the run; the session's folder row
+  // and its Recent row both keep the running mark.
+  await app.press("id:sidebar-workspaces >> text:Look around and tell me what this project is");
+  await app.waitUntil(() => app.count("id:sidebar-workspaces >> id:sidebar-session-running") === 1);
+  expect(app.count("id:sidebar-recents >> id:sidebar-session-running")).toBe(1);
+  expect(app.count("id:sidebar-workspaces >> id:sidebar-session-running")).toBe(1);
+});
+
+test("a folded project row marks a run still working inside, whichever project is open", async () => {
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: { "harness.scenario": "multi-slow" },
+  });
+  await app.waitFor("text:What are we building?");
+
+  // A run in pipi is parked when a session in another folder takes the screen.
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+  await app.type("label:Message", "keep working in the background");
+  await app.submit("label:Message");
+  await app.waitUntil(() => app.count("id:sidebar-recents >> id:sidebar-session-running") === 1);
+  await app.press("id:sidebar-workspaces >> text:Fix QuickJS GC mark phase");
+  await app.waitUntil(() => app.count("id:sidebar-workspaces >> id:sidebar-session-running") === 1);
+
+  // Fold its folder and Recent: the folded project row still says the run is on,
+  // even though pipi is not the open workspace.
+  await app.press("label:Collapse pipi");
+  await app.press("label:Collapse Recent");
+  expect(app.count("id:sidebar-project-running")).toBe(1);
+});

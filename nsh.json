@@ -42,8 +42,11 @@
   "capabilities": {
     "process": {
       "execute": [
-        "node", "/opt/homebrew/bin/node", "/usr/local/bin/node", "/bin/sh",
-        "git", "/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git",
+        "node", "node.exe", "sh",
+        "git", "git.exe",
+        "where", "where.exe", "cmd", "cmd.exe",
+        "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+        "zenity", "kdialog",
         "pi", "claude", "codex", "devin", "opencode", "cursor-agent",
         "gemini", "copilot", "grok", "goose", "kimi", "qwen", "dsh",
         "agy_acp_server", "agy", "hermes", "kiro-cli", "kiro", "droid", "amp",
@@ -51,6 +54,12 @@
       ],
       "env": [
         "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL",
+        "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH",
+        "COMSPEC", "PATHEXT", "SYSTEMROOT", "SystemRoot", "WINDIR", "SYSTEMDRIVE",
+        "TEMP", "TMP", "ProgramFiles", "ProgramFiles(x86)", "ProgramData",
+        "NVM_HOME", "NVM_SYMLINK", "VOLTA_HOME", "FNM_DIR", "MISE_DATA_DIR", "MISE_CONFIG_DIR",
+        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
+        "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "SNAP",
         "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_OFFLINE",
         "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_HOME", "CURSOR_API_KEY",
         "DEVIN_API_KEY", "DASHSCOPE_API_KEY", "FACTORY_API_KEY", "AMP_API_KEY",

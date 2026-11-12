@@ -11,14 +11,14 @@
 //   role framing (`researcher`, `planner`, `implementer`, `reviewer`), and non-escalating
 //   runtime permission mode (`resolveRuntimeMode`).
 // - Streams live child task progress & SessionEvents back to pipi's UI over JSONL stdout!
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { childEnv, resolveBinary } from "./env-paths.mjs";
+import { childEnv, resolveBinary, spawnBinary } from "./env-paths.mjs";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -118,7 +118,7 @@ function spawnChildAgentRpc(agentSpec, taskCwd, resolvedMode) {
     });
     const args = ["--mode", "rpc", "--no-session"];
     if (fs.existsSync(piExtension)) args.push("--extension", piExtension);
-    return spawn(piBin, args, { cwd: taskCwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    return spawnBinary(piBin, args, { cwd: taskCwd, env, stdio: ["pipe", "pipe", "pipe"] });
   }
   const customCfg = customAgents.find((c) => c.id === agentSpec.id);
   const cfg = {
@@ -131,7 +131,7 @@ function spawnChildAgentRpc(agentSpec, taskCwd, resolvedMode) {
     customAgent: customCfg,
     isSubagent: true,
   };
-  return spawn(process.execPath, [externalAgentScript, JSON.stringify(cfg)], {
+  return spawnBinary(process.execPath, [externalAgentScript, JSON.stringify(cfg)], {
     cwd: taskCwd,
     env: childEnv({ PIPI_RUNTIME_MODE: resolvedMode, PIPI_IS_SUBAGENT: "1" }),
     stdio: ["pipe", "pipe", "pipe"],

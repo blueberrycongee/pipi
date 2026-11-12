@@ -4,6 +4,7 @@ import process from "process";
 import type { ChildProcess, CommandOutput } from "process";
 import { fileURLToPath } from "url";
 import type { StartAgentOptions } from "../agents/types";
+import { env } from "../lib/env";
 import { tr } from "../lib/i18n";
 import type { Exit, Transport } from "./client";
 
@@ -47,7 +48,14 @@ void [
 export function appDir(): string | undefined {
   try {
     const url = new URL("..", import.meta.url);
-    return url.protocol === "file:" ? fileURLToPath(url).replace(/\/$/, "") : undefined;
+    if (url.protocol !== "file:") return undefined;
+    let dir = fileURLToPath(url).replace(/[\\/]+$/, "");
+    // nsh's fileURLToPath leaves a POSIX-style `/C:/...` on Windows; the fs
+    // capability grants compare against the native `C:\...` form.
+    if (process.platform === "windows" && /^\/[A-Za-z]:/.test(dir)) {
+      dir = dir.slice(1).replace(/\//g, "\\");
+    }
+    return dir;
   } catch {
     return undefined;
   }
@@ -77,12 +85,29 @@ async function sidecarDir(): Promise<string | undefined> {
   return `${dir}/sidecar`;
 }
 
-/** Where `node` may be granted directly when the app was started from Finder/Dock (short PATH). */
-const DIRECT_NODE_COMMANDS = ["node", "/opt/homebrew/bin/node", "/usr/local/bin/node"];
+const isWindows = process.platform === "windows";
+const isMac = process.platform === "macos";
+
+/** Where `node` may be granted directly when the app was launched by the OS shell (short PATH). */
+const DIRECT_NODE_COMMANDS: string[] = isWindows
+  ? ["node", "node.exe"]
+  : isMac
+    ? ["node", "/opt/homebrew/bin/node", "/usr/local/bin/node"]
+    : ["node", "/usr/bin/node", "/usr/local/bin/node"];
 
 type NodeLauncher = { kind: "direct"; command: string } | { kind: "shell"; path: string };
 
 const SHELL_EXEC_SCRIPT = 'node="$1"; shift; exec "$node" "$@"';
+
+/**
+ * `cmd /d /s /c` argv for a discovered absolute executable path. The outer quotes are
+ * stripped by `/s`; each argument is quoted, with inner `"` doubled so Node's argv
+ * parser reads them back as literal quotes (the JSON payload contains quotes).
+ */
+function windowsCmdArgv(executable: string, args: string[]): string[] {
+  const quote = (value: string) => `"${value.replace(/"/g, '""')}"`;
+  return ["/d", "/s", "/c", `"${[executable, ...args].map(quote).join(" ")}"`];
+}
 
 /** Why the sidecar could not start, in words for the person at the screen. */
 export class SidecarError extends Error {
@@ -108,7 +133,7 @@ function nodeMissingError(): SidecarError {
   return new SidecarError(
     tr("Node.js was not found", "未找到 Node.js"),
     tr(
-      "pipi requires Node.js 22.19 or newer installed on your Mac.",
+      "pipi requires Node.js 22.19 or newer installed on this machine.",
       "pipi 需要安装 Node.js 22.19 或更高版本。",
     ),
   );
@@ -133,7 +158,7 @@ function compareSemverDesc(a: string, b: string): number {
   return b.localeCompare(a);
 }
 
-async function sortedVersionBins(versionsRoot: string, binSubpath = "bin/node"): Promise<string[]> {
+async function sortedVersionBins(versionsRoot: string, binSubpath = isWindows ? "node.exe" : "bin/node"): Promise<string[]> {
   try {
     if (!(await fs.exists(versionsRoot))) return [];
     const entries = await fs.readdir(versionsRoot);
@@ -150,14 +175,50 @@ async function sortedVersionBins(versionsRoot: string, binSubpath = "bin/node"):
 }
 
 /**
- * Discovers user-space Node.js installations (NVM, Volta, fnm, mise, asdf, MacPorts, login shell)
- * when Finder/Dock launches `pipi.app` with macOS's minimal `/usr/bin:/bin:/usr/sbin:/sbin` PATH.
+ * Discovers user-space Node.js installations (NVM, Volta, fnm, mise, asdf, Scoop, login
+ * shell) when the OS launches pipi with a minimal PATH (Finder/Dock on macOS, the Start
+ * menu on Windows).
  */
 async function discoverUserNodePath(): Promise<string | undefined> {
   let home = "";
   try {
     home = os.homedir();
   } catch {
+    return undefined;
+  }
+  if (home && isWindows) {
+    const localAppData = env("LOCALAPPDATA") || `${home}\\AppData\\Local`;
+    const appData = env("APPDATA") || `${home}\\AppData\\Roaming`;
+    const nvmSymlink = env("NVM_SYMLINK") || "C:\\nvm4w\\nodejs";
+    const miseBins = await sortedVersionBins(`${localAppData}\\mise\\installs\\node`);
+    const fnmShells = await sortedVersionBins(`${localAppData}\\fnm_multishells`);
+    const candidates = [
+      ...fnmShells,
+      ...miseBins,
+      `${nvmSymlink}\\node.exe`,
+      `${localAppData}\\Programs\\nodejs\\node.exe`,
+      "C:\\Program Files\\nodejs\\node.exe",
+      "C:\\Program Files (x86)\\nodejs\\node.exe",
+      `${home}\\scoop\\shims\\node.exe`,
+      `${home}\\scoop\\apps\\nodejs\\current\\node.exe`,
+      `${home}\\.volta\\bin\\node.exe`,
+      `${localAppData}\\Volta\\bin\\node.exe`,
+      `${home}\\.asdf\\shims\\node.exe`,
+      `${appData}\\nvm\\nodejs\\node.exe`,
+      `${localAppData}\\nvs\\default\\node.exe`,
+      `${appData}\\npm\\node.exe`,
+      `${home}\\.local\\bin\\node.exe`,
+    ];
+    for (const candidate of candidates) {
+      try {
+        if (await fs.exists(candidate)) return candidate;
+      } catch {}
+    }
+    try {
+      const probe = await process.run("where", ["node"], { timeoutMs: 4000 });
+      const resolved = probe.stdout.trim().split(/\r?\n/).map((l) => l.trim()).find((l) => l.endsWith(".exe"));
+      if (probe.code === 0 && resolved) return resolved;
+    } catch {}
     return undefined;
   }
   if (home) {
@@ -175,7 +236,9 @@ async function discoverUserNodePath(): Promise<string | undefined> {
       ...asdfBins,
       `${home}/.asdf/shims/node`,
       `${home}/.local/bin/node`,
+      `${home}/bin/node`,
       "/opt/local/bin/node",
+      "/snap/bin/node",
     ];
     for (const candidate of candidates) {
       try {
@@ -184,7 +247,7 @@ async function discoverUserNodePath(): Promise<string | undefined> {
     }
   }
   try {
-    const probe = await process.run("/bin/sh", ["-lc", "command -v node"], { timeoutMs: 4000 });
+    const probe = await process.run("sh", ["-lc", "command -v node"], { timeoutMs: 4000 });
     const resolved = probe.stdout.trim().split("\n").pop()?.trim();
     if (probe.code === 0 && resolved && resolved.startsWith("/")) return resolved;
   } catch {}
@@ -223,7 +286,14 @@ function spawnWithLauncher(
   if (launcher.kind === "direct") {
     return process.spawn(launcher.command, args, options);
   }
-  return process.spawn("/bin/sh", ["-c", SHELL_EXEC_SCRIPT, "sh", launcher.path, ...args], options);
+  // Only bare executable names are granted on every platform (absolute paths are
+  // platform-specific), so a discovered absolute node path goes through the host
+  // shell — `sh -c exec` on POSIX, `cmd /c` on Windows — the same way it does on
+  // macOS today.
+  if (isWindows) {
+    return process.spawn("cmd", windowsCmdArgv(launcher.path, args), options);
+  }
+  return process.spawn("sh", ["-c", SHELL_EXEC_SCRIPT, "sh", launcher.path, ...args], options);
 }
 
 function runWithLauncher(
@@ -234,7 +304,10 @@ function runWithLauncher(
   if (launcher.kind === "direct") {
     return process.run(launcher.command, args, options);
   }
-  return process.run("/bin/sh", ["-c", SHELL_EXEC_SCRIPT, "sh", launcher.path, ...args], options);
+  if (isWindows) {
+    return process.run("cmd", windowsCmdArgv(launcher.path, args), options);
+  }
+  return process.run("sh", ["-c", SHELL_EXEC_SCRIPT, "sh", launcher.path, ...args], options);
 }
 
 const LIVE_CHILDREN_KEY = "__pipiLiveChildren";

@@ -6,13 +6,12 @@
 // line, command responses correlated by `id`, `agent_settled` at turn end), so pipi's
 // QuickJS `PiClient`, `Transcript`, streaming deltas, approvals, and session persistence
 // work identically across every external coding agent!
-import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { agentAuthEnv, childEnv, ensureDir, externalSessionsDir, resolveBinary } from "./env-paths.mjs";
+import { agentAuthEnv, childEnv, ensureDir, externalSessionsDir, resolveBinary, shellForCommand, spawnBinary } from "./env-paths.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const mcpStdioScript = path.join(__dirname, "pipi-mcp-stdio.mjs");
@@ -145,6 +144,11 @@ let activeChild = undefined;
 let abortRequested = false;
 let queuedSteering = [];
 let queuedFollowUp = [];
+// A queued steering message interrupted the in-flight turn; it (not the abort)
+// owns the next turn, so the drain below must run even though the turn ended
+// aborted — t3code's "steering by interrupt-restart" for engines without
+// native mid-turn injection.
+let steerInterrupt = false;
 let totalInputTokens = 0;
 let totalOutputTokens = 0;
 let totalCost = 0;
@@ -295,6 +299,22 @@ function imageBlocks(images) {
     .map((i) => ({ type: "image", data: i.data, mimeType: String(i.mimeType || "image/png") }));
 }
 
+// Signals the agent's whole process group (spawned `detached`): a CLI's own
+// children — an in-flight build, a tool call — hold the stdio pipes open after
+// the parent dies, and `close` would wait on them and stall the interrupt.
+function signalAgent(signal) {
+  const child = driver === "acp" ? acpChild : activeChild;
+  if (!child) return;
+  try {
+    if (process.platform === "win32") child.kill(signal);
+    else process.kill(-child.pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {}
+  }
+}
+
 function interruptActiveTurn() {
   abortRequested = true;
   for (const [, resolve] of pendingUiRequests) resolve(false);
@@ -304,17 +324,11 @@ function interruptActiveTurn() {
     // drop the peer after a grace period (next turn re-attaches via load).
     if (acpSessionId) acpNotify("session/cancel", { sessionId: acpSessionId });
     const grace = setTimeout(() => {
-      if (acpStream) {
-        try {
-          acpChild?.kill();
-        } catch {}
-      }
+      if (acpStream) signalAgent("SIGKILL");
     }, 8000);
     grace.unref?.();
   } else if (activeChild) {
-    try {
-      activeChild.kill("SIGTERM");
-    } catch {}
+    signalAgent("SIGTERM");
   }
 }
 
@@ -337,13 +351,20 @@ async function settleActiveTurn(timeoutMs = 0) {
   if (timer) clearTimeout(timer);
   if (outcome === "stalled") {
     if (driver === "acp") dropAcpPeer("ACP turn cancelled");
-    else if (activeChild) {
-      try {
-        activeChild.kill("SIGKILL");
-      } catch {}
-    }
+    else if (activeChild) signalAgent("SIGKILL");
     await active.catch(() => undefined);
   }
+}
+
+// Drivers whose conversation survives a restart: a "steer" interrupts the
+// in-flight turn now and re-runs on the resumed thread (ACP re-prompts on the
+// same live session), instead of queueing behind the turn like a follow-up.
+// Cursor's exec mode keeps no resumable thread here, so it stays queued.
+const STEER_RESTART_DRIVERS = new Set(["claude", "codex", "opencode"]);
+
+function canSteerRestart() {
+  if (driver === "acp") return !!acpSessionId;
+  return STEER_RESTART_DRIVERS.has(driver) && !!nativeThreadId;
 }
 
 function executeTurn(promptText, images = []) {
@@ -434,9 +455,19 @@ async function runTurn(promptText, images = []) {
   emitTurn({ type: "agent_end", willRetry: false });
   emitTurn({ type: "agent_settled", aborted: abortRequested });
 
-  // Drain queued follow-up / steering messages if not aborted
-  if (!abortRequested && sessionEpoch === turnEpoch && (queuedSteering.length > 0 || queuedFollowUp.length > 0)) {
-    const next = queuedSteering.shift() || queuedFollowUp.shift();
+  // Drain queued follow-up / steering messages if not aborted — or when the
+  // abort came from a steer, in which case the queued steering owns the next
+  // turn on the resumed conversation.
+  const mayDrain = !abortRequested || steerInterrupt;
+  steerInterrupt = false;
+  if (mayDrain && sessionEpoch === turnEpoch && (queuedSteering.length > 0 || queuedFollowUp.length > 0)) {
+    let next;
+    if (steeringMode === "all" && queuedSteering.length > 1) {
+      const all = queuedSteering.splice(0);
+      next = { text: all.map((q) => q.text).join("\n\n"), images: all.flatMap((q) => q.images) };
+    } else {
+      next = queuedSteering.shift() || queuedFollowUp.shift();
+    }
     emitTurn({ type: "queue_update", steering: queuedSteering.map((q) => q.text), followUp: queuedFollowUp.map((q) => q.text) });
     if (next) void executeTurn(next.text, next.images);
   }
@@ -578,10 +609,11 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch) {
 
 function spawnJsonlProcess(bin, args, extraEnv, onLine) {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, {
+    const child = spawnBinary(bin, args, {
       cwd,
       env: agentRuntimeEnv(extraEnv),
       stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     });
     activeChild = child;
     let stdoutBuf = "";
@@ -828,7 +860,7 @@ function resolveAcpArgs(bin) {
   const preset = BUILTIN_ACP_PRESETS[agentId];
   if (preset) {
     // Antigravity's standalone CLI `agy` needs `acp` subcommand, whereas `agy_acp_server` starts directly.
-    if (agentId === "antigravity" && path.basename(bin) === "agy") {
+    if (agentId === "antigravity" && path.basename(bin).replace(/\.(exe|cmd|bat|ps1)$/i, "") === "agy") {
       return ["acp", ...extra];
     }
     return [...(preset.args || []), ...extra];
@@ -1180,10 +1212,11 @@ function handleAcpUpdate(u) {
 }
 
 function spawnAcp(bin) {
-  const child = spawn(bin, resolveAcpArgs(bin), {
+  const child = spawnBinary(bin, resolveAcpArgs(bin), {
     cwd,
     env: agentRuntimeEnv(),
     stdio: ["pipe", "pipe", "pipe"],
+    detached: process.platform !== "win32",
   });
   acpChild = child;
   activeChild = child;
@@ -1256,9 +1289,16 @@ function dropAcpPeer(reason = "ACP agent reset") {
   acpPending.clear();
   for (const [, resolve] of pendingUiRequests) resolve(false);
   pendingUiRequests.clear();
-  try {
-    child?.kill();
-  } catch {}
+  if (child) {
+    try {
+      if (process.platform === "win32") child.kill();
+      else process.kill(-child.pid, "SIGKILL");
+    } catch {
+      try {
+        child.kill();
+      } catch {}
+    }
+  }
 }
 
 /**
@@ -1492,15 +1532,30 @@ async function handleCommand(cmd) {
       const text = String(cmd.message || "");
       const images = imageBlocks(cmd.images);
       if (isStreaming) {
-        if (cmd.streamingBehavior === "followUp") queuedFollowUp.push({ text, images });
-        else queuedSteering.push({ text, images });
+        if (cmd.streamingBehavior === "followUp") {
+          queuedFollowUp.push({ text, images });
+        } else {
+          queuedSteering.push({ text, images });
+          // Where the conversation survives a restart, a steer interrupts the
+          // in-flight turn now and re-runs on the resumed thread — instead of
+          // waiting for the turn to end like a prioritized follow-up.
+          if (canSteerRestart()) {
+            steerInterrupt = true;
+            void settleActiveTurn(10_000);
+          }
+        }
         emit({ type: "queue_update", steering: queuedSteering.map((q) => q.text), followUp: queuedFollowUp.map((q) => q.text) });
         return { disposition: "queued" };
       }
       void executeTurn(text, images);
       return { disposition: "started" };
     }
+    case "steer":
+      return handleCommand({ ...cmd, type: "prompt", streamingBehavior: "steer" });
+    case "follow_up":
+      return handleCommand({ ...cmd, type: "prompt", streamingBehavior: "followUp" });
     case "abort":
+      steerInterrupt = false;
       await settleActiveTurn(10_000);
       return undefined;
     case "clear_queue": {
@@ -1514,6 +1569,7 @@ async function handleCommand(cmd) {
       sessionEpoch++;
       queuedSteering = [];
       queuedFollowUp = [];
+      steerInterrupt = false;
       await settleActiveTurn(2500);
       await settleAcpNegotiation();
       messages = [];
@@ -1530,6 +1586,7 @@ async function handleCommand(cmd) {
       sessionEpoch++;
       queuedSteering = [];
       queuedFollowUp = [];
+      steerInterrupt = false;
       await settleActiveTurn(2500);
       await settleAcpNegotiation();
       await loadExternalSession(String(cmd.sessionPath));
@@ -1539,6 +1596,7 @@ async function handleCommand(cmd) {
       sessionEpoch++;
       queuedSteering = [];
       queuedFollowUp = [];
+      steerInterrupt = false;
       await settleActiveTurn(2500);
       await settleAcpNegotiation();
       sessionId = crypto.randomUUID();
@@ -1595,8 +1653,8 @@ async function handleCommand(cmd) {
     }
     case "bash": {
       return await new Promise((resolve) => {
-        const sh = process.env.SHELL || "/bin/zsh";
-        const child = spawn(sh, ["-lc", String(cmd.command || "")], { cwd, env: childEnv() });
+        const sh = shellForCommand(String(cmd.command || ""));
+        const child = spawnBinary(sh.file, sh.args, { cwd, env: childEnv() });
         let out = "";
         child.stdout.setEncoding("utf8");
         child.stderr.setEncoding("utf8");
