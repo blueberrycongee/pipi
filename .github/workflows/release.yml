@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  workflow_dispatch: {} # validation run: builds, signs, notarizes, verifies — publishes nothing
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: Build, sign, notarize, verify
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      PIPI_RELEASE_TEAM_ID: ${{ secrets.PIPI_RELEASE_TEAM_ID }}
+      PIPI_RELEASE_SIGN_ID: ${{ secrets.PIPI_RELEASE_SIGN_ID }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nsh
+        env:
+          NSH_VERSION: v0.5.0
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: nsh check .
+      - name: Install release credentials
+        env:
+          PIPI_RELEASE_CERTIFICATE_P12: ${{ secrets.PIPI_RELEASE_CERTIFICATE_P12 }}
+          PIPI_RELEASE_CERTIFICATE_PASSWORD: ${{ secrets.PIPI_RELEASE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          node scripts/install-notary-key.mjs
+          node scripts/import-release-signing.mjs
+      - name: Build, sign, notarize and verify
+        run: node scripts/release-macos.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pipi-mac-arm64
+          path: |
+            release/pipi-*-mac-arm64.zip
+            release/verification.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove release credentials
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/pipi-release.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/pipi-release.keychain-db"
+          fi
+          rm -f "$RUNNER_TEMP/pipi-notary.p8" "$RUNNER_TEMP/pipi-release.p12"
+
+  release:
+    name: GitHub Release
+    needs: macos
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: pipi-mac-arm64
+          path: dist
+      - name: Publish verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node -e '
+            const v = require("./dist/verification.json");
+            if ("v" + v.version !== process.env.RELEASE_TAG) throw Error("Artifact version does not match tag");
+          '
+          cat > release-notes.md <<'EOF'
+          Signed with an Apple Developer ID certificate and notarized by Apple; the app carries a stapled notarization ticket and passed Gatekeeper assessment before upload.
+          EOF
+          gh release create "$RELEASE_TAG" --verify-tag --title "pipi $RELEASE_TAG" \
+            --notes-file release-notes.md dist/pipi-*-mac-arm64.zip dist/verification.json

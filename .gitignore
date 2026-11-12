@@ -1,0 +1,9 @@
+.nsh/
+target/
+node_modules/
+dist/
+thirdparty/
+release/
+*.p12
+*.p8
+.commit/

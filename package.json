@@ -1,0 +1,11 @@
+{
+  "name": "pipi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A native desktop control surface for coding agents, built with Native Shell (nsh)",
+  "type": "module",
+  "scripts": {
+    "package:macos": "./scripts/package-mac.sh",
+    "release:macos": "node scripts/release-macos.mjs"
+  }
+}

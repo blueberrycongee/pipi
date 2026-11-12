@@ -1,0 +1,497 @@
+import {
+  Animated,
+  cleanup,
+  type CompositeAnimation,
+  createAnimatedValue,
+  effect,
+  type JSX,
+  keymap,
+  LayoutAnimation,
+  reduceMotion,
+  signal,
+  untracked,
+  View,
+} from "nsh";
+import { isAvailable, Menu, titleBar } from "nsh/desktop";
+import { tr } from "../lib/i18n";
+import {
+  canArchiveCurrentSession,
+  cancelPendingDialog,
+  cancelRenaming,
+  chooseWorkspace,
+  compactNow,
+  currentView,
+  exportHtml,
+  focusComposer,
+  inspectDelegatedTask,
+  inspectingTask,
+  isBashRunning,
+  isCurrentSessionArchived,
+  isOrchestrateOpen,
+  isPaletteOpen,
+  isRenaming,
+  isRunning,
+  newSession,
+  pendingDialog,
+  randomWallpaper,
+  restartPi,
+  setOrchestrateOpen,
+  setPaletteOpen,
+  showChat,
+  showSettings,
+  stop,
+  toggleArchiveCurrentSession,
+} from "../store/app";
+import {
+  setSidebarOpen,
+  setSidebarWidth,
+  SIDEBAR_DEFAULT_WIDTH,
+  SIDEBAR_MAX_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+  sidebarOpen,
+  sidebarWidth,
+} from "../store/prefs";
+import { EASING } from "../ui/motion";
+import { OrchestrateDialog } from "./AgentPicker";
+import { Chat } from "./Chat";
+import { ExtensionDialog, hasInlinePrompt } from "./ExtensionDialog";
+import { Palette } from "./Palette";
+import { Settings } from "./Settings";
+import { Sidebar } from "./Sidebar";
+import { TitleBar } from "./TitleBar";
+import { Toasts } from "./Toasts";
+
+/**
+ * Minimum horizontal room to the right of `titleBar().left` (macOS traffic
+ * lights): 14pt breathing space + 36pt draggable titlebar gap + 98pt for the
+ * three top-right sidebar action buttons (`size-7` × 3 + gaps + `pr-2.5`).
+ */
+const SIDEBAR_HEADER_RIGHT_CLEARANCE = 148;
+/** Continuing to drag left past `minWidth - SIDEBAR_COLLAPSE_PULL` folds the sidebar automatically (SaaS split-pane behavior). */
+const SIDEBAR_COLLAPSE_PULL = 56;
+/** Hysteresis when dragging back right within the same continuous gesture to re-open. */
+const SIDEBAR_REOPEN_PULL = 18;
+/** Deliberate hover pause before showing the subtle resize hairline, so crossing the border never flashes. */
+const SASH_HOVER_DELAY_MS = 140;
+
+const effectiveSidebarMinWidth = () =>
+  Math.max(SIDEBAR_MIN_WIDTH, Math.ceil((titleBar().left || 0) + SIDEBAR_HEADER_RIGHT_CLEARANCE));
+
+const toggleSidebar = () => setSidebarOpen(!sidebarOpen());
+const toggleSettings = () => (currentView().name === "settings" ? showChat() : showSettings());
+
+/** Escape leaves what is on top: a dialog or inline prompt closes itself; then settings or sub-agent inspection; then the run stops. */
+function escape() {
+  if (isPaletteOpen() || isOrchestrateOpen()) return;
+  if (pendingDialog()) {
+    if (hasInlinePrompt()) cancelPendingDialog();
+    return;
+  }
+  if (isRenaming()) return cancelRenaming();
+  if (currentView().name === "settings") return showChat();
+  if (inspectingTask()) return inspectDelegatedTask(undefined);
+  if (isRunning() || isBashRunning()) void stop();
+}
+
+/** The application menu: every command has a place in it, and its shortcut lives here. */
+function applicationMenu() {
+  Menu.setApplicationMenu([
+    {
+      label: "pipi",
+      submenu: [
+        { role: "about" },
+        { type: "separator" },
+        { label: tr("Settings…", "设置…"), shortcut: "mod+,", onSelect: toggleSettings },
+        { type: "separator" },
+        { role: "hide" },
+        { role: "hideOthers" },
+        { role: "showAll" },
+        { type: "separator" },
+        { role: "quit" },
+      ],
+    },
+    {
+      label: tr("File", "文件"),
+      submenu: [
+        { label: tr("New Session", "新建会话"), shortcut: "mod+n", onSelect: () => void newSession() },
+        { label: tr("Add Project Folder…", "添加项目文件夹…"), shortcut: "mod+o", onSelect: () => void chooseWorkspace() },
+        { type: "separator" },
+        { label: tr("Export as HTML", "导出为 HTML"), onSelect: () => void exportHtml() },
+        { type: "separator" },
+        { role: "close" },
+      ],
+    },
+    {
+      label: tr("Edit", "编辑"),
+      submenu: [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }],
+    },
+    {
+      label: tr("View", "视图"),
+      submenu: [
+        { label: tr("Command Palette…", "命令面板…"), shortcut: "mod+k", onSelect: () => setPaletteOpen(!isPaletteOpen()) },
+        { label: sidebarOpen() ? tr("Hide Sidebar", "隐藏侧边栏") : tr("Show Sidebar", "显示侧边栏"), shortcut: "mod+b", onSelect: toggleSidebar },
+        { label: tr("Random Wallpaper", "随机壁纸"), shortcut: "mod+u", onSelect: () => void randomWallpaper() },
+        { type: "separator" },
+        { role: "toggleFullScreen" },
+      ],
+    },
+    {
+      label: tr("Session", "会话"),
+      submenu: [
+        { label: tr("Focus Message", "聚焦输入框"), shortcut: "mod+l", onSelect: () => (showChat(), focusComposer()) },
+        { label: tr("Orchestrate Multiple Agents…", "多智能体协同编排…"), shortcut: "mod+shift+o", onSelect: () => setOrchestrateOpen(!isOrchestrateOpen()) },
+        { label: tr("Stop", "停止"), shortcut: "mod+.", disabled: !isRunning() && !isBashRunning(), onSelect: () => void stop() },
+        { type: "separator" },
+        {
+          label: isCurrentSessionArchived() ? tr("Unarchive Session", "取消归档会话") : tr("Archive Session", "归档会话"),
+          disabled: !canArchiveCurrentSession(),
+          onSelect: () => void toggleArchiveCurrentSession(),
+        },
+        { label: tr("Compact Context", "压缩上下文"), onSelect: () => void compactNow() },
+        { label: tr("Restart Agent", "重启智能体"), onSelect: () => void restartPi() },
+      ],
+    },
+    { label: tr("Window", "窗口"), submenu: [{ role: "minimize" }, { role: "zoom" }] },
+  ]);
+}
+
+/**
+ * SaaS-style split shell with:
+ * - Traffic-light & header-action safe minimum width (`effectiveSidebarMinWidth`),
+ * - Elastic clamp at minimum width + automatic collapse when dragging past it,
+ * - Layered fixed-width drawer reveal with zero vertical hover-line artifacts.
+ */
+function SidebarSplit(props: { children: JSX.Element }) {
+  const initialOpen = untracked(sidebarOpen);
+  const liveWidth = signal<number | null>(null);
+  const dragging = signal(false);
+  const sashHover = signal(false);
+  const transitioning = signal(false);
+  const sidebarMounted = signal(initialOpen);
+
+  const drawerOpacity = createAnimatedValue(initialOpen ? 1 : 0);
+  const drawerSlideX = createAnimatedValue(0);
+  const panX = createAnimatedValue(0);
+
+  let drawerAnim: CompositeAnimation | null = null;
+  let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const clearHoverTimer = () => {
+    if (hoverTimer !== undefined) {
+      clearTimeout(hoverTimer);
+      hoverTimer = undefined;
+    }
+  };
+  const clearSettleTimer = () => {
+    if (settleTimer !== undefined) {
+      clearTimeout(settleTimer);
+      settleTimer = undefined;
+    }
+  };
+
+  cleanup(() => {
+    clearHoverTimer();
+    clearSettleTimer();
+    drawerAnim?.stop();
+  });
+
+  const minW = effectiveSidebarMinWidth;
+  const clampedStoredWidth = () => Math.min(SIDEBAR_MAX_WIDTH, Math.max(minW(), sidebarWidth()));
+  const currentWidth = () => {
+    const live = liveWidth();
+    return live !== null ? Math.min(SIDEBAR_MAX_WIDTH, Math.max(minW(), live)) : clampedStoredWidth();
+  };
+
+  // Coordinated expand / collapse choreography: unmounts the resize sash for
+  // the entire transition so no hover indicator line ever slides under the pointer.
+  let initialized = false;
+  let prevOpen = initialOpen;
+  effect(() => {
+    const open = sidebarOpen();
+    const reduced = reduceMotion();
+    untracked(() => {
+      if (!initialized) {
+        initialized = true;
+        prevOpen = open;
+        return;
+      }
+      if (open === prevOpen) return;
+      prevOpen = open;
+
+      clearHoverTimer();
+      sashHover.set(false);
+      clearSettleTimer();
+      drawerAnim?.stop();
+      drawerAnim = null;
+
+      if (reduced) {
+        transitioning.set(false);
+        sidebarMounted.set(open);
+        drawerOpacity.set(open ? 1 : 0);
+        drawerSlideX.set(0);
+        return;
+      }
+
+      transitioning.set(true);
+      if (open) {
+        sidebarMounted.set(true);
+        LayoutAnimation.configureNext({
+          duration: 260,
+          update: { type: "spring", springDamping: 0.96 },
+          create: { type: "easeOut", property: "opacity", duration: 180 },
+          delete: { type: "easeIn", property: "opacity", duration: 140 },
+        });
+        drawerOpacity.set(0.38);
+        drawerSlideX.set(-16);
+        drawerAnim = Animated.parallel([
+          Animated.timing(drawerOpacity, { toValue: 1, duration: 220, easing: EASING.smoothOut }),
+          Animated.spring(drawerSlideX, { toValue: 0, stiffness: 340, damping: 34, mass: 1 }),
+        ]);
+        void drawerAnim.start();
+        settleTimer = setTimeout(() => {
+          settleTimer = undefined;
+          transitioning.set(false);
+        }, 275);
+      } else {
+        LayoutAnimation.configureNext({
+          duration: 200,
+          update: { type: "spring", springDamping: 0.98 },
+          create: { type: "easeOut", property: "opacity", duration: 150 },
+          delete: { type: "easeIn", property: "opacity", duration: 120 },
+        });
+        drawerAnim = Animated.parallel([
+          Animated.timing(drawerOpacity, { toValue: 0, duration: 165, easing: EASING.out }),
+          Animated.timing(drawerSlideX, { toValue: -12, duration: 185, easing: EASING.out }),
+        ]);
+        void drawerAnim.start();
+        settleTimer = setTimeout(() => {
+          settleTimer = undefined;
+          transitioning.set(false);
+          if (!untracked(sidebarOpen)) sidebarMounted.set(false);
+        }, 205);
+      }
+    });
+  });
+
+  // Drag-to-resize & SaaS drag-past-min-to-collapse state
+  let startPageX = 0;
+  let startWidth = SIDEBAR_DEFAULT_WIDTH;
+  let preDragWidth = SIDEBAR_DEFAULT_WIDTH;
+  let lastDeltaX = 0;
+  let collapsedInDrag = false;
+  // Once the pan recognizer takes the gesture it cancels the press, which the
+  // runtime reports as an `onPressUp` (with a zeroed position on some
+  // backends): the drag's release is `onPanEnd` from then on.
+  let panActive = false;
+
+  const updateDrag = (deltaX: number) => {
+    if (!untracked(dragging)) return;
+    lastDeltaX = deltaX;
+    const floor = minW();
+    const raw = startWidth + deltaX;
+
+    if (!collapsedInDrag) {
+      if (raw <= floor - SIDEBAR_COLLAPSE_PULL) {
+        collapsedInDrag = true;
+        liveWidth.set(floor);
+        setSidebarOpen(false);
+        return;
+      }
+      liveWidth.set(Math.round(Math.min(SIDEBAR_MAX_WIDTH, Math.max(floor, raw))));
+    } else if (raw >= floor - SIDEBAR_REOPEN_PULL) {
+      collapsedInDrag = false;
+      liveWidth.set(Math.round(Math.min(SIDEBAR_MAX_WIDTH, Math.max(floor, raw))));
+      setSidebarOpen(true);
+    }
+  };
+
+  const finishDrag = (deltaX: number, velocityX: number) => {
+    if (!untracked(dragging)) return;
+    dragging.set(false);
+    panActive = false;
+    clearHoverTimer();
+    sashHover.set(false);
+
+    const floor = minW();
+    const raw = startWidth + deltaX;
+    liveWidth.set(null);
+    panX.set(0);
+
+    if (collapsedInDrag) {
+      setSidebarWidth(preDragWidth);
+      return;
+    }
+    if (raw < floor + 10 && velocityX < -420) {
+      setSidebarWidth(preDragWidth);
+      setSidebarOpen(false);
+      return;
+    }
+    setSidebarWidth(Math.round(Math.min(SIDEBAR_MAX_WIDTH, Math.max(floor, raw))));
+  };
+
+  const resetToDefaultWidth = () => {
+    const target = Math.max(minW(), SIDEBAR_DEFAULT_WIDTH);
+    if (!reduceMotion()) {
+      LayoutAnimation.configureNext({
+        duration: 220,
+        update: { type: "spring", springDamping: 0.96 },
+      });
+    }
+    setSidebarWidth(target);
+  };
+
+  return (
+    <View class="relative flex-1 flex-row bg-background">
+      <View
+        class="shrink-0 overflow-hidden"
+        style={{ width: sidebarOpen() ? currentWidth() : 0 }}
+      >
+        <View
+          class="h-full border-r border-sidebar-border bg-sidebar"
+          style={{
+            width: currentWidth(),
+            opacity: drawerOpacity,
+            transform: [{ translateX: drawerSlideX }],
+          }}
+        >
+          <If when={sidebarMounted()}>
+            <Sidebar />
+          </If>
+        </View>
+      </View>
+
+      <View class="relative min-w-0 flex-1">
+        {props.children}
+      </View>
+
+      <If when={(sidebarOpen() && !transitioning()) || dragging()}>
+        <View
+          role="adjustable"
+          focusable={false}
+          desktop={{ windowDrag: false }}
+          accessibilityLabel={tr("Sidebar width", "侧边栏宽度")}
+          accessibilityValue={{ min: minW(), max: SIDEBAR_MAX_WIDTH, now: currentWidth() }}
+          accessibilityActions={[{ name: "increment" }, { name: "decrement" }]}
+          onAccessibilityAction={({ actionName }) => {
+            const floor = minW();
+            if (actionName === "increment") {
+              setSidebarWidth(Math.min(SIDEBAR_MAX_WIDTH, currentWidth() + 24));
+            } else if (actionName === "decrement") {
+              const next = currentWidth() - 24;
+              if (next < floor) setSidebarOpen(false);
+              else setSidebarWidth(next);
+            }
+          }}
+          style={
+            dragging()
+              ? { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 40, cursor: "col-resize" }
+              : { position: "absolute", top: 0, bottom: 0, left: currentWidth() - 5, width: 9, zIndex: 30, cursor: "col-resize" }
+          }
+          onMouseEnter={() => {
+            if (dragging() || transitioning()) return;
+            clearHoverTimer();
+            hoverTimer = setTimeout(() => {
+              hoverTimer = undefined;
+              if (untracked(sidebarOpen) && !untracked(transitioning)) {
+                sashHover.set(true);
+              }
+            }, SASH_HOVER_DELAY_MS);
+          }}
+          onMouseLeave={() => {
+            clearHoverTimer();
+            if (!dragging()) sashHover.set(false);
+          }}
+          onMouseMove={(e) => {
+            if (!dragging()) return;
+            if (e.pressedButton === null) {
+              if (!panActive) finishDrag(e.pagePosition.x - startPageX, 0);
+              return;
+            }
+            updateDrag(e.pagePosition.x - startPageX);
+          }}
+          onPressDown={(e) => {
+            if (e.clickCount >= 2) {
+              resetToDefaultWidth();
+              return;
+            }
+            clearHoverTimer();
+            startPageX = e.pagePosition.x;
+            startWidth = currentWidth();
+            preDragWidth = clampedStoredWidth();
+            lastDeltaX = 0;
+            collapsedInDrag = false;
+            panActive = false;
+            panX.set(0);
+            liveWidth.set(startWidth);
+            dragging.set(true);
+          }}
+          onPressUp={(e) => {
+            if (panActive) return;
+            finishDrag(e.pagePosition.x - startPageX, 0);
+          }}
+          onTouchMove={(e) => updateDrag(e.pageX - startPageX)}
+          onTouchEnd={(e) => {
+            if (panActive) return;
+            finishDrag(e.pageX - startPageX, 0);
+          }}
+          onTouchCancel={() => {
+            if (!panActive) finishDrag(lastDeltaX, 0);
+          }}
+          pan={{ x: panX }}
+          onPanStart={() => {
+            panActive = true;
+          }}
+          onPanEnd={(e) => {
+            panActive = false;
+            finishDrag(e.translation.x, e.velocity.x);
+          }}
+        >
+          <View
+            class={`pointer-events-none absolute inset-y-0 w-[1.5px] transition-opacity duration-150 ${
+              dragging() ? "bg-brand/50" : "bg-foreground/15"
+            }`}
+            style={{
+              left: dragging() ? currentWidth() - 1 : 4,
+              opacity: sidebarOpen() && (dragging() || sashHover()) ? 1 : 0,
+            }}
+          />
+        </View>
+      </If>
+    </View>
+  );
+}
+
+/** The window: sidebar, title bar, and the pane the view names; overlays above them all. */
+export function Shell() {
+  if (isAvailable) {
+    // In an effect, the menu follows what it reads: the sidebar's label, whether Stop applies.
+    effect(applicationMenu);
+  } else {
+    keymap.bind({
+      "mod+n": () => void newSession(),
+      "mod+o": () => void chooseWorkspace(),
+      "mod+,": toggleSettings,
+      "mod+k": () => setPaletteOpen(!isPaletteOpen()),
+      "mod+shift+o": () => setOrchestrateOpen(!isOrchestrateOpen()),
+      "mod+b": toggleSidebar,
+      "mod+u": () => void randomWallpaper(),
+      "mod+l": () => (showChat(), focusComposer()),
+    });
+  }
+  keymap.bind("escape", escape);
+
+  return (
+    <View class="flex-1 flex-row bg-background">
+      <SidebarSplit>
+        <Chat />
+        <TitleBar />
+      </SidebarSplit>
+      <Palette />
+      <OrchestrateDialog />
+      <Settings />
+      <ExtensionDialog />
+      <Toasts />
+    </View>
+  );
+}
