@@ -7,7 +7,7 @@ import { Button } from "../ui/Button";
 import { TextField } from "../ui/Controls";
 import { Icon, type IconName } from "../ui/Icon";
 import { DIALOG_RISE, keepLast, Reveal } from "../ui/motion";
-import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, GLASS_SCRIM, POPUP, PRESS } from "../ui/styles";
+import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, SCRIM } from "../ui/styles";
 
 const TOOL_ICONS: Record<string, IconName> = {
   bash: "terminal",
@@ -352,7 +352,7 @@ export function ExtensionDialog() {
     return dialog?.method === method ? (dialog as Extract<typeof dialog, { method: M }>) : undefined;
   };
   return (
-    <Dialog open={modalOpen()} animation="fade" onOpenChange={({ open }) => !open && cancelPendingDialog()} backdropClass="bg-scrim" backdropStyle={GLASS_SCRIM} class="m-auto w-full max-w-110 px-4">
+    <Dialog open={modalOpen()} animation="fade" onOpenChange={({ open }) => !open && cancelPendingDialog()} backdropClass={SCRIM} class="m-auto w-full max-w-110 px-4">
       <View class={`gap-4 p-5 ${POPUP}`} style={{ ...GLASS_REGULAR, ...createMotion({ enter: DIALOG_RISE }).style }}>
         <If when={of("confirm")}>
           {(dialog) => {

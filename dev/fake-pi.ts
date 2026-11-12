@@ -28,8 +28,19 @@ export interface FakeOptions {
   pace?: number;
   /** Milliseconds an agent takes to start and to load a saved session, as real CLIs do (0: at once). */
   startDelay?: number;
+  /** Each saved session opens on a history of its own (its title asked, then answered) instead of the shared sample. */
+  distinctHistories?: boolean;
+  /** Each saved session's history ends on a reply longer than the window (`LONG_REPLY`): where a conversation lands shows. */
+  longHistories?: boolean;
   /** The reply a run streams: the answer text instead of `REPLY`/`STEPS_REPLY`. */
   reply?: string;
+  /**
+   * The first `times` agent processes go away on their own `after` ms after
+   * starting, as one whose input closed does: exit code 0, nothing on stderr.
+   */
+  dies?: { after: number; times: number };
+  /** Only this many agent processes can start; one asked for after that fails as `failStart` does. */
+  starts?: number;
 }
 
 const MODELS: Model[] = [
@@ -93,6 +104,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   let followUpMode: SessionState["followUpMode"] = "one-at-a-time";
   let autoCompactionEnabled = true;
   let sessionSeq = 0;
+  let deathsLeft = options.dies?.times ?? 0;
+  let startsLeft = options.starts ?? Infinity;
 
   /** One agent process: its own session, messages and stream state, as Pi has per process. */
   const transport = (cwd: string, agentId: string, initial: AgentMessage[], custom?: { id: string; name: string; defaultModel?: string }): Transport => {
@@ -101,7 +114,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     const engineThinking = defaultThinking;
     let messages = initial;
     let sessionFile: string | undefined = initial.length ? "/sessions/one.jsonl" : undefined;
-    let sessionName: string | undefined;
+    // A session opened on history carries the name its file was saved with.
+    let sessionName: string | undefined = sessionFile ? sessions.find((s) => s.path === sessionFile)?.name : undefined;
     let sessionId = `session-${++sessionSeq}`;
     let isStreaming = false;
     const queued = { steering: [] as string[], followUp: [] as string[] };
@@ -123,7 +137,17 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     let out: (chunk: string) => void = () => undefined;
     let exit: (exit: Exit) => void = () => undefined;
     let aborted = false;
-    const emit = (record: object) => out(`${JSON.stringify(record)}\n`);
+    /** The process is gone: it writes nothing more, and ends once. */
+    let gone = false;
+    const die = (how: Exit) => {
+      if (gone) return;
+      gone = true;
+      aborted = true;
+      exit(how);
+    };
+    const emit = (record: object) => {
+      if (!gone) out(`${JSON.stringify(record)}\n`);
+    };
     const later = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
     /** One run: thinking, a tool call that "executes", then streamed prose. */
@@ -220,12 +244,28 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       const text = options.reply ?? STEPS_REPLY;
       const plain = prompt.includes("plain");
       const thinking = "Let me check the working tree first.";
+      // "titled": ACP harnesses name a call by its title, not its tool.
       const tools = plain
         ? []
-        : [
-            { id: "acp_1", name: "bash", args: { command: "git status --short" }, out: " M Clip.test.tsx" },
-            { id: "acp_2", name: "bash", args: { command: "git diff --stat" }, out: "2 files changed" },
-          ];
+        : prompt.includes("long-titled")
+          ? [
+              {
+                id: "acp_1",
+                name: 'git add README.md README.en.md Promo.tsx scripts/render-promo.py assets/promo/*.png && git commit -m "docs(readme): rewrite Chinese and English READMEs with transparent promo shots"',
+                args: { description: 'git add README.md README.en.md Promo.tsx scripts/render-promo.py assets/promo/*.png && git commit -m "docs(readme): rewrite Chinese and English READMEs with transparent promo shots"' },
+                out: "[main 37f23d0] docs(readme)",
+              },
+            ]
+          : prompt.includes("titled")
+          ? [
+              { id: "acp_1", name: "Search for 'animate Layout On|animate Next Layout|Layout Animation'", args: { path: "." }, out: "views/Chat.tsx:12" },
+              { id: "acp_2", name: "Search for 'veil|fold'", args: { path: "." }, out: "lib/veil.ts:1" },
+              { id: "acp_3", name: "Listed ./views, ./pi, ./lib, ./store", args: { command: "ls views pi lib store" }, out: "views pi lib store" },
+            ]
+          : [
+              { id: "acp_1", name: "bash", args: { command: "git status --short" }, out: " M Clip.test.tsx" },
+              { id: "acp_2", name: "bash", args: { command: "git diff --stat" }, out: "2 files changed" },
+            ];
       const base = { role: "assistant", provider: "anthropic", model: "claude-sonnet-4-5", usage, timestamp: Date.now() };
       const content: Record<string, unknown>[] = plain ? [] : [{ type: "thinking", thinking }];
       await step({ type: "agent_start" });
@@ -268,6 +308,83 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       aborted = false;
     }
 
+    /** Ends the wait before a retry early (`abort_retry`). */
+    let cancelRetry: (() => void) | undefined;
+
+    /**
+     * A run through Pi's automatic retry, record for record as Pi 1.5 emits it:
+     * a failed attempt ends its low-level run (`agent_end`, `willRetry`), Pi
+     * says it will retry and waits, then runs again. "flaky" answers on the
+     * second attempt; "outage" fails every attempt until Pi gives up. A retry
+     * cancelled while it waits settles as not aborted, as Pi's does.
+     */
+    async function runRetries(user: AgentMessage, prompt: string, step: (record: object) => Promise<void>, update: (event: object) => Promise<void>) {
+      isStreaming = true;
+      const outage = prompt.includes("outage");
+      const maxAttempts = 2;
+      const wait = Math.max(options.pace ?? 0, 50) * 4;
+      const error = "529 overloaded";
+      const base = { role: "assistant", provider: "anthropic", model: "claude-sonnet-4-5", usage, timestamp: Date.now() };
+      const failed = { ...base, content: [], stopReason: "error", errorMessage: error } as unknown as AgentMessage;
+      const text = "Back on my feet: here is the plan.";
+      const done = { ...base, content: [{ type: "text", text }], stopReason: "stop" } as unknown as AgentMessage;
+      let last: AgentMessage | undefined;
+      let retries = 0;
+      await step({ type: "agent_start" });
+      await step({ type: "turn_start" });
+      await step({ type: "message_start", message: user });
+      await step({ type: "message_end", message: user });
+      while (!aborted) {
+        if (outage || retries === 0) {
+          await step({ type: "message_start", message: { ...failed, stopReason: "pending" } });
+          await step({ type: "message_end", message: failed });
+          await step({ type: "turn_end" });
+          const willRetry = retries < maxAttempts && !aborted;
+          emit({ type: "agent_end", willRetry });
+          if (!willRetry) {
+            // The attempt Pi gives up on stays in its history; the ones it retried do not.
+            last = failed;
+            if (retries) emit({ type: "auto_retry_end", success: false, attempt: retries, finalError: error });
+            break;
+          }
+          retries++;
+          emit({ type: "auto_retry_start", attempt: retries, maxAttempts, delayMs: wait, errorMessage: error });
+          const cancelled = await new Promise<boolean>((resolve) => {
+            const timer = setTimeout(() => resolve(false), wait);
+            cancelRetry = () => {
+              clearTimeout(timer);
+              resolve(true);
+            };
+          });
+          cancelRetry = undefined;
+          if (cancelled) {
+            emit({ type: "auto_retry_end", success: false, attempt: retries, finalError: "Retry cancelled" });
+            break;
+          }
+          await step({ type: "agent_start" });
+          await step({ type: "turn_start" });
+          continue;
+        }
+        await step({ type: "message_start", message: { ...done, content: [], stopReason: "pending" } });
+        await update({ type: "text_start", contentIndex: 0 });
+        for (const piece of text.match(/[\s\S]{1,24}/g) ?? []) await update({ type: "text_delta", contentIndex: 0, delta: piece });
+        await update({ type: "text_end", contentIndex: 0, content: text });
+        await step({ type: "message_end", message: done });
+        if (!aborted) emit({ type: "auto_retry_end", success: true, attempt: retries });
+        await step({ type: "turn_end" });
+        emit({ type: "agent_end", willRetry: false });
+        last = done;
+        break;
+      }
+      if (!aborted) {
+        messages = [...messages, user, ...(last ? [last] : [])];
+        if (sessionFile) sessionMessages.set(sessionFile, messages);
+      }
+      isStreaming = false;
+      emit({ type: "agent_settled", aborted });
+      aborted = false;
+    }
+
     async function run(prompt: string, images?: ImageContent[]) {
       const pace = options.pace ?? 0;
       const needsConfirm = prompt.includes("confirm");
@@ -300,10 +417,26 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       isStreaming = true;
       // Pi writes the session file as soon as the run starts, so a session can be found again.
       if (!sessionFile) sessionFile = `/sessions/${encodeURIComponent(cwd)}-${sessionId}.jsonl`;
-      if (!(byWorkspace[cwd] ?? sessions).some((s) => s.path === sessionFile)) {
-        const entry = { path: sessionFile, id: sessionId, firstMessage: prompt, messageCount: 1, created: Date.now(), modified: Date.now() };
-        if (byWorkspace[cwd]) byWorkspace[cwd] = [entry, ...byWorkspace[cwd]];
-        else sessions = [entry, ...sessions];
+      // The listing is newest first by last message (`sidecar/list-sessions.mjs`): a session that takes one leads it.
+      const listed = byWorkspace[cwd] ?? sessions;
+      const known = listed.find((s) => s.path === sessionFile);
+      const entry = known
+        ? { ...known, messageCount: known.messageCount + 1, modified: Date.now() }
+        : { path: sessionFile, id: sessionId, firstMessage: prompt, messageCount: 1, created: Date.now(), modified: Date.now() };
+      const relisted = [entry, ...listed.filter((s) => s.path !== sessionFile)];
+      if (byWorkspace[cwd]) byWorkspace[cwd] = relisted;
+      else sessions = relisted;
+      if (prompt.includes("flaky") || prompt.includes("outage")) return runRetries(user, prompt, step, update);
+      // "crash": the process dies under the run. Pi has the message on file by then, as it writes one when it is sent.
+      if (prompt.includes("crash")) {
+        await step({ type: "agent_start" });
+        await step({ type: "turn_start" });
+        await step({ type: "message_start", message: user });
+        await step({ type: "message_end", message: user });
+        messages = [...messages, user];
+        sessionMessages.set(sessionFile, messages);
+        await later(60);
+        return die({ code: 1 });
       }
       await step({ type: "agent_start" });
       await step({ type: "turn_start" });
@@ -369,11 +502,31 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         case "get_available_thinking_levels":
           return { levels: defaultModel.reasoning ? ["off", "minimal", "low", "medium", "high"] : ["off"] };
         case "get_commands":
-          return { commands: [{ name: "fix-tests", description: "Fix failing tests", source: "prompt" }, { name: "skill:review", description: "Review a change", source: "skill" }] };
+          // Pi lists the command pipi's own extension registers too (`pipi-runtime-mode`): plumbing the menu must not show.
+          // Another engine reports its own commands through the bridge (`source: "agent"`): as Claude Code does,
+          // some under the names of things the shell owns (the session, its name, the model).
+          return agentId === "pi"
+            ? {
+                commands: [
+                  { name: "pipi-runtime-mode", description: "Set pipi runtime permission mode", source: "extension" },
+                  { name: "fix-tests", description: "Fix failing tests", source: "prompt" },
+                  { name: "skill:review", description: "Review a change", source: "skill" },
+                ],
+              }
+            : {
+                commands: [
+                  { name: "clear", description: "Start a new session with empty context", source: "agent", argumentHint: "[name]" },
+                  { name: "model", description: "Set the AI model", source: "agent", argumentHint: "<model>" },
+                  { name: "rename", description: "Rename the current conversation", source: "agent", argumentHint: "[name]" },
+                  { name: "security-review", description: "Review the pending changes for security issues", source: "agent", argumentHint: "[path]" },
+                ],
+              };
         case "get_session_stats":
           return { sessionId, sessionFile, userMessages: 1, assistantMessages: 2, toolCalls: 2, toolResults: 2, totalMessages: messages.length, tokens: { input: 4570, output: 360, cacheRead: 0, cacheWrite: 0, total: 4930 }, cost: 0.016, contextUsage: { tokens: 24000, contextWindow: 200000, percent: 12 } };
         case "prompt":
           if (options.noModels) throw new Error("No API key found for the selected model.");
+          // "refuse": Pi turns the prompt down before any run starts (a key gone missing, a model that left).
+          if (String(command.message).includes("refuse")) throw new Error("No API key found for the selected model.");
           if (isStreaming) {
             const bucket = command.streamingBehavior === "steer" ? queued.steering : queued.followUp;
             bucket.push(String(command.message));
@@ -384,6 +537,9 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           return { disposition: "started" };
         case "abort":
           aborted = isStreaming;
+          return undefined;
+        case "abort_retry":
+          cancelRetry?.();
           return undefined;
         case "clear_queue":
           queued.steering.length = 0;
@@ -400,10 +556,11 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           return { cancelled: false };
         case "switch_session": {
           sessionFile = String(command.sessionPath);
-          messages = sessionMessages.get(sessionFile) ?? sampleHistory();
+          messages = sessionMessages.get(sessionFile) ?? historyOf(sessionFile);
           sessionMessages.set(sessionFile, messages);
           const allKnown = [...sessions, ...Object.values(byWorkspace).flat()];
           sessionName = allKnown.find((s) => s.path === command.sessionPath)?.name;
+          sessionId = `session-${++sessionSeq}`;
           return { cancelled: false };
         }
         case "set_model": {
@@ -439,8 +596,14 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       }
     };
 
+    if (options.dies && deathsLeft > 0) {
+      deathsLeft--;
+      setTimeout(() => die({ code: 0 }), options.dies.after);
+    }
+
     return {
       write(text) {
+        if (gone) throw new Error("Process has exited");
         for (const line of text.split("\n").filter(Boolean)) {
           const command = JSON.parse(line) as Record<string, unknown>;
           sent.push(command);
@@ -465,9 +628,21 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       onStdout: (handler) => void (out = handler),
       onStderr: () => undefined,
       onExit: (handler) => void (exit = handler),
-      end: () => setTimeout(() => exit({ code: 0 }), 0),
-      kill: () => exit({ code: null, signal: "SIGKILL" }),
+      end: () => setTimeout(() => die({ code: 0 }), 0),
+      kill: () => die({ code: null, signal: "SIGKILL" }),
     };
+  };
+
+  /** What a session file not opened before holds. */
+  const historyOf = (file: string): AgentMessage[] => {
+    const sample = sampleHistory();
+    const history = options.longHistories
+      ? sample.map((message, at) => (at === sample.length - 1 ? ({ ...message, content: [{ type: "text", text: LONG_REPLY }] } as AgentMessage) : message))
+      : sample;
+    if (!options.distinctHistories) return history;
+    const summary = [...sessions, ...Object.values(byWorkspace).flat()].find((s) => s.path === file);
+    const asked = summary?.name || summary?.firstMessage;
+    return asked ? [{ ...history[0], content: asked } as AgentMessage, ...history.slice(1)] : history;
   };
 
   const startup = () => (options.startDelay ? new Promise<void>((resolve) => setTimeout(resolve, options.startDelay)) : Promise.resolve());
@@ -507,7 +682,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       });
     },
     async startPi(cwd) {
-      if (options.failStart) throw new Error("spawn node ENOENT");
+      if (options.failStart || startsLeft-- <= 0) throw new Error("spawn node ENOENT");
       await startup();
       activeCwd = cwd;
       activeAgent = "pi";
@@ -516,7 +691,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       return transport(cwd, "pi", options.history ?? []);
     },
     async startAgent(startOpts) {
-      if (options.failStart) throw new Error("spawn node ENOENT");
+      if (options.failStart || startsLeft-- <= 0) throw new Error("spawn node ENOENT");
       await startup();
       activeCwd = startOpts.cwd;
       activeAgent = startOpts.agentId;

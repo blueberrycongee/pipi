@@ -13,8 +13,12 @@ export interface Exit {
  * child process (`sidecar.ts`); tests script one.
  */
 export interface Transport {
-  /** Queues text for Pi's stdin. */
-  write(text: string): void;
+  /**
+   * Queues text for Pi's stdin. A write too big for the pipe's queue may go
+   * out in slices and return a promise settling once it is all queued;
+   * delivery failures throw synchronously or reject that promise.
+   */
+  write(text: string): Promise<void> | void;
   /** Calls `handler` with each piece of stdout, in order. */
   onStdout(handler: (chunk: string) => void): void;
   /** Calls `handler` with each piece of stderr: diagnostics, never protocol. */
@@ -99,11 +103,14 @@ export class PiClient {
     const id = `c${++this.#next}`;
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { command: type, resolve: resolve as (data: unknown) => void, reject });
-      try {
-        this.#transport.write(`${JSON.stringify({ id, type, ...args[0] })}\n`);
-      } catch (error) {
+      const failed = (error: unknown) => {
         this.#pending.delete(id);
         reject(new PiError(type, error instanceof Error ? error.message : String(error)));
+      };
+      try {
+        void Promise.resolve(this.#transport.write(`${JSON.stringify({ id, type, ...args[0] })}\n`)).catch(failed);
+      } catch (error) {
+        failed(error);
       }
     });
   }
@@ -116,7 +123,9 @@ export class PiClient {
   /** Answers an extension's dialog. */
   respond(id: string, answer: ExtensionUiAnswer) {
     if (this.#closed) return;
-    this.#transport.write(`${JSON.stringify({ type: "extension_ui_response", id, ...answer })}\n`);
+    void Promise.resolve(this.#transport.write(`${JSON.stringify({ type: "extension_ui_response", id, ...answer })}\n`)).catch((error: unknown) =>
+      console.warn("pi: the extension response could not be written", error),
+    );
   }
 
   /** Asks Pi to shut down in order, and ends it if it has not within `graceMs`. */

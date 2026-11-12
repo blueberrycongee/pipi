@@ -1,7 +1,7 @@
 import { Canvas, cleanup, createAnimatedValue, createMotion, effect, reduceMotion, token, View } from "nsh";
 import type { CanvasRenderingContext2D } from "nsh";
 import { pipCoat } from "../store/prefs";
-import { BOUNDS, COATS, GRID, LINE_PAINT, pip, SPECIES, type CoatId, type Mood, type Paint, type Path, type Shape } from "./geometry";
+import { BOUNDS, GRID, LINE_PAINT, pip, silhouette, tailPivot, type CoatId, type Mood, type Paint, type Path, type Shape } from "./geometry";
 
 export type { CoatId, Mood } from "./geometry";
 
@@ -129,7 +129,7 @@ export function Pip(props: { size: number; mood?: Mood; coat?: CoatId; still?: b
 
   const height = (props.size * BOUNDS.h) / GRID;
   return (
-    <View class={props.class} style={{ width: props.size, height }} accessibilityLabel="Pip" role="image">
+    <View class={props.class} style={{ width: props.size, height }} accessibilityLabel="pipi" role="image">
       <Canvas
         style={{ width: props.size, height, transformOrigin: "bottom", transform: body.transform }}
         draw={(cx, { width }) => {
@@ -137,18 +137,19 @@ export function Pip(props: { size: number; mood?: Mood; coat?: CoatId; still?: b
           cx.scale(scale, scale);
           cx.translate(0, -BOUNDS.y);
           const coat = props.coat ?? pipCoat();
-          const parts = SPECIES[COATS[coat].species];
+          const body = silhouette(coat);
+          const pivot = tailPivot(coat);
           for (const shape of pip(mood(), coat)) {
-            if (shape !== parts.tail) {
-              draw(cx, shape, parts.body);
+            if (shape.kind !== "path" || !shape.wag) {
+              draw(cx, shape, body);
               continue;
             }
             // The tail swings about its root, behind the body.
             cx.save();
-            cx.translate(parts.tailPivot[0], parts.tailPivot[1]);
+            cx.translate(pivot[0], pivot[1]);
             cx.rotate(tail);
-            cx.translate(-parts.tailPivot[0], -parts.tailPivot[1]);
-            draw(cx, parts.tail, parts.body);
+            cx.translate(-pivot[0], -pivot[1]);
+            draw(cx, shape, body);
             cx.restore();
           }
         }}

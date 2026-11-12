@@ -1,11 +1,12 @@
 import { mount, Text, View } from "nsh";
+import { COAT_IDS } from "./mascot/geometry";
 import { Pip, type Mood } from "./mascot/Pip";
 import { AgentLogo, type AgentLogoId } from "./ui/AgentLogo";
 import { Icon, type IconName } from "./ui/Icon";
 
 const MOODS: Mood[] = ["idle", "think", "work", "write", "happy", "error", "sleep"];
 const AGENTS: AgentLogoId[] = ["pi","claude","codex","devin","opencode","cursor","gemini","copilot","grok","goose","kimi","qwen","dsh","antigravity","hermes","kiro","droid","amp"];
-const ICONS: IconName[] = ["plus","x","check","chevronDown","chevronRight","chevronsUpDown","arrowUp","arrowLeft","stop","search","folder","folderOpen","folderPlus","archive","unarchive","trash","pencil","copy","terminal","file","fileEdit","filePlus","sliders","gear","github","more","alert","info","refresh","sidebar","sparkle","bolt","chip","key","external","download","fork","compact","image","enter","clock","eye","plug","message","command","steer","queue","dot","globe","wrench","agents","layers","shield","shieldLock","shieldHalf","shieldBolt"];
+const ICONS: IconName[] = ["plus","x","check","chevronDown","chevronRight","chevronsUpDown","arrowUp","arrowLeft","stop","search","folder","folderOpen","folderPlus","archive","unarchive","trash","pencil","copy","terminal","thinking","file","fileEdit","filePlus","sliders","gear","github","more","alert","info","refresh","sidebar","sparkle","bolt","chip","key","external","download","fork","compact","image","enter","clock","eye","plug","message","command","steer","queue","dot","globe","wrench","agents","layers","shield","shieldLock","shieldHalf","shieldBolt"];
 
 mount(() => (
   <View class="flex-1 gap-6 bg-background p-8">
@@ -16,6 +17,11 @@ mount(() => (
     </View>
     <View class="flex-row items-end gap-6">
       <Pip size={16} still /><Pip size={20} still /><Pip size={24} still /><Pip size={32} still /><Pip size={48} still /><Pip size={128} />
+    </View>
+    <View class="flex-row flex-wrap items-end gap-3">
+      <Each of={COAT_IDS}>{(id) => (
+        <View class="items-center gap-2"><Pip size={48} coat={id()} still /><Pip size={16} coat={id()} still /></View>
+      )}</Each>
     </View>
     <View class="flex-row flex-wrap gap-3">
       <Each of={ICONS}>{(n) => (

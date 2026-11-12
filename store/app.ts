@@ -15,6 +15,7 @@ import type {
   WorktreeInfo,
 } from "../agents/types";
 import { activeLanguage, tr } from "../lib/i18n";
+import { answersTo, type ComposerCommand, parseSlashLine } from "../lib/slash";
 import {
   chooseRandomWallpaperCandidate,
   DEFAULT_WALLPAPER_ADJUSTMENT,
@@ -28,6 +29,7 @@ import { type Exit, PiClient, PiError } from "../pi/client";
 import type { CredentialKind } from "../pi/credentials";
 import type {
   Commands,
+  AgentMessage,
   CommandType,
   ExtensionUiAnswer,
   ExtensionUiDialog,
@@ -44,7 +46,8 @@ import type {
 import { type SessionSummary, sessionTitle } from "../pi/sessions";
 import { EMPTY_USAGE, type UsageStats } from "../pi/usage";
 import { killAllSidecars, SidecarError } from "../pi/sidecar";
-import { type Row, Transcript } from "../pi/transcript";
+import { type Row, Transcript, withoutImageNotes } from "../pi/transcript";
+import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
 import { backend, type OrchestratorCallbacks, type OrchestratorHandle } from "./backend";
@@ -132,8 +135,9 @@ export interface Attachment extends ImageContent {
   name: string;
 }
 
-export type View = { name: "chat" } | { name: "settings"; section: SettingsSection };
-export type SettingsSection = "general" | "providers" | "agents" | "archive" | "usage" | "about";
+/** Settings on `section`; `agent` names the agent whose configuration is open inside Agents. */
+export type View = { name: "chat" } | { name: "settings"; section: SettingsSection; agent?: string };
+export type SettingsSection = "general" | "agents" | "archive" | "usage" | "about";
 
 /**
  * A session whose agent is still working while the user looks at another one.
@@ -196,6 +200,8 @@ const view = signal<View>({ name: "chat" });
 const draft = signal("");
 const attachments = signal<Attachment[]>([]);
 const composerFocus = signal(0, { equals: false });
+/** Ticks when something outside the model chip (`/model`) asks for its list. */
+const modelPickerAsk = signal(0, { equals: false });
 const scrollToEnd = signal(0, { equals: false });
 const landed = signal(0);
 const paletteOpen = signal(false);
@@ -203,9 +209,19 @@ const orchestrateOpen = signal(false);
 const renaming = signal(false);
 const busy = signal(false);
 /** Where a session change under way is heading: a saved file, or no file for a fresh draft. */
-const heading = signal<{ cwd: string; file?: string; keepTitle?: boolean } | undefined>(undefined);
+const heading = signal<Heading | undefined>(undefined);
+/**
+ * The change under way has nothing of its destination to show yet: what was
+ * on screen is on its way out, and the chat waits. Never on at a cold start
+ * (there is nothing to leave), nor when the destination is already on screen.
+ */
+const leaving = signal(false);
+/** Ticks when a session change puts its destination on screen: with the click when it can, else as it lands. */
+const arrived = signal(0);
 /** Session files of runs that keep going while another session is on screen. */
 const parkedRunning = signal<string[]>([]);
+/** Session files whose background run settled (or a new answer landed) since the user last opened them. */
+const unreadSessions = signal<string[]>([]);
 
 // External Agent Harnesses & Multi-Agent Orchestration state
 const agents = signal<AgentHarnessStatus[]>(defaultAgentStatuses());
@@ -231,7 +247,6 @@ export interface ArchivedSessionItem {
   archivedAt: number;
 }
 
-export const slashCommands = () => commands();
 export const savedSessions = computed<SessionSummary[]>(() => sessions().filter((s) => !isSessionArchived(s.path)));
 export const workspaceSessions = computed<Record<string, SessionSummary[]>>(() => {
   const raw = sessionsByWorkspace();
@@ -291,6 +306,7 @@ export const currentView = () => view();
 export const composerDraft = () => draft();
 export const composerAttachments = () => attachments();
 export const composerFocusTick = () => composerFocus();
+export const modelPickerTick = () => modelPickerAsk();
 export const scrollToEndTick = () => scrollToEnd();
 export const isPaletteOpen = () => paletteOpen();
 export const isOrchestrateOpen = () => orchestrateOpen();
@@ -305,14 +321,77 @@ export const sessionLandedTick = () => landed();
  * reports a new session before it switches to the requested one).
  */
 export const pendingSession = () => heading();
+/** The open conversation is on its way out and its successor has not landed: the chat dims it and waits. */
+export const isLeavingSession = () => leaving();
+/** Ticks each time a session change shows its destination, so the chat settles it in once. */
+export const sessionArrivedTick = () => arrived();
+/** The change under way is heading for a fresh session, whose empty chat is already on screen. */
+export const isDraftAhead = () => heading()?.welcome === true;
 
-/** Marks a session change as heading for `target` until `work` ends. */
-async function headFor<T>(target: { cwd: string; file?: string; keepTitle?: boolean }, work: () => Promise<T>): Promise<T> {
-  heading.set(target);
+type Heading = { cwd: string; file?: string; keepTitle?: boolean; /** A fresh session's empty chat is shown ahead of the agent. */ welcome?: boolean };
+
+/**
+ * Marks a session change as heading for `target` until `work` ends.
+ *
+ * A change answers the click, not the agent: a conversation seen before goes
+ * on screen at once from `visited` (the agent's own history confirms or
+ * replaces it as it lands), and so does a fresh session's empty chat. Only a
+ * destination with nothing to show yet leaves the screen waiting (`leaving`).
+ */
+async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
+  let target = goal;
+  let shown = false;
+  if (!goal.keepTitle) {
+    const warm = phase().name === "ready";
+    const welcome = !goal.file && warm && hasModel();
+    stashTranscript();
+    const seen = goal.file ? visited.get(goal.file) : undefined;
+    if (seen && goal.file) {
+      visited.delete(goal.file);
+      transcript = seen;
+      ahead = { transcript: seen, file: goal.file };
+      shown = true;
+    } else if (welcome) {
+      if (transcript.rows().length) transcript.load([]);
+      target = { ...goal, welcome: true };
+      shown = true;
+    }
+    if (shown) {
+      early = true;
+      shownVersion = -1;
+      markTranscriptSeen();
+    }
+    batch(() => {
+      heading.set(target);
+      leaving.set(!shown && (leaving() || warm));
+      if (shown) {
+        flush();
+        landed.update((n) => n + 1);
+        scrollToEnd.set(0);
+        arrived.update((n) => n + 1);
+      }
+    });
+  } else {
+    heading.set(target);
+  }
+  const run = work();
+  arrival = run.then(
+    () => undefined,
+    () => undefined,
+  );
   try {
-    return await work();
+    return await run;
   } finally {
-    if (heading() === target) heading.set(undefined);
+    if (heading() === target) {
+      early = false;
+      batch(() => {
+        heading.set(undefined);
+        if (leaving()) {
+          leaving.set(false);
+          arrived.update((n) => n + 1);
+        }
+      });
+    }
   }
 }
 
@@ -320,6 +399,19 @@ async function headFor<T>(target: { cwd: string; file?: string; keepTitle?: bool
 export function isSessionRunning(path: string) {
   if (path === state()?.sessionFile) return running() || bashRunning();
   return parkedRunning().includes(path);
+}
+
+/** Whether a background run finished with something the user has not seen yet. */
+export function isSessionUnread(path: string) {
+  return unreadSessions().includes(path);
+}
+
+function markSessionUnread(path: string) {
+  if (!unreadSessions().includes(path)) unreadSessions.set([...unreadSessions(), path]);
+}
+
+function markSessionRead(path: string | undefined) {
+  if (path && unreadSessions().includes(path)) unreadSessions.set(unreadSessions().filter((p) => p !== path));
 }
 
 // Multi-agent accessors
@@ -331,6 +423,65 @@ export const activeAgent = computed<AgentHarnessStatus>(() => {
 });
 export const runtimeMode = () => currentRuntimeMode();
 export const gitWorkspaceInfo = () => gitInfo();
+
+/**
+ * pipi's own slash commands: what the shell itself does from the composer, the
+ * same names on every engine, so what the user learned on one agent holds on
+ * the next. Each is an action the app already has elsewhere (the palette, the
+ * chips), offered only where the engine driving the session can do it:
+ * compaction and HTML export are Pi's RPC and the bridge has neither, so they
+ * are listed on Pi alone (an engine that compacts reports its own `/compact`).
+ *
+ * The shell owns the session and the controls around it: it keeps the
+ * transcript, names the session, and hands every turn its model. An engine's
+ * own command for one of those would change the engine behind the shell's back
+ * — Claude Code's `/clear` starts a new session of its own while pipi still
+ * shows the old conversation — so the names engines use for them are `aliases`
+ * here: `/clear` is `/new` and `/rename` is `/name`, on any engine.
+ */
+const appCommands = computed<ComposerCommand[]>(() => {
+  const onPi = activeAgent().driver === "pi";
+  const own = (name: string, description: string, keywords: string[], more: Partial<ComposerCommand> = {}): ComposerCommand => ({
+    name,
+    description,
+    keywords,
+    source: "app",
+    ...more,
+  });
+  return [
+    own("new", tr("Start a new session", "新建会话"), ["reset", "新建", "新会话", "清空"], { aliases: ["clear"] }),
+    ...(onPi ? [own("compact", tr("Compact the context", "压缩上下文"), ["summarize", "压缩", "上下文"], { argumentHint: tr("[instructions]", "[要求]") })] : []),
+    own("model", tr("Choose the model", "选择模型"), ["models", "模型", "切换模型"]),
+    own("name", tr("Rename this session", "重命名会话"), ["title", "重命名", "命名", "标题"], { argumentHint: tr("[name]", "[名称]"), aliases: ["rename"] }),
+    own("copy", tr("Copy the last reply", "复制最后一条回复"), ["复制", "拷贝"]),
+    ...(onPi ? [own("export", tr("Export the session as HTML", "导出为 HTML"), ["html", "导出"])] : []),
+    own("delegate", tr("Hand a task to another agent", "把任务委派给另一个智能体"), ["subagent", "委派", "子智能体"], {
+      argumentHint: tr("<agent> <task>", "<智能体> <任务>"),
+      needsArguments: true,
+      options: agents()
+        .filter((agent) => agent.available)
+        .map((agent) => ({ value: agent.id, description: agent.name })),
+    }),
+    own("parallel", tr("Run several agents on one task", "多个智能体并行处理同一任务"), ["orchestrate", "pipeline", "并行", "编排", "流水线"], { argumentHint: tr("[task]", "[任务]") }),
+    own("settings", tr("Open Settings", "打开设置"), ["preferences", "config", "设置", "偏好"]),
+  ];
+});
+
+/** Plumbing an engine registers for its host, not for the user: pipi's own Pi extension (`pipi-runtime-mode`), an engine's private names. */
+const INTERNAL_COMMAND = /^(pipi-|__)/;
+
+/** The agent's own commands that are the user's to run: not its plumbing, and not under a name pipi owns. */
+const agentCommands = computed<SlashCommand[]>(() => {
+  const own = appCommands();
+  return commands().filter((command) => !INTERNAL_COMMAND.test(command.name) && !own.some((mine) => answersTo(mine, command.name)));
+});
+
+/**
+ * Every command the composer offers: pipi's own, then the agent's. A name
+ * pipi owns (an alias included) is pipi's — as a TUI's built-ins come before
+ * its templates — so what the menu lists is exactly what `send` runs.
+ */
+export const slashCommands = computed<ComposerCommand[]>(() => [...appCommands(), ...agentCommands()]);
 export const delegatedTasks = () => delegated();
 export const runningDelegatedCount = computed(() => delegated().filter((t) => t.status === "running").length);
 export const inspectingTaskId = () => inspectingId();
@@ -372,7 +523,7 @@ export const currentTitle = computed(() => {
 export const pipMood = computed<Mood>(() => {
   const now = phase();
   if (now.name === "failed") return "error";
-  if (now.name === "starting" || (isSwitching() && !rows().length)) return "sleep";
+  if (now.name === "starting" || leaving() || (isSwitching() && !rows().length && !isDraftAhead())) return "sleep";
   if (cheer()) return "happy";
   const subRunning = runningDelegatedCount() > 0;
   if (!running() && !subRunning) return "idle";
@@ -392,7 +543,33 @@ let generation = 0;
 let transcript = new Transcript(() => activeLanguage());
 /** Runs the user has looked away from, by session file. Their agents keep working. */
 const parked = new Map<string, ParkedRun>();
+/**
+ * Conversations the reader left at rest, by session file: opening one again
+ * shows it with the click instead of after the agent has loaded it.
+ */
+const visited = new Map<string, Transcript>();
+const VISITED_LIMIT = 8;
+/** The conversation shown from `visited`, until the agent's own history confirms or replaces it. */
+let ahead: { transcript: Transcript; file: string } | undefined;
+/** The change under way showed its destination before the agent got there: a change that fails puts the agent's session back. */
+let early = false;
+/** Settles when the session change under way is over, however it ends. */
+let arrival: Promise<void> | undefined;
 const parkedByClient = new Map<PiClient, ParkedRun>();
+/** The parked run on its way back to the screen: making room off screen must not let go of it. */
+let adopting: ParkedRun | undefined;
+/**
+ * When the open agent last went away on its own. One that does is started
+ * again under its session (`revive`); one that will not stay up is not
+ * started for ever — past `REVIVE_LIMIT` in `REVIVE_WINDOW_MS` the screen says so.
+ */
+let lostAt: number[] = [];
+const REVIVE_LIMIT = 3;
+const REVIVE_WINDOW_MS = 60_000;
+/** Settles once the agent being started again has its session open (or could not be started): commands wait on it. */
+let reopening: Promise<void> | undefined;
+/** Settles once that agent is as the reader left it, model and all: a message waits on it. */
+let revival: Promise<void> | undefined;
 /** One shared orchestrator daemon for the whole app; coordinators carry `?cwd=` in their MCP URL. */
 let orchestrator: OrchestratorHandle | undefined;
 let orchestratorStarting: Promise<OrchestratorHandle | undefined> | undefined;
@@ -402,6 +579,9 @@ let shownVersion = -1;
 const pendingTaskFlushes = new Set<string>();
 let taskFlushFrame: number | undefined;
 let toastId = 0;
+const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
+/** The reader asked the open run to stop. However it then ends is their doing: Pi settles a retry cancelled mid-wait as not aborted. */
+let stopAsked = false;
 let bashRequestId: string | undefined;
 
 /** Publishes the transcript to the screen: synchronized to display VSync, at most once a frame. */
@@ -416,6 +596,63 @@ function flush() {
   if (transcript.version === shownVersion) return;
   shownVersion = transcript.version;
   rows.set(transcript.rows());
+}
+
+/**
+ * Sets the open conversation aside for `visited` as a session change leaves
+ * it, a new transcript taking its place. Its rows stay on screen until the
+ * next flush: the chat dims them while the destination loads. A run is not
+ * set aside here — it is parked with its process.
+ */
+function stashTranscript() {
+  const shownAhead = ahead?.transcript === transcript ? ahead : undefined;
+  ahead = undefined;
+  const file = shownAhead ? shownAhead.file : phase().name === "ready" ? state()?.sessionFile : undefined;
+  if (!file || running() || bashRunning() || !transcript.rows().length) return;
+  visited.delete(file);
+  visited.set(file, transcript);
+  for (const oldest of visited.keys()) {
+    if (visited.size <= VISITED_LIMIT) break;
+    visited.delete(oldest);
+  }
+  transcript = new Transcript(() => activeLanguage());
+  shownVersion = -1;
+}
+
+/** Whether two transcripts show the same conversation (row ids are minted per transcript and never match). */
+function sameRows(a: Row[], b: Row[]) {
+  if (a.length !== b.length) return false;
+  const shape = (rows: Row[]) => JSON.stringify(rows, (key, value) => (key === "id" ? undefined : value));
+  return shape(a) === shape(b);
+}
+
+/**
+ * Puts the open session's messages on screen. A conversation shown ahead from
+ * `visited` that the agent's history matches stays as it is — the same rows,
+ * nothing for the list to do; one that moved on since is replaced.
+ */
+function landHistory(messages: AgentMessage[]) {
+  const shown = ahead?.transcript === transcript;
+  ahead = undefined;
+  early = false;
+  if (shown) {
+    const fresh = new Transcript(() => activeLanguage());
+    fresh.load(messages);
+    if (sameRows(fresh.rows(), transcript.rows())) return;
+    transcript = fresh;
+    shownVersion = -1;
+  } else {
+    transcript.load(messages);
+  }
+  markTranscriptSeen();
+  flush();
+  landed.update((n) => n + 1);
+  scrollToEnd.set(0);
+}
+
+/** Marks every row the transcript can put on screen as already seen: a landing never replays row entrances. */
+function markTranscriptSeen() {
+  markRowsSeen(displayRowIds(transcript.rows()));
 }
 
 function flushTaskSoon(taskId: string) {
@@ -463,6 +700,8 @@ function request<C extends CommandType>(
   type: C,
   ...args: {} extends Commands[C]["args"] ? [args?: Commands[C]["args"]] : [args: Commands[C]["args"]]
 ): Promise<Commands[C]["data"]> {
+  // An agent on its way back answers once its session is open again, not before and not never.
+  if (reopening) return reopening.then(() => request(type, ...args));
   if (!client) return Promise.reject(new PiError(type, tr("Agent is not running", "智能体未运行")));
   return client.request(type, ...args);
 }
@@ -573,11 +812,10 @@ function teardownStore() {
   const active = client;
   client = undefined;
   active?.close(0);
-  for (const run of parked.values()) {
-    run.client.close(0);
-  }
+  const runs = [...parked.values()];
   parked.clear();
   parkedByClient.clear();
+  for (const run of runs) run.client.close(0);
   orchestratorStarting = undefined;
   const orch = orchestrator;
   orchestrator = undefined;
@@ -664,8 +902,7 @@ async function launch(
   preserveRows?: { previousRows: Row[]; handoffTitle: string; handoffDetail: string },
 ) {
   const mine = ++generation;
-  client?.close();
-  client = undefined;
+  closeActive();
   if (flushFrame !== undefined) cancelAnimationFrame(flushFrame);
   flushFrame = undefined;
 
@@ -676,6 +913,8 @@ async function launch(
   batch(() => {
     phase.set({ name: "starting" });
     workspace.set(cwd);
+    // Another agent's commands are not this one's: its own arrive once it has started.
+    if (effectiveAgentId !== currentAgentId()) commands.set([]);
     currentAgentId.set(effectiveAgentId);
     inspectingId.set(undefined);
     state.set(undefined);
@@ -698,43 +937,18 @@ async function launch(
     transcript.seedRows(preserveRows.previousRows);
     transcript.summary(preserveRows.handoffTitle, preserveRows.handoffDetail);
     flush();
-    markRowsSeen(transcript.rows().map((r) => r.id));
-  } else {
+    markTranscriptSeen();
+  } else if (!ahead && !leaving()) {
+    // Nothing of the destination to show and nothing on its way out (a cold start, a restart).
     transcript.load([]);
     flush();
-    markRowsSeen([]);
+    markTranscriptSeen();
   }
 
   try {
-    const orch = await ensureOrchestrator(cwd, { silent: true });
-    if (mine !== generation) return;
-    const customCfg = storedCustomAgents().find((c) => c.id === effectiveAgentId);
-    const override = storedAgentOverrides()[effectiveAgentId];
-
-    const startAgentFn = backend().startAgent;
-    const transport = startAgentFn
-      ? await startAgentFn({
-          cwd,
-          agentId: effectiveAgentId,
-          driver,
-          runtimeMode: currentRuntimeMode(),
-          binaryPath: override?.binaryPath,
-          extraArgs: override?.extraArgs,
-          customAgent: customCfg,
-          orchestratorUrl: orch ? withOrchestratorCwd(orch.url, cwd) : undefined,
-          orchestratorToken: orch?.token,
-        })
-      : await backend().startPi(cwd);
-
-    if (mine !== generation) return transport.kill();
     const agentLabel = spec?.name ?? "Pi";
-    let started: PiClient | undefined;
-    started = new PiClient(transport, {
-      onEvent: (event) => routeEvent(started, event),
-      onUiRequest: (ui) => routeUiRequest(started, ui),
-      onExit: (exit, stderr) => routeExit(started, exit, stderr, agentLabel),
-    });
-    client = started;
+    const started = await connect(cwd, effectiveAgentId, mine);
+    if (!started) return;
     const first = await withStartupTimeout(started.request("get_state"), agentLabel);
     if (mine !== generation) return;
     rememberWorkspace(cwd);
@@ -753,13 +967,19 @@ async function launch(
           withStartupTimeout(request("get_messages"), agentLabel),
         ]);
         if (mine !== generation) return;
-        transcript.load(history.messages);
-        markRowsSeen(transcript.rows().map((r) => r.id));
-        flush();
-        landed.update((n) => n + 1);
-        scrollToEnd.set(0);
+        landHistory(history.messages);
+        // The conversation is on screen: the session change is over, its pickers fill in behind it.
+        void finishLaunch().catch(failLaunch);
+        return;
       }
     }
+    await finishLaunch();
+  } catch (error) {
+    failLaunch(error);
+  }
+
+  /** What the open session supports: models, commands, levels, the lists around it. */
+  async function finishLaunch() {
     await Promise.all([
       refreshModels(),
       refreshCommands(),
@@ -781,16 +1001,162 @@ async function launch(
       await Promise.all([refreshState(), refreshLevels(), refreshStats()]);
       scrollToEnd.set(0);
     }
-  } catch (error) {
+  }
+
+  function failLaunch(error: unknown) {
     if (mine !== generation) return;
-    client?.close();
-    client = undefined;
+    closeActive();
+    // A process that ended while starting has said why already (`routeExit`): once is enough.
+    if (phase().name === "failed") return;
     const agentTitle = spec?.name ?? "Pi";
     const title = error instanceof SidecarError ? error.message : tr(`${agentTitle} could not start`, `${agentTitle} 无法启动`);
     const detail = error instanceof SidecarError ? error.hint : message(error);
     phase.set({ name: "failed", title, detail });
     toast("error", detail ? `${title} — ${detail}` : title);
   }
+}
+
+/**
+ * Starts `agentId`'s process in `cwd` and makes it the open agent, not yet
+ * asked anything. `undefined` when another start overtook this one (`mine`).
+ */
+async function connect(cwd: string, agentId: string, mine: number): Promise<PiClient | undefined> {
+  const spec = agents().find((a) => a.id === agentId);
+  const driver = spec?.driver ?? (agentId === "pi" ? "pi" : "acp");
+  const agentLabel = spec?.name ?? "Pi";
+  const orch = await ensureOrchestrator(cwd, { silent: true });
+  if (mine !== generation) return undefined;
+  const customCfg = storedCustomAgents().find((c) => c.id === agentId);
+  const override = storedAgentOverrides()[agentId];
+
+  const startAgentFn = backend().startAgent;
+  const transport = startAgentFn
+    ? await startAgentFn({
+        cwd,
+        agentId,
+        driver,
+        runtimeMode: currentRuntimeMode(),
+        binaryPath: override?.binaryPath,
+        extraArgs: override?.extraArgs,
+        customAgent: customCfg,
+        orchestratorUrl: orch ? withOrchestratorCwd(orch.url, cwd) : undefined,
+        orchestratorToken: orch?.token,
+      })
+    : await backend().startPi(cwd);
+
+  if (mine !== generation) {
+    transport.kill();
+    return undefined;
+  }
+  let started: PiClient | undefined;
+  started = new PiClient(transport, {
+    onEvent: (event) => routeEvent(started, event),
+    onUiRequest: (ui) => routeUiRequest(started, ui),
+    onExit: (exit, stderr) => routeExit(started, exit, stderr, agentLabel),
+  });
+  client = started;
+  return started;
+}
+
+/**
+ * Starts the open agent again under its session after its process went away
+ * on its own (`routeExit`), on any engine. Nothing on screen changes for it:
+ * the conversation, the draft and the pickers stay, commands sent meanwhile
+ * wait (`request`), and the session's file is opened again in the new
+ * process. Only a run that was cut short is said — it cannot be resumed — and
+ * the conversation is then what the session has on file.
+ */
+function revive(agentLabel: string, cutShort: boolean, lost: Extract<Phase, { name: "failed" }>) {
+  const mine = ++generation;
+  const cwd = workspace();
+  const agentId = currentAgentId();
+  const known = state();
+  const file = known?.sessionFile && ((known.messageCount ?? 0) > 0 || transcript.rows().length > 0) ? known.sessionFile : undefined;
+  // What the process took with it: its run, its queue, the prompts and lines its extensions had up.
+  batch(() => {
+    running.set(false);
+    bashRunning.set(false);
+    activity.set({ kind: "idle" });
+    queue.set({ steering: [], followUp: [] });
+    dialogs.set([]);
+    statuses.set({});
+    widgets.set({});
+    if (known) state.set({ ...known, isStreaming: false, isCompacting: false });
+  });
+  bashRequestId = undefined;
+  stopAsked = false;
+
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  reopening = gate;
+  const open = () => {
+    if (reopening === gate) reopening = undefined;
+    release();
+  };
+
+  const work = (async () => {
+    let started: PiClient | undefined;
+    try {
+      started = await connect(cwd, agentId, mine);
+      if (!started) return;
+      await withStartupTimeout(started.request("get_state"), agentLabel);
+      if (mine !== generation) return;
+      const retry = autoRetryChoice();
+      if (retry !== undefined) started.request("set_auto_retry", { enabled: retry }).catch(() => undefined);
+      if (file) await withStartupTimeout(started.request("switch_session", { sessionPath: file }), agentLabel).catch(() => undefined);
+      if (mine !== generation) return;
+      const [next, history] = await Promise.all([
+        withStartupTimeout(started.request("get_state"), agentLabel),
+        withStartupTimeout(started.request("get_messages"), agentLabel),
+      ]);
+      if (mine !== generation) return;
+      state.set(next);
+      // At rest the conversation on screen is the session's own and stays as it is. A run cut short left rows
+      // no file has, and a session that could not be opened again is not the one shown: then the file speaks.
+      if (!ahead && (cutShort || (file !== undefined && next.sessionFile !== file))) {
+        const fresh = new Transcript(() => activeLanguage());
+        fresh.load(history.messages);
+        if (!sameRows(fresh.rows(), transcript.rows())) {
+          transcript = fresh;
+          shownVersion = -1;
+          markTranscriptSeen();
+          flush();
+          landed.update((n) => n + 1);
+          scrollToEnd.set(0);
+        }
+      }
+      open();
+      if (cutShort) {
+        toast(
+          "warning",
+          tr(`${agentLabel} stopped mid-run and was restarted. The run was cut short.`, `${agentLabel} 在运行中途退出，已自动重启。本次运行被中断。`),
+        );
+      }
+      await Promise.all([refreshModels(), refreshCommands(), refreshLevels(), refreshStats()]);
+      if (mine !== generation) return;
+      // A session with nothing in it yet is a fresh one in the new process: the reader's picks go back on it.
+      if (!file) await applySessionChoices();
+      refreshSessions(cwd);
+      void refreshGitWorkspace(cwd);
+    } catch (error) {
+      if (mine !== generation) return;
+      // The new process going away in its turn is `routeExit`'s to answer: it tries once more, or says so.
+      if (started?.closed) return;
+      // It could not be started, or does not answer: nothing is coming back, and the screen says so.
+      closeActive();
+      const title = error instanceof SidecarError ? error.message : lost.title;
+      const detail = error instanceof SidecarError ? error.hint : message(error);
+      phase.set({ name: "failed", title, detail });
+      toast("error", detail ? `${title} — ${detail}` : title);
+    } finally {
+      open();
+    }
+  })();
+  const whole = work.finally(() => {
+    if (revival === whole) revival = undefined;
+  });
+  revival = whole;
+  return whole;
 }
 
 /**
@@ -871,12 +1237,15 @@ export function restartPi() {
   const keep = file && (state()?.messageCount ?? 0) > 0 ? file : heading()?.file;
   busy.set(false);
   pendingHandoff.set(undefined);
+  // The reader's own restart is a new start: what went wrong before does not count against it.
+  lostAt = [];
   return start(workspace(), keep, currentAgentId());
 }
 
 /** Moves the app to another folder (or an isolated Git worktree), optionally opening `sessionPath` right away. */
 export async function openWorkspace(path: string, sessionPath?: string, sessionAgentId?: string) {
   setWorkspaceCollapsed(path, false);
+  markSessionRead(sessionPath);
   if (path === workspace() && phase().name === "ready" && !isSwitching()) {
     rememberWorkspace(path);
     if (sessionPath) {
@@ -923,8 +1292,8 @@ export async function closeWorkspace(cwd: string) {
   // Closing a project stops whatever it left running off screen, and drops its list.
   for (const run of [...parked.values()]) {
     if (run.cwd !== cwd) continue;
-    run.client.close();
     removeParked(run);
+    run.client.close();
   }
   if (orchestrator) {
     for (const task of delegated()) {
@@ -991,8 +1360,7 @@ export async function launchDelegatedTask(input: DelegateTaskInput) {
 
 /**
  * Launches a **Parallel Multi-Agent Run** across multiple chosen agent harnesses
- * simultaneously (each optionally in its own isolated Git worktree, just like
- * t3code's Multi-Model Parallel Compare!).
+ * simultaneously (each optionally in its own isolated Git worktree).
  */
 export async function launchParallelAgents(options: {
   prompt: string;
@@ -1169,7 +1537,7 @@ export function clearFinishedDelegatedTasks() {
   delegated.update((list) => list.filter((t) => t.status === "running"));
 }
 
-/** Merges a finished sub-agent's findings into the active conversation context (like t3code's merge-back!). */
+/** Merges a finished sub-agent's findings into the active conversation context. */
 export function bringTaskResultToChat(taskId: string) {
   const task = delegated().find((t) => t.id === taskId);
   if (!task) return;
@@ -1301,15 +1669,10 @@ export async function refreshUsageStats() {
   }
 }
 
+/** The agent's own commands (`get_commands`); pipi's are `appCommands`, there whatever the agent answers. */
 async function refreshCommands() {
   try {
-    const native = (await request("get_commands")).commands;
-    const extras: SlashCommand[] = [
-      { name: "delegate", description: tr("Delegate a task to another coding agent (@agent <task>)", "委派任务给其他智能体（例如 /delegate claude 审查代码）"), source: "extension" },
-      { name: "parallel", description: tr("Open multi-agent parallel / pipeline orchestration", "打开多智能体并行或流水线编排面板"), source: "extension" },
-    ];
-    const existingNames = new Set(native.map((c) => c.name));
-    commands.set([...native, ...extras.filter((e) => !existingNames.has(e.name))]);
+    commands.set((await request("get_commands")).commands ?? []);
   } catch {
     commands.set([]);
   }
@@ -1405,15 +1768,16 @@ export async function refreshCredentials() {
   }
 }
 
-/** Loads the session the active agent has open: its state, its messages, what its model supports. */
+/**
+ * Loads the session the active agent has open: its state and messages land at
+ * once; what its model supports follows in the background — an external engine
+ * only knows it once its own session is negotiated, which a switch must not wait on.
+ */
 async function syncSession() {
   const [, history] = await Promise.all([refreshState(), request("get_messages")]);
-  transcript.load(history.messages);
-  markRowsSeen(transcript.rows().map((r) => r.id));
-  flush();
-  landed.update((n) => n + 1);
-  scrollToEnd.set(0);
-  await Promise.all([refreshLevels(), refreshStats()]);
+  landHistory(history.messages);
+  void refreshLevels();
+  void refreshStats();
 }
 
 /**
@@ -1441,12 +1805,15 @@ async function applySessionChoices() {
     }
   }
   const wantedLevel = choice.thinkingLevel;
-  if (wantedLevel) {
-    await refreshLevels();
-    if (levels().includes(wantedLevel) && wantedLevel !== known?.thinkingLevel) {
-      await request("set_thinking_level", { level: wantedLevel }).catch(() => undefined);
-    }
-  }
+  if (!wantedLevel) return;
+  // The levels wait on the engine's own session: put the depth back once they are known, not before the session lands.
+  const sessionId = known?.sessionId;
+  void refreshLevels().then(async () => {
+    if (!client || state()?.sessionId !== sessionId) return;
+    if (!levels().includes(wantedLevel) || wantedLevel === state()?.thinkingLevel) return;
+    await request("set_thinking_level", { level: wantedLevel });
+    if (state()?.sessionId === sessionId) state.update((s) => s && { ...s, thinkingLevel: wantedLevel });
+  }).catch(() => undefined);
 }
 
 // ── Events from Active Agent ────────────────────────────────────────────────
@@ -1454,10 +1821,13 @@ async function applySessionChoices() {
 function onEvent(event: SessionEvent) {
   switch (event.type) {
     case "agent_start":
+      stopAsked = false;
       batch(() => {
         if (!running()) runStartedAt.set(Date.now());
         running.set(true);
-        activity.set({ kind: "thinking" });
+        // A retry is a run starting over: the line goes on saying which attempt it is until that attempt
+        // shows life (or the retries end), rather than flapping to "Thinking" and back between attempts.
+        if (activity().kind !== "retrying") activity.set({ kind: "thinking" });
       });
       break;
     case "message_update": {
@@ -1470,9 +1840,14 @@ function onEvent(event: SessionEvent) {
     case "tool_execution_start":
       activity.set({ kind: "tool", name: event.toolName });
       break;
+    case "message_end":
+      // A fresh session gets its file as its first run starts (the bridge writes it then): knowing it is
+      // how the session is found again, should its agent go away under the run.
+      if (event.message.role === "user" && !state()?.sessionFile) void refreshState().catch(() => undefined);
+      break;
     case "turn_start":
     case "turn_end":
-      if (running()) activity.set({ kind: "thinking" });
+      if (running() && activity().kind !== "retrying") activity.set({ kind: "thinking" });
       break;
     case "queue_update":
       queue.set({ steering: event.steering ?? [], followUp: event.followUp ?? [] });
@@ -1502,6 +1877,10 @@ function onEvent(event: SessionEvent) {
     case "bash_execution_update":
       if (!event.id || event.id === bashRequestId) transcript.bashOutput(event.delta);
       break;
+    case "commands_changed":
+      // The bridge learned the agent's own commands (ACP `available_commands_update`, Claude's `initialize`).
+      void refreshCommands();
+      return;
     case "models_changed":
       // The bridge adopted the agent's real catalog (ACP session negotiation).
       void (async () => {
@@ -1520,7 +1899,8 @@ function onEvent(event: SessionEvent) {
       });
       transcript.apply(event);
       flush();
-      if (wasRunning && !event.aborted) celebrate();
+      if (wasRunning && !event.aborted && !stopAsked) celebrate();
+      stopAsked = false;
       refreshState().catch(() => undefined);
       refreshStats();
       refreshSessions();
@@ -1534,10 +1914,15 @@ function onEvent(event: SessionEvent) {
   flushSoon();
 }
 
+/** Whether a conversation's last word is an error: the run that left it there did not end well. */
+function endedInError(rows: Row[]) {
+  const last = rows.at(-1);
+  return last?.kind === "notice" && last.tone === "error";
+}
+
 /** Pip jumps once when a run ends well. */
 function celebrate() {
-  const last = transcript.rows().at(-1);
-  if (last?.kind === "notice" && last.tone === "error") return;
+  if (endedInError(transcript.rows())) return;
   cheer.set(true);
   setTimeout(() => cheer.set(false), 900);
 }
@@ -1602,22 +1987,38 @@ function routeExit(source: PiClient | undefined, exit: Exit, stderr: string, age
     const how = exit.signal
       ? tr(`signal ${exit.signal}`, `信号 ${exit.signal}`)
       : tr(`code ${exit.code ?? "unknown"}`, `退出码 ${exit.code ?? "未知"}`);
+    const starting = phase().name === "starting";
+    const title = starting
+      ? tr(`${agentLabel} could not start`, `${agentLabel} 无法启动`)
+      : tr(`${agentLabel} stopped unexpectedly`, `${agentLabel} 意外退出`);
+    const lost = {
+      name: "failed" as const,
+      title,
+      detail: stderr || exit.error || tr(`The process exited with ${how}.`, `进程已退出（${how}）。`),
+    };
+    const now = Date.now();
+    lostAt = [...lostAt.filter((at) => now - at < REVIVE_WINDOW_MS), now];
+    // A session that was open keeps its screen and gets its agent back. One still starting has nothing
+    // to come back to, and one that keeps going away is not started for ever: those say so.
+    if (phase().name === "ready" && lostAt.length <= REVIVE_LIMIT) {
+      void revive(agentLabel, running() || bashRunning() || Boolean(state()?.isCompacting), lost);
+      return;
+    }
     batch(() => {
       running.set(false);
+      bashRunning.set(false);
       activity.set({ kind: "idle" });
-      phase.set({
-        name: "failed",
-        title: tr(`${agentLabel} stopped unexpectedly`, `${agentLabel} 意外退出`),
-        detail: stderr || exit.error || tr(`The process exited with ${how}.`, `进程已退出（${how}）。`),
-      });
+      phase.set(lost);
     });
-    toast("error", tr(`${agentLabel} stopped unexpectedly`, `${agentLabel} 意外退出`));
+    toast("error", stderr && starting ? `${title} — ${stderr.split("\n").pop()}` : title);
     return;
   }
   const run = parkedByClient.get(source);
   if (!run) return;
+  const working = run.running || run.bashRunning;
   removeParked(run);
-  toast("warning", tr(`${run.title} stopped in the background.`, `${run.title} 已在后台停止。`));
+  // Only a run that was still going is news: a finished one opens again from its file, on a new process.
+  if (working) toast("warning", tr(`${run.title} stopped in the background.`, `${run.title} 已在后台停止。`));
   refreshSessions(run.cwd);
 }
 
@@ -1627,7 +2028,7 @@ function onParkedEvent(run: ParkedRun, event: SessionEvent) {
     case "agent_start":
       if (!run.running) run.runStartedAt = Date.now();
       run.running = true;
-      run.activity = { kind: "thinking" };
+      if (run.activity.kind !== "retrying") run.activity = { kind: "thinking" };
       break;
     case "message_update": {
       const kind = event.assistantMessageEvent.type;
@@ -1641,7 +2042,7 @@ function onParkedEvent(run: ParkedRun, event: SessionEvent) {
       break;
     case "turn_start":
     case "turn_end":
-      if (run.running) run.activity = { kind: "thinking" };
+      if (run.running && run.activity.kind !== "retrying") run.activity = { kind: "thinking" };
       break;
     case "queue_update":
       run.queue = { steering: event.steering ?? [], followUp: event.followUp ?? [] };
@@ -1678,11 +2079,20 @@ function onParkedEvent(run: ParkedRun, event: SessionEvent) {
       run.activity = { kind: "idle" };
       run.queue = { steering: [], followUp: [] };
       run.state = run.state && { ...run.state, isStreaming: false };
-      if (wasRunning && !event.aborted) toast("success", tr(`${run.title} finished in the background.`, `${run.title} 已在后台完成。`));
+      // The transcript settles first: only then is a failure that stood its last row.
+      run.transcript.apply(event);
+      if (wasRunning && !event.aborted) {
+        markSessionUnread(run.path);
+        if (endedInError(run.transcript.rows())) {
+          toast("error", tr(`${run.title} stopped on an error in the background.`, `${run.title} 在后台运行出错，已停止。`));
+        } else {
+          toast("success", tr(`${run.title} finished in the background.`, `${run.title} 已在后台完成。`));
+        }
+      }
       refreshParkedRunning();
       refreshSessions(run.cwd);
       trimParked();
-      break;
+      return;
     }
   }
   run.transcript.apply(event);
@@ -1738,26 +2148,58 @@ export function cancelPendingDialog() {
 
 // ── Toasts ──────────────────────────────────────────────────────────────────
 
+/** How long a toast stays: longer for an error or one that offers an action, and for one that takes longer to read. */
+function toastLifetime(tone: Toast["tone"], text: string, hasAction: boolean) {
+  const base = tone === "error" || hasAction ? 6000 : 4000;
+  // A CJK character reads about as long as two Latin ones.
+  let length = 0;
+  for (const ch of text) length += ch.charCodeAt(0) > 0x2e7f ? 2 : 1;
+  return Math.min(12_000, base + Math.max(0, length - 60) * 40);
+}
+
+/** (Re)starts the time a toast has left. */
+function expireToast(id: number, ttl: number) {
+  clearTimeout(toastTimers.get(id));
+  toastTimers.set(
+    id,
+    setTimeout(() => dismissToast(id), ttl),
+  );
+}
+
 /**
  * pipi's single error/notice channel — every user-visible error surfaces here
- * (`views/Toasts.tsx`, top-right). Identical texts don't re-stack.
+ * (`views/Toasts.tsx`, top-right). The same message again is the same toast:
+ * it stays where it is and its time starts over, so one whose cause just
+ * happened again is not left to run out a moment later, nor taken away and
+ * put back.
  */
 export function toast(
   tone: Toast["tone"],
   text: string,
   options?: { icon?: IconName; action?: ToastAction; durationMs?: number },
 ) {
-  if (!options?.action && toasts().some((item) => item.tone === tone && item.text === text)) return;
+  const ttl = options?.durationMs ?? toastLifetime(tone, text, !!options?.action);
+  const same = toasts().find((item) => item.tone === tone && item.text === text);
+  if (same) {
+    if (options?.icon || options?.action) {
+      toasts.update((list) => list.map((item) => (item.id === same.id ? { ...item, icon: options.icon ?? item.icon, action: options.action ?? item.action } : item)));
+    }
+    expireToast(same.id, ttl);
+    return;
+  }
   const id = ++toastId;
-  toasts.update((list) => {
-    const filtered = list.filter((item) => !(item.tone === tone && item.text === text));
-    return [...filtered.slice(-2), { id, tone, text, icon: options?.icon, action: options?.action }];
-  });
-  const ttl = options?.durationMs ?? (tone === "error" || options?.action ? 6000 : 4000);
-  setTimeout(() => dismissToast(id), ttl);
+  // Three at most: the oldest makes room.
+  for (const gone of toasts().slice(0, -2)) {
+    clearTimeout(toastTimers.get(gone.id));
+    toastTimers.delete(gone.id);
+  }
+  toasts.update((list) => [...list.slice(-2), { id, tone, text, icon: options?.icon, action: options?.action }]);
+  expireToast(id, ttl);
 }
 
 export function dismissToast(id: number) {
+  clearTimeout(toastTimers.get(id));
+  toastTimers.delete(id);
   toasts.update((list) => list.filter((item) => item.id !== id));
 }
 
@@ -1799,10 +2241,73 @@ export function trackAttachmentRead(read: Promise<unknown>) {
 }
 
 /**
+ * Runs the line when it is one of pipi's own commands (`appCommands`); `false`
+ * hands it on to the agent. What a command does not take stays in the
+ * composer, so words typed after it are never lost.
+ */
+async function runAppCommand(text: string): Promise<boolean> {
+  const line = parseSlashLine(text);
+  const command = line && appCommands().find((own) => answersTo(own, line.name));
+  if (!line || !command) return false;
+  const rest = line.args;
+  switch (command.name) {
+    case "new":
+      draft.set(rest);
+      await newSession();
+      break;
+    case "compact":
+      // A run in progress refuses (and says so): the instructions stay to be sent again.
+      if (!running()) draft.set("");
+      await compactNow(rest || undefined);
+      break;
+    case "model":
+      draft.set(rest);
+      openModelPicker();
+      break;
+    case "name":
+      draft.set("");
+      if (rest) await renameSession(rest);
+      else startRenaming();
+      break;
+    case "copy":
+      draft.set(rest);
+      await copyLastReply();
+      break;
+    case "export":
+      draft.set(rest);
+      await exportHtml();
+      break;
+    case "delegate": {
+      // `/delegate <agent> <task>`: the agent by id or name, with or without an `@`.
+      const [, token = "", task = ""] = /^@?(\S+)\s*([\s\S]*)$/.exec(rest) ?? [];
+      const agent = agents().find((a) => a.id.toLowerCase() === token.toLowerCase() || a.name.toLowerCase() === token.toLowerCase());
+      if (agent && task) {
+        draft.set("");
+        await launchDelegatedTask({ title: `${agent.name} · Delegated`, agentId: agent.id, task, mode: "async" });
+        break;
+      }
+      // No agent it can name, or no task for one: the orchestration sheet asks for what is missing, and keeps the task.
+      draft.set(agent ? task : rest);
+      orchestrateOpen.set(true);
+      break;
+    }
+    case "parallel":
+      draft.set(rest);
+      orchestrateOpen.set(true);
+      break;
+    case "settings":
+      draft.set(rest);
+      showSettings();
+      break;
+  }
+  return true;
+}
+
+/**
  * Sends what the composer holds:
+ * - `/name …` that is one of pipi's own commands runs in the app (`runAppCommand`),
+ *   whatever the session is doing; any other `/name` is the agent's and goes to it.
  * - `!cmd` / `!!cmd` runs a shell command.
- * - `/parallel` opens the multi-agent orchestration sheet.
- * - `/delegate <agentId> <task>` or `@<agentId> <task>` spawns a delegated sub-agent directly!
  * - If a Portable Context Handoff is pending (from switching agents mid-conversation
  *   or merging a sub-agent's result), prepends the budgeted handoff context to the wire
  *   prompt while keeping the user's clean message in the visible chat bubble!
@@ -1812,9 +2317,16 @@ export async function send(mode: "steer" | "followUp" = "steer") {
   if (inspectingId()) inspectingId.set(undefined);
 
   if (attachmentReads.size) await Promise.allSettled([...attachmentReads]);
+  // A message written while a session change is under way is for where it lands.
+  for (let wait = arrival; heading() && wait; wait = arrival === wait ? undefined : arrival) await wait;
+  // One written while the agent is being started again goes to it once it is back.
+  while (revival) await revival;
   const text = draft().trim();
   const images = attachments().map(({ type, data, mimeType }) => ({ type, data, mimeType }));
-  if ((!text && !images.length) || phase().name !== "ready") return;
+  if (!text && !images.length) return;
+  // pipi's own commands need no agent: they run whatever the session is doing.
+  if (await runAppCommand(text)) return;
+  if (phase().name !== "ready") return;
 
   if (text.startsWith("!") && !running()) {
     const exclude = text.startsWith("!!");
@@ -1824,38 +2336,9 @@ export async function send(mode: "steer" | "followUp" = "steer") {
     return runBash(command, exclude);
   }
 
-  // Client-side multi-agent slash shortcuts (`/parallel` and `/delegate <agent> <task>`)
-  if (!running() && (text === "/parallel" || text.startsWith("/parallel "))) {
-    const rest = text.slice("/parallel".length).trim();
-    draft.set(rest);
-    orchestrateOpen.set(true);
-    return;
-  }
-  if (!running() && text.startsWith("/delegate ")) {
-    const body = text.slice("/delegate ".length).trim();
-    const spaceAt = body.indexOf(" ");
-    if (spaceAt > 0) {
-      const targetToken = body.slice(0, spaceAt).replace(/^@/, "").toLowerCase();
-      const taskBody = body.slice(spaceAt + 1).trim();
-      const matched = agents().find((a) => a.id.toLowerCase() === targetToken || a.name.toLowerCase() === targetToken);
-      if (matched && taskBody) {
-        draft.set("");
-        await launchDelegatedTask({
-          title: `${matched.name} · Delegated`,
-          agentId: matched.id,
-          task: taskBody,
-          mode: "async",
-        });
-        return;
-      }
-    }
-    orchestrateOpen.set(true);
-    return;
-  }
-
   if (!hasModel()) {
     toast("warning", tr("Connect a model provider before sending.", "请先连接模型服务商再发送。"));
-    showSettings(currentAgentId() === "pi" ? "providers" : "agents");
+    showAgentSettings();
     return;
   }
 
@@ -1864,7 +2347,11 @@ export async function send(mode: "steer" | "followUp" = "steer") {
     setSessionArchived(activeFile, false);
   }
 
-  const handoff = pendingHandoff();
+  // An agent's own command is a line the agent must see as written: `/name` first, or it is no command to it.
+  // The handoff waits for the next message instead of going in front of it.
+  const line = parseSlashLine(text);
+  const agentCommand = Boolean(line && agentCommands().some((command) => command.name === line.name));
+  const handoff = agentCommand ? undefined : pendingHandoff();
   const wirePrompt = handoff ? prependHandoffToPrompt(handoff.context, text) : text;
 
   batch(() => {
@@ -1907,9 +2394,9 @@ export async function send(mode: "steer" | "followUp" = "steer") {
       if (!draft()) draft.set(text);
       if (handoff) pendingHandoff.set(handoff);
     });
-    transcript.note("error", tr("The message was not sent", "消息未能发送"), message(error));
+    // Said once, as every app error is: a toast. The message is back in the composer, and the conversation
+    // keeps no note of it — one no history has, there until the session was next opened and then gone.
     toast("error", `${tr("The message was not sent", "消息未能发送")}: ${message(error)}`);
-    flush();
   }
 }
 
@@ -1952,6 +2439,7 @@ export async function stop() {
   }
   if (bashRunning()) return void request("abort_bash").catch(() => undefined);
   if (!running() && !state()?.isCompacting) return;
+  stopAsked = true;
   if (activity().kind === "retrying") request("abort_retry").catch(() => undefined);
   try {
     const cleared = await request("clear_queue");
@@ -1972,7 +2460,10 @@ export async function recallQueue() {
 
 // ── Sessions ────────────────────────────────────────────────────────────────
 
-/** Closes the open agent process: an explicit restart, or a session that is not working. */
+/**
+ * Closes the open agent process: an explicit restart, or a session that is not working.
+ * The store lets go of it first — an exit the store asked for is not one to recover from (`routeExit`).
+ */
 function closeActive() {
   const current = client;
   client = undefined;
@@ -1995,11 +2486,13 @@ const PARKED_HARD_LIMIT = 12;
 
 function trimParked() {
   while (parked.size > PARKED_LIMIT) {
-    const finished = [...parked.values()].find((run) => !run.running && !run.bashRunning);
-    const victim = finished ?? (parked.size > PARKED_HARD_LIMIT ? [...parked.values()][0] : undefined);
+    // The run on its way back to the screen is about to leave the list on its own.
+    const others = [...parked.values()].filter((run) => run !== adopting);
+    const finished = others.find((run) => !run.running && !run.bashRunning);
+    const victim = finished ?? (parked.size > PARKED_HARD_LIMIT ? others[0] : undefined);
     if (!victim) return;
-    victim.client.close();
     removeParked(victim);
+    victim.client.close();
   }
 }
 
@@ -2062,9 +2555,23 @@ async function adoptParked(path: string): Promise<boolean> {
   const run = parked.get(path);
   if (!run || busy()) return false;
   busy.set(true);
+  markSessionRead(path);
+  adopting = run;
   try {
     if (running() || bashRunning()) await parkActive();
-    else closeActive();
+    else {
+      stashTranscript();
+      closeActive();
+    }
+    if (parked.get(path) !== run || run.client.closed) {
+      // Its process went away while the screen was being cleared for it: its session opens on a new one.
+      if (parked.get(path) === run) removeParked(run);
+      view.set({ name: "chat" });
+      await start(run.cwd, run.path, run.agentId);
+      return true;
+    }
+    ahead = undefined;
+    visited.delete(run.path);
     parked.delete(run.path);
     parkedByClient.delete(run.client);
     generation++;
@@ -2081,6 +2588,7 @@ async function adoptParked(path: string): Promise<boolean> {
       renaming.set(false);
       attachments.set([]);
       heading.set(undefined);
+      leaving.set(false);
       phase.set({ name: "ready" });
       state.set(run.state);
       running.set(run.running);
@@ -2101,15 +2609,17 @@ async function adoptParked(path: string): Promise<boolean> {
     refreshParkedRunning();
     rememberWorkspace(run.cwd);
     void refreshGitWorkspace(run.cwd);
-    markRowsSeen(transcript.rows().map((row) => row.id));
+    markTranscriptSeen();
     flush();
     landed.update((n) => n + 1);
     scrollToEnd.set(0);
-    await Promise.all([refreshState(), refreshLevels(), refreshModels(), refreshCommands(), refreshStats()]).catch(() => undefined);
+    arrived.update((n) => n + 1);
+    void Promise.all([refreshState(), refreshLevels(), refreshModels(), refreshCommands(), refreshStats()]).catch(() => undefined);
     refreshSessions(run.cwd);
     focusComposer();
     return true;
   } finally {
+    if (adopting === run) adopting = undefined;
     busy.set(false);
   }
 }
@@ -2135,6 +2645,14 @@ async function switchInto(cwd: string, sessionPath: string | undefined, agentId 
   }
 }
 
+/** A change that showed its destination ahead and then did not happen: the agent's own session goes back on screen. */
+async function stayPut() {
+  if (!early) return;
+  early = false;
+  ahead = undefined;
+  await syncSession().catch(() => undefined);
+}
+
 async function settle() {
   if (running() || bashRunning()) await stop();
 }
@@ -2148,6 +2666,7 @@ async function changeSession(what: string, action: () => Promise<{ cancelled: bo
     const { cancelled } = await action();
     if (cancelled) {
       toast("info", tr("An extension cancelled the change.", "扩展已取消该操作。"));
+      await stayPut();
       return false;
     }
     batch(() => {
@@ -2171,6 +2690,7 @@ async function changeSession(what: string, action: () => Promise<{ cancelled: bo
     return true;
   } catch (error) {
     toast("error", `${what}: ${message(error)}`);
+    await stayPut();
     return false;
   } finally {
     busy.set(false);
@@ -2232,6 +2752,7 @@ async function openSessionFile(path: string, ownerAgentId?: string) {
 
 export function openSession(path: string, cwd?: string) {
   inspectingId.set(undefined);
+  markSessionRead(path);
   if (cwd && cwd !== workspace()) {
     const summary = (sessionsByWorkspace()[cwd] ?? []).find((s) => s.path === path);
     return openWorkspace(cwd, path, summary?.agentId);
@@ -2256,7 +2777,8 @@ export async function forkFrom(index: number) {
   let text = "";
   const ok = await changeSession(tr("Could not fork", "无法创建分支"), async () => {
     const result = await request("fork", { entryId: target.entryId });
-    text = result.text ?? "";
+    // Pi hands the message back as the model got it: the draft is what the person wrote.
+    text = withoutImageNotes(result.text ?? "");
     return result;
   });
   if (ok && text) draft.set(text);
@@ -2308,16 +2830,18 @@ export async function archiveSession(path: string, cwd = workspace(), options?: 
       : summary
         ? sessionTitle(summary, tr("Conversation", "对话"))
         : tr("Conversation", "对话");
-  if (path === state()?.sessionFile) {
-    const left = await changeSession(tr("Could not archive the session", "无法归档会话"), requestNewSession);
-    if (!left) return;
-  }
   const parkedRun = parked.get(path);
   if (parkedRun) {
-    parkedRun.client.close();
     removeParked(parkedRun);
+    parkedRun.client.close();
   }
+  // The list moves at once; leaving the open session follows, and puts the row back if it cannot.
+  const open = path === state()?.sessionFile;
   setSessionArchived(path, true, cwd);
+  if (open && !(await changeSession(tr("Could not archive the session", "无法归档会话"), requestNewSession))) {
+    setSessionArchived(path, false);
+    return;
+  }
   toast("info", tr(`“${title}” archived.`, `「${title}」已归档。`), {
     icon: "archive",
     action: {
@@ -2358,8 +2882,8 @@ export async function deleteAllArchivedSessions() {
     if (!isSessionArchived(session.path)) continue;
     const parkedRun = parked.get(session.path);
     if (parkedRun) {
-      parkedRun.client.close();
       removeParked(parkedRun);
+      parkedRun.client.close();
     }
     try {
       await backend().deleteSession(session.path);
@@ -2406,9 +2930,10 @@ export async function removeSession(path: string, cwd = workspace()) {
   // Deleting a run that is still going off screen stops it first: its file is going away.
   const parkedRun = parked.get(path);
   if (parkedRun) {
-    parkedRun.client.close();
     removeParked(parkedRun);
+    parkedRun.client.close();
   }
+  visited.delete(path);
   await attempt(tr("Could not delete the session", "无法删除会话"), () => backend().deleteSession(path));
   clearArchivedSessionPref(path);
   sessionsByWorkspace.update((all) => {
@@ -2419,9 +2944,10 @@ export async function removeSession(path: string, cwd = workspace()) {
   refreshSessions(cwd);
 }
 
-export async function compactNow() {
+/** Compacts the context now; `instructions` say what the summary should keep (`/compact <instructions>`). */
+export async function compactNow(instructions?: string) {
   if (running()) return void toast("info", tr("Wait for the run to finish before compacting.", "请等待当前运行结束后再压缩。"));
-  await attempt(tr("Compaction failed", "压缩失败"), () => request("compact"));
+  await attempt(tr("Compaction failed", "压缩失败"), () => request("compact", instructions ? { customInstructions: instructions } : {}));
   refreshStats();
 }
 
@@ -2494,6 +3020,12 @@ export async function saveProviderKey(provider: string, key: string) {
     return true;
   });
   if (!saved) return false;
+  // Only a running Pi has a key to load: a session on another agent is left alone.
+  if (activeAgent().driver !== "pi") {
+    await refreshCredentials();
+    toast("success", tr("Key saved. Pi loads it the next time it starts.", "密钥已保存，Pi 下次启动时加载。"));
+    return true;
+  }
   await restartPi();
   const connected = models().some((model) => model.provider === provider);
   toast(
@@ -2510,7 +3042,9 @@ export async function removeProviderKey(provider: string) {
     await backend().removeCredential(provider);
     return true;
   });
-  if (removed) await restartPi();
+  if (!removed) return;
+  if (activeAgent().driver === "pi") await restartPi();
+  else await refreshCredentials();
 }
 
 // ── Navigation ──────────────────────────────────────────────────────────────
@@ -2521,17 +3055,26 @@ export function showChat() {
 }
 
 export function showSettings(section: SettingsSection = "general") {
-  // Providers manages Pi's own auth.json; other agents keep their keys on the Agents page.
-  if (section === "providers" && currentAgentId() !== "pi") section = "agents";
   view.set({ name: "settings", section });
   if (section === "usage") void refreshUsageStats();
+}
+
+/** Opens Settings on one agent's configuration (the active agent's by default): every agent is set up under Agents. */
+export function showAgentSettings(agentId: string = currentAgentId()) {
+  view.set({ name: "settings", section: "agents", agent: agentId });
 }
 
 export function setPaletteOpen(open: boolean) {
   paletteOpen.set(open);
 }
 
-// ── New thread background wallpaper ─────────────────────────────────────────
+/** Opens the composer's model list, as a press on its chip does. */
+export function openModelPicker() {
+  view.set({ name: "chat" });
+  modelPickerAsk.set(0);
+}
+
+// ── Wallpaper ────────────────────────────────────────────────────────────────
 
 export {
   wallpaper,
@@ -2604,7 +3147,7 @@ async function applyWallpaperFile(sourcePath: string, recordInHistory = true): P
 export async function chooseWallpaperImage(): Promise<boolean> {
   const picker = backend().pickImage;
   if (!picker) return false;
-  const picked = await picker(tr("Choose new thread background", "选择新对话背景图片"));
+  const picked = await picker(tr("Choose wallpaper", "选择壁纸图片"));
   if (!picked) return false;
   const ok = await attempt(tr("Could not set background image", "无法设置背景图片"), () =>
     applyWallpaperFile(picked, isPathInsideFolder(picked, wallpaperFolder())),

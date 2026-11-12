@@ -9,6 +9,7 @@
 // - `session/new` → `configOptions` with PROVIDER-GROUPED model select whose
 //   values are opaque `JSON.stringify([provider, model])`, plus `reasoning_effort`
 // - `session/set_config_option` (strict value validation, like DSH)
+// - `available_commands_update` after `session/new`: the agent's slash commands
 // - `session/resume` / `session/close` / `session/list`
 // - `session/prompt` → scripted updates: thought chunk, `tool_call`, a
 //   permission request carrying ONLY `toolCallId` (DSH's partial shape),
@@ -152,6 +153,13 @@ async function handle(msg) {
       const s = { cwd: p.cwd, model: JSON.stringify(["deepseek-official", "deepseek-v4-flash"]), effort: "medium" };
       sessions.set(sessionId, s);
       reply(msg.id, { sessionId, configOptions: configOptions(s) });
+      update(sessionId, {
+        sessionUpdate: "available_commands_update",
+        availableCommands: [
+          { name: "web", description: "Search the web for information", input: { hint: "query to search for" } },
+          { name: "plan", description: "Create a detailed implementation plan\nwith steps on later lines the menu does not show" },
+        ],
+      });
       return;
     }
     case "session/resume": {

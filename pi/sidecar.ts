@@ -7,6 +7,7 @@ import type { StartAgentOptions } from "../agents/types";
 import { env } from "../lib/env";
 import { tr } from "../lib/i18n";
 import type { Exit, Transport } from "./client";
+import { stdinWriter } from "./stdin";
 
 // Keep all sidecar Node helpers referenced as URL assets so `nsh package` ships
 // every `sidecar/*.mjs` file inside `Contents/Resources/nsh/assets/sidecar/`.
@@ -88,12 +89,24 @@ async function sidecarDir(): Promise<string | undefined> {
 const isWindows = process.platform === "windows";
 const isMac = process.platform === "macos";
 
-/** Where `node` may be granted directly when the app was launched by the OS shell (short PATH). */
-const DIRECT_NODE_COMMANDS: string[] = isWindows
-  ? ["node", "node.exe"]
-  : isMac
-    ? ["node", "/opt/homebrew/bin/node", "/usr/local/bin/node"]
-    : ["node", "/usr/bin/node", "/usr/local/bin/node"];
+/**
+ * `node` as the host PATH has it. Bare names only: they are all `nsh.json` grants
+ * (`capabilities.process.execute`), and a path it does not grant is refused
+ * (`ERR_ACCESS_DENIED`), not missing (`ENOENT`).
+ */
+export const DIRECT_NODE_COMMANDS: string[] = isWindows ? ["node", "node.exe"] : ["node"];
+
+/**
+ * System-wide installs the OS's short PATH leaves out (an app opened from Finder or a
+ * dock). Absolute paths are not execute grants (bare names only), so the host
+ * shell looks for them (`firstExecutable`) and starts the one it finds
+ * (`spawnWithLauncher`).
+ */
+const SYSTEM_NODE_PATHS: string[] = isMac
+  ? ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/opt/local/bin/node"]
+  : ["/usr/bin/node", "/usr/local/bin/node", "/snap/bin/node"];
+
+const FIRST_EXECUTABLE_SCRIPT = 'for p in "$@"; do if [ -x "$p" ]; then printf "%s\\n" "$p"; exit 0; fi; done; exit 1';
 
 type NodeLauncher = { kind: "direct"; command: string } | { kind: "shell"; path: string };
 
@@ -120,7 +133,24 @@ export class SidecarError extends Error {
   }
 }
 
-type Coded = { code?: string; message?: string };
+type Coded = { code?: string; message?: string; permission?: string };
+
+/**
+ * Why an agent process could not be started. nsh refuses two things with
+ * `ERR_ACCESS_DENIED`: a working folder outside `capabilities.fs.write` (`permission`
+ * `"fs"`) and a command `capabilities.process.execute` does not grant (`"process"`).
+ * Only the first is about the folder the person chose.
+ */
+export function startError(error: unknown, agent: string): SidecarError {
+  if (error instanceof SidecarError) return error;
+  const { code, permission, message } = error as Coded;
+  if (code === "ERR_ACCESS_DENIED" && permission === "fs")
+    return new SidecarError(
+      tr("This folder is outside what pipi may open", "此文件夹超出 pipi 可打开的范围"),
+      tr("pipi can work in folders under your home directory.", "pipi 可以在主目录下的文件夹中工作。"),
+    );
+  return new SidecarError(tr(`${agent} could not start`, `${agent} 无法启动`), message ?? String(error));
+}
 
 function desktopOnlyError(): SidecarError {
   return new SidecarError(
@@ -174,6 +204,17 @@ async function sortedVersionBins(versionsRoot: string, binSubpath = isWindows ? 
   }
 }
 
+/** The first of `paths` that is an executable file, asked of the host shell: they are not the app's to read. */
+async function firstExecutable(paths: string[]): Promise<string | undefined> {
+  try {
+    const probe = await process.run("sh", ["-c", FIRST_EXECUTABLE_SCRIPT, "sh", ...paths], { timeoutMs: 4000 });
+    const found = probe.stdout.trim();
+    return probe.code === 0 && found.startsWith("/") ? found : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Discovers user-space Node.js installations (NVM, Volta, fnm, mise, asdf, Scoop, login
  * shell) when the OS launches pipi with a minimal PATH (Finder/Dock on macOS, the Start
@@ -221,6 +262,8 @@ async function discoverUserNodePath(): Promise<string | undefined> {
     } catch {}
     return undefined;
   }
+  const system = await firstExecutable(SYSTEM_NODE_PATHS);
+  if (system) return system;
   if (home) {
     const nvmBins = await sortedVersionBins(`${home}/.nvm/versions/node`);
     const miseBins = await sortedVersionBins(`${home}/.local/share/mise/installs/node`);
@@ -237,8 +280,6 @@ async function discoverUserNodePath(): Promise<string | undefined> {
       `${home}/.asdf/shims/node`,
       `${home}/.local/bin/node`,
       `${home}/bin/node`,
-      "/opt/local/bin/node",
-      "/snap/bin/node",
     ];
     for (const candidate of candidates) {
       try {
@@ -470,10 +511,15 @@ function childToTransport(child: ChildProcess): Transport {
     });
   });
 
+  const stdin = stdinWriter(
+    (text) => child.write(text),
+    () => disposed || exited !== undefined,
+  );
+
   return {
     write: (text) => {
       if (disposed || exited) throw new Error("Process has exited");
-      child.write(text);
+      return stdin.write(text);
     },
     onStdout: (handler) => {
       if (!disposed) child.on("stdout", handler);
@@ -487,9 +533,12 @@ function childToTransport(child: ChildProcess): Transport {
     },
     end: () => {
       if (disposed || exited) return;
-      try {
-        child.end();
-      } catch {}
+      // Slices still in flight must reach the child before its stdin closes.
+      void stdin.settled().then(() => {
+        try {
+          child.end();
+        } catch {}
+      });
     },
     kill: () => {
       tracked.delete(child);
@@ -523,14 +572,7 @@ export async function startAgent(options: StartAgentOptions): Promise<Transport>
       const child = await spawnNode([launcher, payload], { cwd, stdin: "pipe" });
       return childToTransport(child);
     } catch (error) {
-      if (error instanceof SidecarError) throw error;
-      const { code, message } = error as Coded;
-      if (code === "ERR_ACCESS_DENIED")
-        throw new SidecarError(
-          tr("This folder is outside what pipi may open", "此文件夹超出 pipi 可打开的范围"),
-          tr("pipi can work in folders under your home directory.", "pipi 可以在主目录下的文件夹中工作。"),
-        );
-      throw new SidecarError(tr("Pi could not start", "Pi 无法启动"), message ?? String(error));
+      throw startError(error, "Pi");
     }
   }
 
@@ -552,14 +594,7 @@ export async function startAgent(options: StartAgentOptions): Promise<Transport>
     const child = await spawnNode([bridge, payload], { cwd, stdin: "pipe" });
     return childToTransport(child);
   } catch (error) {
-    if (error instanceof SidecarError) throw error;
-    const { code, message } = error as Coded;
-    if (code === "ERR_ACCESS_DENIED")
-      throw new SidecarError(
-        tr("This folder is outside what pipi may open", "此文件夹超出 pipi 可打开的范围"),
-        tr("pipi can work in folders under your home directory.", "pipi 可以在主目录下的文件夹中工作。"),
-      );
-    throw new SidecarError(tr(`${agentId} could not start`, `${agentId} 无法启动`), message ?? String(error));
+    throw startError(error, agentId);
   }
 }
 

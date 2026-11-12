@@ -33,7 +33,7 @@ import { Button, Chip, IconButton } from "../ui/Button";
 import { Segmented, Switch } from "../ui/Controls";
 import { Icon } from "../ui/Icon";
 import { DIALOG_RISE, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal } from "../ui/motion";
-import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, GLASS_SCRIM, POPUP, PRESS } from "../ui/styles";
+import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, SCRIM } from "../ui/styles";
 
 const RUNTIME_MODES: readonly RuntimeMode[] = ["approval-required", "auto-accept-edits", "full-access"];
 const ROLES: readonly DelegateRole[] = ["general", "researcher", "planner", "implementer", "reviewer"];
@@ -112,13 +112,13 @@ export function PermissionPicker() {
       open={open()}
       onOpenChange={(e) => open.set(e.open)}
       placement="top"
-      align="start"
+      align="end"
       offset={8}
       margin={12}
       popupClass={`w-64 p-1 ${POPUP}`}
-      popupStyle={popupStyle("top", "start")}
-      popupStartingStyle={popupHiddenStyle("top", "start")}
-      popupEndingStyle={popupLeavingStyle("top", "start")}
+      popupStyle={popupStyle("top", "end")}
+      popupStartingStyle={popupHiddenStyle("top", "end")}
+      popupEndingStyle={popupLeavingStyle("top", "end")}
       trigger={<Chip icon={runtimeModeIcon(mode())} iconOnly label={`${runtimeModeText(mode()).label} — ${runtimeModeText(mode()).hint}`} tipText={`${runtimeModeText(mode()).label} — ${runtimeModeText(mode()).hint}`} />}
     >
       <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
@@ -154,7 +154,7 @@ export function PermissionPicker() {
 
 /**
  * Live Multi-Agent Sub-Agent Strip shown above the composer whenever background
- * or parallel/pipeline agents exist (modeled on t3code's `ProviderSubagentBar`).
+ * or parallel/pipeline agents exist.
  */
 export function SubagentStrip() {
   const tasks = () => delegatedTasks();
@@ -322,8 +322,7 @@ export function OrchestrateDialog() {
       open={isOrchestrateOpen()}
       animation="fade"
       onOpenChange={({ open }) => setOrchestrateOpen(open)}
-      backdropClass="bg-scrim"
-      backdropStyle={GLASS_SCRIM}
+      backdropClass={SCRIM}
       class="mx-auto mt-20 w-full max-w-150 px-4"
     >
       <View class={`gap-4 p-5 ${POPUP}`} style={{ ...GLASS_REGULAR, ...createMotion({ enter: DIALOG_RISE }).style }}>

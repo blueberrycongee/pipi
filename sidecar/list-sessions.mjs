@@ -19,12 +19,26 @@ function piSessionsDir(cwd) {
   return path.join(base, `--${encoded}--`);
 }
 
+// What Pi appends to a prompt for the model about its images (`withoutImageNotes` in
+// `pi/transcript.ts`): a blank line, then a note per image. A title is the person's words.
+const IMAGE_NOTE_FOR_MODEL =
+  /^\[Image(?:: original \d+x\d+, displayed at \d+x\d+\. Multiply coordinates by [\d.]+ to map to original image\.| converted from \S+ to \S+\.)\]$/;
+const IMAGE_NOTE_OMITTED = /^\[Image omitted: [^\]]*\]$/;
+
+function withoutImageNotes(text) {
+  const at = text.lastIndexOf("\n\n");
+  if (at < 0) return text;
+  const notes = text.slice(at + 2).split("\n");
+  if (!notes.every((line) => IMAGE_NOTE_FOR_MODEL.test(line) || IMAGE_NOTE_OMITTED.test(line))) return text;
+  return text.slice(0, at);
+}
+
 function messageText(message) {
   const content = message?.content;
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     for (const block of content) {
-      if (block?.type === "text" && typeof block.text === "string") return block.text;
+      if (block?.type === "text" && typeof block.text === "string") return withoutImageNotes(block.text);
     }
   }
   return "";
@@ -40,6 +54,10 @@ async function readPiSession(full) {
   let name;
   let firstMessage = "";
   let messageCount = 0;
+  // `modified` is the last message's time — not the file's mtime: non-message
+  // entries (session_info renames, model/thinking changes, compactions, labels,
+  // extension `custom`/`usage` records, v1→v3 migration rewrites) rewrite the
+  // file without advancing the conversation, and must not re-rank the sidebar.
   let modified = Date.parse(header.timestamp || "") || 0;
   for (const line of lines.slice(1)) {
     let entry;
@@ -56,15 +74,15 @@ async function readPiSession(full) {
     if (at > modified) modified = at;
   }
   const stat = await fsp.stat(full).catch(() => undefined);
-  if (stat && stat.mtimeMs > modified) modified = stat.mtimeMs;
+  const created = Date.parse(header.timestamp || "") || stat?.birthtimeMs || Date.now();
   return {
     path: full,
     id: header.id || path.basename(full, ".jsonl"),
     name,
     firstMessage: clip(firstMessage),
     messageCount,
-    created: Date.parse(header.timestamp || "") || stat?.birthtimeMs || Date.now(),
-    modified: Math.round(modified) || Date.now(),
+    created,
+    modified: Math.round(modified) || created,
     agentId: "pi",
   };
 }
@@ -98,6 +116,17 @@ async function listOne(cwd) {
         if (!lines.length) continue;
         const header = JSON.parse(lines[0]);
         if (header.type !== "pipi_external_session") continue;
+        // As with Pi sessions: `modified` follows the last message, not the last
+        // file write — `header.modified` advances on header-only saves (e.g.
+        // `set_session_name`) that add nothing to the conversation.
+        let modified = 0;
+        for (const line of lines.slice(1)) {
+          try {
+            const entry = JSON.parse(line);
+            const at = entry?.type === "message" ? entry.message?.timestamp : undefined;
+            if (typeof at === "number" && at > modified) modified = at;
+          } catch {}
+        }
         mappedExt.push({
           path: full,
           id: header.id || path.basename(file, ".pipi-agent.jsonl"),
@@ -105,7 +134,7 @@ async function listOne(cwd) {
           firstMessage: clip(header.firstMessage ?? ""),
           messageCount: Math.max(0, lines.length - 1),
           created: header.created || Date.now(),
-          modified: header.modified || Date.now(),
+          modified: Math.round(modified) || header.modified || header.created || Date.now(),
           agentId: header.agentId || header.driver || "claude",
         });
       } catch {}

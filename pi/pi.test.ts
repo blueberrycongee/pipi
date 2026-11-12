@@ -1,8 +1,8 @@
 import { expect, test } from "nsh/test";
 import { PiClient, type Transport } from "./client";
 import { createLineSplitter } from "./jsonl";
-import { Transcript, toolSummary } from "./transcript";
-import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity } from "./turns";
+import { Transcript, toolSummary, withoutImageNotes } from "./transcript";
+import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, displayRowIds } from "./turns";
 
 test("splits records on LF only, across chunks, keeping U+2028", () => {
   const lines: string[] = [];
@@ -191,6 +191,42 @@ test("groups interleaved reasoning and tool calls between commentary boundaries 
   expect(classifyTool("Edit-file").category).toBe("edit");
 });
 
+test("displayRowIds names every row a transcript can project", () => {
+  const t = new Transcript();
+  const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
+  const assistant = (content: object[]) => ({ role: "assistant", content, timestamp: 1 }) as never;
+  t.apply({ type: "message_start", message: { role: "user", content: "hi", timestamp: 1 } });
+  t.apply({ type: "message_start", message: assistant([]) });
+  update({ type: "thinking_start", contentIndex: 0 });
+  update({ type: "thinking_delta", contentIndex: 0, delta: "hm" });
+  update({ type: "toolcall_start", contentIndex: 1, id: "c1", toolName: "read" });
+  update({ type: "toolcall_start", contentIndex: 2, id: "c2", toolName: "bash" });
+  t.apply({
+    type: "message_end",
+    message: assistant([
+      { type: "thinking", thinking: "hm" },
+      { type: "toolCall", id: "c1", name: "read", arguments: {} },
+      { type: "toolCall", id: "c2", name: "bash", arguments: {} },
+    ]),
+  });
+  t.apply({ type: "tool_execution_end", toolCallId: "c1", toolName: "read", result: { content: [] }, isError: false });
+  t.apply({ type: "tool_execution_end", toolCallId: "c2", toolName: "bash", result: { content: [] }, isError: false });
+  t.apply({ type: "message_start", message: assistant([]) });
+  update({ type: "text_delta", contentIndex: 0, delta: "Done." });
+  t.apply({ type: "message_end", message: assistant([{ type: "text", text: "Done." }]) });
+
+  // A landing marks them all seen: whatever the fold state projects, its id was named.
+  const markable = new Set(displayRowIds(t.rows()));
+  for (const open of [true, false]) {
+    for (const row of buildDisplayRows(t.rows(), false, () => open)) {
+      expect(markable.has(row.id)).toBe(true);
+    }
+  }
+  // The reply's actions row is minted beside it in views/Rows.tsx.
+  const answer = t.rows().find((row) => row.kind === "text")!;
+  expect(markable.has(`${answer.id}#actions`)).toBe(true);
+});
+
 test("a stopped run leaves nothing streaming or running", () => {
   const t = new Transcript();
   t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
@@ -198,6 +234,128 @@ test("a stopped run leaves nothing streaming or running", () => {
   t.apply({ type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 1, id: "c", toolName: "bash" } });
   t.apply({ type: "agent_settled", aborted: true });
   expect(t.rows()).toMatchObject([{ kind: "text", streaming: false }, { kind: "tool", status: "error" }]);
+});
+
+/** An assistant message as Pi ends it: `error` set, it failed on that; else it answered `text`. */
+const reply = (text: string, error?: string) =>
+  ({ role: "assistant", content: text ? [{ type: "text", text }] : [], stopReason: error ? "error" : "stop", errorMessage: error, timestamp: 2 }) as never;
+
+/** Plays one attempt at a reply: the message, then the low-level run ending. */
+function attempt(t: Transcript, text: string, error?: string) {
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  if (text) t.apply({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text } });
+  t.apply({ type: "message_end", message: reply(text, error) });
+  t.apply({ type: "turn_end" });
+  t.apply({ type: "agent_end", willRetry: false });
+}
+
+test("an error that is retried is never shown; one that stands is reported once, when the run settles", () => {
+  const t = new Transcript();
+  const notices = () => t.rows().filter((row) => row.kind === "notice");
+  t.apply({ type: "message_start", message: { role: "user", content: "hi", timestamp: 1 } });
+
+  // The first attempt breaks off mid-sentence and Pi retries: no error row comes and goes.
+  attempt(t, "Half an ans", "529 overloaded");
+  expect(notices()).toEqual([]);
+  t.apply({ type: "auto_retry_start", attempt: 1, maxAttempts: 2, delayMs: 2000, errorMessage: "529 overloaded" });
+  expect(notices()).toEqual([]);
+  // What the failed attempt wrote stays where it was, as part of the process: it is not the answer.
+  expect(t.rows()).toMatchObject([{ kind: "user" }, { kind: "text", text: "Half an ans", streaming: false }]);
+  expect((t.rows()[1] as { final?: boolean }).final).toBeFalsy();
+
+  // The retry answers: one turn, under one header, and still no error.
+  attempt(t, "The whole answer.");
+  t.apply({ type: "auto_retry_end", success: true, attempt: 1 });
+  t.apply({ type: "agent_settled", aborted: false });
+  expect(notices()).toEqual([]);
+  expect(buildDisplayRows(t.rows()).filter((row) => row.kind === "turn")).toHaveLength(1);
+
+  // Every retry fails: the failure is said once, by the last attempt's own error, not once per attempt plus a summary.
+  t.apply({ type: "message_start", message: { role: "user", content: "again", timestamp: 3 } });
+  attempt(t, "", "529 overloaded");
+  t.apply({ type: "auto_retry_start", attempt: 1, maxAttempts: 2, delayMs: 2000, errorMessage: "529 overloaded" });
+  attempt(t, "", "529 overloaded");
+  t.apply({ type: "auto_retry_start", attempt: 2, maxAttempts: 2, delayMs: 4000, errorMessage: "529 overloaded" });
+  attempt(t, "", "529 overloaded");
+  t.apply({ type: "auto_retry_end", success: false, attempt: 2, finalError: "529 overloaded" });
+  expect(notices()).toEqual([]);
+  t.apply({ type: "agent_settled", aborted: false });
+  expect(notices()).toMatchObject([{ tone: "error", title: "The model returned an error", text: "529 overloaded" }]);
+  expect(t.rows().at(-1)).toMatchObject({ kind: "notice" });
+});
+
+test("a retry the reader cancels leaves no error, and a failure with no retry keeps what it wrote as the answer", () => {
+  const t = new Transcript();
+  t.apply({ type: "message_start", message: { role: "user", content: "hi", timestamp: 1 } });
+  attempt(t, "", "529 overloaded");
+  t.apply({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: "529 overloaded" });
+  // Stop, while Pi waits to try again.
+  t.apply({ type: "auto_retry_end", success: false, attempt: 1, finalError: "Retry cancelled" });
+  t.apply({ type: "agent_settled", aborted: false });
+  expect(t.rows().map((row) => row.kind)).toEqual(["user"]);
+
+  // No retry (a bad key, retries off): the error follows what was written, which is the answer there is.
+  t.apply({ type: "message_start", message: { role: "user", content: "again", timestamp: 3 } });
+  attempt(t, "As far as I got", "401 invalid api key");
+  t.apply({ type: "agent_settled", aborted: false });
+  expect(t.rows().slice(2)).toMatchObject([
+    { kind: "text", text: "As far as I got", final: true, streaming: false },
+    { kind: "notice", tone: "error", text: "401 invalid api key" },
+  ]);
+
+  // The conversation moving on reports it too, in its place: before the next message, not after.
+  attempt(t, "", "500 internal error");
+  t.apply({ type: "message_start", message: { role: "user", content: "queued", timestamp: 5 } });
+  expect(t.rows().slice(-2)).toMatchObject([{ kind: "notice", text: "500 internal error" }, { kind: "user", text: "queued" }]);
+});
+
+test("history shows the same errors a live run did: retried attempts none, a failure that stood one", () => {
+  const t = new Transcript();
+  t.load([
+    { role: "user", content: "hi", timestamp: 1 },
+    reply("", "529 overloaded"),
+    reply("", "529 overloaded"),
+    reply("The whole answer."),
+    { role: "user", content: "again", timestamp: 3 },
+    reply("", "529 overloaded"),
+    reply("As far as I got", "401 invalid api key"),
+  ]);
+  expect(t.rows()).toMatchObject([
+    { kind: "user" },
+    { kind: "text", text: "The whole answer.", final: true },
+    { kind: "user" },
+    { kind: "text", text: "As far as I got", final: true },
+    { kind: "notice", tone: "error", title: "The model returned an error", text: "401 invalid api key" },
+  ]);
+});
+
+test("a message shows what the person wrote, not what Pi told the model about its images", () => {
+  const scaled = "[Image: original 1914x2040, displayed at 1876x2000. Multiply coordinates by 1.02 to map to original image.]";
+  const converted = "[Image converted from image/bmp to image/png.]";
+  const omitted = "[Image omitted: could not be resized below the inline image size limit.]";
+  const image = { type: "image" as const, data: "", mimeType: "image/png" };
+
+  const t = new Transcript();
+  t.load([
+    { role: "user", content: [{ type: "text", text: `Too far apart\n\n${converted}\n${scaled}` }, image], timestamp: 1 },
+    // An image sent with no words is still a message: the picture alone.
+    { role: "user", content: [{ type: "text", text: `\n\n${scaled}` }, image], timestamp: 2 },
+  ]);
+  expect(t.rows()).toMatchObject([
+    { kind: "user", text: "Too far apart", images: 1 },
+    { kind: "user", text: "", images: 1 },
+  ]);
+  // A live message arrives the same way.
+  t.apply({ type: "message_start", message: { role: "user", content: [{ type: "text", text: `Two\n\nparagraphs\n\n${scaled}` }, image], timestamp: 3 } });
+  expect(t.rows().at(-1)).toMatchObject({ kind: "user", text: "Two\n\nparagraphs", images: 1 });
+
+  // That an image was left out is for the reader too: it stays.
+  expect(withoutImageNotes(`Look\n\n${omitted}\n${scaled}`)).toBe(`Look\n\n${omitted}`);
+  expect(withoutImageNotes(`Look\n\n${omitted}`)).toBe(`Look\n\n${omitted}`);
+  // Only Pi's own lines, at the end, after a blank line: the same words written by hand are the person's.
+  expect(withoutImageNotes(`${scaled}\n\nwhat does this note mean?`)).toBe(`${scaled}\n\nwhat does this note mean?`);
+  expect(withoutImageNotes(`see\n${scaled}`)).toBe(`see\n${scaled}`);
+  expect(withoutImageNotes("Plain\n\n[Image: a cat]")).toBe("Plain\n\n[Image: a cat]");
 });
 
 test("titles a tool call from partial argument JSON", () => {

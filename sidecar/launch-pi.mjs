@@ -47,8 +47,12 @@ child.on("error", (error) => {
   process.exit(1);
 });
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-  process.on(signal, () => child.kill(signal));
+  process.on(signal, () => {
+    process.stderr.write(`launch-pi[${process.pid}]: received ${signal}; forwarding to pi\n`);
+    child.kill(signal);
+  });
 }
 child.on("exit", (code, signal) => {
+  if (signal) process.stderr.write(`launch-pi[${process.pid}]: pi ended on ${signal}\n`);
   process.exit(code ?? (signal ? 1 : 0));
 });

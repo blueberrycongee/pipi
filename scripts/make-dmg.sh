@@ -14,6 +14,15 @@ case "$DMG" in /*) ;; *) DMG="$PWD/$DMG";; esac
 cd "$(dirname "$0")/.."
 OUT=.nsh/out
 RW_DMG="$OUT/pipi-rw.dmg"
+MOUNT_DIR=""
+
+cleanup() {
+  if [ -n "$MOUNT_DIR" ] && [ -d "$MOUNT_DIR" ]; then
+    hdiutil detach "$MOUNT_DIR" -force >/dev/null 2>&1 || true
+  fi
+  rm -rf "$OUT/dmg-staging" "$RW_DMG"
+}
+trap cleanup EXIT
 
 if [ ! -d "$APP" ]; then
   echo "make-dmg: no such app bundle: $APP" >&2
@@ -31,7 +40,7 @@ fi
 
 rm -rf "$OUT/dmg-staging" "$RW_DMG" "$DMG"
 mkdir -p "$OUT/dmg-staging/.background"
-cp -R "$APP" "$OUT/dmg-staging/"
+ditto "$APP" "$OUT/dmg-staging/$(basename "$APP")"
 ln -s /Applications "$OUT/dmg-staging/Applications"
 tiffutil -cathidpicheck assets/brand/dmg-background.png assets/brand/dmg-background@2x.png \
   -out "$OUT/dmg-staging/.background/background.tiff" >/dev/null
@@ -40,7 +49,7 @@ hdiutil create -volname pipi -srcfolder "$OUT/dmg-staging" -ov -format UDRW "$RW
 rm -rf "$OUT/dmg-staging"
 
 MOUNT_DIR=$(hdiutil attach -readwrite -noverify -noautoopen "$RW_DMG" | awk '/\/Volumes\// {print substr($0, index($0, "/Volumes/"))}')
-osascript <<EOF
+if ! osascript <<EOF 2>/dev/null
 tell application "Finder"
   tell disk "pipi"
     open
@@ -63,9 +72,13 @@ tell application "Finder"
   end tell
 end tell
 EOF
+then
+  echo "make-dmg: Finder window layout skipped (headless session)" >&2
+fi
 chflags hidden "$MOUNT_DIR/.background" 2>/dev/null || true
 rm -rf "$MOUNT_DIR/.fseventsd" 2>/dev/null || true
 sync
 hdiutil detach "$MOUNT_DIR" -force
+MOUNT_DIR=""
 hdiutil convert "$RW_DMG" -format UDZO -imagekey zlib-level=9 -ov -o "$DMG"
 rm -f "$RW_DMG"

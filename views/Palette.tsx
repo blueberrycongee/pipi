@@ -34,6 +34,7 @@ import {
   sessionState,
   setOrchestrateOpen,
   setPaletteOpen,
+  showAgentSettings,
   showSettings,
   startRenaming,
   switchAgentHarness,
@@ -47,7 +48,7 @@ import { type Appearance, language, type Language, recentWorkspaces, setAppearan
 import { Icon, type IconName } from "../ui/Icon";
 import { DIALOG_RISE } from "../ui/motion";
 import { runtimeModeIcon, runtimeModeText, thinkingText, tr } from "../lib/i18n";
-import { GLASS_REGULAR, GLASS_SCRIM, POPUP, PRESS } from "../ui/styles";
+import { GLASS_REGULAR, POPUP, PRESS, SCRIM } from "../ui/styles";
 
 interface Action extends CommandItem {
   icon: IconName;
@@ -175,9 +176,7 @@ export function Palette() {
       }),
       { id: "settings", label: tr("Settings", "设置"), group: viewGroup, keywords: ["settings", "preferences", "language", "语言"], shortcut: "mod+,", icon: "sliders", run: () => showSettings() },
       { id: "archive-settings", label: tr("Archive", "归档管理"), group: viewGroup, keywords: ["archive", "conversation", "restore", "delete", "归档", "会话", "恢复", "删除"], icon: "archive", run: () => showSettings("archive") },
-      ...(activeAgentId() === "pi"
-        ? [{ id: "providers", label: tr("Providers", "服务商"), group: viewGroup, keywords: ["providers", "api key", "credentials", "login", "密钥"], icon: "plug" as IconName, run: () => showSettings("providers") }]
-        : []),
+      { id: "agent-settings", label: tr(`Configure ${activeAgent().name}…`, `配置 ${activeAgent().name}…`), group: viewGroup, keywords: ["providers", "api key", "credentials", "login", "密钥", "服务商"], icon: "plug", run: () => showAgentSettings() },
       { id: "sidebar", label: sidebarOpen() ? tr("Hide Sidebar", "隐藏侧边栏") : tr("Show Sidebar", "显示侧边栏"), group: viewGroup, keywords: ["sidebar", "侧边栏"], shortcut: "mod+b", icon: "sidebar", run: () => setSidebarOpen(!sidebarOpen()) },
       { id: "random-wallpaper", label: tr("Random Wallpaper", "随机壁纸"), group: viewGroup, keywords: ["wallpaper", "background", "random", "shuffle", "壁纸", "背景", "随机壁纸"], shortcut: "mod+u", icon: "shuffle", run: () => void randomWallpaper() },
       theme("system", tr("System", "跟随系统"), ["theme", "appearance", "system"]),
@@ -253,8 +252,7 @@ export function Palette() {
       open={isPaletteOpen()}
       animation="fade"
       onOpenChange={({ open }) => setPaletteOpen(open)}
-      backdropClass="bg-scrim"
-      backdropStyle={GLASS_SCRIM}
+      backdropClass={SCRIM}
       class="mx-auto mt-28 w-full max-w-150 px-4"
     >
       <View class={`overflow-hidden ${POPUP}`} style={{ ...GLASS_REGULAR, ...createMotion({ enter: DIALOG_RISE }).style }}>

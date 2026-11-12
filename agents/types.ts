@@ -4,8 +4,7 @@ import type { Row } from "../pi/transcript";
 /**
  * External & built-in agent harnesses pipi can drive and orchestrate.
  *
- * Synthesizes t3code's `ProviderAdapter` + `AcpAdapter` + `OrchestratorMcpService`
- * with a rich built-in engine catalog:
+ * Built-in engine catalog:
  * - Dedicated drivers: `pi` (the user's `pi` CLI over JSONL RPC), `claude` (Claude Code CLI),
  *   `codex` (OpenAI Codex CLI), `opencode` (OpenCode CLI), `cursor` (Cursor Agent CLI).
  * - First-class & custom ACP driver: `acp` (Devin, Gemini CLI, GitHub Copilot CLI,

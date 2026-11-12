@@ -31,10 +31,10 @@ test("text+image bubble keeps its text through fold cycles and session switches"
   await app.screenshot(`${OUT}/1-settled.png`);
 
   for (let i = 0; i < 8; i++) {
-    await app.press("text:/^用时/");
+    await app.press("text:用");
     await app.wait(140);
     await app.screenshot(`${OUT}/2-fold-${String(i).padStart(2, "0")}.png`);
-    await app.press("text:/^用时/");
+    await app.press("text:用");
     await app.wait(300);
     await app.screenshot(`${OUT}/2-open-${String(i).padStart(2, "0")}.png`);
   }

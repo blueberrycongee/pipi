@@ -52,6 +52,30 @@ const textOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
 const imagesOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
   typeof content === "string" ? 0 : (content ?? []).filter((block) => block.type === "image").length;
 
+/** What Pi tells the model about a prompt's image: how it was scaled, what it was converted from. */
+const IMAGE_NOTE_FOR_MODEL =
+  /^\[Image(?:: original \d+x\d+, displayed at \d+x\d+\. Multiply coordinates by [\d.]+ to map to original image\.| converted from \S+ to \S+\.)\]$/;
+/** What Pi says of an image it could not send: the reader needs that one too. */
+const IMAGE_NOTE_OMITTED = /^\[Image omitted: [^\]]*\]$/;
+
+/**
+ * A prompt's text as the person wrote it. Pi fits a prompt's images to what
+ * the model takes and says so in the prompt's own text: a blank line, then a
+ * note per image (`[Image: original 1914x2040, displayed at 1876x2000. …]`).
+ * Those are for the model, so they are not shown, copied or made a title of
+ * (`sidecar/list-sessions.mjs` reads titles the same way).
+ */
+export function withoutImageNotes(text: string): string {
+  const at = text.lastIndexOf("\n\n");
+  if (at < 0) return text;
+  const notes = text.slice(at + 2).split("\n");
+  if (!notes.every((line) => IMAGE_NOTE_FOR_MODEL.test(line) || IMAGE_NOTE_OMITTED.test(line))) return text;
+  const kept = notes.filter((line) => IMAGE_NOTE_OMITTED.test(line));
+  if (kept.length === notes.length) return text;
+  const head = text.slice(0, at);
+  return kept.length ? `${head}\n\n${kept.join("\n")}` : head;
+}
+
 /** The arguments a partial JSON object has so far: enough to title a tool call while it streams. */
 function partialArgs(json: string): Record<string, unknown> {
   const args: Record<string, unknown> = {};
@@ -128,13 +152,21 @@ function partialArgs(json: string): Record<string, unknown> {
 }
 
 /**
+ * Row ids count across every transcript, not per transcript: a parked run, the
+ * session loaded after it and a delegated task each have their own, and rows
+ * of two conversations sharing an id look like one row to whatever keys on it
+ * — the list keeps the cell, and its words roll from one session's into the
+ * other's on a switch.
+ */
+let seq = 0;
+
+/**
  * Builds the rows of a session and keeps them current as events arrive.
  * It holds no signals: the store takes `rows()` when `version` moved.
  */
 export class Transcript {
   #rows: Row[] = [];
   #index = new Map<string, number>();
-  #seq = 0;
   /** The assistant message being streamed: its key, and what its tool calls have of their arguments. */
   #live: { key: string; toolIds: Map<number, string>; toolJson: Map<number, string>; thinkingSince: Map<number, number>; argsAt: Map<number, number> } | undefined;
   /** Start timestamps for running tool executions so external engines without `durationMs` still measure elapsed time. */
@@ -145,6 +177,13 @@ export class Transcript {
   #turnStart: number | undefined;
   /** While loading history: the time of the message being read (`null` when it has none). */
   #clock: number | null | undefined;
+  /**
+   * What the last assistant message failed on, not yet said. Whether it is the
+   * run's failure depends on what follows: a retry takes its place and nothing
+   * is said, so an error never shows only to be withdrawn; once the run settles
+   * or the conversation moves on, it is reported, once (`#reportFailure`).
+   */
+  #failure: string | undefined;
   /** Bumped by every change. */
   version = 0;
 
@@ -172,6 +211,7 @@ export class Transcript {
     this.#toolSince.clear();
     this.#bashId = undefined;
     this.#turnStart = undefined;
+    this.#failure = undefined;
     for (const message of messages) {
       if (message.role === "user") this.#closeTurn();
       const at = (message as { timestamp?: unknown }).timestamp;
@@ -190,7 +230,7 @@ export class Transcript {
     switch (event.type) {
       case "message_start":
         if (event.message.role === "assistant") {
-          this.#live = { key: `m${++this.#seq}`, toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
+          this.#live = { key: `m${++seq}`, toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
         } else if (event.message.role === "user") {
           this.#closeTurn();
           this.#append(event.message);
@@ -228,6 +268,9 @@ export class Transcript {
         break;
       }
       case "compaction_end":
+        // Compacting an overflowed context is Pi recovering the reply that failed on it: the retry answers for it.
+        if (event.result && event.willRetry) this.#failure = undefined;
+        else this.#reportFailure();
         if (event.result) {
           const { tokensBefore, estimatedTokensAfter } = event.result;
           const after = estimatedTokensAfter ? this.#tr(` to about ${compactNumber(estimatedTokensAfter)}`, `，压缩至约 ${compactNumber(estimatedTokensAfter)}`) : "";
@@ -241,17 +284,12 @@ export class Transcript {
           this.#push({ kind: "notice", id: this.#id("notice"), tone: "error", title: this.#tr("Compaction failed", "压缩失败"), text: event.errorMessage });
         }
         break;
-      case "auto_retry_end":
-        if (!event.success && event.finalError) {
-          this.#push({
-            kind: "notice",
-            id: this.#id("notice"),
-            tone: "error",
-            title: this.#tr(`Gave up after ${event.attempt} ${event.attempt === 1 ? "retry" : "retries"}`, `重试 ${event.attempt} 次后已放弃`),
-            text: event.finalError,
-          });
-        }
-        break;
+      case "auto_retry_start":
+        // The attempt is being made again: the status line says so while it waits, and the transcript says nothing.
+        // (When the retries run out, the last attempt's own error is what gets reported; a retry the reader
+        // cancelled leaves none. `auto_retry_end` adds nothing to either.)
+        this.#failure = undefined;
+        return;
       case "extension_error":
         this.#push({ kind: "notice", id: this.#id("notice"), tone: "warning", title: this.#tr(`Extension error in ${event.event}`, `扩展在 ${event.event} 中出错`), text: `${event.error}\n${event.extensionPath}` });
         break;
@@ -307,7 +345,7 @@ export class Transcript {
   // ── Internals ─────────────────────────────────────────────────────────────
 
   #id(prefix: string) {
-    return `${prefix}${++this.#seq}`;
+    return `${prefix}${++seq}`;
   }
 
   /** The time as the transcript reads it: now, or while loading, the message's (`undefined` when it has none). */
@@ -429,16 +467,21 @@ export class Transcript {
 
   /** The authoritative message replaces what was reconstructed from deltas, row by row. */
   #finish(message: AssistantMessage) {
-    const live = this.#live ?? { key: `m${++this.#seq}`, toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
+    const live = this.#live ?? { key: `m${++seq}`, toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
     this.#live = undefined;
     this.#blocks(message, live.key, true);
     // The answer is in: the turn took this long, whatever the provider still cleans up.
-    if (!message.content.some((block) => block.type === "toolCall")) this.#closeTurn();
+    // (A message that failed is no answer yet: a retry goes on in the same turn.)
+    if (message.stopReason !== "error" && !message.content.some((block) => block.type === "toolCall")) this.#closeTurn();
   }
 
   #blocks(message: AssistantMessage, key: string, keepRuns: boolean) {
-    // A message that calls no tools ends the turn: its prose is the answer.
-    const final = !message.content.some((block) => block.type === "toolCall");
+    // A later assistant message is the attempt made again: it answers for the one that failed before it.
+    this.#failure = undefined;
+    const failed = message.stopReason === "error";
+    // A message that calls no tools ends the turn: its prose is the answer. Not one that failed —
+    // what it left becomes the answer only if the failure stands (`#reportFailure`).
+    const final = !failed && !message.content.some((block) => block.type === "toolCall");
     message.content.forEach((block, index) => {
       const id = `${key}.${index}`;
       if (block.type === "text") {
@@ -451,17 +494,16 @@ export class Transcript {
       } else if (block.type === "toolCall") {
         const before = this.#get(block.id);
         const base: ToolRow = before?.kind === "tool" ? before : { kind: "tool", id: block.id, name: block.name, args: {}, status: "queued", output: "", images: 0 };
-        this.#set({ ...base, name: block.name, args: block.arguments ?? {}, status: keepRuns && base.status !== "call" ? base.status : "queued" });
+        // A call the failed message never got to run will not run: it does not go on spinning through the retries.
+        if (failed && (base.status === "call" || base.status === "queued")) {
+          this.#set({ ...base, name: block.name, args: block.arguments ?? {}, status: "error", output: base.output || this.#tr("Stopped before it finished.", "完成前已停止。") });
+        } else {
+          this.#set({ ...base, name: block.name, args: block.arguments ?? {}, status: keepRuns && base.status !== "call" ? base.status : "queued" });
+        }
       }
     });
-    if (message.stopReason === "error") {
-      this.#push({
-        kind: "notice",
-        id: this.#id("notice"),
-        tone: "error",
-        title: this.#tr("The model returned an error", "模型返回了错误"),
-        text: message.errorMessage ?? this.#tr("No details were given.", "未提供详细信息。"),
-      });
+    if (failed) {
+      this.#failure = message.errorMessage?.trim() || this.#tr("No details were given.", "未提供详细信息。");
     } else if (message.stopReason === "length") {
       this.#push({
         kind: "notice",
@@ -473,18 +515,37 @@ export class Transcript {
     }
   }
 
+  /**
+   * Says what the run failed on: one notice, after whatever the failed message
+   * left, and the same one a session's history gives. The prose before it is as
+   * much of an answer as there will be.
+   */
+  #reportFailure() {
+    const text = this.#failure;
+    if (text === undefined) return;
+    this.#failure = undefined;
+    for (let at = this.#rows.length - 1; at >= 0; at--) {
+      const row = this.#rows[at];
+      if (row.kind !== "text") break;
+      if (row.streaming || !row.final) this.#rows[at] = { ...row, streaming: false, final: true };
+    }
+    this.#push({ kind: "notice", id: this.#id("notice"), tone: "error", title: this.#tr("The model returned an error", "模型返回了错误"), text });
+  }
+
   /** A whole message: from history, or one that arrives complete (a user's, a tool's result). */
   #append(message: AgentMessage) {
+    // The conversation moves on from a failure nothing took the place of: it is said before what follows.
+    if (message.role !== "assistant") this.#reportFailure();
     switch (message.role) {
       case "user": {
-        const text = textOf(message.content);
+        const text = withoutImageNotes(textOf(message.content));
         const images = imagesOf(message.content);
         if (text || images) this.#push({ kind: "user", id: this.#id("u"), text, images });
         this.#turnStart = this.#now();
         break;
       }
       case "assistant":
-        this.#blocks(message, `m${++this.#seq}`, false);
+        this.#blocks(message, `m${++seq}`, false);
         break;
       case "toolResult":
         this.#tool(
@@ -543,6 +604,7 @@ export class Transcript {
       return row;
     });
     this.#closeTurn();
+    this.#reportFailure();
   }
 }
 

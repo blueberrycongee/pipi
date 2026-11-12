@@ -67,9 +67,9 @@ interface Prefs {
   customAgents: CustomAgentConfig[];
   /** Per-agent last model + thinking picks, restored onto each fresh session. */
   agentSessionChoices: Record<string, AgentSessionChoice>;
-  /** Custom new-thread background wallpaper configuration. */
+  /** The wallpaper laid under the whole window. */
   wallpaper: WallpaperConfig | null;
-  /** Visual shader effect applied to the new-thread background wallpaper. */
+  /** Visual shader effect the wallpaper is drawn through. */
   wallpaperEffect: WallpaperEffect;
   /** Optional directory scanned when rotating random wallpapers (`⌘U`). */
   wallpaperFolder?: string;

@@ -25,7 +25,8 @@ const manifest = JSON.parse(readFileSync(join(root, "nsh.json"), "utf8"));
 const version = manifest.version;
 const app = join(root, ".nsh/out", `${manifest.name}.app`);
 const releaseDir = join(root, "release");
-const receiptPath = join(releaseDir, "notarization/submission.json");
+const appReceiptPath = join(releaseDir, "notarization/app-submission.json");
+const dmgReceiptPath = join(releaseDir, "notarization/submission.json");
 const archiveName = `pipi-${version}-mac-arm64.dmg`;
 
 const env = process.env;
@@ -109,16 +110,16 @@ const notaryAuth = () =>
 // Apple accepts the upload before the receipt exists; an interrupted submit is
 // ambiguous, so the receipt records what was sent before any wait begins and a
 // rerun resumes that submission instead of uploading again.
-async function notarize(archive) {
-  mkdirSync(dirname(receiptPath), { recursive: true });
+async function notarize(archive, receiptFile) {
+  mkdirSync(dirname(receiptFile), { recursive: true });
   const hash = sha256(archive);
   const save = (receipt) => {
-    writeFileSync(`${receiptPath}.tmp`, JSON.stringify(receipt, null, 2) + "\n");
-    renameSync(`${receiptPath}.tmp`, receiptPath);
+    writeFileSync(`${receiptFile}.tmp`, JSON.stringify(receipt, null, 2) + "\n");
+    renameSync(`${receiptFile}.tmp`, receiptFile);
   };
   let receipt;
-  if (existsSync(receiptPath)) {
-    receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+  if (existsSync(receiptFile)) {
+    receipt = JSON.parse(readFileSync(receiptFile, "utf8"));
     if (receipt.sha256 !== hash) throw new Error("Notarization receipt hash does not match the archive");
     if (receipt.status === "UploadUnknown") {
       throw new Error("Notarization upload outcome is unknown; check Apple history before resubmitting");
@@ -201,16 +202,21 @@ console.log("Signing with the pinned Developer ID (hardened runtime, timestamp)"
 signApp(identity);
 
 mkdirSync(releaseDir, { recursive: true });
+console.log("Notarizing and stapling pipi.app before building the disk image");
+const appArchive = join(releaseDir, "app-submission.zip");
+rmSync(appArchive, { force: true });
+run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", app, appArchive]);
+const appReceipt = await notarize(appArchive, appReceiptPath);
+rmSync(appArchive, { force: true });
+await stapler("staple", app);
+await stapler("validate", app);
+
 console.log(`Building ${archiveName}`);
 const uploadArchive = join(releaseDir, "submission.dmg");
 makeDmg(uploadArchive);
-console.log("Signing the disk image");
+console.log("Signing, notarizing, and stapling the disk image");
 signDmg(identity, uploadArchive);
-const receipt = await notarize(uploadArchive);
-
-console.log("Stapling the notarization ticket to the app and the disk image");
-await stapler("staple", app);
-await stapler("validate", app);
+const receipt = await notarize(uploadArchive, dmgReceiptPath);
 await stapler("staple", uploadArchive);
 await stapler("validate", uploadArchive);
 
@@ -238,11 +244,11 @@ writeFileSync(join(releaseDir, "verification.json"), JSON.stringify({
   bundleId: manifest.id,
   identity,
   teamId: env.PIPI_RELEASE_TEAM_ID,
-  notarization: receipt.id,
+  notarization: { app: appReceipt.id, dmg: receipt.id },
   artifact: { file: archiveName, sha256: sha256(artifact) },
   checks: [
     "codesign --verify --deep --strict (app)",
-    "stapler validate (app, dmg)",
+    "stapler validate (app inside dmg, dmg)",
     "spctl -a -vv -t execute (app)",
     "spctl -a -vv -t install (dmg)",
   ],

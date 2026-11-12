@@ -84,8 +84,9 @@ const AGENT_NAMES = {
  * The only honest pre-connect entry: "the engine's own configured default".
  * Real model catalogs are adopted at runtime — ACP agents advertise them on
  * `session/new` (`models.availableModels`, or Devin-style `configOptions` also
- * pushed live via `config_option_update`). CLI drivers take an explicit model
- * through `extraArgs`. No fabricated lists.
+ * pushed live via `config_option_update`), and Claude Code is asked directly
+ * through its stream-json `initialize` control request (probeClaude below).
+ * No fabricated lists.
  */
 function engineDefaultModel() {
   const name = config.customAgent?.name || AGENT_NAMES[agentId] || agentId;
@@ -96,8 +97,6 @@ function engineDefaultModel() {
     provider: agentId,
     reasoning: false,
     input: driver === "acp" ? ["text", "image"] : ["text"],
-    contextWindow: 200000,
-    maxTokens: 16384,
     cost: zeroCost,
   };
 }
@@ -113,8 +112,6 @@ function initialModels() {
         provider: config.customAgent.id || "acp",
         reasoning: false,
         input: ["text", "image"],
-        contextWindow: 128000,
-        maxTokens: 16384,
         cost: zeroCost,
       },
     ];
@@ -146,8 +143,8 @@ let queuedSteering = [];
 let queuedFollowUp = [];
 // A queued steering message interrupted the in-flight turn; it (not the abort)
 // owns the next turn, so the drain below must run even though the turn ended
-// aborted — t3code's "steering by interrupt-restart" for engines without
-// native mid-turn injection.
+// aborted — steering by interrupt-restart for engines without native mid-turn
+// injection.
 let steerInterrupt = false;
 let totalInputTokens = 0;
 let totalOutputTokens = 0;
@@ -158,6 +155,40 @@ const pendingUiRequests = new Map();
 
 function emit(record) {
   process.stdout.write(`${JSON.stringify(record)}\n`);
+}
+
+/**
+ * A write to a child that just died surfaces as an `error` event on its stdin
+ * (EPIPE), not as a throw — and an unhandled one ends this bridge, taking the
+ * session with it. The child's own `close`/`error` already says what happened.
+ */
+function guardStdin(child) {
+  child.stdin?.on("error", () => {});
+  return child;
+}
+
+// ── The agent's own slash commands ───────────────────────────────────────────────
+// Only what the engine itself reports: ACP's `available_commands_update`
+// (`{name, description, input: {hint}}`) and Claude Code's `initialize` answer
+// (`commands: [{name, description, argumentHint}]`). Either is run the way the
+// engine documents: `/name args` as the prompt's text. The other drivers report
+// none, and get none — pipi's own commands (`/delegate`, `/parallel`, …) are
+// the client's and never pass through here.
+let agentCommands = [];
+
+function adoptCommands(reported) {
+  const next = [];
+  for (const c of Array.isArray(reported) ? reported : []) {
+    const name = String(c?.name ?? "").trim().replace(/^\//, "");
+    if (!name || /\s/.test(name) || next.some((known) => known.name === name)) continue;
+    // A skill's description can run to a page: the menu shows a line.
+    const description = typeof c?.description === "string" ? c.description.trim().split("\n")[0].slice(0, 200) : "";
+    const hint = typeof c?.argumentHint === "string" ? c.argumentHint.trim() : typeof c?.input?.hint === "string" ? c.input.hint.trim() : "";
+    next.push({ name, ...(description ? { description } : {}), source: "agent", ...(hint ? { argumentHint: hint } : {}) });
+  }
+  if (JSON.stringify(next) === JSON.stringify(agentCommands)) return;
+  agentCommands = next;
+  emit({ type: "commands_changed" });
 }
 
 function normalizeToolName(raw) {
@@ -320,13 +351,10 @@ function interruptActiveTurn() {
   for (const [, resolve] of pendingUiRequests) resolve(false);
   pendingUiRequests.clear();
   if (driver === "acp") {
-    // Politely interrupt the prompt; if the agent ignores `session/cancel`,
-    // drop the peer after a grace period (next turn re-attaches via load).
-    if (acpSessionId) acpNotify("session/cancel", { sessionId: acpSessionId });
-    const grace = setTimeout(() => {
-      if (acpStream) signalAgent("SIGKILL");
-    }, 8000);
-    grace.unref?.();
+    // Politely interrupt the in-flight prompt; an agent that ignores
+    // `session/cancel` is dropped by settleActiveTurn's stall timeout
+    // (dropAcpPeer), and the next turn re-attaches via session/load.
+    if (acpStream) acpNotify("session/cancel", { sessionId: acpSessionId });
   } else if (activeChild) {
     signalAgent("SIGTERM");
   }
@@ -615,6 +643,7 @@ function spawnJsonlProcess(bin, args, extraEnv, onLine) {
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
+    guardStdin(child);
     activeChild = child;
     let stdoutBuf = "";
     let stderrBuf = "";
@@ -653,6 +682,165 @@ function spawnJsonlProcess(bin, args, extraEnv, onLine) {
   });
 }
 
+// ── Claude Code catalog probe (stream-json control protocol) ─────────────────
+// Claude Code has no CLI flag to list models, but its SDK control protocol
+// answers an `initialize` request with the models this install and account can
+// actually run (aliases resolved through the user's own settings — a custom
+// `ANTHROPIC_DEFAULT_*_MODEL` shows up as the real backend id). One throwaway
+// `claude` process, no session persisted, no prompt ever sent.
+const CLAUDE_PROBE_TIMEOUT_MS = 20_000;
+const CLAUDE_CATALOG_TTL_MS = 60_000;
+const CLAUDE_CATALOG_RETRY_MS = 15_000;
+let claudeCatalogPromise = undefined;
+let claudeCatalogCooldownUntil = 0;
+
+function probeClaudeInitialization(bin) {
+  return new Promise((resolve) => {
+    const requestId = `probe_${crypto.randomUUID()}`;
+    const child = spawnBinary(
+      bin,
+      [
+        "--output-format", "stream-json",
+        "--verbose",
+        "--input-format", "stream-json",
+        "--setting-sources", "user,project,local",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        "--settings", JSON.stringify({ disableAllHooks: true }),
+      ],
+      {
+        cwd,
+        env: agentRuntimeEnv({
+          ENABLE_CLAUDEAI_MCP_SERVERS: "false",
+          CLAUDE_CODE_AUTO_CONNECT_IDE: "0",
+          CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL: "1",
+          CLAUDE_CODE_ENTRYPOINT: "sdk-ts",
+        }),
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: process.platform !== "win32",
+      },
+    );
+    guardStdin(child);
+    const finish = (payload) => {
+      clearTimeout(timer);
+      try {
+        if (process.platform === "win32") child.kill();
+        else process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill();
+        } catch {}
+      }
+      resolve(payload);
+    };
+    const timer = setTimeout(() => finish(undefined), CLAUDE_PROBE_TIMEOUT_MS);
+    timer.unref?.();
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", () => {});
+    let buf = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buf += chunk;
+      let nl = buf.indexOf("\n");
+      while (nl !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (line) {
+          try {
+            const msg = JSON.parse(line);
+            if (msg.type === "control_response" && msg.response?.request_id === requestId && msg.response?.subtype === "success") {
+              finish(msg.response.response);
+            }
+          } catch {}
+        }
+        nl = buf.indexOf("\n");
+      }
+    });
+    child.on("error", () => finish(undefined));
+    child.on("close", () => finish(undefined));
+    try {
+      child.stdin.write(`${JSON.stringify({ type: "control_request", request_id: requestId, request: { subtype: "initialize" } })}\n`);
+    } catch {
+      finish(undefined);
+    }
+  });
+}
+
+const CLAUDE_EFFORT_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh", "max"]);
+const claudeEfforts = (info) =>
+  (Array.isArray(info?.supportedEffortLevels) ? info.supportedEffortLevels : []).filter((e) => typeof e === "string" && CLAUDE_EFFORT_LEVELS.has(e));
+// `resolvedModel` carries Claude's `[1m]` context-window suffix.
+const claudeContextWindow = (info) => (typeof info?.resolvedModel === "string" && info.resolvedModel.endsWith("[1m]") ? 1_000_000 : 200_000);
+
+/** Adopts the catalog the probe reported; `default` stays the placeholder (it is a pointer, not a model). */
+function adoptClaudeModels(init) {
+  const reported = Array.isArray(init?.models) ? init.models : [];
+  if (!reported.length) return;
+  const reportedDefault = reported.find((m) => m?.value === "default");
+  const discovered = [engineDefaultModel()];
+  if (reportedDefault) {
+    discovered[0].reasoning = reportedDefault.supportsEffort === true;
+    discovered[0].effortLevels = claudeEfforts(reportedDefault);
+    discovered[0].contextWindow = claudeContextWindow(reportedDefault);
+  }
+  for (const m of reported) {
+    const id = String(m?.value ?? "").trim();
+    if (!id || id === "default" || discovered.some((d) => d.id === id)) continue;
+    discovered.push({
+      id,
+      name: String(m?.displayName || m?.resolvedModel || id).trim() || id,
+      api: "claude",
+      provider: "claude",
+      reasoning: m?.supportsEffort === true,
+      effortLevels: claudeEfforts(m),
+      input: ["text"],
+      contextWindow: claudeContextWindow(m),
+      maxTokens: 16384,
+      cost: zeroCost,
+    });
+  }
+  // A selection the probe no longer reports (a stale alias, a removed custom
+  // model) stays listed rather than silently snapping the session to default.
+  if (currentModel && currentModel.id !== "default" && !discovered.some((m) => m.id === currentModel.id)) {
+    discovered.push(currentModel);
+  }
+  const sig = (m) => `${m.provider}/${m.id}:${m.name}:${m.reasoning}`;
+  if (availableModels.length === discovered.length && availableModels.every((m, i) => sig(m) === sig(discovered[i]))) return;
+  availableModels.splice(0, availableModels.length, ...discovered);
+  currentModel = discovered.find((m) => m.id === currentModel?.id) || discovered[0];
+  emit({ type: "models_changed" });
+}
+
+/**
+ * Claude's catalog lives behind one short-lived probe process; concurrent
+ * catalog reads share it, a fresh result holds for the TTL, and a failure
+ * backs off so a dead CLI never stalls the picker on every open.
+ */
+function ensureClaudeCatalog() {
+  if (driver !== "claude") return Promise.resolve();
+  if (!claudeCatalogPromise && Date.now() >= claudeCatalogCooldownUntil) {
+    const bin = resolveDriverBinary();
+    if (!bin) return Promise.resolve();
+    claudeCatalogPromise = probeClaudeInitialization(bin)
+      .then((init) => {
+        if (init && Array.isArray(init.commands)) adoptCommands(init.commands);
+        if (init && Array.isArray(init.models) && init.models.length) {
+          adoptClaudeModels(init);
+          claudeCatalogCooldownUntil = Date.now() + CLAUDE_CATALOG_TTL_MS;
+        } else {
+          claudeCatalogCooldownUntil = Date.now() + CLAUDE_CATALOG_RETRY_MS;
+        }
+      })
+      .catch(() => {
+        claudeCatalogCooldownUntil = Date.now() + CLAUDE_CATALOG_RETRY_MS;
+      })
+      .finally(() => {
+        claudeCatalogPromise = undefined;
+      });
+  }
+  return claudeCatalogPromise ?? Promise.resolve();
+}
+
 async function runClaudeTurn(bin, promptText, turnEpoch = sessionEpoch) {
   const permMap = {
     "approval-required": "default",
@@ -670,6 +858,11 @@ async function runClaudeTurn(bin, promptText, turnEpoch = sessionEpoch) {
     perm,
   ];
   if (currentModel?.id && currentModel.id !== "default") args.push("--model", currentModel.id);
+  // Only a level the user actually picked reaches the engine; while unset, the
+  // session keeps Claude's own effort instead of a pipi default.
+  if (thinkingLevelSet && thinkingLevel !== "off" && currentModel?.reasoning && (!currentModel.effortLevels?.length || currentModel.effortLevels.includes(thinkingLevel))) {
+    args.push("--effort", thinkingLevel);
+  }
   if (perm === "bypassPermissions") args.push("--allow-dangerously-skip-permissions");
   if (nativeThreadId) args.push("--resume", nativeThreadId);
   if (!isSubagent && orchestratorUrl && orchestratorToken && fs.existsSync(mcpStdioScript)) {
@@ -932,6 +1125,15 @@ function acpWrite(payload) {
   } catch {}
 }
 
+/** What the peer last wrote to stderr — usually why it died. Snapped to a line start. */
+function acpStderrTail() {
+  const tail = acpErrBuf.trim();
+  if (tail.length <= 2000) return tail;
+  const cut = tail.slice(-2000);
+  const nl = cut.indexOf("\n");
+  return `…${nl === -1 ? cut : cut.slice(nl + 1)}`;
+}
+
 function acpRequest(method, params, timeoutMs = 60_000) {
   if (!acpChild) return Promise.reject(new Error("ACP agent is not running"));
   const id = acpRpcId++;
@@ -970,8 +1172,9 @@ function adoptModels(list, currentId) {
       provider: agentId,
       reasoning: false,
       input: image === false ? ["text"] : ["text", "image"],
-      contextWindow: Number(m?.contextWindow) || 200000,
-      maxTokens: Number(m?.maxTokens) || 16384,
+      // Only what the agent advertised; ACP's spec carries no window fields.
+      ...(Number(m?.contextWindow) > 0 ? { contextWindow: Number(m.contextWindow) } : {}),
+      ...(Number(m?.maxTokens) > 0 ? { maxTokens: Number(m.maxTokens) } : {}),
       cost: zeroCost,
     });
   }
@@ -1028,8 +1231,6 @@ function adoptModelConfigOption(modelOpt) {
       provider,
       reasoning: false,
       input: ["text", "image"],
-      contextWindow: 200000,
-      maxTokens: 16384,
       cost: zeroCost,
     });
   }
@@ -1206,6 +1407,8 @@ function handleAcpUpdate(u) {
     acpUsage = { used: Number(u.used ?? 0), size: Number(u.size ?? 0) };
   } else if (kind === "config_option_update") {
     adoptConfigOptions(u.configOptions);
+  } else if (kind === "available_commands_update") {
+    adoptCommands(u.availableCommands);
   } else if (kind === "current_mode_update" && acpModes) {
     acpModes.currentModeId = u.currentModeId;
   }
@@ -1218,6 +1421,7 @@ function spawnAcp(bin) {
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32",
   });
+  guardStdin(child);
   acpChild = child;
   activeChild = child;
   acpOutBuf = "";
@@ -1258,13 +1462,19 @@ function spawnAcp(bin) {
       nl = acpOutBuf.indexOf("\n");
     }
   });
-  const drop = () => {
+  const drop = (cause, signal) => {
     if (acpChild !== child) return;
     acpChild = undefined;
     acpSessionId = undefined;
     acpStream = undefined;
     if (activeChild === child) activeChild = undefined;
-    for (const [, w] of acpPending) w.reject(new Error("ACP agent exited"));
+    const detail = cause instanceof Error ? cause.message : signal ? `killed with ${signal}` : `code ${cause}`;
+    const stderr = acpStderrTail();
+    const message = `ACP agent exited (${detail})${stderr ? `:\n${stderr}` : ""}`;
+    for (const [, w] of acpPending) {
+      if (w.timer) clearTimeout(w.timer);
+      w.reject(new Error(message));
+    }
     acpPending.clear();
     for (const [, resolve] of pendingUiRequests) resolve(false);
     pendingUiRequests.clear();
@@ -1282,9 +1492,11 @@ function dropAcpPeer(reason = "ACP agent reset") {
   acpSessionId = undefined;
   acpStream = undefined;
   if (activeChild === child) activeChild = undefined;
+  const stderr = acpStderrTail();
+  const detail = stderr ? `${reason}:\n${stderr}` : reason;
   for (const [, w] of acpPending) {
     if (w.timer) clearTimeout(w.timer);
-    w.reject(new Error(reason));
+    w.reject(new Error(detail));
   }
   acpPending.clear();
   for (const [, resolve] of pendingUiRequests) resolve(false);
@@ -1327,6 +1539,29 @@ function ensureAcp(bin) {
 }
 
 async function ensureAcpSession(bin) {
+  // A session change (`sessionEpoch`) mid-handshake does not wait for it: the
+  // round in flight is left stale and negotiation runs again for the session
+  // now open — a stale round's failure (its peer dropped) is not the caller's.
+  for (;;) {
+    while (sessionChange) await sessionChange;
+    const epoch = sessionEpoch;
+    acpRoundEpoch = epoch;
+    try {
+      const id = await negotiateAcpRound(bin, epoch);
+      if (id !== undefined) return id;
+    } catch (err) {
+      if (sessionEpoch === epoch) throw err;
+    } finally {
+      acpRoundEpoch = undefined;
+    }
+  }
+}
+
+/** The pipi session epoch the ACP negotiation round in flight was started for. */
+let acpRoundEpoch = undefined;
+
+/** One handshake for the session open at `epoch`; `undefined` when a session change made it stale. */
+async function negotiateAcpRound(bin, epoch) {
   if (!acpChild) {
     spawnAcp(bin);
     let init;
@@ -1374,30 +1609,46 @@ async function ensureAcpSession(bin) {
             },
           ]
         : [];
-    let sess;
-    if (nativeThreadId) {
-      // ACP v1 `session/resume` (sessionCapabilities.resume) for DeepSeek Harness and
-      // newer agents; the older `loadSession`/`session/load` draft for Devin & co.
-      if (acpSessionCaps?.resume !== undefined) {
-        sess = await acpRequest("session/resume", { sessionId: nativeThreadId, cwd, mcpServers }, 15_000).catch(() => undefined);
-      } else if (acpLoadSession) {
-        sess = await acpRequest("session/load", { sessionId: nativeThreadId, cwd, mcpServers }, 15_000).catch(() => undefined);
+    const stale = () => sessionEpoch !== epoch;
+    try {
+      let sess;
+      if (nativeThreadId) {
+        // ACP v1 `session/resume` (sessionCapabilities.resume) for DeepSeek Harness and
+        // newer agents; the older `loadSession`/`session/load` draft for Devin & co.
+        if (acpSessionCaps?.resume !== undefined) {
+          sess = await acpRequest("session/resume", { sessionId: nativeThreadId, cwd, mcpServers }, 15_000).catch(() => undefined);
+        } else if (acpLoadSession) {
+          sess = await acpRequest("session/load", { sessionId: nativeThreadId, cwd, mcpServers }, 15_000).catch(() => undefined);
+        }
       }
+      if (!sess && !stale()) {
+        sess = await acpRequest("session/new", { cwd, mcpServers }, 20_000);
+      }
+      if (stale()) {
+        // Opened for the session the user left: keep its id only so the next round closes it.
+        if (sess?.sessionId) acpSessionId = sess.sessionId;
+        acpReset = true;
+        return undefined;
+      }
+      acpSessionId = sess?.sessionId || nativeThreadId || sessionId;
+      const learnedNativeId = nativeThreadId !== acpSessionId;
+      nativeThreadId = acpSessionId;
+      acpReset = false;
+      adoptSessionInfo(sess);
+      if (learnedNativeId && sessionFile) {
+        await saveExternalSession().catch(() => undefined);
+      }
+      await pushAcpModel();
+      await pushAcpMode();
+      await pushAcpEffort();
+      if (stale()) return undefined;
+    } catch (err) {
+      // Do not retain a half-negotiated peer. A failed session/new or config
+      // update used to leave acpChild alive with acpReset=true, so every
+      // catalog read or next prompt retried the same broken handshake.
+      dropAcpPeer("ACP session negotiation failed");
+      throw err;
     }
-    if (!sess) {
-      sess = await acpRequest("session/new", { cwd, mcpServers }, 20_000);
-    }
-    acpSessionId = sess?.sessionId || nativeThreadId || sessionId;
-    const learnedNativeId = nativeThreadId !== acpSessionId;
-    nativeThreadId = acpSessionId;
-    acpReset = false;
-    adoptSessionInfo(sess);
-    if (learnedNativeId && sessionFile) {
-      await saveExternalSession().catch(() => undefined);
-    }
-    await pushAcpModel();
-    await pushAcpMode();
-    await pushAcpEffort();
   }
   return acpSessionId;
 }
@@ -1408,14 +1659,17 @@ const ACP_STOP_REASONS = { end_turn: "stop", max_tokens: "length", cancelled: "a
 // the persistent session; peer lifetime managed by ensureAcp/spawnAcp above.
 async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch) {
   const acpId = await ensureAcp(bin);
-  if (sessionEpoch !== turnEpoch) return;
+  // `session/cancel` only applies to a prompt already in flight — one sent
+  // after the cancel starts fresh, so a turn aborted during negotiation must
+  // never reach session/prompt.
+  if (sessionEpoch !== turnEpoch || abortRequested) return;
   const stream = makeTurnStreamHelper(turnEpoch);
   acpStream = stream;
   try {
     const res = await acpRequest("session/prompt", { sessionId: acpId, prompt: [{ type: "text", text: promptText }, ...images] }, 0);
     stream.finish(abortRequested ? "aborted" : ACP_STOP_REASONS[res?.stopReason] || "stop");
   } catch (err) {
-    stream.finish(abortRequested ? "aborted" : "error", !abortRequested ? (err instanceof Error ? err.message : String(err)) || acpErrBuf : undefined);
+    stream.finish(abortRequested ? "aborted" : "error", !abortRequested ? (err instanceof Error ? err.message : String(err)) || acpStderrTail() : undefined);
   } finally {
     if (acpStream === stream) acpStream = undefined;
   }
@@ -1453,27 +1707,63 @@ async function discoverAcpCatalog() {
 }
 
 /**
- * A session-changing command must not interleave with an in-flight handshake,
- * nor hang behind a stalled one: give a live negotiation a brief window to
- * finish, otherwise drop the peer so local session switches always complete.
+ * Reads the engine's real catalog for whichever driver is active: ACP session
+ * negotiation, or Claude's initialize probe. Reads block at most
+ * ACP_DISCOVERY_WAIT_MS; a late answer still lands via `models_changed`.
  */
-async function settleAcpNegotiation() {
-  const pending = acpEnsurePromise;
-  if (!pending) return;
-  let timer;
-  const outcome = await Promise.race([
-    pending.then(() => "settled", () => "settled"),
-    new Promise((resolve) => {
-      timer = setTimeout(() => resolve("stalled"), 1500);
-      timer.unref?.();
-    }),
-  ]);
-  if (timer) clearTimeout(timer);
-  if (outcome === "stalled") {
-    dropAcpPeer("ACP negotiation cancelled for session change");
-    await pending.catch(() => undefined);
+async function discoverCatalog() {
+  if (driver === "claude") {
+    const probe = ensureClaudeCatalog();
+    let timer;
+    await Promise.race([
+      probe,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, ACP_DISCOVERY_WAIT_MS);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    return;
   }
-  acpCatalogCooldownUntil = 0;
+  await discoverAcpCatalog();
+}
+
+/** A session change under way: the next ACP negotiation round waits for its state. */
+let sessionChange = undefined;
+
+/**
+ * Runs a session-changing command without waiting on the engine: the turn is
+ * interrupted, a handshake in flight is left stale (`ensureAcpSession` runs it
+ * again for the new session), and one still stalled after a brief window has
+ * its peer dropped in the background so it never holds up the next prompt.
+ */
+async function changeSession(apply) {
+  sessionEpoch++;
+  const changedAt = sessionEpoch;
+  queuedSteering = [];
+  queuedFollowUp = [];
+  steerInterrupt = false;
+  acpReset = true;
+  let done;
+  const mine = new Promise((resolve) => {
+    done = resolve;
+  });
+  sessionChange = mine;
+  try {
+    if (acpRoundEpoch !== undefined) {
+      const timer = setTimeout(() => {
+        if (acpRoundEpoch !== undefined && acpRoundEpoch < changedAt) dropAcpPeer("ACP negotiation cancelled for session change");
+      }, 1500);
+      timer.unref?.();
+    }
+    acpCatalogCooldownUntil = 0;
+    await settleActiveTurn(2500);
+    await apply();
+    acpReset = true;
+  } finally {
+    if (sessionChange === mine) sessionChange = undefined;
+    done();
+  }
 }
 
 async function handleCommand(cmd) {
@@ -1494,27 +1784,28 @@ async function handleCommand(cmd) {
         pendingMessageCount: queuedSteering.length + queuedFollowUp.length,
       };
     case "get_available_models":
-      await discoverAcpCatalog();
+      await discoverCatalog();
       return { models: availableModels };
     case "get_available_thinking_levels":
-      await discoverAcpCatalog();
+      await discoverCatalog();
       if (driver === "acp" && acpEffortConfig?.values?.length) return { levels: [...new Set(["off", ...acpEffortConfig.values])] };
+      if (driver === "claude" && currentModel?.reasoning) {
+        const efforts = Array.isArray(currentModel.effortLevels) && currentModel.effortLevels.length ? currentModel.effortLevels : ["low", "medium", "high"];
+        return { levels: [...new Set(["off", ...efforts])] };
+      }
       return { levels: currentModel?.reasoning ? ["off", "low", "medium", "high"] : ["off"] };
     case "get_messages":
       return { messages };
     case "get_commands":
-      return {
-        commands: [
-          { name: "delegate", description: "Delegate a task to another agent harness", source: "extension" },
-          { name: "parallel", description: "Run multiple agents in parallel worktrees", source: "extension" },
-        ],
-      };
+      return { commands: agentCommands };
     case "get_session_stats": {
       const userCount = messages.filter((m) => m.role === "user").length;
       const assistantCount = messages.filter((m) => m.role === "assistant").length;
       const toolResults = messages.filter((m) => m.role === "toolResult").length;
       const used = acpUsage ? acpUsage.used : totalInputTokens + totalOutputTokens;
-      const win = acpUsage?.size || currentModel?.contextWindow || 200000;
+      // The window is only what the engine reported (`usage_update.size`) or
+      // advertised per model — never assumed. No percent without it.
+      const win = acpUsage?.size || currentModel?.contextWindow || null;
       return {
         sessionFile,
         sessionId,
@@ -1525,7 +1816,11 @@ async function handleCommand(cmd) {
         totalMessages: messages.length,
         tokens: { input: totalInputTokens, output: totalOutputTokens, cacheRead: 0, cacheWrite: 0, total: used },
         cost: totalCost,
-        contextUsage: { tokens: used, contextWindow: win, percent: Math.min(100, (used / win) * 100) },
+        contextUsage: {
+          tokens: used,
+          contextWindow: win,
+          percent: win ? Math.min(100, (used / win) * 100) : null,
+        },
       };
     }
     case "prompt": {
@@ -1566,46 +1861,28 @@ async function handleCommand(cmd) {
       return cleared;
     }
     case "new_session":
-      sessionEpoch++;
-      queuedSteering = [];
-      queuedFollowUp = [];
-      steerInterrupt = false;
-      await settleActiveTurn(2500);
-      await settleAcpNegotiation();
-      messages = [];
-      sessionId = crypto.randomUUID();
-      sessionFile = undefined;
-      sessionName = undefined;
-      nativeThreadId = undefined;
-      acpReset = true;
-      totalInputTokens = 0;
-      totalOutputTokens = 0;
-      totalCost = 0;
+      await changeSession(async () => {
+        messages = [];
+        sessionId = crypto.randomUUID();
+        sessionFile = undefined;
+        sessionName = undefined;
+        nativeThreadId = undefined;
+        totalInputTokens = 0;
+        totalOutputTokens = 0;
+        totalCost = 0;
+      });
       return { cancelled: false };
     case "switch_session":
-      sessionEpoch++;
-      queuedSteering = [];
-      queuedFollowUp = [];
-      steerInterrupt = false;
-      await settleActiveTurn(2500);
-      await settleAcpNegotiation();
-      await loadExternalSession(String(cmd.sessionPath));
-      acpReset = true;
+      await changeSession(() => loadExternalSession(String(cmd.sessionPath)));
       return { cancelled: false };
-    case "clone": {
-      sessionEpoch++;
-      queuedSteering = [];
-      queuedFollowUp = [];
-      steerInterrupt = false;
-      await settleActiveTurn(2500);
-      await settleAcpNegotiation();
-      sessionId = crypto.randomUUID();
-      sessionFile = undefined;
-      nativeThreadId = undefined;
-      acpReset = true;
-      await saveExternalSession();
+    case "clone":
+      await changeSession(async () => {
+        sessionId = crypto.randomUUID();
+        sessionFile = undefined;
+        nativeThreadId = undefined;
+        await saveExternalSession();
+      });
       return { cancelled: false };
-    }
     case "set_model": {
       const found = availableModels.find((m) => m.id === cmd.modelId && m.provider === cmd.provider) || availableModels.find((m) => m.id === cmd.modelId);
       if (!found) throw new Error(`Model not found: ${cmd.provider}/${cmd.modelId}`);
@@ -1664,6 +1941,10 @@ async function handleCommand(cmd) {
         };
         child.stdout.on("data", push);
         child.stderr.on("data", push);
+        // A shell that could not start (the folder is gone, no shell on PATH) is the command's answer, not the bridge's end.
+        child.on("error", (err) => {
+          resolve({ output: `${out}${err.message}\n`, exitCode: 127, cancelled: false, truncated: false });
+        });
         child.on("close", (code) => {
           const bashMsg = { role: "bashExecution", command: String(cmd.command || ""), output: out, exitCode: code ?? 0, cancelled: false, truncated: false, timestamp: Date.now() };
           if (!cmd.excludeFromContext) messages.push(bashMsg);
@@ -1703,6 +1984,10 @@ process.stdin.on("data", (chunk) => {
     nl = stdinBuf.indexOf("\n");
   }
 });
+// Warm Claude's catalog now so the model picker is populated before its first
+// open; the picker reads it again through get_available_models either way.
+if (driver === "claude") void ensureClaudeCatalog();
+
 function shutdownBridge() {
   try {
     acpChild?.kill();
@@ -1712,14 +1997,18 @@ function shutdownBridge() {
   } catch {}
 }
 
-for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+// Report the cause before dying: the app's dead-agent screen surfaces this
+// stderr tail, and the 128+signum code keeps a signal from reading as a clean exit.
+for (const sig of ["SIGHUP", "SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     shutdownBridge();
-    process.exit(0);
+    process.stderr.write(`external-agent[${process.pid}]: received ${sig}; shutting down\n`);
+    process.exit(128 + { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 }[sig]);
   });
 }
 process.stdin.on("end", () => {
   shutdownBridge();
+  process.stderr.write(`external-agent[${process.pid}]: stdin closed; shutting down\n`);
   process.exit(0);
 });
 process.on("exit", shutdownBridge);

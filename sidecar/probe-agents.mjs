@@ -2,7 +2,7 @@
 //
 //   node sidecar/probe-agents.mjs [json-payload]
 //
-// Follows t3code's rule: never triggers browser OAuth popups or project hooks.
+// Never triggers browser OAuth popups or project hooks.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -23,8 +23,6 @@ function defaultModelEntry(provider, name) {
       provider,
       reasoning: false,
       input: ["text"],
-      contextWindow: 200000,
-      maxTokens: 16384,
       cost: zeroCost,
     },
   ];
@@ -460,8 +458,6 @@ const results = await Promise.all([
           provider: custom.id,
           reasoning: true,
           input: ["text"],
-          contextWindow: 128000,
-          maxTokens: 16384,
           cost: zeroCost,
         },
       ],

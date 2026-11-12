@@ -68,8 +68,10 @@ test("opening a session in another folder shows no passing state in the chat", a
   await app.press("id:sidebar-recents >> text:Fix QuickJS GC mark phase");
   const seen = await frames(app, () => app.texts());
 
-  const passing = ["What are we building?", "Connect a model to begin", "Pi is not running", "Connect a model provider to start"];
+  // What was on screen stays (dimmed) until the destination lands; nothing else passes through.
+  const passing = ["Connect a model to begin", "Pi is not running", "Connect a model provider to start", "No model"];
   expect(passing.filter((text) => seen.some((frame) => frame.includes(text)))).toEqual([]);
+  expect(app.texts()).not.toContain("What are we building?");
   // The title bar names the destination from the first frame (the sidebar's button says "New session" throughout).
   const untitled = (frame: string[]) => frame.filter((text) => text === "New session").length;
   expect(seen.filter((frame) => untitled(frame) > untitled(app.texts())).length).toBe(0);
@@ -195,7 +197,7 @@ test("reopening a draft while its reveal is closing keeps the draft row alive", 
   expect(quiet.count(RECENT_DRAFT)).toBe(1);
 });
 
-test("only the running session row shows Pip unless both its folder and Recent are folded", async () => {
+test("a running session shows Pip on every row it has unless both its folder and Recent are folded", async () => {
   const app = await open("./Harness.tsx", {
     width: 1180,
     height: 780,
@@ -209,9 +211,11 @@ test("only the running session row shows Pip unless both its folder and Recent a
   expect(app.count("id:sidebar-draft-running")).toBe(0);
   expect(app.count("id:sidebar-session-running")).toBe(0);
 
-  await app.type("label:Message", "check alignment");
+  // A "long" run streams for far longer than any action below can possibly pump.
+  await app.type("label:Message", "long check alignment");
   await app.submit("label:Message");
-  expect(app.count("id:sidebar-draft-running")).toBe(1);
+  // The draft's folder row and its Recent row both carry the mark.
+  expect(app.count("id:sidebar-draft-running")).toBe(2);
   // Expanded active folder and inactive folders never duplicate Pip.
   expect(app.count("id:sidebar-project-running")).toBe(0);
 
@@ -232,12 +236,14 @@ test("a run parked by a session switch keeps its mark on every row the session h
   });
   await app.waitFor("text:What are we building?");
 
-  // Open a session from Recent and set it working.
+  // Open a session from Recent and set it working. Recent owns the highlight,
+  // but the on-screen run still marks the session's folder row as well.
   await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
   await app.waitUntil(() => app.texts().includes("Here is the plan."));
   await app.type("label:Message", "keep working in the background");
   await app.submit("label:Message");
   await app.waitUntil(() => app.count("id:sidebar-recents >> id:sidebar-session-running") === 1);
+  expect(app.count("id:sidebar-workspaces >> id:sidebar-session-running")).toBe(1);
 
   // Switching away through the folder parks the run; the session's folder row
   // and its Recent row both keep the running mark.
@@ -272,4 +278,39 @@ test("a folded project row marks a run still working inside, whichever project i
   await app.press("label:Collapse pipi");
   await app.press("label:Collapse Recent");
   expect(app.count("id:sidebar-project-running")).toBe(1);
+});
+
+test("a session in Recent keeps its place when it takes a message; only a new one goes on top", async () => {
+  const app = await launch("welcome");
+  await app.waitFor("text:What are we building?");
+  const saved = [
+    "Look around and tell me what this project is",
+    "Refactor the transcript reducer",
+    "Why does the build fail on Linux?",
+    "Release notes for 0.1",
+  ];
+  const titles = ["a task of today", ...saved];
+  /** Recent's session rows, top to bottom: the texts after its heading, which the chat's follow. */
+  const recent = () => {
+    const texts = app.texts();
+    const rows = texts.slice(texts.indexOf("Recent") + 1);
+    return titles.filter((title) => rows.includes(title)).sort((a, b) => rows.indexOf(a) - rows.indexOf(b));
+  };
+  expect(recent()).toEqual(saved);
+
+  // The oldest session takes a message: its last activity is now the newest of all.
+  await app.press("id:sidebar-recents >> text:Release notes for 0.1");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+  await app.type("label:Message", "one more note");
+  await app.submit("label:Message");
+  const orders = await frames(app, () => recent().join(" | "));
+  expect(orders.every((order) => order === saved.join(" | "))).toBe(true);
+
+  // A session the list has not shown before lands on top, where its draft row was.
+  await app.press("id:sidebar-recents-action");
+  await app.waitUntil(() => app.texts().includes("What are we building?"));
+  await app.type("label:Message", "a task of today");
+  await app.submit("label:Message");
+  await frames(app, () => 0);
+  expect(recent()).toEqual(titles);
 });

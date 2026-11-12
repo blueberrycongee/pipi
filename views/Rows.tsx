@@ -21,6 +21,7 @@ import { copyMessage, copyText, forkFrom, transcriptRows } from "../store/app";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
+import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, PRESS } from "../ui/styles";
 import { clearProseState, PROSE, ProseBlock, type ProseRow } from "./Prose";
 
@@ -263,9 +264,22 @@ function useProcessFold(id: () => string) {
   };
 }
 
-/** Turns whose process was open by default, and for those whose answer has come, whether it stayed open. */
-const turnsSeenOpen = new Set<string>();
-const turnsHeld = new Map<string, boolean>();
+/**
+ * What a conversation's folds remember: the reader's disclosures and each seen
+ * turn's held-open choice. Row ids collide across conversations, so the memory
+ * swaps with the conversation on screen — an inspected task's and the main
+ * session's stay apart, and coming back restores what was left open.
+ */
+interface FoldMemory {
+  expanded: Record<string, boolean>;
+  seenOpen: Set<string>;
+  held: Map<string, boolean>;
+}
+const foldMemories = new Map<string, FoldMemory>();
+let foldKey = "";
+let foldMemory: FoldMemory = { expanded: {}, seenOpen: new Set(), held: new Map() };
+let turnsSeenOpen = foldMemory.seenOpen;
+let turnsHeld = foldMemory.held;
 
 /**
  * Whether a turn's process shows: the reader's toggle, else `fallback` (open
@@ -289,15 +303,29 @@ export function turnOpen(id: string, fallback: boolean, following: boolean, hasD
   return held;
 }
 
-/** Clears per-session disclosure and streaming veil state when switching sessions. */
-export function resetExpanded() {
+/**
+ * The conversation about to fill the list (`key`): its fold memory replaces the
+ * current one, which stays under its own key for when the reader comes back.
+ * Everything else keyed by row id — running folds, the veil, the prose cache —
+ * clears, since those ids mean other rows in another conversation.
+ */
+export function swapConversation(key: string) {
   for (const id of [...foldTimers.keys()]) clearTurnTimers(id);
   pendingAutoClose.clear();
   closingTurns.set({});
   openingTurns.set({});
-  expanded.set({});
-  turnsSeenOpen.clear();
-  turnsHeld.clear();
+
+  if (key !== foldKey) {
+    foldMemory.expanded = expanded();
+    foldMemories.set(foldKey, foldMemory);
+    foldKey = key;
+    foldMemory = foldMemories.get(key) ?? { expanded: {}, seenOpen: new Set(), held: new Map() };
+    foldMemories.set(key, foldMemory);
+    turnsSeenOpen = foldMemory.seenOpen;
+    turnsHeld = foldMemory.held;
+    expanded.set(foldMemory.expanded);
+  }
+
   replyActionRows.clear();
   clearProseState();
 }
@@ -447,13 +475,13 @@ function ProcessLine(props: { open: boolean; onPress?: () => void; children?: JS
   return (
     <If
       when={props.onPress}
-      else={<View class="h-7 select-none flex-row items-center gap-1.5">{props.children}</View>}
+      else={<View class="h-7 min-w-0 max-w-full select-none flex-row items-center gap-1.5">{props.children}</View>}
     >
       <View
         role="button"
         onPress={props.onPress}
         accessibilityState={{ expanded: props.open }}
-        class={`group h-7 select-none flex-row items-center gap-1.5 self-start rounded-md ${FOCUS_RING}`}
+        class={`group h-7 min-w-0 max-w-full select-none flex-row items-center gap-1.5 self-start rounded-md ${FOCUS_RING}`}
       >
         {props.children}
         <View
@@ -556,12 +584,22 @@ function ThinkingRow(props: { row: Extract<Row, { kind: "thinking" }>; defaultOp
   const hasBody = () => Boolean(props.row.text.trim());
   const text = () => `min-w-0 shrink truncate ${props.compact ? "text-sm" : "text-md"} text-subtle`;
 
+  // Among a run's steps it reads as the tool calls beside it do: a glyph, then the words.
+  if (props.compact) {
+    return (
+      <Collapsible open={open() && hasBody()} reveal content={<ReasoningBody text={props.row.text} />}>
+        <Disclosure open={open() && hasBody()} compact onPress={() => hasBody() && toggle(props.row.id, fallback())}>
+          <LeadGlyph id={props.row.id} running={props.row.streaming} error={false} icon="thinking" />
+          <RollingText id={() => props.row.id} text={label} class="min-w-0 shrink truncate text-sm text-muted-foreground" />
+        </Disclosure>
+      </Collapsible>
+    );
+  }
+
   return (
     <Collapsible open={open() && hasBody()} reveal content={<ReasoningBody text={props.row.text} />}>
       <ProcessLine open={open() && hasBody()} onPress={hasBody() ? () => toggle(props.row.id, fallback()) : undefined}>
-        <Text class={text()} style={{ opacity: pulseOpacity }}>
-          {label()}
-        </Text>
+        <RollingText id={() => props.row.id} text={label} class={text()} style={{ opacity: pulseOpacity }} />
       </ProcessLine>
     </Collapsible>
   );
@@ -648,9 +686,11 @@ function ToolCallRow(props: { row: ToolRow; compact?: boolean }) {
           error={props.row.status === "error"}
           icon={desc().icon}
         />
-        <Text class={`shrink-0 text-sm ${props.row.status === "error" ? "font-medium text-destructive" : "text-muted-foreground"}`}>
-          {desc().verb}
-        </Text>
+        <RollingText
+          id={() => props.row.id}
+          text={() => desc().verb}
+          class={`shrink-0 text-sm ${props.row.status === "error" ? "font-medium text-destructive" : "text-muted-foreground"}`}
+        />
         <If when={desc().target}>
           <Text
             class={`min-w-0 shrink truncate ${
@@ -716,9 +756,7 @@ function ActivityView(props: { row: ActivityRow }) {
       }
     >
       <ProcessLine open={open() && hasBody()} onPress={hasBody() ? () => toggle(props.row.id, false) : undefined}>
-        <Text class="min-w-0 shrink truncate text-md text-subtle" style={{ opacity: pulseOpacity }}>
-          {title()}
-        </Text>
+        <RollingText id={() => props.row.id} text={title} class="min-w-0 shrink truncate text-md text-subtle" style={{ opacity: pulseOpacity }} />
       </ProcessLine>
     </Collapsible>
   );
@@ -774,15 +812,18 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
         onPress={props.row.hasDetails ? () => toggleTurn(props.row.id, props.row.open) : undefined}
       >
         <View style={{ opacity: settleOpacity }}>
-          <Text class="shrink-0 text-md text-subtle" style={{ opacity: pulseOpacity }}>
-            {describeTurn(props.row, activeLanguage())}
-          </Text>
+          <RollingText
+            id={() => props.row.id}
+            text={() => describeTurn(props.row, activeLanguage())}
+            class="shrink-0 text-md text-subtle"
+            style={{ opacity: pulseOpacity }}
+          />
         </View>
         <If when={elapsed() !== undefined && (elapsed() ?? 0) >= 1000}>
           <Text class="shrink-0 text-md tabular-nums text-subtle">{(elapsed() ?? 0) < 60_000 ? `${Math.floor((elapsed() ?? 0) / 1000)}s` : duration(elapsed() ?? 0)}</Text>
         </If>
         <Presence show={Boolean(livePreview())} scaleFrom={0.97} class="min-w-0 shrink">
-          <Text class="truncate text-md text-subtle">{shownPreview()}</Text>
+          <RollingText id={() => props.row.id} text={() => shownPreview() ?? ""} class="min-w-0 shrink truncate text-md text-subtle" />
         </Presence>
       </ProcessLine>
     </View>
@@ -805,7 +846,11 @@ function BashRow(props: { row: Extract<Row, { kind: "bash" }> }) {
     <Collapsible open={open()} reveal content={<Output text={props.row.output} />}>
       <Disclosure open={open()} onPress={() => toggle(props.row.id, true)}>
         <LeadGlyph id={props.row.id} running={running()} error={error()} icon="terminal" />
-        <Text class="shrink-0 text-sm text-muted-foreground">{running() ? tr("Running", "正在运行") : tr("Ran", "运行")}</Text>
+        <RollingText
+          id={() => props.row.id}
+          text={() => (running() ? tr("Running", "正在运行") : tr("Ran", "运行"))}
+          class="shrink-0 text-sm text-muted-foreground"
+        />
         <Text class="min-w-0 shrink truncate font-mono text-xs text-foreground">{props.row.command}</Text>
         <If when={note()}>
           <Text class="shrink-0 text-xs tabular-nums text-subtle">{note()}</Text>

@@ -13,7 +13,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { crc32, deflateSync } from "node:zlib";
-import { BOUNDS, COATS, COAT_IDS, GRID, LINE_COLORS, LINE_PAINT, pip, SPECIES, svgPath } from "../mascot/geometry.ts";
+import { COAT_IDS, GRID, LINE_COLORS, LINE_PAINT, pip, silhouette, svgPath } from "../mascot/geometry.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const out = (...parts) => {
@@ -35,7 +35,7 @@ function svgShape(s, line) {
 
 function svg(mood, coat = "ghost", { size = 256, line = LINE_COLORS.light } = {}) {
   const body = pip(mood, coat).map((s) => svgShape(s, line)).join("");
-  const clip = `<defs><clipPath id="body"><path d="${svgPath(SPECIES[COATS[coat].species].body.d)}"/></clipPath></defs>`;
+  const clip = `<defs><clipPath id="body"><path d="${svgPath(silhouette(coat).d)}"/></clipPath></defs>`;
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${GRID} ${GRID}"><title>Pip</title>${clip}${body}</svg>\n`;
 }
 
@@ -204,7 +204,7 @@ function png({ width, height, px }) {
 function drawPip(target, mood, ox, oy, side, { coat = "ghost", line = LINE_COLORS.light, shadow = false } = {}) {
   const scale = side / GRID;
   const shapes = pip(mood, coat).map(prepare);
-  const body = prepare({ ...SPECIES[COATS[coat].species].body, fill: "#000000" });
+  const body = prepare({ ...silhouette(coat), fill: "#000000" });
   const rgb = (paint) => hex(color(paint, line));
   if (shadow) {
     const scx = ox + side * 0.5;
@@ -222,10 +222,8 @@ function drawPip(target, mood, ox, oy, side, { coat = "ghost", line = LINE_COLOR
   }
   for (let y = Math.max(0, Math.floor(oy)); y < Math.min(target.height, Math.ceil(oy + side)); y++) {
     const gy = (y + 0.5 - oy) / scale;
-    if (gy < body.minY - 2 || gy > body.maxY + 2) continue;
     for (let x = Math.max(0, Math.floor(ox)); x < Math.min(target.width, Math.ceil(ox + side)); x++) {
       const gx = (x + 0.5 - ox) / scale;
-      if (gx < body.minX - 2 || gx > body.maxX + 2) continue;
       const i = y * target.width + x;
       let inside = -1;
       for (const s of shapes) {
@@ -248,10 +246,8 @@ function glyph(size, mood = "idle") {
 }
 
 /**
- * The app icon: Pip on a crisp white macOS squircle tile. The tile follows
- * macOS's icon grid (an 824 px squircle in a 1024 px canvas, with the system's
- * soft shadow and subtle rim border) so it sits cleanly in the Dock on both
- * light and dark wallpapers.
+ * The app icon: Pip on a pure white macOS squircle tile (an 824 px squircle in
+ * a 1024 px canvas, flat #FFFFFF with no drop or floor shadows).
  */
 function icon(size = 1024) {
   const target = canvas(size);
@@ -261,41 +257,20 @@ function icon(size = 1024) {
   const cx = tile.x + half;
   const cy = tile.y + half;
   // A superellipse: the continuous corners of macOS's icon shape.
-  const squircle = (px, py, grow = 0) => {
-    const nx = Math.abs(px - cx) / (half + grow);
-    const ny = Math.abs(py - cy) / (half + grow);
+  const squircle = (px, py) => {
+    const nx = Math.abs(px - cx) / half;
+    const ny = Math.abs(py - cy) / half;
     const k = (nx ** 5 + ny ** 5) ** (1 / 5);
-    return (k - 1) * (half + grow) * 0.92;
+    return (k - 1) * half * 0.92;
   };
-  const top = hex("#FFFFFF");
-  const bottom = hex("#F4F5F8");
-  const border = hex("#D8DCE6");
+  const white = hex("#FFFFFF");
   const pipSide = 620 * u;
   const pipX = cx - pipSide / 2 - 8 * u;
-  // The art's middle (grid y 32) sits a little above the tile's.
-  const pipY = cy - pipSide / 2 - 20 * u;
-  const floor = pipY + ((BOUNDS.y + BOUNDS.h) / GRID) * pipSide;
+  const pipY = cy - pipSide / 2 - 6 * u;
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      const px = x + 0.5;
-      const py = y + 0.5;
-      const i = y * size + x;
-      // The Dock's shadow: soft, below the tile.
-      const shadow = squircle(px, py - 12 * u, 2 * u);
-      target.over(i, [0, 0, 0], 0.22 * Math.max(0, Math.min(1, 1 - (shadow + 6 * u) / (28 * u))) ** 2);
-      const d = squircle(px, py);
-      const a = cover(d);
-      if (a <= 0) continue;
-      const t = (py - tile.y) / tile.h;
-      let color = mix(top, bottom, t ** 1.1);
-      // A crisp hairline border inside the edge so the white tile holds its shape on light backgrounds.
-      const edge = Math.max(0, 1 - Math.abs(d + 1.5 * u) / (1.8 * u));
-      color = mix(color, border, 0.55 * edge * (0.55 + 0.45 * t));
-      target.over(i, color, a);
-      // Pip floats: a soft neutral shadow on the floor, clear of the hem.
-      const sx = (px - cx) / (210 * u);
-      const sy = (py - floor - 46 * u) / (18 * u);
-      target.over(i, [0.08, 0.09, 0.14], a * 0.1 * Math.exp(-(sx * sx + sy * sy) * 1.4));
+      const a = cover(squircle(x + 0.5, y + 0.5));
+      if (a > 0) target.over(y * size + x, white, a);
     }
   }
   drawPip(target, "idle", pipX, pipY, pipSide);

@@ -167,11 +167,24 @@ const system: Backend = {
 
     const { url, token } = await readyPromise;
 
+    const send = (payload: Record<string, unknown>) =>
+      void Promise.resolve(transport.write(`${JSON.stringify(payload)}\n`)).catch((error: unknown) =>
+        console.warn("orchestrator: the command could not be written", error),
+      );
+
     const call = <T>(type: string, payload: Record<string, unknown>): Promise<T> => {
       const id = `orch_${seq++}`;
       return new Promise<T>((resolve, reject) => {
         pending.set(id, { resolve: resolve as (data: unknown) => void, reject });
-        transport.write(`${JSON.stringify({ id, type, ...payload })}\n`);
+        const failed = (error: unknown) => {
+          pending.delete(id);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        };
+        try {
+          void Promise.resolve(transport.write(`${JSON.stringify({ id, type, ...payload })}\n`)).catch(failed);
+        } catch (error) {
+          failed(error);
+        }
       });
     };
 
@@ -179,7 +192,7 @@ const system: Backend = {
       url,
       token,
       configure(config) {
-        transport.write(`${JSON.stringify({ type: "configure", ...config })}\n`);
+        send({ type: "configure", ...config });
       },
       delegate(input) {
         return call<Omit<DelegatedTask, "rows">>("delegate", { input });
@@ -188,7 +201,7 @@ const system: Backend = {
         await call("cancel", { taskId });
       },
       respondUi(compositeId, answer) {
-        transport.write(`${JSON.stringify({ type: "subagent_ui_response", compositeId, answer })}\n`);
+        send({ type: "subagent_ui_response", compositeId, answer });
       },
       close() {
         transport.kill();

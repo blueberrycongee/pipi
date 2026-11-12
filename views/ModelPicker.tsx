@@ -1,8 +1,9 @@
-import { computed, signal, Text, View } from "nsh";
+import { computed, effect, signal, Text, untracked, View } from "nsh";
 import { Button as BaseButton, Command, type CommandItem, Popover } from "nsh/base";
 import { thinkingText, tr } from "../lib/i18n";
+import type { ThinkingLevel } from "../pi/protocol";
 import { providerName } from "../pi/providers";
-import { activeAgentId, availableModels, chooseModel, chooseThinkingLevel, focusComposer, sessionState, showSettings, thinkingLevels } from "../store/app";
+import { activeAgent, availableModels, chooseModel, chooseThinkingLevel, focusComposer, modelPickerTick, sessionState, showAgentSettings, sidecarPhase, thinkingLevels } from "../store/app";
 import { Chip } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import { popupHiddenStyle, popupLeavingStyle, popupStyle, Presence } from "../ui/motion";
@@ -49,8 +50,8 @@ export function ModelList(props: { onChosen: () => void; class?: string }) {
       empty={
         <View class="items-center gap-3 px-6 py-8">
           <Text class="text-center text-sm text-muted-foreground">{tr("No models match. Connect a provider to see its models here.", "没有匹配的模型。连接服务商后即可在此查看其模型。")}</Text>
-          <BaseButton onPress={() => (props.onChosen(), showSettings("providers"))} class={`h-7 justify-center rounded-md bg-secondary px-2.5 ${PRESS} hover:bg-secondary/80`}>
-            <Text class="text-base font-medium text-secondary-foreground">{activeAgentId() === "pi" ? tr("Open Pi Settings", "打开 Pi 设置") : tr("Open Agents", "打开智能体设置")}</Text>
+          <BaseButton onPress={() => (props.onChosen(), showAgentSettings())} class={`h-7 justify-center rounded-md bg-secondary px-2.5 ${PRESS} hover:bg-secondary/80`}>
+            <Text class="text-base font-medium text-secondary-foreground">{tr(`Configure ${activeAgent().name}`, `配置 ${activeAgent().name}`)}</Text>
           </BaseButton>
         </View>
       }
@@ -69,14 +70,24 @@ export function ModelList(props: { onChosen: () => void; class?: string }) {
 /** The composer's model chip: shows the model in use, opens the list to change it. */
 export function ModelPicker() {
   const open = signal(false);
+  let held = "";
   const label = () => {
     const model = sessionState()?.model;
-    return model && model.provider !== "unknown" ? model.name || model.id : tr("No model", "无模型");
+    // While the agent starts (a session switch), the chip keeps its words rather than passing through "No model".
+    if (!model && held && sidecarPhase().name === "starting") return held;
+    return (held = model && model.provider !== "unknown" ? model.name || model.id : tr("No model", "无模型"));
   };
   const close = () => {
     open.set(false);
     focusComposer();
   };
+  // `/model` opens the list as a press on the chip does.
+  let asked = false;
+  effect(() => {
+    modelPickerTick();
+    if (asked) untracked(() => open.set(true));
+    asked = true;
+  });
   return (
     <Popover
       open={open()}
@@ -99,7 +110,13 @@ export function ModelPicker() {
 /** The composer's thinking chip, shown for models that reason. */
 export function ThinkingPicker() {
   const open = signal(false);
-  const level = () => sessionState()?.thinkingLevel ?? "off";
+  let held: ThinkingLevel | undefined;
+  const level = () => {
+    const now = sessionState()?.thinkingLevel;
+    // As the model chip does: an agent that is starting has not said otherwise.
+    if (!now && held && sidecarPhase().name === "starting") return held;
+    return (held = now ?? "off");
+  };
   return (
     <Presence show={thinkingLevels().length > 1} scaleFrom={0.92}>
       <Popover

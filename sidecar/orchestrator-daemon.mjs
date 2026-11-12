@@ -2,7 +2,7 @@
 //
 //   node sidecar/orchestrator-daemon.mjs
 //
-// Inspired by t3code's `OrchestratorMcpService` + `McpHttpServer` + `WorktreeMcpService`:
+// Architecture:
 // - Listens on an ephemeral `127.0.0.1` HTTP port secured with a random bearer token,
 //   emitting `{ type: "ready", url, token }` on stdout so pipi's QuickJS store can pass
 //   `PIPI_ORCHESTRATOR_URL` & `PIPI_ORCHESTRATOR_TOKEN` to coordinator agents (Pi, Claude Code, Codex, ACP).
@@ -321,6 +321,12 @@ async function startDelegatedTask(input) {
       void finishTask(code === 0 ? "completed" : "failed", code !== 0 ? stderrBuf.trim() || `Subagent exited with code ${code}` : undefined);
     }
   });
+  // One sub-agent that could not start, or died under a write (EPIPE on its stdin), fails its own task:
+  // unhandled, either would end this daemon and every other task with it.
+  child.on("error", (err) => {
+    if (record.status === "running") void finishTask("failed", err.message);
+  });
+  child.stdin?.on("error", () => {});
 
   // Handshake, optional model/thinking config, and dispatch task prompt
   (async () => {

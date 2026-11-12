@@ -23,6 +23,7 @@ import {
   startRenaming,
   transcriptRows,
   unarchiveCurrentSession,
+  wallpaper,
 } from "../store/app";
 import { setSidebarOpen, sidebarOpen } from "../store/prefs";
 import { Button, Chip, IconButton } from "../ui/Button";
@@ -31,28 +32,40 @@ import { animateLayoutOn, enter, Presence } from "../ui/motion";
 import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, HEADER_GLASS, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 
-/** How full the model's context window is: a ring and a percentage. */
+/** How full the model's context window is: a ring and a percentage. An engine
+ * that reports no window still gets its used count in the tooltip, with the
+ * ring left unfilled rather than a made-up share. */
 function ContextMeter() {
   const usage = () => sessionStats()?.contextUsage;
-  const percent = () => usage()?.percent ?? 0;
+  const percent = () => usage()?.percent ?? null;
+  const visible = () => {
+    const context = usage();
+    if (!context || transcriptRows().length === 0) return false;
+    const share = percent();
+    return share === null ? (context.tokens ?? 0) > 0 : share >= 50;
+  };
   const detail = () => {
     const stats = sessionStats();
     const context = usage();
     if (!stats || !context) return tr("Context", "上下文");
     const used = context.tokens === null ? "—" : compactNumber(context.tokens);
-    return tr(
-      `${used} of ${compactNumber(context.contextWindow)} tokens in context · ${money(stats.cost)} this session`,
-      `上下文已用 ${used} / ${compactNumber(context.contextWindow)} tokens · 本会话 ${money(stats.cost)}`,
-    );
+    const tokens =
+      context.contextWindow === null
+        ? tr(`${used} tokens in context`, `上下文已用 ${used} tokens`)
+        : tr(
+            `${used} of ${compactNumber(context.contextWindow)} tokens in context`,
+            `上下文已用 ${used} / ${compactNumber(context.contextWindow)} tokens`,
+          );
+    return `${tokens} · ${tr(`${money(stats.cost)} this session`, `本会话 ${money(stats.cost)}`)}`;
   };
   return (
-    <Presence show={Boolean(usage() && percent() >= 50 && transcriptRows().length > 0)} scaleFrom={0.85}>
+    <Presence show={visible()} scaleFrom={0.85}>
       <View class="h-6 flex-row items-center gap-1.5 rounded-md px-1.5" tooltip={tip(detail())} accessibilityLabel={detail()}>
         <Canvas
           style={{ width: 14, height: 14 }}
           draw={(cx, { width }) => {
             const middle = width / 2;
-            const share = Math.min(1, percent() / 100);
+            const share = Math.min(1, (percent() ?? 0) / 100);
             cx.lineWidth = 2;
             cx.lineCap = "round";
             cx.strokeStyle = token("input");
@@ -118,16 +131,18 @@ function SessionTitle() {
   );
 }
 
-/** The bar over the main pane: what is open, and what can be done with it. It moves the window. */
+/** The bar over the main pane: what is open, and what can be done with it. It moves the window.
+ * Over a wallpaper it is no band of its own: the picture runs up behind it to the window's edge,
+ * and what it stands on is the chat's veil (`PaneVeil` in `views/Wallpaper.tsx`). */
 export function TitleBar() {
   const subTask = () => inspectingTask();
   animateLayoutOn(() => !!subTask(), 220, () => !isRunning());
   return (
     <View
       desktop={{ windowDrag: true }}
-      class={`absolute inset-x-0 top-0 z-20 flex-row items-center gap-1 pr-3 ${HEADER_GLASS}`}
+      class={`absolute inset-x-0 top-0 z-20 flex-row items-center gap-1 pr-3 ${wallpaper() ? "" : HEADER_GLASS}`}
       style={{
-        ...GLASS_REGULAR,
+        ...(wallpaper() ? undefined : GLASS_REGULAR),
         height: titleBar().height || 44,
         paddingLeft: sidebarOpen() ? 12 : (titleBar().left ? titleBar().left + 12 : 12),
       }}

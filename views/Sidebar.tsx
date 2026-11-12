@@ -19,6 +19,7 @@ import {
   currentView,
   isRunning,
   isSessionRunning,
+  isSessionUnread,
   newSession,
   newSessionInWorkspace,
   openSession,
@@ -52,7 +53,7 @@ import {
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { animateNextLayout, delayedFade, Presence, Reveal } from "../ui/motion";
-import { FOCUS_RING, PRESS } from "../ui/styles";
+import { FOCUS_RING, PRESS, WALLPAPER_FROST } from "../ui/styles";
 import { tip } from "../ui/Tip";
 
 /** A row inside an expanded workspace folder: a saved session. */
@@ -63,13 +64,25 @@ type GroupId = "workspaces" | "recents" | "archived";
 /** A session in 最近: the summary plus the project folder that owns it. */
 type RecentItem = { id: string; session: SessionSummary; cwd: string };
 
-/** Sessions the sidebar lists, how many 最近 surfaces, and the indent of a row's text. */
-const RECENT_LIMIT = 8;
+/** How many sessions 最近 lists before its footer offers to show the rest. */
+const RECENT_LIMIT = 100;
 const REPO_URL = "https://github.com/blueberrycongee/pipi";
 const ICON_SLOT = "size-5 shrink-0 items-center justify-center";
 /** Trailing 24pt slot (`right-1` inside `px-2`) centered on the sidebar's 24pt right axis. */
 const TRAILING_SLOT = "pointer-events-none absolute right-1 top-0.5 size-6 flex-row items-center justify-center";
 const ROW_PRESS = `${PRESS} ${FOCUS_RING} hover:bg-sidebar-accent group-hover:bg-sidebar-accent active:bg-sidebar-accent`;
+/**
+ * The pointer rests while rows slide under it — a draft row opening or closing
+ * shifts every row below as a session changes. A hover is the pointer's doing,
+ * not the list's: until it moves again, the rows passing under it stay quiet
+ * instead of lighting up one after the other (and one of them for good, beside
+ * the row just opened).
+ */
+const pointerResting = signal(false);
+/** A row's wrapper: `group` carries its hover looks, which a resting pointer does not earn. */
+const hoverGroup = () => (pointerResting() ? "relative" : "group relative");
+/** A pressable's own hover background, dropped the same way. */
+const calm = (classes: string) => (pointerResting() ? classes.replace(" hover:bg-sidebar-accent", "") : classes);
 /** The group each session was last clicked in (`ownsActiveSession`). */
 const chosenGroups = signal<Record<string, GroupId>>({});
 /** Which group (`workspaces` or `recents`) owns the open draft session's highlight. */
@@ -140,8 +153,24 @@ function animateSidebarList() {
   if (!isRunning()) animateNextLayout(220);
 }
 
-/** Recent sessions across every open folder, newest first, deduped by file. */
-const recents = computed<RecentItem[]>(() => {
+/**
+ * Where each session stands in 最近: its last activity as of the first time
+ * the list showed it, by session file. A row is found where it was left, so a
+ * session that goes on working keeps its place instead of leaping to the top
+ * with every message; a session that is new to the list lands by its own time
+ * — a fresh one on top, a reopened folder's among the rest. The order is taken
+ * anew, by last activity, when the app next starts.
+ */
+const recentStanding = new Map<string, number>();
+const standingOf = (session: SessionSummary) => {
+  const known = recentStanding.get(session.path);
+  if (known !== undefined) return known;
+  recentStanding.set(session.path, session.modified);
+  return session.modified;
+};
+
+/** Recent sessions across every open folder, deduped by file, each in the place it first took (`recentStanding`). */
+const allRecents = computed<RecentItem[]>(() => {
   const active = workspacePath();
   const seen = new Set<string>();
   const out: RecentItem[] = [];
@@ -153,16 +182,23 @@ const recents = computed<RecentItem[]>(() => {
       out.push({ id: `recent:${session.path}`, session, cwd });
     }
   }
-  out.sort((a, b) => b.session.modified - a.session.modified);
-  return out.slice(0, RECENT_LIMIT);
+  out.sort(
+    (a, b) =>
+      standingOf(b.session) - standingOf(a.session) || b.session.created - a.session.created || a.session.path.localeCompare(b.session.path),
+  );
+  return out;
 });
 
+/** What 最近 shows: its newest slice until the footer expands it, then everything. */
+const recentsExpanded = signal(false);
+const recents = computed<RecentItem[]>(() => (recentsExpanded() ? allRecents() : allRecents().slice(0, RECENT_LIMIT)));
+
 /**
- * Which group highlights (and carries Pip for) the open session when both
- * 工作区 and 最近 list it: the group the user clicked it in, falling back to
- * whichever group is currently unfolded. The choice is remembered per session,
- * so clicking a row in 最近 does not move the current session's highlight
- * before the clicked one opens.
+ * Which group highlights the open session when both 工作区 and 最近 list it:
+ * the group the user clicked it in, falling back to whichever group is
+ * currently unfolded. The choice is remembered per session, so clicking a row
+ * in 最近 does not move the current session's highlight before the clicked one
+ * opens. Only the highlight is owned — a working session marks every row it has.
  */
 function ownsActiveSession(group: GroupId, sessionPath: string, cwd: string): boolean {
   if (isSessionArchived(sessionPath)) return group === "archived";
@@ -173,7 +209,7 @@ function ownsActiveSession(group: GroupId, sessionPath: string, cwd: string): bo
   return group === owner;
 }
 
-/** Which group highlights (and carries Pip for) the open draft session when both 工作区 and 最近 list it. */
+/** Which group highlights the open draft session when both 工作区 and 最近 list it (the mark follows `active`, not the owner). */
 function ownsDraftSession(group: GroupId, cwd: string): boolean {
   const inWorkspaces = !isGroupCollapsed("workspaces") && !isWorkspaceCollapsed(cwd);
   const inRecents = !isGroupCollapsed("recents") && hasRecentDraft();
@@ -296,11 +332,11 @@ function GroupHeading(props: {
 }) {
   const collapsed = () => isGroupCollapsed(props.id);
   return (
-    <View class="group relative">
+    <View class={hoverGroup()}>
       <BaseButton
         onPress={() => toggleGroupCollapsed(props.id)}
         accessibilityLabel={collapsed() ? tr(`Expand ${props.label}`, `展开 ${props.label}`) : tr(`Collapse ${props.label}`, `收起 ${props.label}`)}
-        class={`h-6 w-full min-w-0 flex-row items-center gap-1 rounded-md pl-2.5 ${props.action ? "pr-8" : "pr-2.5"} ${ROW_PRESS}`}
+        class={`h-6 w-full min-w-0 flex-row items-center gap-1 rounded-md pl-2.5 ${props.action ? "pr-8" : "pr-2.5"} ${calm(ROW_PRESS)}`}
       >
         <Text class="shrink-0 truncate text-sm text-subtle">{props.label}</Text>
         <If when={collapsed() && props.count > 0}>
@@ -359,16 +395,19 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
   const sessions = () => (active() ? savedSessions() : (workspaceSessions()[props.cwd] ?? []));
   const shownInRecents = (path: string | undefined) =>
     !isGroupCollapsed("recents") && Boolean(path && recents().some((item) => item.session.path === path));
-  const activeShownInRecents = () => (isDraftSession() ? hasRecentDraft() : shownInRecents(openFile()));
+  const activeShownInRecents = () =>
+    !isGroupCollapsed("recents") && (isDraftSession() ? hasRecentDraft() : shownInRecents(openFile()));
   /** A folded folder still says so when a run inside it keeps working off screen — active or parked, any project. */
   const hiddenRunningInside = () => sessions().some((s) => isSessionRunning(s.path) && !shownInRecents(s.path));
   const collapsedRunning = () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents()));
+  /** A folded folder surfaces an answer that finished out of sight the same way. */
+  const collapsedUnread = () => collapsed() && !collapsedRunning() && sessions().some((s) => isSessionUnread(s.path) && !shownInRecents(s.path));
   const startingHere = () => active() && sidecarPhase().name === "starting";
   const canRemove = () => props.allProjects.length > 1;
 
   return (
     <View
-      class={props.first ? "" : "pt-0.5"}
+      class={props.first ? "" : "pt-1"}
       onContextMenu={(e) =>
         Menu.popup(
           [
@@ -393,12 +432,12 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
         )
       }
     >
-      <View class="group relative">
+      <View class={hoverGroup()}>
         <BaseButton
           onPress={() => toggleProject(props.cwd)}
           accessibilityLabel={collapsed() ? tr(`Expand ${label().name}`, `展开 ${label().name}`) : tr(`Collapse ${label().name}`, `收起 ${label().name}`)}
           tooltip={tip(tildePath(props.cwd, home), undefined, "right")}
-          class={`h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md pl-2.5 pr-8 ${ROW_PRESS}`}
+          class={`h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md pl-2.5 pr-8 ${calm(ROW_PRESS)}`}
         >
           <View class={ICON_SLOT}>
             <Icon name={collapsed() ? "folder" : "folderOpen"} size={14} tone={active() ? "foreground" : "muted-foreground"} />
@@ -437,7 +476,15 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
           >
             <Pip size={16} mood="work" />
           </Presence>
-          <If when={!startingHere() && !collapsedRunning() && collapsed() && sessions().length > 0}>
+          <Presence
+            show={!startingHere() && collapsedUnread()}
+            testID="sidebar-project-unread"
+            accessibilityLabel={tr("Finished in the background", "后台已完成")}
+            class="absolute inset-0 items-center justify-center"
+          >
+            <View class="size-1.5 rounded-full bg-brand" />
+          </Presence>
+          <If when={!startingHere() && !collapsedRunning() && !collapsedUnread() && collapsed() && sessions().length > 0}>
             <View class="absolute inset-0 items-center justify-center">
               <Text class="text-xs tabular-nums text-subtle">{String(sessions().length)}</Text>
             </View>
@@ -495,7 +542,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
   const resolvedCwd = () => props.cwd || workspacePath();
   const active = () => Boolean(resolvedCwd()) && resolvedCwd() === workspacePath() && isDraftSession();
   const primary = () => active() && ownsDraftSession(props.group, resolvedCwd());
-  const running = () => primary() && isRunning();
+  const running = () => active() && isRunning();
   const selected = () => primary() && currentView().name === "chat";
   const shownTitle = signal(untracked(() => (isDraftSession() ? currentTitle() : tr("New session", "新会话"))));
   const shownAgentId = signal(untracked(activeAgentId));
@@ -508,7 +555,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
   });
   const engine = () => engineOf(shownAgentId());
   return (
-    <View class="group relative">
+    <View class={hoverGroup()}>
       <BaseButton
         selected={selected()}
         onPress={() => {
@@ -522,7 +569,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
           undefined,
           "right",
         )}
-        class={sessionRowClass(Boolean(props.indent), running(), false)}
+        class={calm(sessionRowClass(Boolean(props.indent), running(), false))}
       >
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{shownTitle()}</Text>
@@ -543,12 +590,15 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
   const primary = () => active() && owns();
   /** A run kept going off screen marks every row the session has — whichever group the reader is looking at. */
   const backgroundRunning = () => !active() && isSessionRunning(props.session.path);
-  const running = () => (primary() && isRunning()) || backgroundRunning();
+  /** The on-screen run marks all of the session's rows too; `owns` picks where the highlight sits, not the mark. */
+  const running = () => (active() && isRunning()) || backgroundRunning();
+  /** A run that finished off screen leaves a dot until the session is opened again. */
+  const unread = () => !active() && !backgroundRunning() && isSessionUnread(props.session.path);
   const archived = () => isSessionArchived(props.session.path);
   const engine = () => engineOf(props.session.agentId);
   const selected = () => primary() && currentView().name === "chat";
   return (
-    <View class="group relative" onContextMenu={(e) => Menu.popup(sessionMenuItems(props.session, props.cwd), e.pagePosition)}>
+    <View class={hoverGroup()} onContextMenu={(e) => Menu.popup(sessionMenuItems(props.session, props.cwd), e.pagePosition)}>
       <BaseButton
         selected={selected()}
         onPress={() => {
@@ -557,7 +607,7 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           void openSession(props.session.path, props.cwd);
         }}
         tooltip={tip(`${engine().name} · ${tildePath(props.cwd, home)}`, undefined, "right")}
-        class={sessionRowClass(Boolean(props.indent), running(), true)}
+        class={calm(sessionRowClass(Boolean(props.indent), running() || unread(), true))}
       >
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{titleOf(props.session)}</Text>
@@ -569,6 +619,14 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           accessibilityLabel={backgroundRunning() ? tr("Running in the background", "后台运行中") : undefined}
         >
           <Pip size={16} mood="work" />
+        </Presence>
+        <Presence
+          show={unread()}
+          testID="sidebar-session-unread"
+          accessibilityLabel={tr("Finished in the background", "后台已完成")}
+          class="absolute inset-0 items-center justify-center"
+        >
+          <View class="size-1.5 rounded-full bg-brand" />
         </Presence>
       </View>
       <IconButton
@@ -587,27 +645,11 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
   );
 }
 
-function EmptyProjectRow(props: { cwd: string }) {
-  const active = () => props.cwd === workspacePath();
-  return (
-    <BaseButton
-      onPress={() => startNewSessionIn(props.cwd)}
-      class={`h-7 w-full flex-row items-center rounded-md pl-9 pr-2.5 ${ROW_PRESS}`}
-    >
-      <Text class="truncate text-xs text-subtle">
-        {active() ? tr("No saved sessions yet", "暂无已保存会话") : tr("No sessions — click to start", "暂无会话，点击开始")}
-      </Text>
-    </BaseButton>
-  );
-}
-
-function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; singleEmpty: boolean }) {
+function ProjectSessions(props: { cwd: string; allProjects: readonly string[] }) {
   const isCurrent = () => props.cwd === workspacePath();
   const folderSessions = () => (isCurrent() ? savedSessions() : (workspaceSessions()[props.cwd] ?? []));
-  const loaded = () => (isCurrent() ? sessionsReady() && listSteady() : props.cwd in workspaceSessions());
   const hasDraft = () =>
     isCurrent() && listSteady() && isDraftSession() && (folderSessions().length > 0 || props.allProjects.length > 1);
-  const showEmpty = () => folderSessions().length === 0 && !hasDraft() && loaded() && !props.singleEmpty;
 
   const items = computed<FolderItem[]>(() =>
     folderSessions().map((session) => ({ id: `session:${session.path}`, session })),
@@ -621,20 +663,17 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; s
       <Each of={items()} key={(item) => item.id}>
         {(item) => <SessionRow session={item().session} cwd={props.cwd} group="workspaces" indent />}
       </Each>
-      <Reveal open={showEmpty()}>
-        <EmptyProjectRow cwd={props.cwd} />
-      </Reveal>
     </View>
   );
 }
 
-function ProjectSection(props: { cwd: string; first: boolean; allProjects: readonly string[]; singleEmpty: boolean }) {
+function ProjectSection(props: { cwd: string; first: boolean; allProjects: readonly string[] }) {
   const collapsed = () => isWorkspaceCollapsed(props.cwd);
   return (
     <Collapsible
       open={!collapsed()}
       reveal
-      content={<ProjectSessions cwd={props.cwd} allProjects={props.allProjects} singleEmpty={props.singleEmpty} />}
+      content={<ProjectSessions cwd={props.cwd} allProjects={props.allProjects} />}
     >
       <ProjectRow cwd={props.cwd} first={props.first} allProjects={props.allProjects} />
     </Collapsible>
@@ -647,14 +686,23 @@ function toggleProject(cwd: string) {
 
 /** The scrollable tree: 工作区's project folders, 最近's sessions across them, and 已归档's tucked-away sessions. */
 function SidebarTree() {
-  const recentCount = () => recents().length + (hasRecentDraft() ? 1 : 0);
+  const recentCount = () => allRecents().length + (hasRecentDraft() ? 1 : 0);
   const showRecents = () => recentCount() > 0;
 
+  // The rows under the pointer are about to move: a draft row opens or closes above them.
+  let draftShown = untracked(() => listSteady() && isDraftSession());
+  effect(() => {
+    const shown = listSteady() && isDraftSession();
+    if (shown === draftShown) return;
+    draftShown = shown;
+    pointerResting.set(true);
+  });
+
   return (
-    <View class="flex-1">
+    <View class="flex-1" onMouseMove={() => pointerResting() && pointerResting.set(false)}>
       <Scroll
         class="flex-1"
-        contentClass="px-2 pb-3"
+        contentClass="px-2 pb-2"
         accessibilityLabel={tr("Workspaces and sessions", "工作区与会话")}
       >
         <FunctionalGroup
@@ -674,7 +722,7 @@ function SidebarTree() {
         >
           <View testID="sidebar-workspaces">
             <Each of={projects()} key={(cwd) => cwd}>
-              {(cwd, index) => <ProjectSection cwd={cwd()} first={index() === 0} allProjects={projects()} singleEmpty={singleEmpty()} />}
+              {(cwd, index) => <ProjectSection cwd={cwd()} first={index() === 0} allProjects={projects()} />}
             </Each>
           </View>
         </FunctionalGroup>
@@ -692,6 +740,19 @@ function SidebarTree() {
               <Each of={recents()} key={(item) => item.id}>
                 {(item) => <SessionRow session={item().session} cwd={item().cwd} group="recents" />}
               </Each>
+              <If when={allRecents().length > RECENT_LIMIT}>
+                <BaseButton
+                  testID="sidebar-recents-more"
+                  onPress={() => {
+                    animateSidebarList();
+                    recentsExpanded.update((on) => !on);
+                  }}
+                  accessibilityLabel={recentsExpanded() ? tr("Show less", "收起") : tr("Show more", "展开更多")}
+                  class={`h-7 w-full min-w-0 flex-row items-center rounded-md pl-8 pr-2.5 ${ROW_PRESS}`}
+                >
+                  <Text class="truncate text-sm text-subtle">{recentsExpanded() ? tr("Show less", "收起") : tr("Show more", "展开更多")}</Text>
+                </BaseButton>
+              </If>
             </View>
           </FunctionalGroup>
         </Reveal>
@@ -714,7 +775,7 @@ function SidebarTree() {
           </FunctionalGroup>
         </Reveal>
       </Scroll>
-      <Presence show={singleEmpty()} class="pointer-events-none absolute inset-x-0 top-28 items-center gap-3 px-6">
+      <Presence show={singleEmpty()} class="pointer-events-none absolute inset-0 items-center justify-center gap-3 px-6">
         <Pip size={40} mood="sleep" still />
         <Text class="text-center text-sm text-subtle">
           {tr("No sessions here yet.", "此文件夹暂无会话。")}
@@ -760,7 +821,7 @@ export function Sidebar() {
     prevDraft = true;
   });
   return (
-    <View class="size-full bg-sidebar">
+    <View class={`size-full ${WALLPAPER_FROST ? "" : "bg-sidebar"}`}>
       <View
         desktop={{ windowDrag: true }}
         class="shrink-0 flex-row items-center justify-end pr-2.5"
@@ -768,7 +829,7 @@ export function Sidebar() {
       >
         <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
       </View>
-      <View class="shrink-0 px-2 pb-1.5">
+      <View class="shrink-0 px-2 pb-2">
         <BaseButton
           testID="sidebar-new-session"
           onPress={startNewSession}

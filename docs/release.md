@@ -2,17 +2,20 @@
 
 `npm run release:macos` turns `nsh package`'s ad hoc signed `.app` into a
 distributable build: it re-signs with the pinned Developer ID Application
-certificate (hardened runtime, secure timestamp), wraps the app in the styled
-DMG (`scripts/make-dmg.sh`, shared with `package:macos`), signs the disk
-image, submits the DMG to Apple's notary service — Apple notarizes the
-outermost container — staples the ticket into both the app and the DMG, and
-runs `codesign --verify --deep --strict`, `stapler validate` and
-`spctl -a -vv` before writing `release/verification.json`. A missing
-credential or any failed check stops the run before an artifact exists; it
-never falls back to ad hoc signing.
+certificate (hardened runtime, secure timestamp), notarizes and staples
+`pipi.app` first, wraps that stapled app in the styled DMG (`scripts/make-dmg.sh`,
+shared with `package:macos`), signs the disk image, submits the DMG to Apple's
+notary service, staples the ticket into the DMG as well, and runs
+`codesign --verify --deep --strict`, `stapler validate` and `spctl -a -vv`
+before writing `release/verification.json`. Both `pipi.app` inside the DMG and
+the outer `.dmg` carry stapled tickets. A missing credential or any failed check
+stops the run before an artifact exists; it never falls back to ad hoc signing.
 
 The [release workflow](../.github/workflows/release.yml) does the same on
-`macos-15` when a `v*` tag is pushed, then publishes the verified DMG as a
+`macos-15` when a `v*` tag is pushed. Separate `windows-latest` and
+`ubuntu-24.04` jobs run `nsh check` before packaging the Windows installer /
+`.zip` and Linux `.tar.gz` (all non-macOS artifacts are unsigned — Windows
+SmartScreen will warn on first launch); a final job publishes all of it as one
 GitHub Release. A manual dispatch runs every gate but publishes nothing. The
 tag must equal `v` + `nsh.json`'s version — bump `nsh.json` first.
 

@@ -1,16 +1,19 @@
-import { cleanup, computed, createAnimatedValue, effect, List, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
-import type { JSX, ListRef, ScrollEvent } from "nsh";
+import { Animated, cleanup, computed, createAnimatedValue, effect, List, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
+import type { JSX, ListRef, ScrollEvent, ViewRef } from "nsh";
 import { Button as BaseButton, Popover } from "nsh/base";
+import { titleBar } from "nsh/desktop";
 import { basename, tildePath } from "../lib/format";
 import { tr } from "../lib/i18n";
 import { Pip } from "../mascot/Pip";
 import {
   activeAgent,
-  activeAgentId,
   chooseWorkspace,
   currentActivity,
   hasModel,
   inspectingTask,
+  inspectingTaskId,
+  isDraftAhead,
+  isLeavingSession,
   isRunning,
   isSwitching,
   newSession,
@@ -19,18 +22,22 @@ import {
   pipMood,
   restartPi,
   scrollToEndTick,
+  sessionArrivedTick,
   sessionLandedTick,
   sessionState,
+  showAgentSettings,
   showSettings,
   sidecarPhase,
   transcriptRows,
+  wallpaper,
   workspacePath,
 } from "../store/app";
 import { backend } from "../store/backend";
 import { recentWorkspaces } from "../store/prefs";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
-import { enterStagger, popupHiddenStyle, popupLeavingStyle, popupStyle, SPRING, useBreathingOpacity } from "../ui/motion";
+import { DURATION, EASING, enterStagger, markRowsSeen, popupHiddenStyle, popupLeavingStyle, popupStyle, PATIENCE_MS, SPRING } from "../ui/motion";
+import { RollingText } from "../ui/RollingText";
 import { tip } from "../ui/Tip";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { Composer } from "./Composer";
@@ -42,14 +49,14 @@ import {
   onFoldSettled,
   onFoldToggle,
   replyActions,
-  resetExpanded,
   setProcessTurns,
+  swapConversation,
   trackFoldState,
   TranscriptRow,
   turnOpen,
 } from "./Rows";
-import { NewThreadBackground } from "./Wallpaper";
-import { buildDisplayRows, stableDisplayRows } from "../pi/turns";
+import { HeaderBand, PaneVeil } from "./Wallpaper";
+import { buildDisplayRows, displayRowIds, stableDisplayRows } from "../pi/turns";
 
 /** Whether the currently displayed conversation (main or inspected sub-agent) is actively running. */
 function isChatActive() {
@@ -70,8 +77,10 @@ function activityLabel() {
   switch (activity.kind) {
     case "writing":
       return tr("Writing", "正在回复");
-    case "tool":
-      return tr(`Running ${activity.name}`, `正在执行 ${activity.name}`);
+    case "tool": {
+      const oneLine = activity.name.replace(/\s*\n\s*/g, " ; ").replace(/\s+/g, " ").trim();
+      return tr(`Running ${oneLine}`, `正在执行 ${oneLine}`);
+    }
     case "compacting":
       return tr("Compacting context", "正在压缩上下文");
     case "retrying":
@@ -83,15 +92,13 @@ function activityLabel() {
 
 /** The line under the transcript while Pi works: Pip and what it is doing (the turn's header keeps the time).
  * Reserves a constant 36pt (`h-9`) slot so starting, finishing or celebrating a run never
- * shifts the scroll content height or causes a layout jump at the end of a stream. */
-function ActivityLine() {
+ * shifts the scroll content height or causes a layout jump at the end of a stream.
+ * It is the last thing in the list, so where it stands is where the conversation ends (`anchor`). */
+function ActivityLine(props: { anchor?: (node: ViewRef) => void }) {
   const shown = signal(false);
   const opacity = createAnimatedValue(0);
   const translateY = createAnimatedValue(4);
-  const labelOpacity = createAnimatedValue(1);
-  const shownLabel = signal(activityLabel());
   let exitTimer: ReturnType<typeof setTimeout> | undefined;
-  let labelTimer: ReturnType<typeof setTimeout> | undefined;
 
   effect(() => {
     const active = isChatActive() || pipMood() === "happy";
@@ -120,32 +127,10 @@ function ActivityLine() {
     });
   });
 
-  // Cross-fade the activity label smoothly when Pi transitions between Thinking -> Running tool -> Writing.
-  effect(() => {
-    const next = activityLabel();
-    const reduced = reduceMotion();
-    untracked(() => {
-      if (next === shownLabel()) return;
-      clearTimeout(labelTimer);
-      if (reduced || !shown()) {
-        shownLabel.set(next);
-        labelOpacity.set(1);
-        return;
-      }
-      void labelOpacity.timing(0, { duration: 85, easing: "easeIn" });
-      labelTimer = setTimeout(() => {
-        shownLabel.set(next);
-        void labelOpacity.timing(1, { duration: 135, easing: "easeOut" });
-      }, 85);
-    });
-  });
-
   cleanup(() => {
     clearTimeout(exitTimer);
-    clearTimeout(labelTimer);
     void opacity.stop();
     void translateY.stop();
-    void labelOpacity.stop();
   });
 
   const reason = () => {
@@ -154,20 +139,20 @@ function ActivityLine() {
   };
 
   return (
-    <View class="h-9 w-full max-w-190 select-none justify-center self-center">
+    <View ref={(node: ViewRef) => props.anchor?.(node)} class="h-9 w-full max-w-190 select-none justify-center overflow-hidden self-center">
       <If when={shown()}>
         <View
-          class="flex-row items-center gap-2.5 pt-1"
+          class="min-w-0 flex-row items-center gap-2.5 pt-1"
           style={{ opacity, transform: [{ translateY }] }}
           accessibilityState={{ busy: isChatActive() }}
         >
-          <Pip size={22} mood={pipMood()} />
+          <View class="shrink-0">
+            <Pip size={22} mood={pipMood()} />
+          </View>
           <If when={isChatActive()}>
-            <Text class="text-sm text-muted-foreground" style={{ opacity: labelOpacity }}>
-              {shownLabel()}
-            </Text>
+            <RollingText text={activityLabel} class="min-w-0 shrink truncate text-sm text-muted-foreground" />
             <If when={reason()}>
-              <Text class="flex-1 truncate text-xs text-subtle">{reason()}</Text>
+              <Text class="min-w-0 flex-1 truncate text-xs text-subtle">{reason()}</Text>
             </If>
           </If>
         </View>
@@ -176,21 +161,50 @@ function ActivityLine() {
   );
 }
 
-/** A centered message with Pip: every state the chat can be in before there is a conversation. */
-function Stage(props: { title: string; detail?: string; size?: number; children?: JSX.Element }) {
+/**
+ * A centered message with Pip: every state the chat can be in before there is a conversation.
+ *
+ * `around` is the same message with the composer in the middle of it (`HERO`): Pip and the title stand
+ * on the composer's top edge and what follows hangs from its lower one. Both are placed from the
+ * composer's own box, so the three are one figure whatever the composer grows to.
+ */
+function Stage(props: { title: string; detail?: string; size?: number; around?: boolean; children?: JSX.Element }) {
+  const pip = (
+    <View style={enterStagger(0)}>
+      <Pip size={props.size ?? 96} mood={pipMood()} />
+    </View>
+  );
+  const words = (
+    <View class="max-w-110 items-center gap-1.5" style={enterStagger(1)}>
+      <Text class="text-center text-2xl font-semibold tracking-tight text-foreground" role="header">
+        {props.title}
+      </Text>
+      <If when={props.detail}>
+        <Text class="text-center text-sm text-subtle">{props.detail}</Text>
+      </If>
+    </View>
+  );
+  if (untracked(() => props.around)) {
+    return (
+      <>
+        {/* 12 under the title and the composer's own 12 over its surface: a group's gap between them. */}
+        <View class="absolute inset-x-0 bottom-full items-center gap-6 px-8 pb-3">
+          {pip}
+          {words}
+        </View>
+        <If when={props.children}>
+          {/* The composer keeps 20 under its surface: 12 of it is left. */}
+          <View class="absolute inset-x-0 top-full -mt-2 items-center px-8" style={enterStagger(2)}>
+            <View class="pointer-events-auto items-center gap-6">{props.children}</View>
+          </View>
+        </If>
+      </>
+    );
+  }
   return (
     <View class="flex-1 items-center justify-center gap-6 px-8 pb-28 pt-12">
-      <View style={enterStagger(0)}>
-        <Pip size={props.size ?? 96} mood={pipMood()} />
-      </View>
-      <View class="max-w-110 items-center gap-1.5" style={enterStagger(1)}>
-        <Text class="text-center text-2xl font-semibold tracking-tight text-foreground" role="header">
-          {props.title}
-        </Text>
-        <If when={props.detail}>
-          <Text class="text-center text-sm text-subtle">{props.detail}</Text>
-        </If>
-      </View>
+      {pip}
+      {words}
       <If when={props.children}>
         <View class="w-full items-center gap-6" style={enterStagger(2)}>
           {props.children}
@@ -230,9 +244,13 @@ function WelcomeProject() {
         <BaseButton
           accessibilityLabel={tr("Project this session works in", "会话所在项目")}
           tooltip={tip(tildePath(current(), home))}
-          class={`h-7 flex-row items-center gap-1.5 rounded-md px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
+          class={`h-7 flex-row items-center gap-1.5 ${PRESS} ${FOCUS_RING} ${
+            // Over a wallpaper the words cannot stand on the picture: they get the composer's glass, as a capsule.
+            wallpaper() ? "rounded-full border-[0.5px] border-hairline bg-card/65 pl-3 pr-2.5 hover:bg-card/85 dark:bg-card/58 dark:hover:bg-card/75" : "rounded-md px-1.5 hover:bg-accent"
+          }`}
+          style={wallpaper() ? GLASS_REGULAR : undefined}
         >
-          <Text class="max-w-80 truncate text-sm text-muted-foreground underline">{`${activeAgent().name} · ${tildePath(current(), home)}`}</Text>
+          <Text class={`max-w-80 truncate text-sm text-muted-foreground ${wallpaper() ? "" : "underline"}`}>{`${activeAgent().name} · ${tildePath(current(), home)}`}</Text>
           <Icon name="chevronDown" size={12} tone="subtle" />
         </BaseButton>
       }
@@ -270,10 +288,10 @@ function WelcomeProject() {
   );
 }
 
-/** The empty chat: Pip, the question, and which project the session will run in. */
+/** The empty chat: Pip and the question over the composer, and under it which project the session will run in. */
 function Welcome() {
   return (
-    <Stage title={tr("What are we building?", "今天要构建什么？")}>
+    <Stage around title={tr("What are we building?", "今天要构建什么？")}>
       <If when={workspacePath()}>
         <WelcomeProject />
       </If>
@@ -282,18 +300,10 @@ function Welcome() {
 }
 
 function Connect() {
-  const isPi = () => activeAgentId() === "pi";
   const agentName = () => activeAgent().name;
   return (
-    <Stage
-      title={tr("Connect a model to begin", "连接模型以开始使用")}
-      detail={
-        isPi()
-          ? tr("Add an API key and its models appear here.", "添加 API 密钥后即可在此使用其模型。")
-          : tr(`${agentName()} has no models configured yet.`, `${agentName()} 尚未配置可用模型。`)
-      }
-    >
-      <Button label={isPi() ? tr("Add a Provider", "添加服务商") : tr("Configure Agents", "配置智能体")} variant="primary" size="lg" icon="plug" onPress={() => showSettings(isPi() ? "providers" : "agents")} />
+    <Stage title={tr("Connect a model to begin", "连接模型以开始使用")} detail={tr(`${agentName()} has no models configured yet.`, `${agentName()} 尚未配置可用模型。`)}>
+      <Button label={tr(`Configure ${agentName()}`, `配置 ${agentName()}`)} variant="primary" size="lg" icon="plug" onPress={() => showAgentSettings()} />
       <Text class="max-w-110 text-center text-xs text-subtle">
         {tr("Environment keys and installed CLIs are detected automatically.", "环境变量密钥与本机已安装的智能体会自动识别。")}
       </Text>
@@ -303,13 +313,13 @@ function Connect() {
 
 const SLOW_WAKE_MS = 5000;
 
-function Waking() {
+function Waking(props: { around?: boolean }) {
   const agentName = () => activeAgent().name;
   const slow = signal(false);
   const timer = setTimeout(() => slow.set(true), SLOW_WAKE_MS);
   cleanup(() => clearTimeout(timer));
   return (
-    <Stage title={tr(`Waking ${agentName()}…`, `正在唤醒 ${agentName()}…`)} size={80}>
+    <Stage around={props.around} title={tr(`Waking ${agentName()}…`, `正在唤醒 ${agentName()}…`)} size={80}>
       <If when={slow()}>
         <Text class="max-w-110 text-center text-xs text-subtle">
           {tr(
@@ -323,6 +333,51 @@ function Waking() {
         </View>
       </If>
     </Stage>
+  );
+}
+
+/** How long (ms) the conversation being left takes to dim, and its successor to settle in. */
+const LEAVE_MS = 120;
+const ARRIVE_MS = 200;
+
+/**
+ * What a session change shows once it has outlasted patience: a destination
+ * that lands sooner never passes through it, and one that lands later takes
+ * its place as this fades. `around`: the composer stands in the middle of the pane, and so does the wait.
+ */
+function Waiting(props: { show: boolean; around?: boolean }) {
+  const mounted = signal(false);
+  const opacity = createAnimatedValue(0);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  effect(() => {
+    const show = props.show;
+    untracked(() => {
+      clearTimeout(timer);
+      void opacity.stop();
+      if (show) {
+        mounted.set(true);
+        if (reduceMotion()) opacity.set(1);
+        else {
+          opacity.set(0);
+          opacity.keyframes([0, 1], { duration: DURATION.slower, delay: PATIENCE_MS, easing: EASING.smoothOut });
+        }
+      } else if (mounted()) {
+        if (reduceMotion()) return mounted.set(false);
+        void opacity.timing(0, { duration: LEAVE_MS, easing: EASING.out });
+        timer = setTimeout(() => mounted.set(false), LEAVE_MS + 10);
+      }
+    });
+  });
+  cleanup(() => {
+    clearTimeout(timer);
+    void opacity.stop();
+  });
+  return (
+    <If when={mounted()}>
+      <View class={`absolute inset-0 ${props.show ? "" : "pointer-events-none"}`} style={{ opacity }}>
+        <Waking around={props.around} />
+      </View>
+    </If>
   );
 }
 
@@ -341,8 +396,13 @@ function Failure(props: { title: string; detail: string }) {
   );
 }
 
-/** How near the end of the conversation (pt) counts as at it: the list follows from within it, and a reader who scrolls back down to it follows again. */
+/** How near the end of the conversation (pt) counts as at it: the list follows from within it, and a released
+ * reader who scrolls back down glides the rest of the way once the reply can no longer move the end. */
 const FOLLOW_THRESHOLD = 72;
+
+/** How close to the end (pt) re-attaches while the reply can still move it: any catch-up lands short of a
+ * moving end, and following's first pin jumps the difference — arriving at the end itself jumps nothing. */
+const REATTACH_EPS = 8;
 
 /** How long (ms) after a scroll gesture of the reader's begins its scroll events are read as theirs. */
 const INPUT_WINDOW_MS = 1500;
@@ -350,16 +410,63 @@ const INPUT_WINDOW_MS = 1500;
 /** After the reader releases the view, how long (ms) a move towards the end is not read as theirs: the list settles its layout once as it is released. */
 const RELEASE_SETTLE_MS = 300;
 
+/**
+ * The foot of the conversation, measured up from the pane's lower edge. The composer's top edge rests at 112pt
+ * (20 under it, 92 tall), and an inline prompt stands another 128 on top of it. What meets that edge is placed
+ * from it, so the three move together:
+ * - `pad`: the conversation ends 16 above the edge, a container's pad (`end`, the same in points). The activity
+ *   line's 36pt slot is the last thing in it, so a reply at rest stands 52 clear of the composer and Pip, working, about 20.
+ * - `pill`: "Jump to latest" stands on that same line.
+ * - `fade`: rows fade out as they pass under that edge.
+ */
+const FOOT = {
+  rest: { pad: "pb-32", end: 128, pill: "bottom-32", fade: "linear-gradient(to top, transparent 56px, black 118px)" },
+  prompt: { pad: "pb-64", end: 256, pill: "bottom-64", fade: "linear-gradient(to top, transparent 170px, black 240px)" },
+} as const;
+
+/**
+ * Where the composer stands while there is no conversation: in the middle of the pane, with the stage
+ * around it. The pane's free height is shared out over and under the figure — Pip and the title (`head`),
+ * the composer, the project under it (`foot`) — a little more of it under (`rise` to `sink`), so the
+ * figure sits just above the middle, where the eye puts the middle.
+ */
+const HERO = { head: 136, foot: 20, rise: 9, sink: 11 } as const;
+
+/** How the composer travels between the middle of the pane and its foot: as a spring with no bounce in it
+ * moves, a little softer than a panel's — it goes a third of the window, and has all but landed in ~550ms. */
+const DOCK_SPRING = { stiffness: 220, damping: 30, mass: 1 } as const;
+const DOCK_FPS = 60;
+/** How near its end the travel is over, as a share of the way: a point in some three hundred. */
+const DOCK_REST = 1 / 300;
+/** How long (ms) the stage the composer leaves takes to fade where it stood. */
+const STAGE_OUT_MS = 140;
+
+/**
+ * That spring as the native driver runs it, a value per frame from 0 to 1, cut where it has all but landed.
+ * The travel plays these frames as keyframes, not the spring itself: over so long a way the driver's spring
+ * goes on well after it has stopped on screen (a send kept the app busy for two seconds and more), and
+ * nothing that waits for the app to be idle should wait for that. The same frames say where a travel under
+ * way has got to.
+ */
+let dockCurve: number[] | undefined;
+function dockFrames() {
+  if (!dockCurve) {
+    const samples = Animated.sampleSpring({ toValue: 1, ...DOCK_SPRING }, DOCK_FPS);
+    const landed = samples.findIndex((at) => Math.abs(1 - at) < DOCK_REST);
+    dockCurve = [...samples.slice(0, landed < 0 ? samples.length : landed), 1];
+  }
+  return dockCurve;
+}
+
 type Screen = "starting" | "failed" | "connect" | "welcome" | "transcript";
 
 /** Floating pill shown when the reader scrolls up past the follow threshold,
  * offering a crisp native spring return to the bottom of the conversation. */
-function ScrollToBottomPill(props: { visible: boolean; streaming: boolean; promptOpen: boolean; onPress: () => void }) {
+function ScrollToBottomPill(props: { visible: boolean; promptOpen: boolean; onPress: () => void }) {
   const mounted = signal(false);
   const opacity = createAnimatedValue(0);
   const translateY = createAnimatedValue(8);
   const scale = createAnimatedValue(0.94);
-  const dotOpacity = useBreathingOpacity(() => mounted() && props.streaming, 0.3, 1050);
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   effect(() => {
@@ -402,7 +509,7 @@ function ScrollToBottomPill(props: { visible: boolean; streaming: boolean; promp
   return (
     <If when={mounted()}>
       <View
-        class={`pointer-events-none absolute inset-x-0 z-10 items-center ${props.promptOpen ? "bottom-68" : "bottom-36"}`}
+        class={`pointer-events-none absolute inset-x-0 z-10 items-center ${FOOT[props.promptOpen ? "prompt" : "rest"].pill}`}
         style={{ opacity, transform: [{ translateY }, { scale }] }}
       >
         <BaseButton
@@ -411,12 +518,7 @@ function ScrollToBottomPill(props: { visible: boolean; streaming: boolean; promp
           class={`pointer-events-auto h-7 flex-row items-center gap-1.5 rounded-full px-3 ${POPUP} ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-muted/80 active:bg-muted`}
           style={GLASS_REGULAR}
         >
-          <If when={props.streaming}>
-            <View class="size-1.5 rounded-full bg-brand" style={{ opacity: dotOpacity }} />
-          </If>
-          <Text class="text-xs font-medium text-foreground">
-            {props.streaming ? tr("Follow reply", "跟随输出") : tr("Jump to latest", "回到最新")}
-          </Text>
+          <Text class="text-xs font-medium text-foreground">{tr("Jump to latest", "回到最新")}</Text>
           <View class="rotate-180">
             <Icon name="arrowUp" size={12} tone="muted-foreground" />
           </View>
@@ -456,12 +558,16 @@ export function Chat() {
   let releasedAt = 0;
   let lastY: number | undefined;
   let lastDistance = 0;
+  let held: Screen = "starting";
   const screen = computed<Screen>(() => {
     const phase = sidecarPhase().name;
-    if (phase === "failed") return "failed";
-    if (phase === "starting" || isSwitching() || !sessionState()) return transcriptRows().length ? "transcript" : "starting";
-    if (transcriptRows().length || isRunning()) return "transcript";
-    return hasModel() ? "welcome" : "connect";
+    if (phase === "failed") return (held = "failed");
+    // What is being left stays, dimmed, until its successor lands: no state in between passes through.
+    if (isLeavingSession()) return held;
+    if (isDraftAhead()) return (held = "welcome");
+    if (phase === "starting" || isSwitching() || !sessionState()) return (held = transcriptRows().length ? "transcript" : "starting");
+    if (transcriptRows().length || isRunning()) return (held = "transcript");
+    return (held = hasModel() ? "welcome" : "connect");
   });
   const stable = stableDisplayRows();
   let shown: ChatRow[] = [];
@@ -495,19 +601,105 @@ export function Chat() {
     return phase.name === "failed" ? phase : { title: "", detail: "" };
   };
 
+  /**
+   * Where the composer stands. A conversation docks it at the pane's foot. With none — the empty chat,
+   * and the wait for the agent before it — nothing is above it to read, so it stands in the middle of
+   * the pane with the stage around it (`HERO`), and the first message sends it down.
+   *
+   * Both places are layout — the spacers over and under it — and never a transform at rest: a popup
+   * opens where its trigger is laid out, the figure re-centers as the composer grows, and a window
+   * resize costs no frame. The move between them is the layout changing at once while `slide` puts the
+   * composer back where it was drawn, in the same turn and so the same frame, and then lets it go to rest.
+   * The stage it leaves does not travel with it: `stand` holds that where it stood while it fades.
+   */
+  const hero = computed(() => screen() === "welcome" || screen() === "starting");
+  /** The composer's offset from where it is laid out: zero but while it travels. */
+  const slide = createAnimatedValue(0);
+  /** The stage's offset from the composer's layout: zero around it, and the way back up once it has left. */
+  const stand = createAnimatedValue(0);
+  const stageFade = createAnimatedValue(1);
+  /** The stage around the composer: the screen's while it stands in the middle, and that one still while it fades. */
+  const stage = signal<Screen | undefined>(untracked(hero) ? untracked(screen) : undefined);
+  let paneHeight = 0;
+  let figureHeight = 0;
+  /** How far the pane goes on under the composer in the middle, as laid out: the way down to the dock. */
+  let drop = 0;
+  /** The same before it is laid out, for the way up: the lower spacer's share of the free height. */
+  const dropAhead = () => HERO.foot + (Math.max(0, paneHeight - figureHeight - HERO.head - HERO.foot) * HERO.sink) / (HERO.rise + HERO.sink);
+  /** The travel under way, to start the next one from where this one has got to. */
+  let travel: { from: number; at: number } | undefined;
+  const slideNow = () => {
+    if (!travel) return 0;
+    const frames = dockFrames();
+    const frame = Math.round(((Date.now() - travel.at) / 1000) * DOCK_FPS);
+    return frame < frames.length ? travel.from * (1 - frames[frame]) : 0;
+  };
+  let stageTimer: ReturnType<typeof setTimeout> | undefined;
+  let wasHero = untracked(hero);
+  let wasLeaving = untracked(isLeavingSession);
+  effect(() => {
+    const middle = hero();
+    const on = screen();
+    const leaving = isLeavingSession();
+    untracked(() => {
+      // The pane was dimmed out for a change that has now landed: its stage is not there to fade.
+      const dimmedOut = wasLeaving;
+      wasLeaving = leaving;
+      if (middle) {
+        clearTimeout(stageTimer);
+        stage.set(on);
+      }
+      if (middle === wasHero) return;
+      wasHero = middle;
+      const reduced = reduceMotion();
+      const way = middle ? dropAhead() : drop || dropAhead();
+      const from = slideNow() + (middle ? way : -way);
+      travel = undefined;
+      // Up: the stage is where it will be, and the composer comes to it. Down: it stays where it was.
+      stand.set(middle ? 0 : -way);
+      if (reduced) slide.set(0);
+      else {
+        const mine = (travel = { from, at: Date.now() });
+        // Set first: the layout changes in this turn, and so must where the composer is drawn.
+        slide.set(from);
+        const frames = dockFrames();
+        void slide
+          .keyframes(
+            frames.map((at) => from * (1 - at)),
+            { duration: ((frames.length - 1) * 1000) / DOCK_FPS, easing: "linear" },
+          )
+          .then(() => {
+            if (travel === mine) travel = undefined;
+          });
+      }
+      if (middle) return;
+      void stageFade.stop();
+      if (reduced || dimmedOut) return stage.set(undefined);
+      stageFade.set(1);
+      void stageFade.timing(0, { duration: STAGE_OUT_MS, easing: EASING.out });
+      stageTimer = setTimeout(() => stage.set(undefined), STAGE_OUT_MS + 10);
+    });
+  });
+  cleanup(() => {
+    clearTimeout(stageTimer);
+    void slide.stop();
+    void stageFade.stop();
+  });
+
   const onScroll = (e: ScrollEvent) => {
     const y = e.offset.y;
     const distance = e.contentSize.height - (y + e.size.height);
     distanceFromEnd.set(distance);
     // The list reports its own layout passes too (a row measured, the fold
     // closing): only a move within a gesture of the reader's is theirs. Up and
-    // away from the end releases; back down to the end follows again.
+    // away from the end releases; back down follows again — at the end itself
+    // while the reply can still move it, from within the threshold once still.
     if (lastY !== undefined && Date.now() - inputAt < INPUT_WINDOW_MS) {
       if (following() && y < lastY - 0.5 && distance > Math.max(lastDistance, 0) + 0.5) {
         following.set(false);
         releasedAt = Date.now();
-      } else if (!following() && y > lastY + 0.5 && distance <= FOLLOW_THRESHOLD && Date.now() - releasedAt > RELEASE_SETTLE_MS) {
-        follow(false);
+      } else if (!following() && y > lastY + 0.5 && distance <= (isChatActive() ? REATTACH_EPS : FOLLOW_THRESHOLD) && Date.now() - releasedAt > RELEASE_SETTLE_MS) {
+        follow(!reduceMotion() && !isChatActive());
       }
     }
     lastY = y;
@@ -516,6 +708,29 @@ export function Chat() {
   const onInput = () => {
     inputAt = Date.now();
   };
+
+  const foot = () => FOOT[hasInlinePrompt() ? "prompt" : "rest"];
+
+  // A released view holds its offset, so the list reports no scroll while the
+  // reply grows under it, and the distance last reported goes stale: a reader
+  // who scrolled up less than the threshold would never be offered the way
+  // back. So what changes the rows of a released view measures where the end
+  // went: the activity line's foot plus the pad under it, from the list's own.
+  let ending: ViewRef | undefined;
+  const measureEnd = () => {
+    if (untracked(following)) return;
+    const pad = untracked(foot).end;
+    void Promise.all([list?.measure(), ending?.measure()]).then(([frame, end]) => {
+      // Rows far from the end are not mounted: the distance the scroll reported stands.
+      if (!frame || !end || untracked(following)) return;
+      distanceFromEnd.set(end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height));
+    });
+  };
+  effect(() => {
+    displayRows();
+    foot();
+    untracked(measureEnd);
+  });
 
   const follow = (animated: boolean) => {
     inputAt = 0;
@@ -532,7 +747,10 @@ export function Chat() {
     following.set(false);
     releasedAt = Date.now();
   });
-  onFoldSettled(() => pokeRepaint());
+  onFoldSettled(() => {
+    pokeRepaint();
+    measureEnd();
+  });
 
   // A reply still growing moves the end under an animated scroll: go there at once.
   const jumpToLatest = () => follow(!reduceMotion() && !isChatActive());
@@ -540,6 +758,22 @@ export function Chat() {
   effect(() => {
     scrollToEndTick();
     untracked(() => follow(false));
+  });
+  // That reaches a list on screen only. A conversation can land while none is —
+  // the empty chat held, dimmed, until its successor is whole — and the list
+  // made for it then would open at its start, with the scroll to the end already
+  // spent. So a list made anew opens at its end (`initialScrollAtEnd`, before its
+  // first frame) and follows from there, whatever the one before it was left doing.
+  let listed = false;
+  effect(() => {
+    const was = listed;
+    listed = screen() === "transcript";
+    if (!listed || was) return;
+    untracked(() => {
+      inputAt = 0;
+      lastY = undefined;
+      following.set(true);
+    });
   });
   effect(() => {
     if (hasInlinePrompt() && untracked(following)) list?.scrollToEnd({ animated: !reduceMotion() });
@@ -578,36 +812,76 @@ export function Chat() {
     untracked(pokeRepaint);
   });
 
-  // Another session's rows are other rows: what was expanded there is not here.
-  // (By id: the session's state is replaced with every refresh of it, mid-run too.)
-  const sessionId = computed(() => sessionState()?.sessionId);
+  /**
+   * A session change is one motion, whatever it costs behind the screen. The
+   * click is answered at once: a destination that can be shown (a conversation
+   * seen before, a fresh session's empty chat) is, and settles in; otherwise
+   * what is on screen dims out while the title bar and the sidebar already
+   * name the destination, which settles in the same way as it lands. A quick
+   * landing interrupts the dim-out, so it reads as a dip rather than a blank;
+   * a slow one is waited for on an empty pane, then with Pip (`Waiting`).
+   */
+  const pane = createAnimatedValue(1);
+  let dimmed = false;
   effect(() => {
-    sessionId();
-    inputAt = 0;
-    lastY = undefined;
-    following.set(true);
-    distanceFromEnd.set(0);
-    resetExpanded();
-    pokeRepaint();
+    const leaving = isLeavingSession();
+    untracked(() => {
+      if (!leaving) return;
+      dimmed = true;
+      if (reduceMotion()) pane.set(0);
+      else void pane.timing(0, { duration: LEAVE_MS, easing: EASING.out });
+    });
+  });
+  let arrivedAt = untracked(sessionArrivedTick);
+  effect(() => {
+    const tick = sessionArrivedTick();
+    untracked(() => {
+      if (tick === arrivedAt) return;
+      arrivedAt = tick;
+      if (reduceMotion()) pane.set(1);
+      else {
+        if (!dimmed) pane.set(0);
+        void pane.timing(1, { duration: ARRIVE_MS, easing: EASING.out });
+      }
+      dimmed = false;
+    });
+  });
+  cleanup(() => void pane.stop());
+
+  // Another conversation's rows are other rows — another session's, an
+  // inspected task's: what was expanded there is not here, and the rows
+  // landing were already on screen, so none of them enters again.
+  const conversation = computed(() => `${sessionState()?.sessionId ?? ""}${inspectingTaskId() ?? ""}`);
+  // Only the conversation changing runs this. What it reads on the way — the
+  // rows, the fold memory — is not what it waits for: tracked, every delta of a
+  // reply would follow again and take the view back from a reader who scrolled up.
+  effect(() => {
+    const key = conversation();
+    untracked(() => {
+      inputAt = 0;
+      lastY = undefined;
+      following.set(true);
+      distanceFromEnd.set(0);
+      swapConversation(key);
+      markRowsSeen(displayRowIds(transcriptRows()));
+      pokeRepaint();
+    });
   });
 
   return (
     <View class="relative flex-1">
-      <NewThreadBackground visible={screen() !== "transcript"} />
-      <View class="relative flex-1">
+      <PaneVeil docked={!hero()} reading={screen() === "transcript"} />
+      <View class={`relative flex-1 ${isLeavingSession() ? "pointer-events-none" : ""}`} style={{ opacity: pane }}>
         <If when={screen() === "transcript"}>
           <View
             selectable
             class="flex-1"
-            style={{
-              maskImage: hasInlinePrompt()
-                ? "linear-gradient(to bottom, transparent 0px, black 40px, black calc(100% - 240px), transparent calc(100% - 170px))"
-                : "linear-gradient(to bottom, transparent 0px, black 40px, black calc(100% - 118px), transparent calc(100% - 56px))",
-            }}
+            style={{ maskImage: `linear-gradient(to bottom, transparent 0px, black 40px), ${foot().fade}` }}
           >
             <List
               ref={list}
               each={displayRows()}
+              initialScrollAtEnd
               estimatedItemSize={44}
               keyExtractor={(row) => row.id}
               onScroll={onScroll}
@@ -616,30 +890,50 @@ export function Chat() {
               onMomentumStart={onInput}
               maintainVisibleContentPosition={following() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
               class="flex-1"
-              contentClass={hasInlinePrompt() ? "px-6 pb-76 pt-14" : "px-6 pb-44 pt-14"}
+              contentClass={`px-6 pt-14 ${foot().pad}`}
               accessibilityLabel={tr("Conversation", "对话")}
-              footer={<ActivityLine />}
+              footer={<ActivityLine anchor={(node) => (ending = node)} />}
             >
               {(row) => <TranscriptRow row={row()} />}
             </List>
           </View>
-          <ScrollToBottomPill visible={!following() && distanceFromEnd() > FOLLOW_THRESHOLD} streaming={isChatActive()} promptOpen={hasInlinePrompt()} onPress={jumpToLatest} />
-        </If>
-        <If when={screen() === "welcome"}>
-          <Welcome />
+          <ScrollToBottomPill visible={!following() && distanceFromEnd() > FOLLOW_THRESHOLD} promptOpen={hasInlinePrompt()} onPress={jumpToLatest} />
         </If>
         <If when={screen() === "connect"}>
           <Connect />
-        </If>
-        <If when={screen() === "starting"}>
-          <Waking />
         </If>
         <If when={screen() === "failed"}>
           <Failure title={failure().title} detail={failure().detail} />
         </If>
       </View>
-      <View class="pointer-events-none absolute inset-x-0 bottom-0 z-10">
-        <Composer />
+      <Waiting show={isLeavingSession() && !hero()} />
+      <HeaderBand show={screen() === "transcript"} height={titleBar().height || 44} />
+      {/* The composer's column: the spacers over and under it are where it stands (`hero`). */}
+      <View class="pointer-events-none absolute inset-0 z-10" onLayout={(e) => (paneHeight = e.bounds.size.height)}>
+        <View style={{ flexGrow: hero() ? HERO.rise : 1, flexShrink: 1, flexBasis: hero() ? HERO.head : 0 }} />
+        <View class="relative" style={{ transform: [{ translateY: slide }] }} onLayout={(e) => (figureHeight = e.bounds.size.height)}>
+          <View class="absolute inset-0" style={{ transform: [{ translateY: Animated.subtract(stand, slide) }] }}>
+            <If when={stage() !== undefined}>
+              {/* The stage is the pane's content: it dims and lands with it, and fades on its own once the composer has left it. */}
+              <View class="absolute inset-0" style={{ opacity: hero() ? pane : stageFade }}>
+                <If when={stage() === "welcome"}>
+                  <Welcome />
+                </If>
+                <If when={stage() === "starting"}>
+                  <Waking around />
+                </If>
+              </View>
+            </If>
+            <Waiting around show={isLeavingSession() && hero()} />
+          </View>
+          <Composer />
+        </View>
+        <View
+          style={{ flexGrow: hero() ? HERO.sink : 0, flexShrink: 1, flexBasis: hero() ? HERO.foot : 0 }}
+          onLayout={(e) => {
+            if (hero()) drop = e.bounds.size.height;
+          }}
+        />
       </View>
       <If when={repaint() % 2 === 0}>
         <View class="pointer-events-none absolute size-0" />

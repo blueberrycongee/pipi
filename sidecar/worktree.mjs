@@ -1,4 +1,4 @@
-// Git worktree isolation helper modeled after t3code's WorktreeMcpService:
+// Git worktree isolation helper for delegated tasks:
 //
 //   node sidecar/worktree.mjs status <cwd>
 //   node sidecar/worktree.mjs create <cwd> <label>

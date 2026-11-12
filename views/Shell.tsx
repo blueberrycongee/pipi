@@ -41,6 +41,7 @@ import {
   showSettings,
   stop,
   toggleArchiveCurrentSession,
+  wallpaper,
 } from "../store/app";
 import {
   setSidebarOpen,
@@ -52,6 +53,7 @@ import {
   sidebarWidth,
 } from "../store/prefs";
 import { EASING } from "../ui/motion";
+import { SIDEBAR_GLASS, WALLPAPER_FROST } from "../ui/styles";
 import { OrchestrateDialog } from "./AgentPicker";
 import { Chat } from "./Chat";
 import { ExtensionDialog, hasInlinePrompt } from "./ExtensionDialog";
@@ -60,6 +62,7 @@ import { Settings } from "./Settings";
 import { Sidebar } from "./Sidebar";
 import { TitleBar } from "./TitleBar";
 import { Toasts } from "./Toasts";
+import { WallpaperUnderlay } from "./Wallpaper";
 
 /**
  * Minimum horizontal room to the right of `titleBar().left` (macOS traffic
@@ -73,6 +76,16 @@ const SIDEBAR_COLLAPSE_PULL = 56;
 const SIDEBAR_REOPEN_PULL = 18;
 /** Deliberate hover pause before showing the subtle resize hairline, so crossing the border never flashes. */
 const SASH_HOVER_DELAY_MS = 140;
+
+/**
+ * The sidebar is frosted glass — a backdrop blur under a theme tint — and
+ * over a wallpaper that is the picture laid under the whole window, running
+ * on under the sidebar from the pane beside it: light enough a blur that its
+ * shapes survive, under a tint heavy enough that rows stay legible on any
+ * picture (a bright one in dark, a dark one in light). Linux draws no backdrop
+ * filter: there the sidebar keeps its solid fill.
+ */
+const sidebarSurface = () => (!WALLPAPER_FROST ? "bg-sidebar" : wallpaper() ? "bg-sidebar/50" : "bg-sidebar/30");
 
 const effectiveSidebarMinWidth = () =>
   Math.max(SIDEBAR_MIN_WIDTH, Math.ceil((titleBar().left || 0) + SIDEBAR_HEADER_RIGHT_CLEARANCE));
@@ -343,16 +356,18 @@ function SidebarSplit(props: { children: JSX.Element }) {
 
   return (
     <View class="relative flex-1 flex-row bg-background">
+      <WallpaperUnderlay />
       <View
         class="shrink-0 overflow-hidden"
         style={{ width: sidebarOpen() ? currentWidth() : 0 }}
       >
         <View
-          class="h-full border-r border-sidebar-border bg-sidebar"
+          class={`h-full border-r border-sidebar-border ${sidebarSurface()}`}
           style={{
             width: currentWidth(),
             opacity: drawerOpacity,
             transform: [{ translateX: drawerSlideX }],
+            ...(WALLPAPER_FROST ? SIDEBAR_GLASS : undefined),
           }}
         >
           <If when={sidebarMounted()}>
@@ -361,7 +376,8 @@ function SidebarSplit(props: { children: JSX.Element }) {
         </View>
       </View>
 
-      <View class="relative min-w-0 flex-1">
+      {/* Over a wallpaper the pane has no fill of its own: the chat's veil is its page. */}
+      <View class={`relative min-w-0 flex-1 ${wallpaper() ? "" : "bg-background"}`}>
         {props.children}
       </View>
 

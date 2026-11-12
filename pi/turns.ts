@@ -221,8 +221,9 @@ function sumDiffStats(tools: readonly ToolRow[]): DiffStats | undefined {
 }
 
 function humanizeToolName(name: string): string {
-  return name
-    .replace(/^mcp__[^_]+__/, "")
+  const trimmed = name.replace(/^mcp__[^_]+__/, "").trim();
+  if (/\s/.test(trimmed)) return trimmed.replace(/\s*\n\s*/g, " ; ").replace(/\s+/g, " ");
+  return trimmed
     .replace(/[_-]+/g, " ")
     .replace(/([a-z])([A-Z])/g, "$1 $2")
     .trim();
@@ -400,12 +401,25 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
     default: {
       const label = humanizeToolName(row.name) || (zh ? "工具" : "tool");
       const target = pickStr(args, "path", "file_path", "command", "query", "pattern", "url", "title", "name", "description");
+      const shown = target ? (target.includes("/") ? shortFileTarget(target) : compactCommand(target)) : "";
+      // An ACP harness names a call by its title ("Search for 'veil|fold'"): the
+      // title is what the row reads, and truncates as a target does.
+      if (/\s/.test(row.name.trim())) {
+        return {
+          category,
+          icon,
+          verb: active ? (zh ? "正在调用" : "Calling") : failed ? (zh ? "调用失败" : "Failed") : zh ? "调用" : "Used",
+          target: row.name.trim(),
+          meta: shown && shown !== "." && !row.name.includes(target) ? shown : "",
+          monoTarget: false,
+        };
+      }
       const verb = active ? (zh ? `正在调用 ${label}` : `Calling ${label}`) : failed ? (zh ? `${label} 失败` : `${label} failed`) : zh ? `调用 ${label}` : `Used ${label}`;
       return {
         category,
         icon,
         verb,
-        target: target ? (target.includes("/") ? shortFileTarget(target) : compactCommand(target)) : "",
+        target: shown,
         meta: "",
         monoTarget: Boolean(target && (target.includes("/") || target.includes("--"))),
       };
@@ -494,7 +508,7 @@ function toolLine(tool: ToolRow, running: boolean, zh: boolean): string {
       return zh ? (running ? "正在更新计划" : "已更新计划") : running ? "Updating plan" : "Updated plan";
     default: {
       const name = humanizeToolName(tool.name) || (zh ? "工具" : "tool");
-      const label = name[0].toUpperCase() + name.slice(1);
+      const label = /\s/.test(tool.name.trim()) ? name : name[0].toUpperCase() + name.slice(1);
       return running ? (zh ? `正在运行 ${label}` : `Running ${label}`) : label;
     }
   }
@@ -715,6 +729,25 @@ function sameRow(a: DisplayRow, b: DisplayRow): boolean {
     return a.running === b.running && a.startedAt === b.startedAt && a.durationMs === b.durationMs && a.open === b.open && a.hasDetails === b.hasDetails && a.activeStep === b.activeStep;
   }
   return false;
+}
+
+/**
+ * Every row id the chat's list can project from `rows`: the transcript rows
+ * themselves, the synthesized `turn:` and `act:` rows (named by their first
+ * row or step), and each reply's `#actions` row (minted in `views/Rows.tsx`).
+ * A session landing marks them all seen so loaded history never replays the
+ * live-row entrance.
+ */
+export function displayRowIds(rows: readonly Row[]): string[] {
+  const ids: string[] = [];
+  for (const row of rows) {
+    ids.push(row.id);
+    if (!isTurnRow(row)) continue;
+    ids.push(`turn:${row.id}`);
+    if (row.kind === "text") ids.push(`${row.id}#actions`);
+    else ids.push(`act:${row.id}`);
+  }
+  return ids;
 }
 
 /**

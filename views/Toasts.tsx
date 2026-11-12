@@ -5,7 +5,7 @@ import { activeToasts, dismissToast, type Toast } from "../store/app";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName, type Tone } from "../ui/Icon";
 import { EASING, Reveal } from "../ui/motion";
-import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS } from "../ui/styles";
+import { FOCUS_RING, POPUP_TOAST, PRESS } from "../ui/styles";
 
 const LOOK: Record<Toast["tone"], { icon: IconName; tone: Tone }> = {
   info: { icon: "info", tone: "muted-foreground" },
@@ -46,8 +46,8 @@ function ToastCard(props: { toast: Toast; leaving: boolean }) {
     <Reveal open={!props.leaving} offset={-6}>
       <View class="items-end pb-2" style={{ transform: [{ scale: exitScale }] }}>
         <View
-          class={`${props.leaving ? "pointer-events-none" : "pointer-events-auto"} max-w-120 flex-row items-center gap-2.5 py-2 pl-3 pr-1.5 ${POPUP}`}
-          style={{ ...GLASS_REGULAR, ...enter.style }}
+          class={`${props.leaving ? "pointer-events-none" : "pointer-events-auto"} max-w-120 flex-row items-center gap-2.5 py-2 pl-3 pr-1.5 ${POPUP_TOAST}`}
+          style={enter.style}
           role="alert"
         >
           <View class="shrink-0">
@@ -131,7 +131,7 @@ export function Toasts() {
   });
 
   return (
-    <View class="pointer-events-none absolute right-4 top-14 items-end">
+    <View class="pointer-events-none absolute right-8 top-14 items-end">
       <Each of={shown()} key={(entry) => entry.toast.id}>
         {(entry) => <ToastCard toast={entry().toast} leaving={entry().leaving} />}
       </Each>

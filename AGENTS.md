@@ -31,6 +31,12 @@ multi-agent orchestration, and settings.
   session parks its process and transcript (`parkActive` in
   `store/app.ts`) and starts a second process for the target. Coming back
   adopts the parked process; the sidebar dots the runs still working.
+- An agent process that goes away on its own is the app's to put back, on
+  any engine: `routeExit` in `store/app.ts` starts it again under its
+  session (`revive`) with the screen as it was — only a run cut short is
+  said. The dead-agent screen is for a process that dies while starting,
+  or will not stay up. An exit the store asked for is never routed: let go
+  of a client (`closeActive`, `removeParked`) before closing it.
 - Nothing is bundled: `agents/catalog.ts` lists the built-in harnesses
   and the user's custom ACP configs, `sidecar/probe-agents.mjs` finds
   them on PATH (never triggering OAuth popups or project hooks), and each
@@ -59,8 +65,21 @@ multi-agent orchestration, and settings.
 - `nsh test Sidebar.test.tsx` — the sidebar frame by frame through session
   switches, on a manual clock with slow agent starts (`harness.startDelay`);
   `open` and `press` run the clock ~400ms themselves, so delays must exceed that
+- `nsh test Slash.test.tsx` — the composer's slash menu: what `/` lists on
+  each agent, Enter runs, Tab fills in, Escape closes; `nsh test
+  store/slash.test.ts` — what a command puts on the wire across engines
+- `nsh test Recover.test.tsx` — an agent process lost at rest, under a run,
+  or again and again (`harness.dies`, or a prompt containing "crash"): what
+  stays on screen, what is said, and when the app stops starting it again
+- `nsh test Switch.test.tsx` — a session change from the press on: what is
+  shown with the click, and that nothing passes through while the agent loads;
+  `nsh test SwitchFilm.test.tsx --target macos` films the changes into
+  `.nsh/shots/switch-*.png` (compare frames: the fades do not show in `texts()`)
 - `nsh test Shots.test.tsx --target macos` — screenshots of every state in
   `.nsh/shots/` (design review); `Gallery.test.tsx` does Pip and the icons
+- `nsh test WallpaperLook.test.tsx --target macos` — the app under a wallpaper,
+  every surface it reaches, in `.nsh/shots/wallpaper-*.png` (`harness.wallpaper`
+  lays one; name any image in the test's `PICTURE`)
 - `nsh test E2E.test.tsx --target macos` — a real run through the real
   sidecar; needs a model (see below)
 - `nsh package .` — build an installable app package (targets the host OS;
@@ -92,9 +111,9 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   pipi-dev.
 - Releases ride on tags pushed to `public` (`v*` triggers
   `.github/workflows/release.yml`, which ships the signed, notarized
-  DMG). The repo needs the `PIPI_RELEASE_*` / `APPLE_API_*` secrets
-  configured for CI releases; `npm run release:macos` is the local
-  fallback.
+  macOS DMG plus the Windows installer/zip and the Linux tar.gz). The
+  repo needs the `PIPI_RELEASE_*` / `APPLE_API_*` secrets configured for
+  CI releases; `npm run release:macos` is the local fallback.
 
 ## Layout
 
@@ -105,7 +124,8 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   (context carried between agents)
 - `pi/` — the wire protocol, no UI (Pi is the reference driver):
   `protocol.ts` (RPC types), `jsonl.ts`, `client.ts` (commands ↔
-  responses by id), `sidecar.ts` (spawns agent processes),
+  responses by id), `stdin.ts` (writes sliced under the child's 1 MiB
+  queue), `sidecar.ts` (spawns agent processes),
   `transcript.ts` (events → chat rows), `sessions.ts`, `credentials.ts`
   (`auth.json`), `providers.ts`
 - `store/` — `app.ts` (all state and actions; signals are private),
@@ -138,6 +158,17 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   import (under hot reload the default import has no `env`).
 - A child's environment is only what `nsh.json` `capabilities.process.env`
   lists: a new provider variable must be added there.
+- The app starts only the commands `capabilities.process.execute` lists, by
+  the bare names listed there. A path it does not list is refused with
+  `ERR_ACCESS_DENIED` — the code a working folder outside `fs.write` gets
+  too; `permission` (`"process"` or `"fs"`) tells them apart, and only
+  `"fs"` is about the folder (`startError` in `pi/sidecar.ts`). A binary
+  found by its path is started through the host shell
+  (`spawnWithLauncher`), and the system-wide installs are looked for
+  through it as well (`firstExecutable`). `fs` grants `/`: any folder the
+  panel returns may run an agent (on Windows `/` is not absolute and
+  grants nothing — `${homeDir}` stands). `nsh test pi/sidecar.test.ts`
+  holds the names to the manifest.
 - No raw colors or palette classes in components: theme tokens only.
 - Errors surface one way: `toast(tone, text)` in `store/app.ts`, rendered
   top-right by `views/Toasts.tsx`. User-triggered actions go through
@@ -145,7 +176,16 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   failures toast as `warning`. A `phase: "failed"` blocking screen keeps
   its full-screen state AND fires an error toast. Transcript rows and
   `transcript.note` carry conversation/agent content only — app errors are
-  never reported inline, in banners, or in dialogs.
+  never reported inline, in banners, or in dialogs. The same toast again
+  stays in place and its time starts over; it is never removed and re-added.
+- A run's error is said once, and only when it stands (`#failure` in
+  `pi/transcript.ts`): a failed assistant message is held back until the run
+  settles or the conversation moves on, and a retry (`auto_retry_start`, an
+  overflow compaction with `willRetry`, a later assistant message) takes its
+  place unsaid — the status line counts the attempts meanwhile and keeps
+  `retrying` until the attempt shows life. Live and reloaded history read
+  the same. `nsh test Errors.test.tsx` plays these on the scripted Pi
+  (prompts with "flaky", "outage", "refuse").
 - List rows are recycled: read `item()` where used; per-row state lives in a
   map by id (`views/Rows.tsx`).
 - The message flow (`pi/turns.ts`): a turn is a header, its
@@ -171,6 +211,17 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   to run state: a run that starts or settles re-lays the transcript in that
   same pass, and the list's cells cross-fade, jump, and are left shifted and
   clipped (`AcpClip.test.tsx --target macos` shows it).
+- A session change answers the click, not the agent (`headFor` in
+  `store/app.ts`, the pane in `views/Chat.tsx`; `DESIGN.md` → Motion). The
+  destination goes on screen at once when there is one to show: a conversation
+  left at rest comes back from `visited` (the agent's history then confirms it
+  — the same rows, nothing for the list to do — or replaces it), a new
+  session's empty chat is shown ahead of the agent (`isDraftAhead`). Otherwise
+  the change is `leaving`: the rows on screen stay until the destination lands
+  (never clear them first — that is the blank flash), the chat dims them and
+  holds its screen, and `arrived` ticks once to settle the destination in. Do
+  not add a second entrance on top (`landed` is not one), and do not gate the
+  composer on the agent being ready: `send` waits for the change to end.
 - `nsh test Scroll.test.tsx --target macos` checks follow and release on the
   real list. To see a streaming glitch, take screenshots in a loop
   (`app.screenshot`) and compare frames: one-frame faults do not show in

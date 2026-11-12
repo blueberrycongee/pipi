@@ -59,9 +59,73 @@ jobs:
           fi
           rm -f "$RUNNER_TEMP/pipi-notary.p8" "$RUNNER_TEMP/pipi-release.p12"
 
+  windows:
+    name: Build (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nsh
+        shell: pwsh
+        env:
+          NSH_VERSION: v0.5.0
+        run: |
+          irm https://nsh.dev/install.ps1 | iex
+          "$env:LOCALAPPDATA\nsh\bin" >> $env:GITHUB_PATH
+      - run: nsh check .
+      - name: Package
+        run: nsh package . --target windows
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $v = (Get-Content nsh.json -Raw | ConvertFrom-Json).version
+          New-Item -ItemType Directory release | Out-Null
+          Get-ChildItem .nsh/out -File -Filter 'pipi*' | ForEach-Object {
+            $dest = $_.Name -replace '^pipi', "pipi-$v-windows-x64"
+            Copy-Item $_.FullName (Join-Path release $dest)
+          }
+          Get-ChildItem release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pipi-windows-x64
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  linux:
+    name: Build (Linux x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nsh
+        env:
+          NSH_VERSION: v0.5.0
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: nsh check .
+      - name: Package
+        run: nsh package . --target linux
+      - name: Stage artifacts
+        run: |
+          v=$(node -p 'require("./nsh.json").version')
+          mkdir release
+          for f in .nsh/out/pipi*; do
+            [ -f "$f" ] || continue
+            mv "$f" "release/$(basename "$f" | sed "s/^pipi/pipi-$v-linux-x64/")"
+          done
+          ls -la release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pipi-linux-x64
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
   release:
     name: GitHub Release
-    needs: macos
+    needs: [macos, windows, linux]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -72,8 +136,9 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
-          name: pipi-mac-arm64
+          pattern: pipi-*
           path: dist
+          merge-multiple: true
       - name: Publish verified assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -84,7 +149,11 @@ jobs:
             if ("v" + v.version !== process.env.RELEASE_TAG) throw Error("Artifact version does not match tag");
           '
           cat > release-notes.md <<'EOF'
-          Signed with an Apple Developer ID certificate and notarized by Apple; the disk image and the app carry stapled notarization tickets and passed Gatekeeper assessment before upload.
+          **macOS**: signed with an Apple Developer ID certificate and notarized by Apple; both the disk image and `pipi.app` inside it carry stapled notarization tickets and passed Gatekeeper assessment before upload.
+
+          **Windows**: unpack `pipi-*-windows-x64.zip` and run `pipi.exe` (or run the setup installer if present). The build is unsigned, so SmartScreen may ask for confirmation on first launch.
+
+          **Linux**: unpack `pipi-*-linux-x64.tar.gz` and run `pipi`. Needs GTK 4.14 or newer (Ubuntu 24.04 and later).
           EOF
           gh release create "$RELEASE_TAG" --verify-tag --title "pipi $RELEASE_TAG" \
-            --notes-file release-notes.md dist/pipi-*-mac-arm64.dmg dist/verification.json
+            --notes-file release-notes.md dist/*

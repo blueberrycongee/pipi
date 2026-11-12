@@ -135,8 +135,11 @@ export interface Model {
   baseUrl?: string;
   reasoning: boolean;
   input: string[];
-  contextWindow: number;
-  maxTokens: number;
+  /** Only set when the engine itself reports them — never assumed per catalog. */
+  effortLevels?: string[];
+  /** Only set when the engine itself reports it — never assumed per catalog. */
+  contextWindow?: number;
+  maxTokens?: number;
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
@@ -165,13 +168,16 @@ export interface SessionStats {
   totalMessages: number;
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
   cost: number;
-  contextUsage?: { tokens: number | null; contextWindow: number; percent: number | null };
+  contextUsage?: { tokens: number | null; contextWindow: number | null; percent: number | null };
 }
 
 export interface SlashCommand {
   name: string;
   description?: string;
-  source: "extension" | "prompt" | "skill";
+  /** Pi's three kinds; `agent` is the bridge's, for a command another engine reports as its own. */
+  source: "extension" | "prompt" | "skill" | "agent";
+  /** What follows the name. Only set when the engine itself reports it (the bridge). */
+  argumentHint?: string;
 }
 
 export interface CompactionResult {
@@ -272,6 +278,7 @@ export type SessionEvent =
   | { type: "queue_update"; steering: string[]; followUp: string[] }
   | { type: "session_info_changed"; name?: string }
   | { type: "models_changed" }
+  | { type: "commands_changed" }
   | { type: "thinking_level_changed"; level: ThinkingLevel }
   | { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
   | { type: "compaction_end"; reason: string; result?: CompactionResult; aborted: boolean; willRetry?: boolean; errorMessage?: string }

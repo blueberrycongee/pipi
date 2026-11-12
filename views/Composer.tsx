@@ -1,9 +1,9 @@
 import { readFile } from "fs/promises";
 import { cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
-import type { InputRef, PasteEvent } from "nsh";
+import type { InputRef, PasteEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input } from "nsh/base";
 import { commandSourceLabel, tr } from "../lib/i18n";
-import type { SlashCommand } from "../pi/protocol";
+import { matchCommands, matchOptions, readSlashInput } from "../lib/slash";
 import {
   activeAgent,
   addAttachment,
@@ -64,45 +64,141 @@ const fileUriPath = (uri: string): string | undefined => {
   }
 };
 
-/** The slash commands that match what is being typed: `/` and a name, before any space. */
-function useSlashMenu() {
-  const selected = signal(0);
-  const matches = computed<SlashCommand[]>(() => {
-    const text = composerDraft();
-    if (!text.startsWith("/") || /\s/.test(text)) return [];
-    const query = text.slice(1).toLowerCase();
-    const all = slashCommands();
-    const starts = all.filter((command) => command.name.toLowerCase().startsWith(query));
-    const holds = all.filter((command) => !command.name.toLowerCase().startsWith(query) && command.name.toLowerCase().includes(query));
-    return [...starts, ...holds].slice(0, 8);
-  });
-  const open = () => matches().length > 0;
-  const accept = (command = matches()[Math.min(selected(), matches().length - 1)]) => {
-    if (command) setDraft(`/${command.name} `);
-  };
-  effect(() => {
-    matches();
-    selected.set(0);
-  });
-  // The arrow keys belong to the menu only while it shows.
-  effect(() => {
-    if (!open()) return;
-    const move = (by: number) => selected.update((at) => (at + by + matches().length) % matches().length);
-    cleanup(keymap.bind({ up: () => move(-1), down: () => move(1), tab: () => accept() }, { when: "always", repeat: true }));
-  });
-  return { matches, selected, open, accept };
+/** One line of the slash menu: a command, or a value for a command's first argument. */
+interface SlashRow {
+  key: string;
+  /** In mono: the command with its slash, or the argument's value. */
+  title: string;
+  /** What follows the command, dimmed after it: `<agent> <task>`. */
+  hint?: string;
+  description?: string;
+  /** Whose command it is. */
+  tag?: string;
+  /** The draft Tab leaves: the row filled in, the caret where the next word goes. */
+  completion: string;
+  /** The line choosing the row sends. Without one, choosing fills the row in as Tab does: there is more to say first. */
+  runs?: string;
 }
 
-function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu> }) {
+/**
+ * The slash menu's state: what the draft finds, which row is marked, and the
+ * keys that are the menu's while it shows. Choosing a row (Enter, a press)
+ * runs it; Tab fills it in so arguments can follow; Escape closes the menu and
+ * leaves the draft, which then sends as written. The commands are the shell's
+ * own and the active engine's (`slashCommands`), so the list changes with the
+ * agent and the shell's part of it does not.
+ */
+function useSlashMenu() {
+  const selected = signal(0);
+  /** Ticks when an arrow key moves the mark: the list scrolls after the keys, not after the pointer. */
+  const keyed = signal(0, { equals: false });
+  /** The kind of input Escape closed the menu on; it stays closed while the draft is still that. */
+  const dismissed = signal<"command" | "argument" | undefined>(undefined);
+  const input = computed(() => readSlashInput(composerDraft()));
+  const rows = computed<SlashRow[]>(() => {
+    const asked = input();
+    if (!asked || asked.kind === dismissed()) return [];
+    if (asked.kind === "command") {
+      const agentName = activeAgent().name;
+      return matchCommands(slashCommands(), asked.query).map((command) => ({
+        key: command.name,
+        title: `/${command.name}`,
+        hint: command.argumentHint,
+        description: command.description,
+        tag: commandSourceLabel(command.source, agentName),
+        completion: `/${command.name} `,
+        runs: command.needsArguments ? undefined : `/${command.name}`,
+      }));
+    }
+    const command = slashCommands().find((known) => known.name === asked.name);
+    return matchOptions(command?.options ?? [], asked.query).map((option) => ({
+      key: `${asked.name} ${option.value}`,
+      title: option.value,
+      description: option.description,
+      completion: `/${asked.name} ${option.value} `,
+    }));
+  });
+  /**
+   * A command is being typed that nothing here answers to. Each engine has its
+   * own commands, and a name known from one engine's own tool may not exist on
+   * this one: the menu says so rather than closing, since the line then goes to
+   * the agent as written.
+   */
+  const unmatched = computed(() => {
+    const asked = input();
+    return asked?.kind === "command" && asked.query !== "" && asked.kind !== dismissed() && rows().length === 0;
+  });
+  const open = () => rows().length > 0 || unmatched();
+  const current = () => rows()[Math.min(selected(), rows().length - 1)] as SlashRow | undefined;
+  effect(() => {
+    rows();
+    selected.set(0);
+  });
+  effect(() => {
+    if (input()?.kind !== dismissed()) dismissed.set(undefined);
+  });
+  // These keys are the menu's only while it shows. Escape's newest binding is this one, so it closes the menu before it stops a run.
+  effect(() => {
+    if (!open()) return;
+    cleanup(keymap.bind("escape", () => dismissed.set(untracked(input)?.kind), { when: "always" }));
+    // With no row to mark, the arrows and Tab stay the input's.
+    if (!rows().length) return;
+    const move = (by: number) => {
+      selected.update((at) => (Math.min(at, rows().length - 1) + by + rows().length) % rows().length);
+      keyed.set(0);
+    };
+    cleanup(keymap.bind({ up: () => move(-1), down: () => move(1) }, { when: "always", repeat: true }));
+    cleanup(
+      keymap.bind(
+        "tab",
+        () => {
+          const row = current();
+          if (row) setDraft(row.completion);
+        },
+        { when: "always" },
+      ),
+    );
+  });
+  return { rows, unmatched, selected, keyed, open, current };
+}
+
+/**
+ * The menu over the composer: eight and a half rows show at most — the half
+ * row says the list goes on — and the rest scroll. The mark follows the
+ * pointer once it moves, so there is one marked row and never a hovered one
+ * beside it; a row scrolled under a resting pointer does not take it.
+ */
+function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (row: SlashRow) => void }) {
   const mounted = signal(false);
   const opacity = createAnimatedValue(0);
   const translateY = createAnimatedValue(6);
   const scale = createAnimatedValue(0.97);
-  const shownMatches = keepLast(() => {
-    const list = props.menu.matches();
-    return list.length > 0 ? list : undefined;
-  }, [] as SlashCommand[]);
+  // What the menu holds, kept while it fades out: its rows, or the line that says nothing matches.
+  const shown = keepLast(
+    () => {
+      const list = props.menu.rows();
+      if (list.length > 0) return { rows: list, unmatched: false };
+      return props.menu.unmatched() ? { rows: [] as SlashRow[], unmatched: true } : undefined;
+    },
+    { rows: [] as SlashRow[], unmatched: false },
+  );
+  const rowViews = new Map<string, ViewRef>();
+  let list: ScrollRef | undefined;
   let exitTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // The marked row stays in view: the arrow keys take the list with them.
+  effect(() => {
+    props.menu.keyed();
+    const row = untracked(props.menu.current);
+    if (row) rowViews.get(row.key)?.reveal({ vertical: "nearest", animated: false });
+  });
+  // A list that changes while it shows marks its first row again: back to the top with it.
+  let showing = false;
+  effect(() => {
+    const now = props.menu.rows().length > 0;
+    if (now && showing) list?.scrollTo({ y: 0, animated: false });
+    showing = now;
+  });
 
   effect(() => {
     const open = props.menu.open();
@@ -150,26 +246,42 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu> }) {
   return (
     <If when={mounted()}>
       <View
-        class={`absolute inset-x-0 bottom-full mb-2 p-1 ${POPUP}${props.menu.open() ? "" : " pointer-events-none"}`}
+        class={`absolute inset-x-0 bottom-full mb-2 overflow-hidden ${POPUP}${props.menu.open() ? "" : " pointer-events-none"}`}
         style={{ ...GLASS_REGULAR, opacity, transform: [{ translateY }, { scale }] }}
         role="menu"
         accessibilityLabel={tr("Commands", "命令")}
       >
-        <Each of={shownMatches() ?? []} key={(command) => command.name}>
-          {(command, index) => (
-            <View
-              role="menuitem"
-              focusable={false}
-              onPress={() => props.menu.accept(command())}
-              class={`h-8 flex-row items-center gap-2 rounded-md px-2 ${PRESS} hover:bg-accent`}
-              classList={{ "bg-accent": index() === props.menu.selected() }}
-            >
-              <Text class="shrink-0 font-mono text-sm text-foreground">{`/${command().name}`}</Text>
-              <Text class="min-w-0 flex-1 truncate text-sm text-muted-foreground">{command().description ?? ""}</Text>
-              <Text class="shrink-0 text-xs text-subtle">{commandSourceLabel(command().source)}</Text>
+        <Scroll ref={list} class="max-h-69" contentClass="p-1">
+          <If when={shown()?.unmatched === true}>
+            <View class="h-8 flex-row items-center px-2">
+              <Text class="min-w-0 flex-1 truncate text-sm text-muted-foreground">
+                {tr(`No command by that name. Enter sends it to ${activeAgent().name} as written.`, `没有这个命令，回车将原样发给 ${activeAgent().name}。`)}
+              </Text>
             </View>
-          )}
-        </Each>
+          </If>
+          <Each of={shown()?.rows ?? []} key={(row) => row.key}>
+            {(row, index) => (
+              <View
+                ref={(view: ViewRef) => rowViews.set(row().key, view)}
+                role="menuitem"
+                focusable={false}
+                onPress={() => props.onChoose(row())}
+                onMouseMove={() => {
+                  if (props.menu.selected() !== index()) props.menu.selected.set(index());
+                }}
+                class={`h-8 flex-row items-center gap-2 rounded-md px-2 ${PRESS}`}
+                classList={{ "bg-accent": index() === props.menu.selected() }}
+              >
+                <Text class="shrink-0 font-mono text-sm text-foreground">{row().title}</Text>
+                <If when={Boolean(row().hint)}>
+                  <Text class="shrink-0 font-mono text-sm text-subtle">{row().hint ?? ""}</Text>
+                </If>
+                <Text class="min-w-0 flex-1 truncate text-sm text-muted-foreground">{row().description ?? ""}</Text>
+                <Text class="shrink-0 text-xs text-subtle">{row().tag ?? ""}</Text>
+              </View>
+            )}
+          </Each>
+        </Scroll>
       </View>
     </If>
   );
@@ -331,8 +443,15 @@ export function Composer() {
     input?.focus();
   });
 
+  /** Choosing a menu row runs it; one that needs more first is filled in for it, as Tab does. */
+  const choose = (row: SlashRow, mode: "steer" | "followUp" = "steer") => {
+    if (row.runs === undefined) return setDraft(row.completion);
+    setDraft(row.runs);
+    void send(mode);
+  };
   const submit = (mode: "steer" | "followUp" = "steer") => {
-    if (slash.open()) return slash.accept();
+    const row = slash.current();
+    if (row) return choose(row, mode);
     void send(mode);
   };
   keymap.bind("mod+enter", () => submit("followUp"), { when: "always" });
@@ -434,7 +553,7 @@ export function Composer() {
       <View class="pointer-events-auto relative w-full max-w-190 self-center">
         <SubagentStrip />
         <ExtensionPrompt />
-        <SlashMenu menu={slash} />
+        <SlashMenu menu={slash} onChoose={choose} />
         <AttachmentTray />
         <View class={`rounded-[22px] ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
           <Queue />
@@ -464,7 +583,7 @@ export function Composer() {
             submitBehavior="submit"
             autoCapitalize="none"
             autoCorrect={false}
-            disabled={!ready()}
+            disabled={sidecarPhase().name === "failed"}
             placeholder={placeholder()}
             accessibilityLabel={tr("Message", "消息")}
             class="mx-4 mt-4 text-md text-foreground caret-brand placeholder:text-subtle"
@@ -476,36 +595,38 @@ export function Composer() {
               <AgentPicker />
               <ModelPicker />
               <ThinkingPicker />
-              <PermissionPicker />
             </View>
-            <View class="shrink-0 flex-row items-center gap-1.5" style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
-              <If
-                when={showStop()}
-                else={
-                  <BaseButton
-                    onPress={() => submit()}
-                    disabled={!ready() || !hasText()}
-                    accessibilityLabel={isRunning() ? tr("Steer", "引导") : tr("Send", "发送")}
-                    tooltip={tip(
-                      isRunning() ? tr("Steer — ⌘↵ queues a follow-up", "引导 — ⌘↵ 排队追问") : tr("Send — ⌘↵ queues a follow-up", "发送 — ⌘↵ 排队追问"),
-                      "enter",
-                      "top",
-                    )}
-                    class={`size-7 shrink-0 items-center justify-center rounded-full bg-primary shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:bg-muted disabled:shadow-none`}
-                  >
-                    <Icon name="arrowUp" tone={ready() && hasText() ? "brand-foreground" : "subtle"} />
-                  </BaseButton>
-                }
-              >
-                <BaseButton
-                  onPress={() => void stop()}
-                  accessibilityLabel={tr("Stop", "停止")}
-                  tooltip={tip(tr("Stop", "停止"), "escape", "top")}
-                  class={`size-7 shrink-0 items-center justify-center rounded-full bg-secondary shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-secondary/80 active:scale-92 motion-reduce:active:scale-100`}
+            <View class="shrink-0 flex-row items-center gap-1.5">
+              <PermissionPicker />
+              <View style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
+                <If
+                  when={showStop()}
+                  else={
+                    <BaseButton
+                      onPress={() => submit()}
+                      disabled={!ready() || !hasText()}
+                      accessibilityLabel={isRunning() ? tr("Steer", "引导") : tr("Send", "发送")}
+                      tooltip={tip(
+                        isRunning() ? tr("Steer — ⌘↵ queues a follow-up", "引导 — ⌘↵ 排队追问") : tr("Send — ⌘↵ queues a follow-up", "发送 — ⌘↵ 排队追问"),
+                        "enter",
+                        "top",
+                      )}
+                      class={`size-7 shrink-0 items-center justify-center rounded-full bg-primary shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:bg-muted disabled:shadow-none`}
+                    >
+                      <Icon name="arrowUp" tone={ready() && hasText() ? "brand-foreground" : "subtle"} />
+                    </BaseButton>
+                  }
                 >
-                  <Icon name="stop" tone="foreground" />
-                </BaseButton>
-              </If>
+                  <BaseButton
+                    onPress={() => void stop()}
+                    accessibilityLabel={tr("Stop", "停止")}
+                    tooltip={tip(tr("Stop", "停止"), "escape", "top")}
+                    class={`size-7 shrink-0 items-center justify-center rounded-full bg-secondary shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-secondary/80 active:scale-92 motion-reduce:active:scale-100`}
+                  >
+                    <Icon name="stop" tone="foreground" />
+                  </BaseButton>
+                </If>
+              </View>
             </View>
           </View>
         </View>

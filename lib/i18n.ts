@@ -1,7 +1,8 @@
 import { computed, locale } from "nsh";
 import { builtinAgentSpec } from "../agents/catalog";
 import type { AgentHarnessStatus, DelegateRole, RuntimeMode } from "../agents/types";
-import type { QueueMode, SlashCommand, ThinkingLevel } from "../pi/protocol";
+import type { QueueMode, ThinkingLevel } from "../pi/protocol";
+import type { ComposerCommand } from "./slash";
 import { language } from "../store/prefs";
 import type { IconName } from "../ui/Icon";
 import { compactPath, tildePath } from "./format";
@@ -53,9 +54,13 @@ export function queueModeLabel(mode: QueueMode): string {
   return mode === "all" ? tr("All at once", "一次全部") : tr("One at a time", "逐条发送");
 }
 
-/** Slash command source label in the active language. */
-export function commandSourceLabel(source: SlashCommand["source"]): string {
+/** Whose slash command it is, in the active language: the app's, the agent's own (by its name), or one of Pi's kinds. */
+export function commandSourceLabel(source: ComposerCommand["source"], agentName: string): string {
   switch (source) {
+    case "app":
+      return "pipi";
+    case "agent":
+      return agentName;
     case "extension":
       return tr("Extension", "扩展");
     case "prompt":

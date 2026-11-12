@@ -34,6 +34,8 @@ const ICONS = {
   pencil: { stroke: "M10.25 3.25l2.5 2.5L5.5 13H3v-2.5z" },
   copy: { stroke: "M6.5 6.5h6.25v6.25H6.5zM3.25 9.5V3.25H9.5" },
   terminal: { stroke: "M2.5 3.5h11v9h-11zM5 6.5l2 1.5-2 1.5M8.75 10h2.25" },
+  /** The thinking face: a raised brow and a hand at the chin. */
+  thinking: { stroke: "M5.2 11.6a5.5 5.5 0 1 1 5.3 1.3M6.2 6.5v.1M10.3 6.5v.1M9.4 4.2l1.8.4M2.5 13.5h3.2l2.6-3.3h1.5" },
   file: { stroke: "M4 2.5h5l3 3v8H4zM9 2.5v3h3" },
   fileEdit: { stroke: "M8.5 2.5H4v11h4M8.5 2.5l3.5 3.5v1.5M9.5 13.5l.4-2 3.1-3.1 1.6 1.6-3.1 3.1z" },
   filePlus: { stroke: "M4 2.5h5l3 3v8H4zM9 2.5v3h3M8 8v3.5M6.25 9.75h3.5" },

@@ -50,6 +50,7 @@ import {
   setSteeringMode,
   setWallpaperEffect,
   setWallpaperThemeColors,
+  showAgentSettings,
   showChat,
   showSettings,
   sidecarPhase,
@@ -59,6 +60,7 @@ import {
   updateAgentOverride,
   updateAutoArchiveDays,
   usageStats,
+  type View as AppView,
   wallpaper,
   wallpaperEffect,
   wallpaperFolder,
@@ -87,28 +89,33 @@ import { Button, Chip, IconButton } from "../ui/Button";
 import { Rule, Segmented, SettingGroup, SettingRow, Switch, TextField } from "../ui/Controls";
 import { Icon, type IconName } from "../ui/Icon";
 import { animateNextLayout, EASING, enterStagger, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, SPRING } from "../ui/motion";
-import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS } from "../ui/styles";
+import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, SCRIM } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { CroppedWallpaperSurface, WallpaperAdjustDialog } from "./Wallpaper";
 
-/** The settings overlay blurs the app content behind the panel instead of dimming it. */
-const SETTINGS_SCRIM = { backdropFilter: "blur(16px) saturate(140%)" };
-
 const SECTIONS: { id: SettingsSection; label: () => string; icon: IconName }[] = [
   { id: "general", label: () => tr("General", "常规"), icon: "sliders" },
-  { id: "providers", label: () => "Pi", icon: "plug" },
   { id: "agents", label: () => tr("Agents", "智能体"), icon: "agents" },
   { id: "archive", label: () => tr("Archive", "归档"), icon: "archive" },
   { id: "usage", label: () => tr("Usage", "用量"), icon: "bolt" },
   { id: "about", label: () => tr("About", "关于"), icon: "info" },
 ];
 
-function Page(props: { title: string; lead?: string; action?: JSX.Element; children?: JSX.Element }) {
+/** A settings page. `back` names the page it was opened from: a page inside a section leads back to it. */
+function Page(props: { title: string; lead?: string; action?: JSX.Element; back?: { label: string; onPress: () => void }; children?: JSX.Element }) {
   return (
     <Scroll class="flex-1" contentClass="items-center px-8 pb-10 pt-6">
       <View class="w-full max-w-160 gap-6" style={enterStagger(0)}>
         <View class="flex-row items-start justify-between gap-4">
           <View class="min-w-0 flex-1 gap-1">
+            <If when={props.back}>
+              {(back) => (
+                <BaseButton testID="settings-back" onPress={() => back().onPress()} class={`-ml-1.5 mb-1 h-6 flex-row items-center gap-1 self-start rounded-md px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
+                  <Icon name="arrowLeft" size={12} tone="muted-foreground" />
+                  <Text class="text-sm text-muted-foreground">{back().label}</Text>
+                </BaseButton>
+              )}
+            </If>
             <Text class="text-xl font-semibold tracking-tight text-foreground" role="header">
               {props.title}
             </Text>
@@ -141,19 +148,31 @@ function PathValue(props: { path: string }) {
 
 // ── Providers ───────────────────────────────────────────────────────────────
 
-/** How a provider is connected, from what Pi reports and what its credential store holds. */
-function connection(id: string): { connected: boolean; via: string; removable: boolean } {
+/**
+ * Whether pipi keeps this agent's model providers itself. Only Pi's RPC documents a credential store
+ * (`auth.json`) and run knobs a client may set; every other harness brings its own sign-in and models.
+ */
+const managesProviders = (agent: AgentHarnessStatus) => agent.driver === "pi";
+
+/** How a provider is connected: from the models the agent lists while it runs (`live`), else from what its credential store holds. */
+function connection(id: string, live: boolean): { connected: boolean; via: string; removable: boolean } {
   const stored = storedProviders()[id];
+  if (!live) {
+    if (stored === "api_key") return { connected: true, via: tr("API key", "API 密钥"), removable: true };
+    if (stored === "oauth") return { connected: true, via: tr("Signed in", "已登录"), removable: true };
+    return { connected: false, via: "", removable: false };
+  }
   const models = availableModels().filter((model) => model.provider === id).length;
   if (stored === "api_key") return { connected: models > 0, via: models ? tr("API key", "API 密钥") : tr("API key saved, no models", "已保存密钥，暂无模型"), removable: true };
   if (stored === "oauth") return { connected: models > 0, via: tr("Signed in", "已登录"), removable: true };
   return { connected: models > 0, via: models ? tr("Environment or models.json", "环境变量或 models.json") : "", removable: false };
 }
 
-function ProviderRow(props: { provider: ProviderInfo; editing: boolean; onEdit: (editing: boolean) => void }) {
+function ProviderRow(props: { provider: ProviderInfo; agentName: string; live: boolean; editing: boolean; onEdit: (editing: boolean) => void }) {
   const key = signal("");
   const saving = signal(false);
-  const link = () => connection(props.provider.id);
+  const link = () => connection(props.provider.id, props.live);
+  const store = () => `${tildePath(agentDir(), backend().home())}/auth.json`;
   const count = () => availableModels().filter((model) => model.provider === props.provider.id).length;
   const save = async () => {
     if (!key().trim() || saving()) return;
@@ -172,7 +191,7 @@ function ProviderRow(props: { provider: ProviderInfo; editing: boolean; onEdit: 
         <View class="min-w-0 flex-1 gap-0.5">
           <Text class="truncate text-base text-foreground">{props.provider.name}</Text>
           <Text class="truncate text-xs text-subtle">
-            {link().connected ? `${link().via} · ${tr(`${count()} ${count() === 1 ? "model" : "models"}`, `${count()} 个模型`)}` : link().via || props.provider.env}
+            {link().connected ? (props.live ? `${link().via} · ${tr(`${count()} ${count() === 1 ? "model" : "models"}`, `${count()} 个模型`)}` : link().via) : link().via || props.provider.env}
           </Text>
         </View>
         <Presence show={!props.editing} class="shrink-0 flex-row items-center gap-1.5">
@@ -203,10 +222,9 @@ function ProviderRow(props: { provider: ProviderInfo; editing: boolean; onEdit: 
           </View>
           <View class="flex-row items-center gap-3">
             <Text class="min-w-0 flex-1 text-xs text-subtle">
-              {tr(
-                `Stored in ${tildePath(agentDir(), backend().home())}/auth.json. ${activeAgent().name} restarts to load the new key.`,
-                `保存在 ${tildePath(agentDir(), backend().home())}/auth.json，保存后 ${activeAgent().name} 将重启加载。`,
-              )}
+              {props.live
+                ? tr(`Stored in ${store()}. ${props.agentName} restarts to load the new key.`, `保存在 ${store()}，保存后 ${props.agentName} 将重启加载。`)
+                : tr(`Stored in ${store()}. ${props.agentName} loads it the next time it starts.`, `保存在 ${store()}，${props.agentName} 下次启动时加载。`)}
             </Text>
             <If when={props.provider.keysUrl}>
               {(url) => (
@@ -223,22 +241,33 @@ function ProviderRow(props: { provider: ProviderInfo; editing: boolean; onEdit: 
   );
 }
 
-/** Pi's own page: its key manager and the session knobs only Pi's RPC honors; other harnesses ignore them. */
-function PiPage() {
+/**
+ * An agent's own page inside Agents, for one whose providers pipi manages: its key manager and the
+ * session knobs its RPC honors. The keys are a file, there whichever agent runs; the knobs are set on
+ * a running session, so they show while this agent is the active one.
+ */
+function AgentProvidersPage(props: { agent: AgentHarnessStatus }) {
+  const name = () => props.agent.name;
+  const live = () => activeAgentId() === props.agent.id;
   const editing = signal<string | undefined>(undefined);
   // Pi does not report whether retry is on: the switch shows the user's last choice, and Pi's default before one.
   const retry = () => autoRetryChoice() ?? true;
   const queueOptions = () => QUEUE_MODE_VALUES.map((value) => ({ value, label: queueModeLabel(value) }));
   // Providers Pi reports models for but the catalog does not name: custom endpoints from models.json, extensions.
   const known = new Set(PROVIDERS.map((provider) => provider.id));
-  const others = computed(() => [...new Set(availableModels().map((model) => model.provider))].filter((id) => !known.has(id)).map((id) => ({ id, name: providerName(id), env: "" })));
+  const others = computed(() => (live() ? [...new Set(availableModels().map((model) => model.provider))].filter((id) => !known.has(id)).map((id) => ({ id, name: providerName(id), env: "" })) : []));
   // Connected providers come first; the rest keep the catalog's order.
   const ordered = computed(() => {
     const all = [...others(), ...PROVIDERS];
-    return [...all.filter((provider) => connection(provider.id).connected || storedProviders()[provider.id]), ...all.filter((provider) => !connection(provider.id).connected && !storedProviders()[provider.id])];
+    const linked = (id: string) => connection(id, live()).connected || !!storedProviders()[id];
+    return [...all.filter((provider) => linked(provider.id)), ...all.filter((provider) => !linked(provider.id))];
   });
   return (
-    <Page title="Pi" lead={tr("The model providers Pi can call, and how its runs behave.", "Pi 可调用的模型服务商，以及它的运行方式。")}>
+    <Page
+      title={name()}
+      lead={tr(`The model providers ${name()} can call, and how its runs behave.`, `${name()} 可调用的模型服务商，以及它的运行方式。`)}
+      back={{ label: tr("Agents", "智能体"), onPress: () => showSettings("agents") }}
+    >
       <SettingGroup title={tr("Providers", "服务商")}>
         <Each of={ordered()} key={(provider) => provider.id}>
           {(provider, index) => (
@@ -246,7 +275,7 @@ function PiPage() {
               <If when={index() > 0}>
                 <Rule />
               </If>
-              <ProviderRow provider={provider()} editing={editing() === provider().id} onEdit={(on) => editing.set(on ? provider().id : undefined)} />
+              <ProviderRow provider={provider()} agentName={name()} live={live()} editing={editing() === provider().id} onEdit={(on) => editing.set(on ? provider().id : undefined)} />
             </View>
           )}
         </Each>
@@ -256,7 +285,9 @@ function PiPage() {
           title={tr("Subscriptions and OAuth", "订阅与 OAuth")}
           description={tr("Sign in to Claude or ChatGPT plans in a terminal: run pi, then /login. Restart afterwards.", "在终端运行 pi 并输入 /login 登录订阅账号，完成后在此重启。")}
         >
-          <Button label={tr(`Restart ${activeAgent().name}`, `重启 ${activeAgent().name}`)} icon="refresh" onPress={() => void restartPi()} />
+          <If when={live()}>
+            <Button label={tr(`Restart ${name()}`, `重启 ${name()}`)} icon="refresh" onPress={() => void restartPi()} />
+          </If>
         </SettingRow>
         <Rule />
         <SettingRow
@@ -266,24 +297,38 @@ function PiPage() {
           <PathValue path={`${agentDir()}/models.json`} />
         </SettingRow>
       </SettingGroup>
-      <SettingGroup title={tr("While working", "运行期间")}>
-        <SettingRow title={tr("Steering messages", "引导消息")} description={tr("Delivered after the current tool call.", "当前工具调用结束后立即发送。")}>
-          <Segmented label={tr("Steering messages", "引导消息")} value={sessionState()?.steeringMode ?? "one-at-a-time"} options={queueOptions()} onChange={(mode) => void setSteeringMode(mode)} />
-        </SettingRow>
-        <Rule />
-        <SettingRow title={tr("Follow-up messages", "追问消息")} description={tr("Queued until the run finishes.", "排队等待整轮回复结束后发送。")}>
-          <Segmented label={tr("Follow-up messages", "追问消息")} value={sessionState()?.followUpMode ?? "one-at-a-time"} options={queueOptions()} onChange={(mode) => void setFollowUpMode(mode)} />
-        </SettingRow>
-      </SettingGroup>
-      <SettingGroup title={tr("Long sessions", "长会话")}>
-        <SettingRow title={tr("Compact automatically", "自动压缩")}>
-          <Switch label={tr("Compact automatically", "自动压缩")} checked={sessionState()?.autoCompactionEnabled ?? true} onChange={(on) => void setAutoCompaction(on)} />
-        </SettingRow>
-        <Rule />
-        <SettingRow title={tr("Retry automatically", "自动重试")}>
-          <Switch label={tr("Retry automatically", "自动重试")} checked={retry()} onChange={(on) => void setAutoRetry(on)} />
-        </SettingRow>
-      </SettingGroup>
+      <If when={!live()}>
+        <SettingGroup title={tr("While working", "运行期间")}>
+          <SettingRow
+            title={tr("Run behavior", "运行方式")}
+            description={tr(`Steering, follow-ups, compaction and retry are set on a running ${name()} session.`, `引导、追问、自动压缩与重试需在 ${name()} 会话运行时设置。`)}
+          >
+            <If when={props.agent.available}>
+              <Button label={tr(`Switch to ${name()}`, `切换到 ${name()}`)} onPress={() => void switchAgentHarness(props.agent.id)} />
+            </If>
+          </SettingRow>
+        </SettingGroup>
+      </If>
+      <If when={live()}>
+        <SettingGroup title={tr("While working", "运行期间")}>
+          <SettingRow title={tr("Steering messages", "引导消息")} description={tr("Delivered after the current tool call.", "当前工具调用结束后立即发送。")}>
+            <Segmented label={tr("Steering messages", "引导消息")} value={sessionState()?.steeringMode ?? "one-at-a-time"} options={queueOptions()} onChange={(mode) => void setSteeringMode(mode)} />
+          </SettingRow>
+          <Rule />
+          <SettingRow title={tr("Follow-up messages", "追问消息")} description={tr("Queued until the run finishes.", "排队等待整轮回复结束后发送。")}>
+            <Segmented label={tr("Follow-up messages", "追问消息")} value={sessionState()?.followUpMode ?? "one-at-a-time"} options={queueOptions()} onChange={(mode) => void setFollowUpMode(mode)} />
+          </SettingRow>
+        </SettingGroup>
+        <SettingGroup title={tr("Long sessions", "长会话")}>
+          <SettingRow title={tr("Compact automatically", "自动压缩")}>
+            <Switch label={tr("Compact automatically", "自动压缩")} checked={sessionState()?.autoCompactionEnabled ?? true} onChange={(on) => void setAutoCompaction(on)} />
+          </SettingRow>
+          <Rule />
+          <SettingRow title={tr("Retry automatically", "自动重试")}>
+            <Switch label={tr("Retry automatically", "自动重试")} checked={retry()} onChange={(on) => void setAutoRetry(on)} />
+          </SettingRow>
+        </SettingGroup>
+      </If>
     </Page>
   );
 }
@@ -387,18 +432,19 @@ function AgentHarnessRow(props: { agent: AgentHarnessStatus; editing: boolean; o
                 }}
               />
             </If>
-            <If when={props.agent.id !== "pi"}>
-              <IconButton
-                icon="sliders"
-                label={tr(`Configure ${props.agent.name}`, `配置 ${props.agent.name}`)}
-                onPress={() => {
-                  binPath.set(override()?.binaryPath ?? "");
-                  extraFlags.set((override()?.extraArgs ?? []).join(" "));
-                  apiKeyInput.set("");
-                  props.onEdit(true);
-                }}
-              />
+            <If when={managesProviders(props.agent)}>
+              <Button label={tr("Providers", "服务商")} size="sm" icon="plug" onPress={() => showAgentSettings(props.agent.id)} />
             </If>
+            <IconButton
+              icon="sliders"
+              label={tr(`Configure ${props.agent.name}`, `配置 ${props.agent.name}`)}
+              onPress={() => {
+                binPath.set(override()?.binaryPath ?? "");
+                extraFlags.set((override()?.extraArgs ?? []).join(" "));
+                apiKeyInput.set("");
+                props.onEdit(true);
+              }}
+            />
             <If when={props.agent.id !== "pi" && !props.agent.isCustom}>
               <Switch
                 label={tr(`Show ${props.agent.name} in picker`, `在选择器中启用 ${props.agent.name}`)}
@@ -494,8 +540,13 @@ function AgentHarnessRow(props: { agent: AgentHarnessStatus; editing: boolean; o
   );
 }
 
-function AgentsPage() {
-  const editing = signal<string | undefined>(undefined);
+/** The agents list. `focus` is an agent opened from outside (the Connect screen, the palette): it arrives with its configuration unfolded. */
+function AgentsPage(props: { focus?: string }) {
+  const editing = signal<string | undefined>(untracked(() => props.focus));
+  effect(() => {
+    const id = props.focus;
+    if (id) editing.set(id);
+  });
   const filter = signal<AgentFilter>("all");
   const query = signal("");
   const addingCustom = signal(false);
@@ -781,11 +832,11 @@ function General() {
         </SettingRow>
         <Rule />
         <SettingRow
-          title={tr("New thread background", "新对话背景")}
+          title={tr("Wallpaper", "壁纸")}
           description={
             wallpaper()
               ? `${wallpaper()!.name} · ${wallpaper()!.width}×${wallpaper()!.height}`
-              : tr("Shown behind the empty chat screen before a conversation starts.", "在开始新对话前的空白欢迎页顶部显示背景壁纸。")
+              : tr("A picture behind the whole window.", "铺在整个窗口之下的图片。")
           }
         >
           <View class="flex-row items-center gap-2">
@@ -804,14 +855,11 @@ function General() {
                 <>
                   <BaseButton
                     onPress={() => adjustOpen.set(true)}
-                    accessibilityLabel={tr("Preview and adjust background", "预览并调整背景")}
+                    accessibilityLabel={tr("Preview and adjust wallpaper", "预览并调整壁纸")}
                     class={`relative h-9 w-15 overflow-hidden rounded-md border border-border bg-sunken ${PRESS} ${FOCUS_RING}`}
                   >
                     <CroppedWallpaperSurface
                       config={wp()}
-                      viewportWidth={60}
-                      viewportHeight={36}
-                      adjustment={wp().adjustment}
                       effect={wallpaperEffect()}
                     />
                   </BaseButton>
@@ -873,11 +921,11 @@ function General() {
         <If when={wallpaper()}>
           <Rule />
           <SettingRow
-            title={tr("Background effect", "背景效果")}
+            title={tr("Wallpaper effect", "壁纸效果")}
             description={wallpaperEffectDescription(wallpaperEffect())}
           >
             <Segmented
-              label={tr("Background effect", "背景效果")}
+              label={tr("Wallpaper effect", "壁纸效果")}
               value={wallpaperEffect()}
               options={WALLPAPER_EFFECTS.map((eff) => ({
                 value: eff,
@@ -903,7 +951,7 @@ function General() {
         </If>
       </SettingGroup>
       <WallpaperAdjustDialog open={adjustOpen()} onClose={() => adjustOpen.set(false)} />
-      <SettingGroup title="Pip">
+      <SettingGroup title="pipi">
         <View class="gap-3 px-3 py-3">
           {(["cat", "dog"] as const).map((species) => (
             <View class="gap-1">
@@ -1397,8 +1445,8 @@ function About() {
         </View>
         <Text class="max-w-100 text-center text-sm text-muted-foreground">
           {tr(
-            "This is Pip, a little ghost. Pip thinks when the agent thinks, bobs and wags while it works, and jumps when a run ends well. Pick its coat in General — cats and dogs.",
-            "这是 Pip，一只小幽灵。智能体思考时它思考，工作时它飘动摇尾，运行圆满结束时它会欢快跃起。可在“常规”里给它换毛色——猫狗都有。",
+            "This is pipi, a little ghost. pipi thinks when the agent thinks, bobs and wags while it works, and jumps when a run ends well. Pick its coat in General — cats and dogs.",
+            "这是 pipi，一只小幽灵。智能体思考时它思考，工作时它飘动摇尾，运行圆满结束时它会欢快跃起。可在“常规”里给它换毛色——猫狗都有。",
           )}
         </Text>
       </View>
@@ -1415,11 +1463,7 @@ function About() {
   );
 }
 
-/** The Pi page is Pi's key manager (auth.json) and run knobs; other agents bring their own models and keys, set on the Agents page. */
-const sectionFor = (wanted: SettingsSection): SettingsSection => (wanted === "providers" && activeAgentId() !== "pi" ? "agents" : wanted);
-const visibleSections = () => SECTIONS.filter((item) => item.id !== "providers" || activeAgentId() === "pi");
-
-/** The section nav inside the settings panel. */
+/** The section nav inside the settings panel: the same sections whichever agent is active. */
 function SettingsNav(props: { section: SettingsSection }) {
   return (
     <View class="w-44 shrink-0 border-r border-border">
@@ -1427,7 +1471,7 @@ function SettingsNav(props: { section: SettingsSection }) {
         <Text class="px-2.5 pb-2 pt-2 text-xs font-medium text-subtle" role="header">
           {tr("Settings", "设置")}
         </Text>
-        <Each of={visibleSections()}>
+        <Each of={SECTIONS}>
           {(item) => (
             <BaseButton
               testID={`settings-nav-${item().id}`}
@@ -1445,14 +1489,21 @@ function SettingsNav(props: { section: SettingsSection }) {
   );
 }
 
-/** Settings floats over the chat: an in-window layer that blurs what is behind it; Escape or a press outside closes it. */
+/** Settings floats over the chat: an in-window layer over the backdrop every floating layer has (`SCRIM`), the window still in sight behind it; Escape or a press outside closes it. */
 export function Settings() {
   const open = () => currentView().name === "settings";
-  const shownSection = keepLast(() => {
+  const shown = keepLast<Extract<AppView, { name: "settings" }>>(() => {
     const view = currentView();
-    return view.name === "settings" ? sectionFor(view.section) : undefined;
-  }, "general" as SettingsSection);
-  const section = () => shownSection() ?? "general";
+    return view.name === "settings" ? view : undefined;
+  });
+  const section = (): SettingsSection => shown()?.section ?? "general";
+  const focusedAgent = () => (section() === "agents" ? shown()?.agent : undefined);
+  /** The agent whose own page is open inside Agents; one without a page unfolds in the list instead. */
+  const pagedAgent = () => {
+    const id = focusedAgent();
+    const agent = id ? availableAgents().find((a) => a.id === id) : undefined;
+    return agent && managesProviders(agent) ? agent : undefined;
+  };
 
   const mounted = signal(untracked(open));
   const scrimOpacity = createAnimatedValue(untracked(open) ? 1 : 0);
@@ -1517,7 +1568,7 @@ export function Settings() {
   return (
     <If when={mounted()}>
       <View class={`absolute inset-0 z-40 items-center justify-center p-6${open() ? "" : " pointer-events-none"}`}>
-        <View class="absolute inset-0" style={{ ...SETTINGS_SCRIM, opacity: scrimOpacity }} />
+        <View class={`absolute inset-0 ${SCRIM}`} style={{ opacity: scrimOpacity }} />
         <BaseButton onPress={showChat} accessibilityLabel={tr("Close settings", "关闭设置")} class="absolute inset-0" />
         <View
           class={`h-full max-h-160 w-full max-w-220 min-h-0 flex-row overflow-hidden ${POPUP}`}
@@ -1528,12 +1579,10 @@ export function Settings() {
             <If when={section() === "general"}>
               <General />
             </If>
-            <If when={section() === "providers"}>
-              <PiPage />
+            <If when={section() === "agents" && !pagedAgent()}>
+              <AgentsPage focus={focusedAgent()} />
             </If>
-            <If when={section() === "agents"}>
-              <AgentsPage />
-            </If>
+            <If when={pagedAgent()}>{(agent) => <AgentProvidersPage agent={agent()} />}</If>
             <If when={section() === "archive"}>
               <ArchivePage />
             </If>

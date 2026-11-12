@@ -8,7 +8,7 @@ const launch = (scenario = "welcome", options: OpenOptions = {}) =>
 test("greets with Pip and lists the folder's sessions", async () => {
   const app = await launch();
   await app.waitFor("text:What are we building?");
-  expect(app.count("label:Pip")).toBeGreaterThan(0);
+  expect(app.count("label:pipi")).toBeGreaterThan(0);
   expect(app.texts()).toContain("Refactor the transcript reducer");
   expect(app.texts()).not.toContain("Today");
   expect(app.texts()).toContain("Claude Sonnet 4.5");
@@ -89,16 +89,53 @@ test("switches sessions and starts a new one", async () => {
   await app.waitFor("text:What are we building?");
 });
 
-test("without a provider, leads to Providers and connects one", async () => {
+test("without a provider, leads to the agent's providers and connects one", async () => {
   const app = await launch("connect");
   await app.waitFor("text:Connect a model to begin");
-  await app.press("text:Add a Provider");
+  await app.press("text:Configure Pi");
   await app.waitFor("text:Anthropic");
   await app.press("text:Add Key >> nth=0");
   await app.type("label:Anthropic API key", "sk-ant-test");
   await app.press("text:Save");
   await app.waitFor("text:Key saved. The provider's models are ready.");
   expect(app.texts().some((text) => text.startsWith("API key · "))).toBe(true);
+});
+
+test("Settings keeps the same sections whichever agent is active; Pi's providers sit under Agents", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  const sections = ["general", "agents", "archive", "usage", "about"];
+  const shown = () => sections.map((id) => app.count(`id:settings-nav-${id}`));
+
+  // On Pi: no section of its own; its providers open from its row and lead back to the list.
+  await app.press("label:Settings");
+  await app.waitFor("id:settings-nav-agents");
+  expect(shown()).toEqual([1, 1, 1, 1, 1]);
+  expect(app.count("id:settings-nav-providers")).toBe(0);
+  await app.press("id:settings-nav-agents");
+  await app.waitFor("text:Coding Agent Harnesses");
+  await app.press("text:Providers");
+  await app.waitFor("text:Anthropic");
+  expect(app.texts()).toContain("Steering messages");
+  await app.press("id:settings-back");
+  await app.waitFor("text:Coding Agent Harnesses");
+  await app.press("label:Settings");
+  await app.waitUntil(() => app.count("id:settings-nav-agents") === 0);
+
+  // On another agent: the same sections, and Pi's keys still there to manage.
+  await app.press("id:agent-chip");
+  await app.press("id:agent-picker >> text:Claude Code");
+  await app.waitFor("text:Claude Code Default");
+  await app.press("label:Settings");
+  await app.waitFor("id:settings-nav-agents");
+  expect(shown()).toEqual([1, 1, 1, 1, 1]);
+  await app.press("id:settings-nav-agents");
+  await app.waitFor("text:Coding Agent Harnesses");
+  await app.press("text:Providers");
+  await app.waitFor("text:Anthropic");
+  // The run knobs belong to a running Pi session: here they give way to the switch.
+  expect(app.texts()).not.toContain("Steering messages");
+  expect(app.texts()).toContain("Switch to Pi");
 });
 
 test("changes the model from the composer", async () => {
@@ -167,12 +204,12 @@ test("follows a Chinese system locale and switches language live in Settings", a
   await app.press("label:Settings");
   await app.waitFor("text:General >> nth=0");
   await app.waitFor("text:Language");
-  expect(app.texts()).toContain("New thread background");
+  expect(app.texts()).toContain("Wallpaper");
   expect(app.texts()).toContain("Wallpaper folder");
   await app.press("text:中文");
   await app.waitFor("text:语言");
   expect(app.texts()).toContain("主题");
-  expect(app.texts()).toContain("新对话背景");
+  expect(app.texts()).toContain("壁纸");
   expect(app.texts()).toContain("壁纸文件夹");
   expect(app.texts()).toContain("智能体");
   await app.keyboard.press("escape");

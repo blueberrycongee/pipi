@@ -1,6 +1,5 @@
 // Injected Pi Orchestration & Permission Extension (`sidecar/pipi-orchestrator-extension.mjs`):
 //
-// Modeled directly on t3code's `packages/provider-pi/src/server/mcpExtensionSource.ts`.
 // Passed to Pi via `--extension sidecar/pipi-orchestrator-extension.mjs`:
 // 1. Enforces pipi's shared RuntimeMode (`approval-required` / `auto-accept-edits` / `full-access`)
 //    using Pi's public blocking `tool_call` hook -> `ctx.ui.confirm(...)` (which renders natively

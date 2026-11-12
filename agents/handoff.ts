@@ -1,8 +1,7 @@
 import type { Row } from "../pi/transcript";
 
 /**
- * Portable Context Handoff (modeled on `t3code`'s `handoffBudget.ts` and
- * `docs/user/portable-handoffs.md`):
+ * Portable Context Handoff:
  *
  * When the user switches coding agents mid-conversation (e.g., from Pi to
  * Claude Code, or from Claude Code to Codex), or continues a delegated run
@@ -106,7 +105,7 @@ function renderItem(item: HandoffItem, fromAgent: string): string {
 }
 
 /**
- * Selects intact historical items within `budgetBytes` following t3code's priority order,
+ * Selects intact historical items within `budgetBytes` in priority order,
  * preserving chronological order in the resulting handoff payload.
  */
 export function buildPortableHandoff(input: {
@@ -143,7 +142,7 @@ export function buildPortableHandoff(input: {
     remaining -= cost;
   };
 
-  // Priority order (matching t3code `selectHistory`):
+  // Priority order:
   // 1. Latest user message, 2. Latest assistant reply, 3. Original user message, 4. Newest-to-oldest fill.
   for (let i = items.length - 1; i >= 0; i--) {
     if (items[i].role === "user") {

@@ -47,10 +47,15 @@ test("states", async () => {
     await shot(app, `history-${scheme}`);
     await app.press("label:Settings");
     await shot(app, `settings-general-${scheme}`);
-    for (const section of ["providers", "agents", "usage", "about"]) {
+    for (const section of ["agents", "usage", "about"]) {
       await app.press(`id:settings-nav-${section}`);
       await shot(app, `settings-${section}-${scheme}`);
     }
+    // An agent's own page opens from its row in Agents.
+    await app.press("id:settings-nav-agents");
+    await app.press("text:Providers");
+    await app.waitFor("text:Anthropic");
+    await shot(app, `settings-providers-${scheme}`);
 
     app = await launch("connect", scheme);
     await app.waitFor("text:Connect a model to begin");

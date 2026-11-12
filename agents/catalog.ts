@@ -36,15 +36,7 @@ export interface BuiltinAgentSpec {
 
 const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-function makeModel(
-  provider: string,
-  id: string,
-  name: string,
-  contextWindow = 200_000,
-  maxTokens = 16_384,
-  image = true,
-  cost = zeroCost,
-): Model {
+function makeModel(provider: string, id: string, name: string, image = true, cost = zeroCost): Model {
   return {
     id,
     name,
@@ -52,8 +44,6 @@ function makeModel(
     provider,
     reasoning: true,
     input: image ? ["text", "image"] : ["text"],
-    contextWindow,
-    maxTokens,
     cost,
   };
 }
@@ -66,7 +56,7 @@ function makeModel(
  * `extraArgs`. No fabricated lists.
  */
 function defaultEngineModels(provider: string, name: string): Model[] {
-  const model = makeModel(provider, "default", `${name} Default`, 200_000, 16_384, false);
+  const model = makeModel(provider, "default", `${name} Default`, false);
   model.reasoning = false;
   return [model];
 }
@@ -369,8 +359,6 @@ export function acpDefaultModel(custom: CustomAgentConfig): Model {
     provider: custom.id,
     reasoning: true,
     input: ["text"],
-    contextWindow: 128_000,
-    maxTokens: 16_384,
     cost: zeroCost,
   };
 }
@@ -420,7 +408,7 @@ export function defaultAgentStatuses(
   return [...builtins, ...customStatuses];
 }
 
-// ── Runtime Mode Ceiling (from t3code's delegatedTaskModes.ts) ──────────────
+// ── Runtime Mode Ceiling ─────────────────────────────────────────────────────
 
 export function runtimeModeRank(mode: RuntimeMode): number {
   switch (mode) {
@@ -460,7 +448,7 @@ export function resolveRuntimeMode(
   return allowed[0] ?? "approval-required";
 }
 
-/** Wraps a delegated task prompt with its assigned sub-agent role, matching t3code. */
+/** Wraps a delegated task prompt with its assigned sub-agent role. */
 export function formatRoleTaskPrompt(task: string, role: DelegateRole = "general"): string {
   const trimmed = task.trim();
   switch (role) {
