@@ -213,6 +213,13 @@ rmSync(appArchive, { force: true });
 await stapler("staple", app);
 await stapler("validate", app);
 
+// The updater's download is the nsh-named archive of the signed, stapled app —
+// `nsh package` wrote one before signing, so it is rebuilt here from the final
+// bundle.
+console.log("Writing the signed update archive");
+const updateArchive = join(releaseDir, `pipi-${version}-macos-aarch64.tar.gz`);
+run("tar", ["-czf", updateArchive, "-C", dirname(app), basename(app)]);
+
 console.log(`Building ${archiveName}`);
 const uploadArchive = join(releaseDir, "submission.dmg");
 makeDmg(uploadArchive);

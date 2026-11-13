@@ -48,6 +48,7 @@ jobs:
           name: pipi-mac-arm64
           path: |
             release/pipi-*-mac-arm64.dmg
+            release/pipi-*-macos-aarch64.tar.gz
             release/verification.json
           if-no-files-found: error
           retention-days: 30
@@ -81,7 +82,9 @@ jobs:
           $v = (Get-Content nsh.json -Raw | ConvertFrom-Json).version
           New-Item -ItemType Directory release | Out-Null
           Get-ChildItem .nsh/out -File -Filter 'pipi*' | ForEach-Object {
-            $dest = $_.Name -replace '^pipi', "pipi-$v-windows-x64"
+            # Archives already carrying the nsh package name keep it — the
+            # update manifest parses <name>-<version>-<os>-<arch>.
+            $dest = $_.Name -match '^pipi-\d' ? $_.Name : ($_.Name -replace '^pipi', "pipi-$v-windows-x64")
             Copy-Item $_.FullName (Join-Path release $dest)
           }
           Get-ChildItem release
@@ -113,7 +116,13 @@ jobs:
           mkdir release
           for f in .nsh/out/pipi*; do
             [ -f "$f" ] || continue
-            mv "$f" "release/$(basename "$f" | sed "s/^pipi/pipi-$v-linux-x64/")"
+            b=$(basename "$f")
+            # Archives already carrying the nsh package name keep it — the
+            # update manifest parses <name>-<version>-<os>-<arch>.
+            case "$b" in
+              pipi-[0-9]*) mv "$f" "release/$b" ;;
+              *) mv "$f" "release/$(printf '%s' "$b" | sed "s/^pipi/pipi-$v-linux-x64/")" ;;
+            esac
           done
           ls -la release
       - uses: actions/upload-artifact@v4
@@ -163,6 +172,13 @@ jobs:
           EOF
           # The update manifest the app's updater reads (`updater.github` in
           # nsh.json): written next to the archives, published beside them.
-          nsh update-manifest dist/pipi-* --notes release-notes.md -o dist
+          # Only the nsh-named update archives parse — the dmg, installers and
+          # receipts are assets, not manifest entries.
+          v="${RELEASE_TAG#v}"
+          nsh update-manifest \
+            "dist/pipi-$v-macos-aarch64.tar.gz" \
+            "dist/pipi-$v-windows-x86_64.zip" \
+            "dist/pipi-$v-linux-x86_64.tar.gz" \
+            --notes release-notes.md -o dist
           gh release create "$RELEASE_TAG" --verify-tag --title "pipi $RELEASE_TAG" \
             --notes-file release-notes.md dist/*
