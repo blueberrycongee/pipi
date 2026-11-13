@@ -17,7 +17,7 @@ import {
   thinkingLabel,
   type TurnHeaderRow,
 } from "../pi/turns";
-import { copyMessage, copyText, forkFrom, transcriptRows } from "../store/app";
+import { copyMessage, copyText, daemonSessionOfId, forkFrom, openDaemonSession, transcriptRows } from "../store/app";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
@@ -671,40 +671,72 @@ function ToolDetail(props: { row: ToolRow; insetClass?: string }) {
   );
 }
 
+/** Extracts a navigable daemon session id from a session-tool call (`session_start`, `session_send`, etc.). */
+function sessionIdOfTool(row: ToolRow): string | undefined {
+  const lower = row.name.replace(/^mcp__[^_]+__/i, "").toLowerCase();
+  if (lower === "session_start" && row.output) {
+    try {
+      const parsed = JSON.parse(row.output) as { id?: unknown };
+      if (typeof parsed?.id === "string" && parsed.id && daemonSessionOfId(parsed.id)) return parsed.id;
+    } catch {
+      // Output may be partial or an error text.
+    }
+  }
+  if (lower === "session_send" || lower === "session_read" || lower === "session_stop") {
+    const id = typeof row.args?.session === "string" ? row.args.session : undefined;
+    if (id && daemonSessionOfId(id)) return id;
+  }
+  return undefined;
+}
+
 function ToolCallRow(props: { row: ToolRow; compact?: boolean }) {
   const open = () => isOpen(props.row.id, false);
   const desc = () => describeToolCall(props.row, activeLanguage());
   const running = () => props.row.status === "call" || props.row.status === "queued" || props.row.status === "running";
+  const targetSession = () => sessionIdOfTool(props.row);
 
   return (
-    <Collapsible open={open()} reveal content={<ToolDetail row={props.row} />}
-    >
-      <Disclosure open={open()} compact={props.compact} onPress={() => toggle(props.row.id, false)}>
-        <LeadGlyph
-          id={props.row.id}
-          running={running()}
-          error={props.row.status === "error"}
-          icon={desc().icon}
-        />
-        <RollingText
-          id={() => props.row.id}
-          text={() => desc().verb}
-          class={`shrink-0 text-sm ${props.row.status === "error" ? "font-medium text-destructive" : "text-muted-foreground"}`}
-        />
-        <If when={desc().target}>
-          <Text
-            class={`min-w-0 shrink truncate ${
-              desc().monoTarget ? "font-mono text-xs text-foreground" : "text-sm text-foreground"
-            }`}
-          >
-            {desc().target}
-          </Text>
+    <Collapsible open={open()} reveal content={<ToolDetail row={props.row} />}>
+      <View class="flex-row items-center gap-1">
+        <View class="min-w-0 flex-1">
+          <Disclosure open={open()} compact={props.compact} onPress={() => toggle(props.row.id, false)}>
+            <LeadGlyph
+              id={props.row.id}
+              running={running()}
+              error={props.row.status === "error"}
+              icon={desc().icon}
+            />
+            <RollingText
+              id={() => props.row.id}
+              text={() => desc().verb}
+              class={`shrink-0 text-sm ${props.row.status === "error" ? "font-medium text-destructive" : "text-muted-foreground"}`}
+            />
+            <If when={desc().target}>
+              <Text
+                class={`min-w-0 shrink truncate ${
+                  desc().monoTarget ? "font-mono text-xs text-foreground" : "text-sm text-foreground"
+                }`}
+              >
+                {desc().target}
+              </Text>
+            </If>
+            <If when={desc().meta}>
+              <Text class="shrink-0 truncate text-xs text-subtle">{desc().meta}</Text>
+            </If>
+            <DiffBadge stats={desc().diffStats} />
+          </Disclosure>
+        </View>
+        <If when={targetSession()}>
+          {(sid) => (
+            <IconButton
+              icon="external"
+              size="sm"
+              label={tr("Open session", "打开会话")}
+              onPress={() => openDaemonSession(sid())}
+            />
+          )}
         </If>
-        <If when={desc().meta}>
-          <Text class="shrink-0 truncate text-xs text-subtle">{desc().meta}</Text>
-        </If>
-        <DiffBadge stats={desc().diffStats} />
-      </Disclosure>
+      </View>
     </Collapsible>
   );
 }
@@ -720,6 +752,10 @@ function ActivityView(props: { row: ActivityRow }) {
   const title = () => describeActivity(props.row, activeLanguage());
   const pulseOpacity = useBreathingOpacity(() => props.row.running, 0.55, 1300);
   const only = () => (props.row.steps.length === 1 ? props.row.steps[0] : undefined);
+  const onlySession = () => {
+    const step = only();
+    return step?.kind === "tool" ? sessionIdOfTool(step) : undefined;
+  };
   const hasBody = () => {
     const step = only();
     return !step || step.kind === "tool" || Boolean(step.text.trim());
@@ -755,9 +791,21 @@ function ActivityView(props: { row: ActivityRow }) {
         </If>
       }
     >
-      <ProcessLine open={open() && hasBody()} onPress={hasBody() ? () => toggle(props.row.id, false) : undefined}>
-        <RollingText id={() => props.row.id} text={title} class="min-w-0 shrink truncate text-md text-subtle" style={{ opacity: pulseOpacity }} />
-      </ProcessLine>
+      <View class="flex-row items-center gap-1">
+        <ProcessLine open={open() && hasBody()} onPress={hasBody() ? () => toggle(props.row.id, false) : undefined}>
+          <RollingText id={() => props.row.id} text={title} class="min-w-0 shrink truncate text-md text-subtle" style={{ opacity: pulseOpacity }} />
+        </ProcessLine>
+        <If when={onlySession()}>
+          {(sid) => (
+            <IconButton
+              icon="external"
+              size="sm"
+              label={tr("Open session", "打开会话")}
+              onPress={() => openDaemonSession(sid())}
+            />
+          )}
+        </If>
+      </View>
     </Collapsible>
   );
 }
@@ -900,6 +948,50 @@ function SummaryRow(props: { row: Extract<Row, { kind: "summary" }> }) {
   );
 }
 
+/** An answer delivered back from another session (`<pipi-message>`): one labelled divider, its text unfolds. */
+function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
+  const open = () => isOpen(props.row.id, false);
+  const label = () =>
+    props.row.status === "blocked"
+      ? tr(`${props.row.fromTitle} is waiting on you`, `「${props.row.fromTitle}」在等待你确认`)
+      : props.row.status === "failed"
+        ? tr(`${props.row.fromTitle} stopped`, `「${props.row.fromTitle}」已停止`)
+        : tr(`Answer from ${props.row.fromTitle}`, `「${props.row.fromTitle}」的回答`);
+  return (
+    <Collapsible
+      open={open()}
+      reveal
+      content={
+        <View class="mt-2 rounded-lg border border-border bg-card px-3 py-2.5">
+          <TextView markdown={props.row.text} selectable classes={{ ...PROSE, root: "gap-2 text-sm text-muted-foreground" }} />
+        </View>
+      }
+    >
+      <View
+        role="button"
+        onPress={() => toggle(props.row.id, false)}
+        accessibilityState={{ expanded: open() }}
+        accessibilityLabel={label()}
+        class={`h-7 select-none flex-row items-center gap-3 rounded-md ${FOCUS_RING}`}
+      >
+        <View class="h-px flex-1 bg-border" />
+        <Icon name="agents" size={14} tone="brand-text" />
+        <Text class="max-w-96 truncate text-xs text-muted-foreground">{label()}</Text>
+        <If when={props.row.status === "blocked"}>
+          <View class="size-1.5 rounded-full bg-warning" />
+        </If>
+        <IconButton
+          icon="external"
+          size="sm"
+          label={tr(`Open ${props.row.fromTitle}`, `打开「${props.row.fromTitle}」`)}
+          onPress={() => openDaemonSession(props.row.from)}
+        />
+        <View class="h-px flex-1 bg-border" />
+      </View>
+    </Collapsible>
+  );
+}
+
 /** A row of the chat's list: the projection's, with each reply as a row per block (and its actions after it, once finished). */
 export type ChatRow = Exclude<DisplayRow, { kind: "text" }> | ProseRow | ReplyActionsRow;
 
@@ -907,13 +999,16 @@ export type ChatRow = Exclude<DisplayRow, { kind: "text" }> | ProseRow | ReplyAc
 const SPACING: Record<ChatRow["kind"], string> = {
   user: "pt-7",
   turn: "pt-1.5 pb-2",
-  prose: "py-1.5",
+  // Selection drops target line boxes only, so room between a reply's blocks is
+  // where a drag dead-ends back to the block before; keep it thin.
+  prose: "py-0.5",
   actions: "pb-1",
   thinking: "py-1",
   activity: "py-1",
   bash: "py-1",
   notice: "py-2",
   summary: "py-3",
+  delivery: "py-3",
 };
 
 /** One row of the transcript. */
@@ -945,6 +1040,7 @@ export function TranscriptRow(props: { row: ChatRow }) {
             <If when={of("bash")}>{(row) => <BashRow row={row()} />}</If>
             <If when={of("notice")}>{(row) => <NoticeRow row={row()} />}</If>
             <If when={of("summary")}>{(row) => <SummaryRow row={row()} />}</If>
+            <If when={of("delivery")}>{(row) => <DeliveryRow row={row()} />}</If>
           </View>
         </View>
       }

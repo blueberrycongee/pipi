@@ -1,11 +1,13 @@
 import { computed, createMotion, Text, View } from "nsh";
 import { Command, type CommandItem, Dialog } from "nsh/base";
+import { runtimeModeRank } from "../agents/catalog";
 import type { RuntimeMode } from "../agents/types";
 import { basename, tildePath } from "../lib/format";
 import { sessionTitle } from "../pi/sessions";
 import {
   activeAgent,
   activeAgentId,
+  activeProjectPath,
   archiveCurrentSession,
   archivedSessionItems,
   availableAgents,
@@ -18,6 +20,9 @@ import {
   compactNow,
   copyLastReply,
   createAndOpenWorktree,
+  currentDaemonId,
+  currentRuntimeCeiling,
+  daemonSessions,
   duplicateSession,
   exportHtml,
   gitWorkspaceInfo,
@@ -25,14 +30,17 @@ import {
   isPaletteOpen,
   newSession,
   newSessionInWorkspace,
+  openDaemonSession,
   openSession,
   openWorkspace,
+  projectCwdOf,
   randomWallpaper,
   restartPi,
   runtimeMode,
   savedSessions,
+  sessionParentOf,
   sessionState,
-  setOrchestrateOpen,
+  setCompareOpen,
   setPaletteOpen,
   showAgentSettings,
   showSettings,
@@ -111,7 +119,7 @@ export function Palette() {
       { id: "compact", label: tr("Compact Context", "压缩上下文"), group: sessionGroup, keywords: ["compact context"], icon: "compact", run: () => void compactNow() },
       { id: "copy", label: tr("Copy Last Reply", "复制最后一条回复"), group: sessionGroup, keywords: ["copy last reply"], icon: "copy", run: () => void copyLastReply() },
       { id: "export", label: tr("Export as HTML", "导出为 HTML"), group: sessionGroup, keywords: ["export html"], icon: "download", run: () => void exportHtml() },
-      { id: "orchestrate", label: tr("Orchestrate Multiple Agents…", "多智能体协同编排…"), group: agentsGroup, keywords: ["orchestrate", "parallel", "pipeline", "delegate", "subagent", "swarm", "编排", "并行", "子智能体"], shortcut: "mod+shift+o", icon: "fork", run: () => setOrchestrateOpen(true) },
+      { id: "orchestrate", label: tr("Compare Agents…", "智能体并行对比…"), group: agentsGroup, keywords: ["orchestrate", "parallel", "compare", "subagent", "swarm", "编排", "并行", "对比", "子智能体"], shortcut: "mod+shift+o", icon: "fork", run: () => setCompareOpen(true) },
       { id: "agents-settings", label: tr("Configure External Coding Agents…", "配置外部编码智能体…"), group: agentsGroup, keywords: ["claude", "codex", "opencode", "cursor", "acp", "agents", "智能体"], icon: "agents", run: () => showSettings("agents") },
       ...availableAgents()
         .filter((a) => a.available)
@@ -126,17 +134,19 @@ export function Palette() {
             run: () => void switchAgentHarness(a.id),
           }),
         ),
-      ...permissionModes.map(
-        (m): Action => ({
-          id: `permission:${m}`,
-          label: tr(`Permissions: ${runtimeModeText(m).label}`, `权限上限：${runtimeModeText(m).label}`),
-          group: agentsGroup,
-          keywords: ["permission", "approval", "sandbox", "mode", m, "权限"],
-          icon: runtimeModeIcon(m),
-          checked: runtimeMode() === m,
-          run: () => void changeRuntimeMode(m),
-        }),
-      ),
+      ...permissionModes
+        .filter((m) => runtimeModeRank(m) <= runtimeModeRank(currentRuntimeCeiling()))
+        .map(
+          (m): Action => ({
+            id: `permission:${m}`,
+            label: tr(`Permissions: ${runtimeModeText(m).label}`, `权限：${runtimeModeText(m).label}`),
+            group: agentsGroup,
+            keywords: ["permission", "approval", "sandbox", "mode", m, "权限"],
+            icon: runtimeModeIcon(m),
+            checked: runtimeMode() === m,
+            run: () => void changeRuntimeMode(m),
+          }),
+        ),
       { id: "folder", label: tr("Add Project Folder…", "添加项目文件夹…"), group: workspaceGroup, keywords: ["open folder", "add project", "workspace", "项目", "工作区"], shortcut: "mod+o", icon: "folderPlus", run: () => void chooseWorkspace() },
       ...(gitWorkspaceInfo().isGitRepo
         ? [
@@ -207,24 +217,45 @@ export function Palette() {
           run: () => void chooseModel(item),
         }),
       ),
-      ...[...new Set([workspacePath(), ...recentWorkspaces()].filter(Boolean))]
+      ...[...new Set([activeProjectPath(), ...recentWorkspaces()].filter(Boolean))]
         .flatMap((cwd) => {
-          const list = cwd === workspacePath() ? savedSessions() : (workspaceSessions()[cwd] ?? []);
+          const list = cwd === activeProjectPath() ? savedSessions() : (workspaceSessions()[cwd] ?? []);
           return list.map((session) => ({ cwd, session }));
         })
         .slice(0, 60)
         .map(({ cwd, session }): Action => {
           const folder = basename(cwd);
           const multi = recentWorkspaces().length > 1;
-          const title = sessionTitle(session, tr("New session", "新会话"));
+          const rawTitle = sessionTitle(session, tr("New session", "新会话"));
+          const parent = sessionParentOf(session.path);
+          const title = parent ? `${parent.title} › ${rawTitle}` : rawTitle;
           return {
             id: `session:${cwd}:${session.path}`,
             label: multi && folder ? `${folder} / ${title}` : title,
             group: tr("Sessions", "历史会话"),
-            keywords: [folder, title, "session"],
+            keywords: [folder, title, rawTitle, "session"],
             icon: "message",
-            checked: cwd === workspacePath() && session.path === sessionState()?.sessionFile,
+            checked: cwd === activeProjectPath() && session.path === sessionState()?.sessionFile,
             run: () => void openSession(session.path, cwd),
+          };
+        }),
+      ...daemonSessions()
+        .filter((ds) => !ds.file && (ds.parentId || ds.initiator === "external"))
+        .slice(0, 30)
+        .map((ds): Action => {
+          const cwd = projectCwdOf(ds.cwd, ds);
+          const folder = basename(cwd);
+          const multi = recentWorkspaces().length > 1;
+          const parent = ds.parentId ? daemonSessions().find((p) => p.id === ds.parentId) : undefined;
+          const title = parent ? `${parent.title} › ${ds.title}` : ds.title;
+          return {
+            id: `daemon-session:${ds.id}`,
+            label: multi && folder ? `${folder} / ${title}` : title,
+            group: tr("Sessions", "历史会话"),
+            keywords: [folder, title, ds.title, "session"],
+            icon: "message",
+            checked: ds.id === currentDaemonId(),
+            run: () => openDaemonSession(ds.id),
           };
         }),
       ...archivedSessionItems()

@@ -1,8 +1,9 @@
 // Stdio-to-HTTP MCP proxy (`sidecar/pipi-mcp-stdio.mjs`):
 //
 // Injected into external coordinator agents (`Claude Code`, `Codex`, `ACP`) so they
-// receive the exact same `orchestrator_capabilities`, `delegate_task`, `task_status`,
-// and `task_cancel` MCP tools as Pi!
+// receive the same six session tools (`agents_list`, `sessions_list`, `session_read`,
+// `session_send`, `session_start`, `session_stop`) as Pi — the daemon resolves the
+// calling session from this proxy's injected bearer token.
 const endpoint = process.env.PIPI_ORCHESTRATOR_URL || "";
 const token = process.env.PIPI_ORCHESTRATOR_TOKEN || "";
 

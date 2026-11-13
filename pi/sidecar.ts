@@ -11,11 +11,14 @@ import { stdinWriter } from "./stdin";
 
 // Keep all sidecar Node helpers referenced as URL assets so `nsh package` ships
 // every `sidecar/*.mjs` file inside `Contents/Resources/nsh/assets/sidecar/`.
+import daemonClientAsset from "../sidecar/daemon-client.mjs?url";
+import daemonLinkAsset from "../sidecar/daemon-link.mjs?url";
 import envPathsAsset from "../sidecar/env-paths.mjs?url";
 import externalAgentAsset from "../sidecar/external-agent.mjs?url";
 import launchPiAsset from "../sidecar/launch-pi.mjs?url";
 import listSessionsAsset from "../sidecar/list-sessions.mjs?url";
-import orchestratorDaemonAsset from "../sidecar/orchestrator-daemon.mjs?url";
+import pipiCliAsset from "../sidecar/pipi-cli.mjs?url";
+import pipiDaemonAsset from "../sidecar/pipi-daemon.mjs?url";
 import pipiMcpStdioAsset from "../sidecar/pipi-mcp-stdio.mjs?url";
 import pipiOrchestratorExtensionAsset from "../sidecar/pipi-orchestrator-extension.mjs?url";
 import probeAgentsAsset from "../sidecar/probe-agents.mjs?url";
@@ -23,11 +26,14 @@ import usageStatsAsset from "../sidecar/usage-stats.mjs?url";
 import worktreeAsset from "../sidecar/worktree.mjs?url";
 
 void [
+  daemonClientAsset,
+  daemonLinkAsset,
   envPathsAsset,
   externalAgentAsset,
   launchPiAsset,
   listSessionsAsset,
-  orchestratorDaemonAsset,
+  pipiCliAsset,
+  pipiDaemonAsset,
   pipiMcpStdioAsset,
   pipiOrchestratorExtensionAsset,
   probeAgentsAsset,
@@ -566,7 +572,6 @@ export async function startAgent(options: StartAgentOptions): Promise<Transport>
       orchestratorUrl: options.orchestratorUrl,
       orchestratorToken: options.orchestratorToken,
       extraArgs: options.extraArgs,
-      isSubagent: options.isSubagent,
     });
     try {
       const child = await spawnNode([launcher, payload], { cwd, stdin: "pipe" });
@@ -588,7 +593,6 @@ export async function startAgent(options: StartAgentOptions): Promise<Transport>
     customAgent: options.customAgent,
     orchestratorUrl: options.orchestratorUrl,
     orchestratorToken: options.orchestratorToken,
-    isSubagent: options.isSubagent,
   });
   try {
     const child = await spawnNode([bridge, payload], { cwd, stdin: "pipe" });

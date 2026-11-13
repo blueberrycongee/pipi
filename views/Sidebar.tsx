@@ -1,42 +1,52 @@
-import { computed, createAnimatedValue, effect, openUrl, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
+import { computed, createAnimatedValue, effect, openUrl, platform, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
 import type { JSX } from "nsh";
 import { AlertDialog, Button as BaseButton, Collapsible } from "nsh/base";
 import { Menu, type MenuItem, titleBar } from "nsh/desktop";
 import { basename, tildePath } from "../lib/format";
 import { tr } from "../lib/i18n";
 import { Pip } from "../mascot/Pip";
+import type { DaemonSession } from "../pi/daemon";
 import { type SessionSummary, sessionTitle } from "../pi/sessions";
 import { AgentLogo } from "../ui/AgentLogo";
 import {
   activeAgentId,
+  activeProjectPath,
   archivedSessionItems,
   archiveSession,
   availableAgents,
+  childSessionsOf,
+  childSessionsOfDaemon,
+  childSessionsOfOpen,
   chooseWorkspace,
   closeWorkspace,
   copyText,
+  currentDaemonId,
+  currentDaemonSession,
   currentTitle,
   currentView,
+  daemonSessionByFile,
+  daemonSessionOfId,
+  daemonSessions,
   isRunning,
   isSessionRunning,
   isSessionUnread,
   newSession,
   newSessionInWorkspace,
+  openDaemonSession,
   openSession,
   openWorkspace,
   pendingSession,
+  projectCwdOf,
   removeSession,
-  runningDelegatedCount,
   savedSessions,
   sessionsReady,
   sessionState,
-  setOrchestrateOpen,
   showChat,
   showSettings,
   sidecarPhase,
   startRenaming,
+  stopDaemonSession,
   unarchiveSession,
-  workspacePath,
   workspaceSessions,
 } from "../store/app";
 import { backend } from "../store/backend";
@@ -57,7 +67,7 @@ import { FOCUS_RING, PRESS, WALLPAPER_FROST } from "../ui/styles";
 import { tip } from "../ui/Tip";
 
 /** A row inside an expanded workspace folder: a saved session. */
-type FolderItem = { id: string; session: SessionSummary };
+type FolderItem = { id: string; session?: SessionSummary; child?: DaemonSession };
 
 type GroupId = "workspaces" | "recents" | "archived";
 
@@ -70,6 +80,12 @@ const REPO_URL = "https://github.com/blueberrycongee/pipi";
 const ICON_SLOT = "size-5 shrink-0 items-center justify-center";
 /** Trailing 24pt slot (`right-1` inside `px-2`) centered on the sidebar's 24pt right axis. */
 const TRAILING_SLOT = "pointer-events-none absolute right-1 top-0.5 size-6 flex-row items-center justify-center";
+/**
+ * Window controls stand at the sidebar strip's left end (macOS's traffic
+ * lights; a Linux layout can place them there too — `titleBar().left`).
+ * `platform.os` covers them headless, where `titleBar()` reports zeros.
+ */
+const leftControls = () => platform.os === "macos" || titleBar().left > 0;
 const ROW_PRESS = `${PRESS} ${FOCUS_RING} hover:bg-sidebar-accent group-hover:bg-sidebar-accent active:bg-sidebar-accent`;
 /**
  * The pointer rests while rows slide under it — a draft row opening or closing
@@ -91,13 +107,20 @@ let explicitDraftGroup: GroupId | undefined;
 
 /** The open project folders: the active one first, then the recents it also leads. */
 const projects = computed(() => {
-  const active = workspacePath();
+  const active = activeProjectPath();
   const list = recentWorkspaces();
   if (!active) return list;
   return list.includes(active) ? list : [active, ...list];
 });
 
 const titleOf = (session: SessionSummary) => sessionTitle(session, tr("New session", "新会话"));
+
+/** The daemon session open on screen (or where a session change is heading). */
+const openDaemon = () => {
+  const pending = pendingSession();
+  if (pending) return pending.daemonId ? daemonSessionOfId(pending.daemonId) : daemonSessionByFile(pending.file);
+  return currentDaemonSession();
+};
 
 /**
  * The open session has no row of its own yet: it is not in the saved list. Pi
@@ -107,6 +130,8 @@ const titleOf = (session: SessionSummary) => sessionTitle(session, tr("New sessi
  * While a session change is under way, its destination decides instead.
  */
 const isDraftSession = () => {
+  const ds = openDaemon();
+  if (ds && (ds.parentId || ds.initiator === "external")) return false;
   const pending = pendingSession();
   if (pending) return !pending.file;
   const current = sessionState();
@@ -129,12 +154,13 @@ const singleEmpty = computed(
     projects().length === 1 &&
     savedSessions().length === 0 &&
     archivedSessionItems().length === 0 &&
+    !daemonSessions().some((ds) => ds.parentId || ds.initiator === "external") &&
     sessionsReady() &&
     listSteady(),
 );
 
 /** Whether 最近 surfaces the open unsaved draft session at its top. */
-const hasRecentDraft = computed(() => Boolean(workspacePath()) && listSteady() && isDraftSession() && !singleEmpty());
+const hasRecentDraft = computed(() => Boolean(activeProjectPath()) && listSteady() && isDraftSession() && !singleEmpty());
 
 /**
  * True when a draft slot closes because the draft session itself just entered
@@ -171,13 +197,15 @@ const standingOf = (session: SessionSummary) => {
 
 /** Recent sessions across every open folder, deduped by file, each in the place it first took (`recentStanding`). */
 const allRecents = computed<RecentItem[]>(() => {
-  const active = workspacePath();
+  const active = activeProjectPath();
   const seen = new Set<string>();
   const out: RecentItem[] = [];
   for (const cwd of projects()) {
     const list = cwd === active ? savedSessions() : (workspaceSessions()[cwd] ?? []);
     for (const session of list) {
       if (seen.has(session.path)) continue;
+      // A daemon child belongs under its parent row, not in the flat recent list.
+      if (daemonSessionByFile(session.path)?.parentId) continue;
       seen.add(session.path);
       out.push({ id: `recent:${session.path}`, session, cwd });
     }
@@ -389,7 +417,7 @@ function FunctionalGroup(props: {
 
 function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly string[] }) {
   const home = backend().home();
-  const active = () => props.cwd === workspacePath();
+  const active = () => props.cwd === activeProjectPath();
   const collapsed = () => isWorkspaceCollapsed(props.cwd);
   const label = () => projectLabel(props.cwd, props.allProjects);
   const sessions = () => (active() ? savedSessions() : (workspaceSessions()[props.cwd] ?? []));
@@ -398,10 +426,23 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
   const activeShownInRecents = () =>
     !isGroupCollapsed("recents") && (isDraftSession() ? hasRecentDraft() : shownInRecents(openFile()));
   /** A folded folder still says so when a run inside it keeps working off screen — active or parked, any project. */
-  const hiddenRunningInside = () => sessions().some((s) => isSessionRunning(s.path) && !shownInRecents(s.path));
+  const hiddenRunningInside = () =>
+    sessions().some((s) => isSessionRunning(s.path) && !shownInRecents(s.path)) ||
+    daemonSessions().some(
+      (ds) =>
+        projectCwdOf(ds.cwd, ds) === props.cwd &&
+        (ds.status === "working" || ds.status === "blocked") &&
+        (!ds.file || !shownInRecents(ds.file)),
+    );
   const collapsedRunning = () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents()));
   /** A folded folder surfaces an answer that finished out of sight the same way. */
-  const collapsedUnread = () => collapsed() && !collapsedRunning() && sessions().some((s) => isSessionUnread(s.path) && !shownInRecents(s.path));
+  const collapsedUnread = () =>
+    collapsed() &&
+    !collapsedRunning() &&
+    (sessions().some((s) => isSessionUnread(s.path) && !shownInRecents(s.path)) ||
+      daemonSessions().some(
+        (ds) => projectCwdOf(ds.cwd, ds) === props.cwd && ds.unread && (!ds.file || !shownInRecents(ds.file)),
+      ));
   const startingHere = () => active() && sidecarPhase().name === "starting";
   const canRemove = () => props.allProjects.length > 1;
 
@@ -504,8 +545,10 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
 }
 
 /** A session row anywhere in the sidebar: the engine's mark, the title, and the running cue or archive action. */
-const sessionRowClass = (indent: boolean, reserveTrailing: boolean, reserveHoverAction: boolean) =>
-  `h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md ${indent ? "pl-8" : "pl-2.5"} ${
+const sessionRowClass = (indent: boolean, reserveTrailing: boolean, reserveHoverAction: boolean, depth = 0) =>
+  `h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md ${
+    depth >= 3 ? "pl-16" : depth === 2 ? "pl-14" : depth === 1 ? "pl-12" : indent ? "pl-8" : "pl-2.5"
+  } ${
     reserveTrailing ? "pr-8" : reserveHoverAction ? "pr-2.5 group-hover:pr-8" : "pr-2.5"
   } ${PRESS} active:scale-[0.99] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-sidebar-accent group-hover:bg-sidebar-accent active:bg-sidebar-accent selected:bg-sidebar-accent`;
 
@@ -539,8 +582,8 @@ function EngineMark(props: { id: string; available: boolean }) {
 
 function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean }) {
   const home = backend().home();
-  const resolvedCwd = () => props.cwd || workspacePath();
-  const active = () => Boolean(resolvedCwd()) && resolvedCwd() === workspacePath() && isDraftSession();
+  const resolvedCwd = () => props.cwd || activeProjectPath();
+  const active = () => Boolean(resolvedCwd()) && resolvedCwd() === activeProjectPath() && isDraftSession();
   const primary = () => active() && ownsDraftSession(props.group, resolvedCwd());
   const running = () => active() && isRunning();
   const selected = () => primary() && currentView().name === "chat";
@@ -562,7 +605,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
           const target = shownCwd();
           draftGroup.set(props.group);
           showChat();
-          if (target && target !== workspacePath()) void openWorkspace(target);
+          if (target && target !== activeProjectPath()) void openWorkspace(target);
         }}
         tooltip={tip(
           props.group === "recents" ? `${engine().name} · ${tildePath(shownCwd(), home)}` : engine().name,
@@ -585,15 +628,23 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
 
 function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupId; indent?: boolean }) {
   const home = backend().home();
-  const active = () => !isDraftSession() && props.cwd === workspacePath() && props.session.path === openFile();
+  const active = () => !isDraftSession() && props.cwd === activeProjectPath() && props.session.path === openFile();
   const owns = () => ownsActiveSession(props.group, props.session.path, props.cwd);
   const primary = () => active() && owns();
+  /** The daemon session behind this file — its status is the row's truth (a parent's children keep its mark too). */
+  const daemon = () => daemonSessionByFile(props.session.path);
+  const waitingHere = () => childSessionsOf(props.session.path).some((c) => c.status === "working" || c.status === "blocked");
+  const daemonRunning = () => isSessionRunning(props.session.path) || waitingHere();
   /** A run kept going off screen marks every row the session has — whichever group the reader is looking at. */
-  const backgroundRunning = () => !active() && isSessionRunning(props.session.path);
+  const backgroundRunning = () => !active() && daemonRunning();
   /** The on-screen run marks all of the session's rows too; `owns` picks where the highlight sits, not the mark. */
-  const running = () => (active() && isRunning()) || backgroundRunning();
+  const running = () => (active() && isRunning()) || daemonRunning();
+  /** A session waiting on a person (an approval) shows the waiting mark, not the working one. */
+  const blocked = () => !active() && (daemon()?.status === "blocked" || childSessionsOf(props.session.path).some((c) => c.status === "blocked"));
+  /** A run that died off screen keeps its mark until the session is opened again. */
+  const failed = () => !active() && !running() && daemon()?.status === "failed";
   /** A run that finished off screen leaves a dot until the session is opened again. */
-  const unread = () => !active() && !backgroundRunning() && isSessionUnread(props.session.path);
+  const unread = () => !active() && !backgroundRunning() && !failed() && isSessionUnread(props.session.path);
   const archived = () => isSessionArchived(props.session.path);
   const engine = () => engineOf(props.session.agentId);
   const selected = () => primary() && currentView().name === "chat";
@@ -607,7 +658,7 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           void openSession(props.session.path, props.cwd);
         }}
         tooltip={tip(`${engine().name} · ${tildePath(props.cwd, home)}`, undefined, "right")}
-        class={calm(sessionRowClass(Boolean(props.indent), running() || unread(), true))}
+        class={calm(sessionRowClass(Boolean(props.indent), running() || unread() || blocked(), true))}
       >
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{titleOf(props.session)}</Text>
@@ -619,6 +670,22 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           accessibilityLabel={backgroundRunning() ? tr("Running in the background", "后台运行中") : undefined}
         >
           <Pip size={16} mood="work" />
+        </Presence>
+        <Presence
+          show={!running() && blocked()}
+          testID="sidebar-session-blocked"
+          accessibilityLabel={tr("Waiting for confirmation", "等待确认")}
+          class="absolute inset-0 items-center justify-center"
+        >
+          <Icon name="clock" size={14} tone="warning" />
+        </Presence>
+        <Presence
+          show={failed()}
+          testID="sidebar-session-failed"
+          accessibilityLabel={tr("Failed in the background", "后台运行失败")}
+          class="absolute inset-0 items-center justify-center"
+        >
+          <Icon name="alert" size={14} tone="destructive" />
         </Presence>
         <Presence
           show={unread()}
@@ -645,23 +712,150 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
   );
 }
 
+/** A session the daemon started under another one (or externally without a file yet) — nested in the sidebar. */
+function DaemonSessionRow(props: { session: DaemonSession; group: GroupId }) {
+  const home = backend().home();
+  const session = () => props.session;
+  const file = () => session().file;
+  const openId = () => pendingSession()?.daemonId ?? currentDaemonId();
+  const active = () =>
+    session().id === openId() || (file() !== undefined && file() === openFile() && !isDraftSession());
+  const engine = () => engineOf(session().agentId);
+  const working = () => (active() && isRunning()) || session().status === "working" || session().status === "blocked";
+  const blocked = () => !active() && session().status === "blocked";
+  const failed = () => !active() && (session().status === "failed" || session().status === "interrupted");
+  const unread = () => session().unread && !active() && !failed() && !working();
+  const selected = () => active() && currentView().name === "chat";
+  const rowDepth = () => (session().parentId ? Math.max(1, session().depth) : 0);
+  return (
+    <View class={hoverGroup()} onContextMenu={(e) => Menu.popup(childMenuItems(session()), e.pagePosition)}>
+      <BaseButton
+        selected={selected()}
+        onPress={() => openDaemonSession(session().id)}
+        tooltip={tip(
+          `${engine().name} · ${tildePath(session().cwd, home)}${session().worktree?.branch ? ` · ${session().worktree!.branch}` : ""}${
+            file() ? "" : ` · ${statusLabel(session().status)}`
+          }`,
+          undefined,
+          "right",
+        )}
+        class={calm(sessionRowClass(true, working() || unread() || failed(), false, rowDepth()))}
+      >
+        <EngineMark id={engine().id} available={engine().available} />
+        <Text class={sessionTitleClass(selected())}>{session().title}</Text>
+      </BaseButton>
+      <View class={TRAILING_SLOT}>
+        <Presence
+          show={working() && !blocked()}
+          testID="sidebar-child-running"
+          accessibilityLabel={tr("Running in the background", "后台运行中")}
+        >
+          <Pip size={16} mood="work" />
+        </Presence>
+        <Presence
+          show={blocked()}
+          testID="sidebar-child-blocked"
+          accessibilityLabel={tr("Waiting for confirmation", "等待确认")}
+          class="absolute inset-0 items-center justify-center"
+        >
+          <Icon name="clock" size={14} tone="warning" />
+        </Presence>
+        <Presence
+          show={failed()}
+          testID="sidebar-child-failed"
+          accessibilityLabel={session().status === "interrupted" ? tr("Interrupted", "已中断") : tr("Failed", "已失败")}
+          class="absolute inset-0 items-center justify-center"
+        >
+          <Icon name="alert" size={14} tone="destructive" />
+        </Presence>
+        <Presence
+          show={unread()}
+          testID="sidebar-child-unread"
+          accessibilityLabel={tr("Finished in the background", "后台已完成")}
+          class="absolute inset-0 items-center justify-center"
+        >
+          <View class="size-1.5 rounded-full bg-brand" />
+        </Presence>
+      </View>
+    </View>
+  );
+}
+
+/** The status words a child row carries when it has no transcript to open. */
+function statusLabel(status: DaemonSession["status"]) {
+  switch (status) {
+    case "working":
+      return tr("running", "运行中");
+    case "blocked":
+      return tr("waiting", "等待确认");
+    case "failed":
+      return tr("failed", "已失败");
+    case "interrupted":
+      return tr("interrupted", "已中断");
+    default:
+      return tr("idle", "空闲");
+  }
+}
+
+/** A nested session's right-click: open it, or stop it outright. */
+function childMenuItems(session: DaemonSession): MenuItem[] {
+  return [
+    { label: tr("Open", "打开"), onSelect: () => openDaemonSession(session.id) },
+    {
+      label: tr("Stop session", "停止会话"),
+      disabled: session.status !== "working" && session.status !== "blocked",
+      onSelect: () => void stopDaemonSession(session.id),
+    },
+  ];
+}
+
 function ProjectSessions(props: { cwd: string; allProjects: readonly string[] }) {
-  const isCurrent = () => props.cwd === workspacePath();
+  const isCurrent = () => props.cwd === activeProjectPath();
   const folderSessions = () => (isCurrent() ? savedSessions() : (workspaceSessions()[props.cwd] ?? []));
   const hasDraft = () =>
-    isCurrent() && listSteady() && isDraftSession() && (folderSessions().length > 0 || props.allProjects.length > 1);
+    isCurrent() &&
+    listSteady() &&
+    isDraftSession() &&
+    (folderSessions().length > 0 || props.allProjects.length > 1 || childSessionsOfOpen().length > 0);
 
-  const items = computed<FolderItem[]>(() =>
-    folderSessions().map((session) => ({ id: `session:${session.path}`, session })),
-  );
+  const items = computed<FolderItem[]>(() => {
+    const rows: FolderItem[] = [];
+    for (const ds of daemonSessions()) {
+      if (ds.parentId || ds.file) continue;
+      if (projectCwdOf(ds.cwd, ds) !== props.cwd) continue;
+      if (ds.initiator !== "external" && ds.status === "idle" && !ds.unread) continue;
+      if (ds.id === currentDaemonId() && isDraftSession()) continue;
+      rows.push({ id: `child:${ds.id}`, child: ds });
+      for (const child of childSessionsOfDaemon(ds.id)) rows.push({ id: `child:${child.id}`, child });
+    }
+    for (const session of folderSessions()) {
+      // A daemon child with a transcript nests under its parent, not in the flat list again.
+      if (daemonSessionByFile(session.path)?.parentId) continue;
+      rows.push({ id: `session:${session.path}`, session });
+      for (const child of childSessionsOf(session.path)) rows.push({ id: `child:${child.id}`, child });
+    }
+    return rows;
+  });
 
+  const draftChildren = () => childSessionsOfOpen();
   return (
     <View>
       <Reveal open={hasDraft()} instant={draftGraduated()}>
-        <DraftSessionRow cwd={props.cwd} group="workspaces" indent />
+        <View>
+          <DraftSessionRow cwd={props.cwd} group="workspaces" indent />
+          <Each of={draftChildren()} key={(c) => `child:${c.id}`}>
+            {(child) => <DaemonSessionRow session={child()} group="workspaces" />}
+          </Each>
+        </View>
       </Reveal>
       <Each of={items()} key={(item) => item.id}>
-        {(item) => <SessionRow session={item().session} cwd={props.cwd} group="workspaces" indent />}
+        {(item) =>
+          item().child ? (
+            <DaemonSessionRow session={item().child!} group="workspaces" />
+          ) : (
+            <SessionRow session={item().session!} cwd={props.cwd} group="workspaces" indent />
+          )
+        }
       </Each>
     </View>
   );
@@ -735,7 +929,7 @@ function SidebarTree() {
           >
             <View testID="sidebar-recents">
               <Reveal open={hasRecentDraft()} instant={draftGraduated()}>
-                <DraftSessionRow cwd={workspacePath()} group="recents" />
+                <DraftSessionRow cwd={activeProjectPath()} group="recents" />
               </Reveal>
               <Each of={recents()} key={(item) => item.id}>
                 {(item) => <SessionRow session={item().session} cwd={item().cwd} group="recents" />}
@@ -793,15 +987,17 @@ export function Sidebar() {
   let lastDraftOwner: GroupId | undefined = prevDraft ? untracked(draftGroup) : undefined;
   effect(() => {
     const draft = isDraftSession();
-    const cwd = workspacePath();
+    const cwd = activeProjectPath();
     const file = openFile();
     if (!draft) {
-      if (prevDraft && lastDraftOwner && file && !pendingSession()?.file && chosenGroups()[file] === undefined) {
-        const inherited = lastDraftOwner;
-        chosenGroups.update((all) => ({ ...all, [file]: inherited }));
+      if (prevDraft) {
+        if (lastDraftOwner && file && !pendingSession()?.file && chosenGroups()[file] === undefined) {
+          const inherited = lastDraftOwner;
+          chosenGroups.update((all) => ({ ...all, [file]: inherited }));
+        }
+        lastDraftOwner = undefined;
+        explicitDraftGroup = undefined;
       }
-      lastDraftOwner = undefined;
-      explicitDraftGroup = undefined;
       if (file && cwd) {
         lastSavedOwner = ownsActiveSession("recents", file, cwd) ? "recents" : "workspaces";
       }
@@ -822,47 +1018,37 @@ export function Sidebar() {
   });
   return (
     <View class={`size-full ${WALLPAPER_FROST ? "" : "bg-sidebar"}`}>
+      {/* A title bar's height where window controls stand at the strip's left
+         end — it carries the hide button; elsewhere a slim drag margin, and
+         the hide button rides on 新会话's row instead. */}
       <View
         desktop={{ windowDrag: true }}
         class="shrink-0 flex-row items-center justify-end pr-2.5"
-        style={{ height: titleBar().height || 44, paddingLeft: (titleBar().left || 0) + 14 }}
+        style={{ height: leftControls() ? titleBar().height || 44 : 12, paddingLeft: (titleBar().left || 0) + 14 }}
       >
-        <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
+        <If when={leftControls()}>
+          <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
+        </If>
       </View>
-      <View class="shrink-0 px-2 pb-2">
+      <View class={`shrink-0 flex-row items-center gap-1 pb-2 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
         <BaseButton
           testID="sidebar-new-session"
           onPress={startNewSession}
           accessibilityLabel={tr("New session", "新会话")}
           tooltip={tip(tr("New session", "新会话"), "mod+n", "right")}
-          class={`h-8 w-full flex-row items-center gap-1.5 rounded-md px-2.5 ${ROW_PRESS}`}
+          class={`h-8 min-w-0 flex-1 flex-row items-center gap-1.5 rounded-md px-2.5 ${ROW_PRESS}`}
         >
           <View class={ICON_SLOT}>
             <Icon name="pencil" size={14} tone="muted-foreground" />
           </View>
           <Text class="text-base text-sidebar-foreground">{tr("New session", "新会话")}</Text>
         </BaseButton>
+        <If when={!leftControls()}>
+          <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
+        </If>
       </View>
       <SidebarTree />
       <View class="border-t border-sidebar-border p-2">
-        <Reveal open={runningDelegatedCount() > 0} offset={4}>
-          <View class="pb-1">
-            <BaseButton
-              onPress={() => (showChat(), setOrchestrateOpen(true))}
-              class={`h-8 flex-row items-center gap-1.5 rounded-md bg-sidebar-accent/70 pl-2.5 pr-1 ${PRESS} ${FOCUS_RING} hover:bg-sidebar-accent`}
-            >
-              <View class={ICON_SLOT}>
-                <Pip size={16} mood="work" />
-              </View>
-              <Text class="flex-1 truncate text-sm font-medium text-sidebar-foreground">
-                {tr(`${runningDelegatedCount()} sub-agent${runningDelegatedCount() === 1 ? "" : "s"} active`, `${runningDelegatedCount()} 个子智能体运行中`)}
-              </Text>
-              <View class="size-6 shrink-0 items-center justify-center">
-                <Icon name="agents" size={14} tone="brand-text" />
-              </View>
-            </BaseButton>
-          </View>
-        </Reveal>
         <View class="flex-row items-center justify-between pl-1.5 pr-0.5">
           <IconButton
             icon="gear"

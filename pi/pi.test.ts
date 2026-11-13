@@ -394,77 +394,50 @@ test("close(0) kills transport immediately while normal close waits for grace pe
   expect(killed).toBe(1);
 });
 
-test("reuses one orchestrator across workspaces and tears down previous processes on re-boot", async () => {
+test("reuses one daemon across workspaces and detaches (not kills) the session on switch", async () => {
   const { fakeBackend } = await import("../dev/fake-pi");
   const { useBackend } = await import("../store/backend");
   const { boot, openWorkspace } = await import("../store/app");
 
-  let orchestratorStarts = 0;
-  let orchestratorCloses = 0;
-  let activeTransports = 0;
-  const seenUrls: string[] = [];
+  let daemonConnects = 0;
+  let daemonCloses = 0;
+  let attaches = 0;
 
   const base = fakeBackend();
   useBackend({
     ...base,
-    async startOrchestrator(callbacks) {
-      orchestratorStarts++;
-      const handle = await base.startOrchestrator!(callbacks);
+    async connectDaemon(callbacks) {
+      daemonConnects++;
+      const client = await base.connectDaemon!(callbacks);
       return {
-        ...handle,
+        ...client,
+        async attach(spec) {
+          attaches++;
+          return client.attach(spec);
+        },
         close() {
-          orchestratorCloses++;
-          handle.close();
+          daemonCloses++;
+          client.close();
         },
-      };
-    },
-    async startAgent(opts) {
-      if (opts.orchestratorUrl) seenUrls.push(opts.orchestratorUrl);
-      activeTransports++;
-      const inner = await base.startAgent!(opts);
-      let closed = false;
-      let exitFn: ((e: { code: number }) => void) | undefined;
-      const markGone = () => {
-        if (closed) return;
-        closed = true;
-        activeTransports--;
-        exitFn?.({ code: 0 });
-      };
-      return {
-        ...inner,
-        onExit(fn) {
-          exitFn = fn as (e: { code: number }) => void;
-          inner.onExit(fn);
-        },
-        end() {
-          inner.end();
-          markGone();
-        },
-        kill() {
-          inner.kill();
-          markGone();
-        },
-      };
+      } as typeof client;
     },
   });
 
   await boot();
-  expect(orchestratorStarts).toBe(1);
-  expect(activeTransports).toBe(1);
+  expect(daemonConnects).toBe(1);
+  expect(attaches).toBe(1);
 
-  // Switching across multiple workspaces reuses the single orchestrator and closes idle agents
+  // Switching across workspaces keeps the one daemon; each switch is another attach
   await openWorkspace("/Users/pip/code/nsh");
   await openWorkspace("/Users/pip/code/pi-docs");
-  expect(orchestratorStarts).toBe(1);
-  expect(activeTransports).toBe(1);
-  expect(seenUrls.some((u) => u.includes("cwd=%2FUsers%2Fpip%2Fcode%2Fnsh"))).toBe(true);
-  expect(seenUrls.some((u) => u.includes("cwd=%2FUsers%2Fpip%2Fcode%2Fpi-docs"))).toBe(true);
+  expect(daemonConnects).toBe(1);
+  expect(attaches).toBe(3);
 
-  // A hot-reload re-boot tears down the previous agent and orchestrator before starting fresh
+  // A hot-reload re-boot lets go of the link (the daemon's sessions are not the app's to stop) and reconnects
   await boot();
-  expect(orchestratorCloses).toBe(1);
-  expect(orchestratorStarts).toBe(2);
-  expect(activeTransports).toBe(1);
+  expect(daemonCloses).toBe(1);
+  expect(daemonConnects).toBe(2);
+  expect(attaches).toBe(4);
 });
 
 test("wallpaper crop geometry, pan/zoom adjustment, rotation cooldown, and color extraction", async () => {

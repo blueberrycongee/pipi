@@ -5,42 +5,16 @@ import type {
   AgentHarnessStatus,
   AgentOverride,
   CustomAgentConfig,
-  DelegatedTask,
-  DelegateTaskInput,
   RuntimeMode,
   StartAgentOptions,
   WorktreeInfo,
 } from "../agents/types";
 import type { Transport } from "../pi/client";
 import { type CredentialKind, removeCredential, saveApiKey, storedCredentials } from "../pi/credentials";
-import { createLineSplitter } from "../pi/jsonl";
-import type { ExtensionUiAnswer, ExtensionUiRequest, SessionEvent } from "../pi/protocol";
+import { DaemonClient, type DaemonCallbacks } from "../pi/daemon";
 import { deleteSession, listSessions, listWorkspaceSessions, type SessionSummary } from "../pi/sessions";
 import { usageStats, type UsageStats } from "../pi/usage";
 import { runHelper, spawnHelperTransport, startAgent, startPi } from "../pi/sidecar";
-
-export interface OrchestratorCallbacks {
-  onTaskStarted(task: Omit<DelegatedTask, "rows">): void;
-  onTaskUpdated(task: Omit<DelegatedTask, "rows">): void;
-  onTaskEvent(taskId: string, event: SessionEvent): void;
-  onSubagentUiRequest(taskId: string, request: ExtensionUiRequest): void;
-  onExit?(): void;
-}
-
-export interface OrchestratorHandle {
-  url: string;
-  token: string;
-  configure(config: {
-    cwd?: string;
-    runtimeMode?: RuntimeMode;
-    overrides?: Record<string, AgentOverride>;
-    customAgents?: CustomAgentConfig[];
-  }): void;
-  delegate(input: DelegateTaskInput & { cwd?: string; groupId?: string; workflowKind?: DelegatedTask["workflowKind"]; stepIndex?: number }): Promise<Omit<DelegatedTask, "rows">>;
-  cancel(taskId: string): Promise<void>;
-  respondUi(compositeId: string, answer: ExtensionUiAnswer): void;
-  close(): void;
-}
 
 /**
  * Everything the store asks of the machine: the Pi & external agent processes,
@@ -55,7 +29,8 @@ export interface Backend {
   startPi(cwd: string): Promise<Transport>;
   startAgent?(options: StartAgentOptions): Promise<Transport>;
   probeAgents?(options?: { overrides?: Record<string, AgentOverride>; customAgents?: CustomAgentConfig[] }): Promise<AgentHarnessStatus[]>;
-  startOrchestrator?(callbacks: OrchestratorCallbacks): Promise<OrchestratorHandle>;
+  /** Connects to the session daemon (through `daemon-link.mjs`, starting it detached when absent). */
+  connectDaemon?(callbacks: DaemonCallbacks): Promise<DaemonClient>;
   worktreeStatus?(cwd: string): Promise<{ isGitRepo: boolean; root?: string; branch?: string; headCommit?: string; dirty?: boolean; worktrees?: WorktreeInfo[] }>;
   createWorktree?(cwd: string, label: string): Promise<WorktreeInfo>;
   removeWorktree?(cwd: string, worktreePath: string): Promise<void>;
@@ -115,98 +90,12 @@ const system: Backend = {
       return defaultAgentStatuses(options?.customAgents);
     }
   },
-  async startOrchestrator(callbacks) {
-    const transport = await spawnHelperTransport("orchestrator-daemon.mjs");
-    let seq = 1;
-    const pending = new Map<string, { resolve: (data: unknown) => void; reject: (err: Error) => void }>();
-
-    let readyResolve: ((info: { url: string; token: string }) => void) | undefined;
-    let readyReject: ((err: Error) => void) | undefined;
-    const readyPromise = new Promise<{ url: string; token: string }>((resolve, reject) => {
-      readyResolve = resolve;
-      readyReject = reject;
-    });
-
-    const splitter = createLineSplitter((line) => {
-      if (!line.trim()) return;
-      try {
-        const msg = JSON.parse(line) as Record<string, unknown>;
-        if (msg.type === "ready" && typeof msg.url === "string" && typeof msg.token === "string") {
-          readyResolve?.({ url: msg.url, token: msg.token });
-          readyResolve = undefined;
-        } else if (msg.type === "response" && typeof msg.id === "string") {
-          const w = pending.get(msg.id);
-          if (w) {
-            pending.delete(msg.id);
-            if (msg.success) w.resolve(msg.data);
-            else w.reject(new Error(typeof msg.error === "string" ? msg.error : "Orchestrator error"));
-          }
-        } else if (msg.type === "task_started" && msg.task) {
-          callbacks.onTaskStarted(msg.task as Omit<DelegatedTask, "rows">);
-        } else if (msg.type === "task_updated" && msg.task) {
-          callbacks.onTaskUpdated(msg.task as Omit<DelegatedTask, "rows">);
-        } else if (msg.type === "task_event" && typeof msg.taskId === "string" && msg.event) {
-          callbacks.onTaskEvent(msg.taskId, msg.event as SessionEvent);
-        } else if (msg.type === "subagent_ui_request" && typeof msg.taskId === "string" && msg.request) {
-          callbacks.onSubagentUiRequest(msg.taskId, msg.request as ExtensionUiRequest);
-        }
-      } catch {}
-    });
-
-    transport.onStdout((chunk) => splitter.push(chunk));
-
-    transport.onExit((exit) => {
-      if (readyReject) {
-        readyReject(new Error(exit.error || `Orchestrator daemon exited (${exit.code ?? exit.signal})`));
-        readyReject = undefined;
-      }
-      for (const [, w] of pending) w.reject(new Error("Orchestrator daemon stopped"));
-      pending.clear();
-      callbacks.onExit?.();
-    });
-
-    const { url, token } = await readyPromise;
-
-    const send = (payload: Record<string, unknown>) =>
-      void Promise.resolve(transport.write(`${JSON.stringify(payload)}\n`)).catch((error: unknown) =>
-        console.warn("orchestrator: the command could not be written", error),
-      );
-
-    const call = <T>(type: string, payload: Record<string, unknown>): Promise<T> => {
-      const id = `orch_${seq++}`;
-      return new Promise<T>((resolve, reject) => {
-        pending.set(id, { resolve: resolve as (data: unknown) => void, reject });
-        const failed = (error: unknown) => {
-          pending.delete(id);
-          reject(error instanceof Error ? error : new Error(String(error)));
-        };
-        try {
-          void Promise.resolve(transport.write(`${JSON.stringify({ id, type, ...payload })}\n`)).catch(failed);
-        } catch (error) {
-          failed(error);
-        }
-      });
-    };
-
-    return {
-      url,
-      token,
-      configure(config) {
-        send({ type: "configure", ...config });
-      },
-      delegate(input) {
-        return call<Omit<DelegatedTask, "rows">>("delegate", { input });
-      },
-      async cancel(taskId) {
-        await call("cancel", { taskId });
-      },
-      respondUi(compositeId, answer) {
-        send({ type: "subagent_ui_response", compositeId, answer });
-      },
-      close() {
-        transport.kill();
-      },
-    };
+  async connectDaemon(callbacks) {
+    // `${dataDir()}/daemon` keeps the app's daemon state (instance file,
+    // session registry) in its sandboxed data directory; the daemon itself is
+    // started detached by `daemon-link.mjs` so sessions outlive the window.
+    const transport = await spawnHelperTransport("daemon-link.mjs", ["--home", `${system.dataDir()}/daemon`]);
+    return DaemonClient.connect(transport, callbacks);
   },
   async worktreeStatus(cwd) {
     try {

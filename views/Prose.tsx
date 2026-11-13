@@ -480,8 +480,10 @@ function VeiledListView(props: {
   const bullets = ["•", "◦", "▪"];
   const textSize = "text-md leading-relaxed";
 
+  // Loose items sit a little farther apart — still thin: a selection dropped
+  // between items targets only line boxes, and a wide gap dead-ends the drag.
   return (
-    <View class={props.block.loose ? "gap-2" : "gap-1"} selectable={props.depth === 0 ? true : undefined}>
+    <View class={props.block.loose ? "gap-1.5" : "gap-1"} selectable={props.depth === 0 ? true : undefined}>
       <Each of={props.block.items} key="index">
         {(item, j) => {
           const markerText = () =>
@@ -994,7 +996,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                       }
                     >
                       {(quote) => (
-                        <View class="gap-2 border-l-2 border-brand/35 pl-3.5" selectable>
+                        <View class="gap-1.5 border-l-2 border-brand/35 pl-3.5" selectable>
                           <Each of={quote().children} key="index">
                             {(qChild, k) => (
                               <View>

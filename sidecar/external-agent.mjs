@@ -41,7 +41,7 @@ const BUILTIN_ACP_PRESETS = {
   hermes: { binary: "hermes", args: ["acp"] },
   kiro: { binary: "kiro-cli", fallbackBinaries: ["kiro"], args: ["acp"] },
   droid: { binary: "droid", args: ["acp"], envVar: "FACTORY_API_KEY" },
-  amp: { binary: "amp", args: ["acp"], envVar: "AMP_API_KEY" },
+  amp: { binary: "amp-acp", args: [], envVar: "AMP_API_KEY" },
 };
 
 const BUILTIN_ENV_VARS = {
@@ -291,10 +291,10 @@ async function loadExternalSession(targetPath) {
 // ── Orchestration Guidance for External Coordinator Agents ──────────────────
 
 const EXTERNAL_ORCHESTRATION_PROMPT = `
-You are running inside pipi with multi-agent orchestration tools (via the \`pipi\` MCP server when available):
-- Call \`orchestrator_capabilities\` before delegating to inspect available coding agents (Pi, Claude Code, Codex, OpenCode, Cursor, custom ACP) and their models.
-- Call \`delegate_task\` to delegate focused tasks to another coding agent/model, optionally in an isolated Git worktree (\`isolation: "worktree"\`) or with a role (\`researcher\`, \`planner\`, \`implementer\`, \`reviewer\`).
-- Use \`task_status\` and \`task_cancel\` to inspect or stop background delegated tasks.
+You are running inside pipi with session tools (via the \`pipi\` MCP server when available):
+- Call \`agents_list\` to see the coding agents you can start sessions with and whether they can drive sessions themselves.
+- Call \`session_start\` to open a child session on a task — it runs on its own and its answer is delivered back to you when it finishes. Never wait on it.
+- Call \`sessions_list\`, \`session_read\`, \`session_send\`, and \`session_stop\` to inspect, message, or stop sessions in your tree.
 `.trim();
 
 // ── Streaming Turn Execution per Driver ─────────────────────────────────────

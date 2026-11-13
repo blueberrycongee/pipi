@@ -1,5 +1,4 @@
-import type { Model, ThinkingLevel } from "../pi/protocol";
-import type { Row } from "../pi/transcript";
+import type { Model } from "../pi/protocol";
 
 /**
  * External & built-in agent harnesses pipi can drive and orchestrate.
@@ -19,11 +18,11 @@ export type AcpDistribution = "binary" | "npx" | "uvx";
 
 /**
  * Runtime permission policy shared across all agent harnesses and enforced
- * non-escalatingly across delegated child tasks (`resolveRuntimeMode`).
+ * non-escalatingly down each session tree: a child session's mode never
+ * exceeds its parent's (the daemon's `clampMode` — same rule as
+ * `resolveRuntimeMode`).
  */
 export type RuntimeMode = "approval-required" | "auto-accept-edits" | "full-access";
-
-export type DelegateRole = "general" | "researcher" | "planner" | "implementer" | "reviewer";
 
 export type WorkspaceIsolation = "shared" | "worktree";
 
@@ -94,59 +93,18 @@ export interface StartAgentOptions {
   binaryPath?: string;
   extraArgs?: string[];
   customAgent?: CustomAgentConfig;
+  /** Session-daemon MCP endpoint + this session's bearer token (the session tools). */
   orchestratorUrl?: string;
   orchestratorToken?: string;
-  isSubagent?: boolean;
 }
 
-/** Git worktree info for isolated parallel / delegated agent runs. */
+/** Git worktree info for isolated compare / child-session runs. */
 export interface WorktreeInfo {
   path: string;
   branch: string;
+  baseCwd?: string;
   baseBranch?: string;
   headCommit?: string;
   dirty?: boolean;
   diffStat?: string;
-}
-
-/** Input to spawn a delegated child agent task (from coordinator tool or UI). */
-export interface DelegateTaskInput {
-  title?: string;
-  task: string;
-  agentId: string;
-  model?: string;
-  thinkingLevel?: ThinkingLevel;
-  role?: DelegateRole;
-  runtimeMode?: RuntimeMode | "inherit";
-  isolation?: WorkspaceIsolation;
-  mode?: "sync" | "async";
-  /** Parent runtime mode ceiling: child may never escalate beyond this. */
-  parentRuntimeMode?: RuntimeMode;
-}
-
-/** Live or finished state of a delegated sub-agent / orchestrated run. */
-export interface DelegatedTask {
-  id: string;
-  /** Optional grouping id when launched together (Parallel Compare or Pipeline). */
-  groupId?: string;
-  workflowKind?: "delegate" | "parallel" | "pipeline";
-  stepIndex?: number;
-  title: string;
-  task: string;
-  role: DelegateRole;
-  agentId: string;
-  agentName: string;
-  model?: string;
-  thinkingLevel?: ThinkingLevel;
-  runtimeMode: RuntimeMode;
-  isolation: WorkspaceIsolation;
-  cwd: string;
-  worktree?: WorktreeInfo;
-  status: "queued" | "running" | "completed" | "failed" | "cancelled";
-  activityLabel: string;
-  rows: Row[];
-  summary: string;
-  error?: string;
-  startedAt: number;
-  completedAt?: number;
 }

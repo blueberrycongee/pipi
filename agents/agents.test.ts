@@ -1,5 +1,5 @@
 import { expect, test } from "nsh/test";
-import { defaultAgentStatuses, formatRoleTaskPrompt, resolveRuntimeMode } from "./catalog";
+import { defaultAgentStatuses, resolveRuntimeMode } from "./catalog";
 import { buildPortableHandoff, prependHandoffToPrompt, utf8ByteLength } from "./handoff";
 import {
   createTranslatorState,
@@ -24,10 +24,7 @@ test("enforces non-escalating runtime permission ceiling on delegated sub-agents
   expect(() => resolveRuntimeMode("auto-accept-edits", "full-access")).toThrow();
 });
 
-test("formats role-framed sub-agent prompts and lists custom ACP agents", () => {
-  expect(formatRoleTaskPrompt("Audit auth.ts", "reviewer")).toContain("Act as the reviewer sub-agent");
-  expect(formatRoleTaskPrompt("Design schema", "planner")).toContain("Act as the planner sub-agent");
-
+test("lists custom ACP agents alongside the built-ins", () => {
   const list = defaultAgentStatuses([
     { id: "acp-goose", name: "Goose ACP", driver: "acp", command: "goose", args: ["acp"], defaultModel: "goose-v1" },
   ]);

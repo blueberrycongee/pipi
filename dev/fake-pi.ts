@@ -1,9 +1,10 @@
 import { acpDefaultModel, builtinAgentSpec, defaultAgentStatuses } from "../agents/catalog";
-import type { AgentHarnessStatus, DelegatedTask, RuntimeMode, WorktreeInfo } from "../agents/types";
+import type { AgentHarnessStatus, CustomAgentConfig, RuntimeMode, WorktreeInfo } from "../agents/types";
 import type { Exit, Transport } from "../pi/client";
+import type { DaemonAttachSpec, DaemonCallbacks, DaemonClient, DaemonSession } from "../pi/daemon";
 import type { AgentMessage, ImageContent, Model, SessionState } from "../pi/protocol";
 import type { SessionSummary } from "../pi/sessions";
-import type { Backend, OrchestratorCallbacks, OrchestratorHandle } from "../store/backend";
+import type { Backend } from "../store/backend";
 
 /**
  * A scripted Pi for headless tests and the design harness: a `Backend` whose
@@ -541,11 +542,13 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         case "abort_retry":
           cancelRetry?.();
           return undefined;
-        case "clear_queue":
+        case "clear_queue": {
+          const cleared = { steering: [...queued.steering], followUp: [...queued.followUp] };
           queued.steering.length = 0;
           queued.followUp.length = 0;
           emit({ type: "queue_update", steering: [], followUp: [] });
-          return { steering: [], followUp: [] };
+          return cleared;
+        }
         case "new_session":
           messages = [];
           sessionFile = undefined;
@@ -649,7 +652,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   let stored: Record<string, "api_key" | "oauth"> = options.noModels ? {} : { anthropic: "api_key", openai: "oauth" };
   let activeAgent = "pi";
   let worktreeSeq = 1;
-  let taskSeq = 1;
+  let daemonSeq = 0;
+  let daemonCmdSeq = 0;
   const fakeWorktrees: WorktreeInfo[] = [];
 
   const modelsForAgent = (agentId: string, custom?: { id: string; name: string; defaultModel?: string }): Model[] => {
@@ -660,7 +664,134 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     return MODELS;
   };
 
-  return {
+  const agentNameOf = (agentId: string) => builtinAgentSpec(agentId)?.name ?? agentId;
+  const driverOf = (agentId: string): string => builtinAgentSpec(agentId)?.driver ?? (agentId === "pi" ? "pi" : "acp");
+
+  // ── A scripted session daemon ──────────────────────────────────────────────
+  //
+  // The in-process counterpart of `pipi-daemon.mjs`: one registry of daemon
+  // sessions, each holding the fake agent process the session's attach spawns.
+  // Detaching a session only stops forwarding its records — its process keeps
+  // running, so a session left mid-run keeps going exactly as under the real
+  // daemon (Sidebar/Switch tests lean on that).
+
+  interface FakeDaemonSession extends DaemonSession {
+    inner?: Transport;
+    viewers?: {
+      out: Array<(chunk: string) => void>;
+      err: Array<(chunk: string) => void>;
+      exit: Array<(e: Exit) => void>;
+    };
+    custom?: CustomAgentConfig;
+  }
+
+  const daemonSessions = new Map<string, FakeDaemonSession>();
+  let daemonCallbacks: DaemonCallbacks | undefined;
+
+  const daemonInfo = (s: FakeDaemonSession): DaemonSession => {
+    const { inner: _inner, viewers: _viewers, custom: _custom, ...rest } = s;
+    return { ...rest };
+  };
+
+  const pushDaemon = (s: FakeDaemonSession) => daemonCallbacks?.onSession(daemonInfo(s));
+
+  /**
+   * Watches a session's process records the way the real daemon does: run
+   * starts and dialogs mark it `working`/`blocked`, a settle marks it `idle`
+   * (and `unread` when nobody is attached), an exit `failed`/`interrupted`.
+   * The daemon's own bookkeeping (`d_`-numbered commands) is swallowed; every
+   * other line fans out to the attached viewers.
+   */
+  const wireDaemonSession = (s: FakeDaemonSession, inner: Transport) => {
+    inner.onStdout((chunk) => {
+      for (const line of chunk.split("\n")) {
+        if (!line) continue;
+        let record: { type?: string; id?: unknown; command?: string; success?: boolean; aborted?: boolean; data?: { sessionFile?: string } } | undefined;
+        try {
+          record = JSON.parse(line) as typeof record;
+        } catch {
+          record = undefined;
+        }
+        if (record?.type === "response" && String(record.id ?? "").startsWith("d_")) {
+          if (record.command === "get_state" && record.success && record.data?.sessionFile && s.file !== record.data.sessionFile) {
+            s.file = record.data.sessionFile;
+            pushDaemon(s);
+          }
+          continue;
+        }
+        if (record?.type === "agent_start") {
+          s.status = "working";
+          s.lastActive = Date.now();
+          // A run writes the session file as it starts: the daemon asks the process which one.
+          if (!s.file) {
+            try {
+              inner.write(`${JSON.stringify({ id: `d_${++daemonCmdSeq}`, type: "get_state" })}\n`);
+            } catch {}
+          }
+          pushDaemon(s);
+        } else if (record?.type === "message_end") {
+          const msg = (record as { message?: { role?: string; content?: unknown } }).message;
+          // As the real daemon does: an unnamed session takes its title from its first user message.
+          if (msg?.role === "user" && (!s.title || s.title === "New session")) {
+            const text = Array.isArray(msg.content)
+              ? msg.content.filter((b): b is { type: string; text: string } => (b as { type?: string }).type === "text" && typeof (b as { text?: unknown }).text === "string").map((b) => b.text).join(" ")
+              : "";
+            if (text.trim() && !text.trimStart().startsWith("<pipi-message")) {
+              s.title = text.replace(/\s+/g, " ").trim().slice(0, 48);
+              pushDaemon(s);
+            }
+          }
+        } else if (record?.type === "agent_settled") {
+          s.status = "idle";
+          s.lastActive = Date.now();
+          // An aborted turn reports nothing: it stopped because it was told to.
+          if (!s.viewers && !record.aborted) s.unread = true;
+          pushDaemon(s);
+        } else if (record?.type === "extension_ui_request") {
+          s.status = "blocked";
+          s.lastActive = Date.now();
+          pushDaemon(s);
+        }
+        for (const h of s.viewers?.out ?? []) h(`${line}\n`);
+      }
+    });
+    inner.onStderr((chunk) => {
+      for (const h of s.viewers?.err ?? []) h(chunk);
+    });
+    inner.onExit((e) => {
+      s.inner = undefined;
+      s.loaded = false;
+      s.status = s.status === "working" || s.status === "blocked" ? "failed" : "interrupted";
+      pushDaemon(s);
+      for (const h of s.viewers?.exit ?? []) h({ code: e.code ?? null, signal: e.signal ?? undefined });
+    });
+  };
+
+  /** A session's process, as the daemon spawns it: `starts`/`dies`/`failStart`/`startDelay` all apply here. */
+  const spawnDaemonProcess = async (s: FakeDaemonSession): Promise<Transport> => {
+    if (options.failStart || startsLeft-- <= 0) throw new Error("spawn node ENOENT");
+    await startup();
+    activeCwd = s.cwd;
+    activeAgent = s.agentId;
+    defaultModel = modelsForAgent(s.agentId, s.custom)[0] ?? UNKNOWN;
+    defaultThinking = defaultModel.reasoning ? "medium" : "off";
+    const inner = transport(s.cwd, s.agentId, s.agentId === "pi" ? (options.history ?? []) : [], s.custom);
+    wireDaemonSession(s, inner);
+    return inner;
+  };
+
+  /** A session and every generation under it. */
+  const daemonTree = (id: string): FakeDaemonSession[] =>
+    [...daemonSessions.values()].filter((s) => s.parentId === id).flatMap((child) => [child, ...daemonTree(child.id)]);
+
+  /** What the daemon sends one of its sessions (`d_` ids keep its responses off the app's screen). */
+  const daemonWrite = (s: FakeDaemonSession, record: Record<string, unknown>) => {
+    try {
+      s.inner?.write(`${JSON.stringify({ id: `d_${++daemonCmdSeq}`, ...record })}\n`);
+    } catch {}
+  };
+
+  const api: Backend & { sent: Record<string, unknown>[] } = {
     sent,
     home: () => "/Users/pip",
     dataDir: () => "/Users/pip/Library/Application Support/dev.pipi.app",
@@ -708,12 +839,13 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         worktrees: fakeWorktrees,
       };
     },
-    async createWorktree(_cwd, label) {
+    async createWorktree(cwd, label) {
       const idx = worktreeSeq++;
       const clean = label.replace(/[^a-z0-9-]+/gi, "-").toLowerCase();
       const wt: WorktreeInfo = {
         path: `/Users/pip/code/.pipi-worktrees/${clean}-${idx}`,
         branch: `pipi/${clean}-${idx}`,
+        baseCwd: cwd,
         headCommit: "abc1234",
       };
       fakeWorktrees.push(wt);
@@ -723,95 +855,178 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       const i = fakeWorktrees.findIndex((w) => w.path === wtPath);
       if (i >= 0) fakeWorktrees.splice(i, 1);
     },
-    async startOrchestrator(callbacks: OrchestratorCallbacks): Promise<OrchestratorHandle> {
-      const runningTasks = new Map<string, Omit<DelegatedTask, "rows">>();
-      return {
-        url: "http://127.0.0.1:49999/mcp",
-        token: "fake-orch-token",
-        configure() {},
-        async delegate(input) {
-          const id = `task_${taskSeq++}`;
-          const agentNames: Record<string, string> = { pi: "Pi", claude: "Claude Code", codex: "Codex" };
-          const agentName = agentNames[input.agentId ?? "pi"] ?? input.agentId ?? "Pi";
-          const wt: WorktreeInfo | undefined =
-            input.isolation === "worktree"
-              ? {
-                  path: `/Users/pip/code/.pipi-worktrees/${input.agentId ?? "pi"}-${id}`,
-                  branch: `pipi/${input.agentId ?? "pi"}-${id}`,
-                  headCommit: "def5678",
-                }
-              : undefined;
-          const startedAt = Date.now();
-          const task: Omit<DelegatedTask, "rows"> = {
-            id,
-            groupId: input.groupId,
-            workflowKind: input.workflowKind ?? "delegate",
-            stepIndex: input.stepIndex,
-            title: input.title || `${agentName} · Subtask`,
-            task: input.task,
-            agentId: input.agentId ?? "pi",
-            agentName,
-            model: input.model ?? (input.agentId === "claude" ? "claude-sonnet-4-6" : input.agentId === "codex" ? "gpt-5.3-codex" : "claude-sonnet-4-5"),
-            role: input.role ?? "general",
-            runtimeMode: (input.runtimeMode ?? "full-access") as RuntimeMode,
-            isolation: input.isolation ?? "shared",
-            cwd: wt ? wt.path : (input.cwd ?? activeCwd),
-            worktree: wt,
-            status: "running",
-            startedAt,
-            summary: "",
-            activityLabel: `Running ${agentName}…`,
-          };
-          runningTasks.set(id, task);
-          callbacks.onTaskStarted({ ...task });
-
-          const finishTask = async () => {
-            await new Promise<void>((r) => setTimeout(r, options.pace ? Math.min(options.pace, 50) : 10));
-            const cur = runningTasks.get(id);
-            if (!cur || cur.status === "cancelled") return;
-            const summaryText = `${agentName} completed (${cur.role}): Verified changes${wt ? ` in branch ${wt.branch}` : ""}.`;
-            const assistantMsg: AgentMessage = {
-              role: "assistant",
-              content: [{ type: "text", text: summaryText }],
-              provider: cur.agentId,
-              model: cur.model ?? "model",
-              usage,
-              stopReason: "stop",
-              timestamp: Date.now(),
+    async connectDaemon(callbacks: DaemonCallbacks): Promise<DaemonClient> {
+      daemonCallbacks = callbacks;
+      const client = {
+        session(id?: string) {
+          const s = id ? daemonSessions.get(id) : undefined;
+          return s ? daemonInfo(s) : undefined;
+        },
+        async list() {
+          return [...daemonSessions.values()].map(daemonInfo);
+        },
+        async attach(spec: DaemonAttachSpec) {
+          let s = (spec.id ? daemonSessions.get(spec.id) : undefined) ?? (spec.file ? [...daemonSessions.values()].find((k) => k.file === spec.file) : undefined);
+          if (!s) {
+            s = {
+              id: `s_fake_${++daemonSeq}`,
+              title: spec.title || "New session",
+              cwd: spec.cwd,
+              file: spec.file,
+              agentId: spec.agentId,
+              agentName: spec.agentName ?? agentNameOf(spec.agentId),
+              driver: spec.driver ?? driverOf(spec.agentId),
+              initiator: "user",
+              runtimeMode: spec.runtimeMode ?? "full-access",
+              worktree: fakeWorktrees.find((w) => spec.cwd === w.path),
+              status: "idle",
+              unread: false,
+              loaded: false,
+              depth: 0,
+              createdAt: Date.now(),
+              lastActive: Date.now(),
+              custom: spec.customAgent,
             };
-            callbacks.onTaskEvent(id, { type: "agent_start" });
-            callbacks.onTaskEvent(id, { type: "message_start", message: { ...assistantMsg, content: [], stopReason: "pending" } });
-            callbacks.onTaskEvent(id, { type: "message_update", usage, assistantMessageEvent: { type: "text_start", contentIndex: 0 } });
-            callbacks.onTaskEvent(id, { type: "message_update", usage, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: summaryText } });
-            callbacks.onTaskEvent(id, { type: "message_update", usage, assistantMessageEvent: { type: "text_end", contentIndex: 0, content: summaryText } });
-            callbacks.onTaskEvent(id, { type: "message_end", message: assistantMsg });
-            callbacks.onTaskEvent(id, { type: "agent_settled", aborted: false });
-            cur.status = "completed";
-            cur.completedAt = Date.now();
-            cur.summary = summaryText;
-            cur.activityLabel = "Completed";
-            callbacks.onTaskUpdated({ ...cur });
+            daemonSessions.set(s.id, s);
+            pushDaemon(s);
+          }
+          if (spec.title) s.title = spec.title;
+          const file = spec.file ?? s.file;
+          if (!s.inner) {
+            const inner = await spawnDaemonProcess(s);
+            s.inner = inner;
+            if (file) {
+              // As the real daemon does: the process is on the session's file before the attach answers.
+              inner.write(`${JSON.stringify({ id: `d_${++daemonCmdSeq}`, type: "switch_session", sessionPath: file })}\n`);
+              await new Promise<void>((r) => setTimeout(r, (options.startDelay ?? 0) + 1));
+            }
+          }
+          if (file) s.file = file;
+          s.loaded = true;
+          s.unread = false;
+          if (s.status === "failed" || s.status === "interrupted") s.status = "idle";
+          pushDaemon(s);
+          const viewers = { out: [] as Array<(chunk: string) => void>, err: [] as Array<(chunk: string) => void>, exit: [] as Array<(e: Exit) => void> };
+          s.viewers = viewers;
+          let ended = false;
+          const detach = () => {
+            if (ended) return;
+            ended = true;
+            if (s.viewers === viewers) s.viewers = undefined;
+            for (const h of viewers.exit.splice(0)) h({ code: 0 });
           };
-
-          if (input.mode === "sync") {
-            await finishTask();
-            return { ...runningTasks.get(id)! };
-          }
-          void finishTask();
-          return { ...task };
+          const virtual = {
+            sessionId: s.id,
+            write(text: string) {
+              if (ended) throw new Error("Session detached");
+              if (!s.inner) throw new Error("Process has exited");
+              // The daemon watches writes too: an answer un-blocks a session waiting on it.
+              for (const line of text.split("\n")) {
+                if (!line) continue;
+                let record: { type?: string } | undefined;
+                try {
+                  record = JSON.parse(line) as typeof record;
+                } catch {
+                  record = undefined;
+                }
+                if (record?.type === "extension_ui_response" && s.status === "blocked") {
+                  s.status = "working";
+                  pushDaemon(s);
+                }
+              }
+              s.inner.write(text);
+            },
+            onStdout: (h: (chunk: string) => void) => void viewers.out.push(h),
+            onStderr: (h: (chunk: string) => void) => void viewers.err.push(h),
+            onExit: (h: (e: Exit) => void) => void viewers.exit.push(h),
+            end: detach,
+            kill: detach,
+          };
+          return { transport: virtual as unknown as Transport, session: daemonInfo(s) };
         },
-        async cancel(taskId) {
-          const cur = runningTasks.get(taskId);
-          if (cur) {
-            cur.status = "cancelled";
-            cur.completedAt = Date.now();
-            cur.activityLabel = "Cancelled";
-            callbacks.onTaskUpdated({ ...cur });
+        async killSession(sessionId: string) {
+          const s = daemonSessions.get(sessionId);
+          s?.inner?.kill();
+        },
+        async stopTree(sessionId: string) {
+          const own = daemonSessions.get(sessionId);
+          for (const s of [own, ...daemonTree(sessionId)]) {
+            if (s) daemonWrite(s, { type: "abort" });
           }
         },
-        respondUi() {},
+        async stopAll() {
+          for (const s of daemonSessions.values()) {
+            daemonWrite(s, { type: "abort" });
+          }
+        },
+        markRead(sessionId: string) {
+          const s = daemonSessions.get(sessionId);
+          if (s && s.unread) {
+            s.unread = false;
+            pushDaemon(s);
+          }
+        },
+        setRuntimeMode(sessionId: string, mode: RuntimeMode) {
+          const s = daemonSessions.get(sessionId);
+          if (s) {
+            s.runtimeMode = mode;
+            pushDaemon(s);
+          }
+        },
+        reportFile(sessionId: string, file?: string) {
+          const s = daemonSessions.get(sessionId);
+          if (s && file && s.file !== file) {
+            s.file = file;
+            pushDaemon(s);
+          }
+        },
+        async startSession(input: { title: string; agentId: string; cwd: string; message?: string; parentId?: string; runtimeMode?: RuntimeMode; worktree?: boolean }) {
+          const parent = input.parentId ? daemonSessions.get(input.parentId) : undefined;
+          // As the real daemon does: `worktree` asks for an isolated branch under the given cwd.
+          const wt = input.worktree && api.createWorktree ? await api.createWorktree(input.cwd, input.agentId) : undefined;
+          const s: FakeDaemonSession = {
+            id: `s_fake_${++daemonSeq}`,
+            title: input.title || "New session",
+            cwd: wt?.path ?? input.cwd,
+            agentId: input.agentId,
+            agentName: agentNameOf(input.agentId),
+            driver: driverOf(input.agentId),
+            parentId: input.parentId,
+            initiator: "user",
+            runtimeMode: input.runtimeMode ?? "full-access",
+            worktree: wt ?? fakeWorktrees.find((w) => input.cwd === w.path),
+            status: "idle",
+            unread: false,
+            loaded: false,
+            depth: parent ? parent.depth + 1 : 0,
+            createdAt: Date.now(),
+            lastActive: Date.now(),
+          };
+          daemonSessions.set(s.id, s);
+          pushDaemon(s);
+          try {
+            s.inner = await spawnDaemonProcess(s);
+          } catch (error) {
+            s.status = "failed";
+            pushDaemon(s);
+            throw error;
+          }
+          s.loaded = true;
+          pushDaemon(s);
+          if (input.message) daemonWrite(s, { type: "prompt", message: input.message });
+          return daemonInfo(s);
+        },
+        configure() {},
+        async externalMcp() {
+          return { url: "http://127.0.0.1:49999/mcp", token: "fake" };
+        },
+        async installCli() {
+          return "/Users/pip/.local/bin/pipix";
+        },
         close() {},
       };
+      for (const s of daemonSessions.values()) pushDaemon(s);
+      return client as unknown as DaemonClient;
     },
     listSessions: async (cwd) => byWorkspace[cwd] ?? sessions,
     async listWorkspaceSessions(cwds) {
@@ -837,4 +1052,5 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     pickFolder: async () => options.pickedFolder,
     pickImage: async () => options.pickedImage,
   };
+  return api;
 }

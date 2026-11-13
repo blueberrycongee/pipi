@@ -1,15 +1,12 @@
 import { batch, Clipboard, computed, signal } from "nsh";
 import { Window } from "nsh/desktop";
 import * as fs from "fs/promises";
-import { defaultAgentStatuses, resolveRuntimeMode } from "../agents/catalog";
+import { defaultAgentStatuses, runtimeModeRank } from "../agents/catalog";
 import { buildPortableHandoff, prependHandoffToPrompt } from "../agents/handoff";
 import type {
   AgentHarnessStatus,
   AgentOverride,
   CustomAgentConfig,
-  DelegatedTask,
-  DelegateRole,
-  DelegateTaskInput,
   RuntimeMode,
   WorkspaceIsolation,
   WorktreeInfo,
@@ -27,6 +24,7 @@ import {
 import type { Mood } from "../mascot/geometry";
 import { type Exit, PiClient, PiError } from "../pi/client";
 import type { CredentialKind } from "../pi/credentials";
+import { DaemonClient, type DaemonSession } from "../pi/daemon";
 import type {
   Commands,
   AgentMessage,
@@ -50,9 +48,11 @@ import { type Row, Transcript, withoutImageNotes } from "../pi/transcript";
 import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
-import { backend, type OrchestratorCallbacks, type OrchestratorHandle } from "./backend";
+import { backend } from "./backend";
 import {
   addCustomAgentPref,
+  agentSendScope,
+  agentSessionTools,
   archivedSessions,
   archiveSessionsBatch,
   type AutoArchiveDays,
@@ -65,6 +65,7 @@ import {
   isWorkspaceCollapsed,
   lastActiveWorkspace,
   loadPrefs,
+  onDaemonPrefsChange,
   preferredAgentId,
   preferredRuntimeMode,
   recentWorkspaces,
@@ -72,11 +73,14 @@ import {
   rememberSessionChoice,
   rememberWorkspace,
   removeCustomAgentPref,
+  runInBackground,
   setAgentOverride,
   setAutoArchiveDays,
   setGroupCollapsed,
   setPreferredAgentId,
   setPreferredRuntimeMode,
+  sessionTreeDepth,
+  sessionTreeMax,
   setSessionArchived,
   setWallpaperAdjustmentPref,
   setWallpaperEffectPref,
@@ -99,7 +103,8 @@ import {
 /**
  * The app's state: the active coding agent harness (Pi, Claude Code, Codex,
  * OpenCode, Cursor, or custom ACP), its session, portable context handoff,
- * git worktree isolation, and live multi-agent orchestration tasks.
+ * git worktree isolation, and the session daemon's registry of every session
+ * it keeps alive — the app's own one included.
  *
  * The signals are private; screens read the accessors and call the actions below.
  */
@@ -137,34 +142,7 @@ export interface Attachment extends ImageContent {
 
 /** Settings on `section`; `agent` names the agent whose configuration is open inside Agents. */
 export type View = { name: "chat" } | { name: "settings"; section: SettingsSection; agent?: string };
-export type SettingsSection = "general" | "agents" | "archive" | "usage" | "about";
-
-/**
- * A session whose agent is still working while the user looks at another one.
- * Pi hosts one session per process, so switching mid-run means keeping this
- * process (and its transcript) alive off screen rather than switching inside it.
- */
-interface ParkedRun {
-  client: PiClient;
-  transcript: Transcript;
-  /** The session file: how the run is found again. */
-  path: string;
-  cwd: string;
-  agentId: string;
-  runtimeMode: RuntimeMode;
-  /** What the session was called when it was left, for the completion toast. */
-  title: string;
-  state?: SessionState;
-  running: boolean;
-  bashRunning: boolean;
-  bashRequestId?: string;
-  activity: Activity;
-  runStartedAt: number;
-  queue: { steering: string[]; followUp: string[] };
-  dialogs: ExtensionUiDialog[];
-  statuses: Record<string, string>;
-  widgets: Record<string, { lines: string[]; below: boolean }>;
-}
+export type SettingsSection = "general" | "agents" | "sessions" | "archive" | "usage" | "about";
 
 const phase = signal<Phase>({ name: "starting" });
 const workspace = signal("");
@@ -205,7 +183,7 @@ const modelPickerAsk = signal(0, { equals: false });
 const scrollToEnd = signal(0, { equals: false });
 const landed = signal(0);
 const paletteOpen = signal(false);
-const orchestrateOpen = signal(false);
+const compareOpen = signal(false);
 const renaming = signal(false);
 const busy = signal(false);
 /** Where a session change under way is heading: a saved file, or no file for a fresh draft. */
@@ -218,19 +196,19 @@ const heading = signal<Heading | undefined>(undefined);
 const leaving = signal(false);
 /** Ticks when a session change puts its destination on screen: with the click when it can, else as it lands. */
 const arrived = signal(0);
-/** Session files of runs that keep going while another session is on screen. */
-const parkedRunning = signal<string[]>([]);
 /** Session files whose background run settled (or a new answer landed) since the user last opened them. */
 const unreadSessions = signal<string[]>([]);
 
-// External Agent Harnesses & Multi-Agent Orchestration state
+// External Agent Harnesses & Session Daemon state
 const agents = signal<AgentHarnessStatus[]>(defaultAgentStatuses());
 const currentAgentId = signal<string>("pi");
 const currentRuntimeMode = signal<RuntimeMode>("full-access");
 const pendingHandoff = signal<{ fromAgent: string; toAgent: string; context: string } | undefined>(undefined);
 const gitInfo = signal<{ isGitRepo: boolean; root?: string; branch?: string; dirty?: boolean; worktrees?: WorktreeInfo[] }>({ isGitRepo: false });
-const delegated = signal<DelegatedTask[]>([]);
-const inspectingId = signal<string | undefined>(undefined);
+/** Every session the daemon has told the app about, pushed whole on each registry change. */
+const daemonSessionList = signal<DaemonSession[]>([]);
+/** The daemon session the open conversation is attached to. */
+const openDaemonId = signal<string | undefined>(undefined);
 
 export const sidecarPhase = () => phase();
 export const workspacePath = () => workspace();
@@ -309,7 +287,7 @@ export const composerFocusTick = () => composerFocus();
 export const modelPickerTick = () => modelPickerAsk();
 export const scrollToEndTick = () => scrollToEnd();
 export const isPaletteOpen = () => paletteOpen();
-export const isOrchestrateOpen = () => orchestrateOpen();
+export const isCompareOpen = () => compareOpen();
 export const isRenaming = () => renaming();
 /** A session change (new, switch, restart) is under way: the chat waits rather than showing a half-loaded session. */
 export const isSwitching = () => busy() || heading() !== undefined;
@@ -328,7 +306,14 @@ export const sessionArrivedTick = () => arrived();
 /** The change under way is heading for a fresh session, whose empty chat is already on screen. */
 export const isDraftAhead = () => heading()?.welcome === true;
 
-type Heading = { cwd: string; file?: string; keepTitle?: boolean; /** A fresh session's empty chat is shown ahead of the agent. */ welcome?: boolean };
+type Heading = {
+  cwd: string;
+  file?: string;
+  daemonId?: string;
+  keepTitle?: boolean;
+  /** A fresh session's empty chat is shown ahead of the agent. */
+  welcome?: boolean;
+};
 
 /**
  * Marks a session change as heading for `target` until `work` ends.
@@ -343,7 +328,7 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
   let shown = false;
   if (!goal.keepTitle) {
     const warm = phase().name === "ready";
-    const welcome = !goal.file && warm && hasModel();
+    const welcome = !goal.file && !goal.daemonId && warm && hasModel();
     stashTranscript();
     const seen = goal.file ? visited.get(goal.file) : undefined;
     if (seen && goal.file) {
@@ -395,15 +380,16 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
   }
 }
 
-/** Whether a session is working, on screen or in the background. */
+/** Whether a session is working, on screen or in the background (the daemon says so, not the screen). */
 export function isSessionRunning(path: string) {
   if (path === state()?.sessionFile) return running() || bashRunning();
-  return parkedRunning().includes(path);
+  const known = daemonSessionByFile(path);
+  return known?.status === "working" || known?.status === "blocked";
 }
 
 /** Whether a background run finished with something the user has not seen yet. */
 export function isSessionUnread(path: string) {
-  return unreadSessions().includes(path);
+  return daemonSessionByFile(path)?.unread === true || unreadSessions().includes(path);
 }
 
 function markSessionUnread(path: string) {
@@ -413,6 +399,151 @@ function markSessionUnread(path: string) {
 function markSessionRead(path: string | undefined) {
   if (path && unreadSessions().includes(path)) unreadSessions.set(unreadSessions().filter((p) => p !== path));
 }
+
+// ── Session daemon accessors ────────────────────────────────────────────────
+
+/** Every session in the daemon's registry: the app's own, agent-started children, compare runs. */
+export const daemonSessions = () => daemonSessionList();
+
+/** A daemon session by its daemon id. */
+export function daemonSessionOfId(id: string | undefined) {
+  return id ? daemonSessionList().find((session) => session.id === id) : undefined;
+}
+
+/** A daemon session by the session file it holds. */
+export function daemonSessionByFile(path: string | undefined) {
+  return path ? daemonSessionList().find((session) => session.file === path) : undefined;
+}
+
+/** Cycle-safe depth-first walk of every descendant session under `rootId`. */
+function descendantSessionsOf(rootId: string | undefined, all = daemonSessionList()): DaemonSession[] {
+  if (!rootId) return [];
+  const out: DaemonSession[] = [];
+  const seen = new Set<string>([rootId]);
+  const visit = (pid: string) => {
+    for (const s of all) {
+      if (s.parentId === pid && !seen.has(s.id)) {
+        seen.add(s.id);
+        out.push(s);
+        visit(s.id);
+      }
+    }
+  };
+  visit(rootId);
+  return out;
+}
+
+/** Sessions started under `sessionId` (every nested generation in tree order). */
+export function childSessionsOfDaemon(sessionId: string | undefined): DaemonSession[] {
+  return descendantSessionsOf(sessionId);
+}
+
+/** Sessions started under the session whose file is `path`, nested in the sidebar under it. */
+export function childSessionsOf(path: string | undefined): DaemonSession[] {
+  if (!path) return [];
+  const own = daemonSessionByFile(path);
+  return descendantSessionsOf(own?.id);
+}
+
+/** Sessions started under the OPEN session while it is still a draft (not yet in `savedSessions`). */
+export function childSessionsOfOpen(): DaemonSession[] {
+  const id = openDaemonId();
+  if (!id) return [];
+  const file = openFile();
+  if (file && savedSessions().some((s) => s.path === file)) return [];
+  return descendantSessionsOf(id);
+}
+
+/** Maps a child worktree directory back to its owning project folder so child worktrees don't clutter Workspaces. */
+export function projectCwdOf(cwd: string, session?: DaemonSession): string {
+  if (!cwd) return cwd;
+  if (session?.worktree?.baseCwd) return session.worktree.baseCwd;
+  if (session?.parentId && cwd.includes("/.pipi-worktrees/")) {
+    const all = daemonSessionList();
+    const seen = new Set<string>([session.id]);
+    let cur: DaemonSession | undefined = session;
+    while (cur?.parentId && !seen.has(cur.parentId)) {
+      seen.add(cur.parentId);
+      const up = all.find((s) => s.id === cur!.parentId);
+      if (!up) break;
+      if (up.worktree?.baseCwd) return up.worktree.baseCwd;
+      if (!up.cwd.includes("/.pipi-worktrees/")) return up.cwd;
+      cur = up;
+    }
+  }
+  return cwd;
+}
+
+/** The session file open on screen — what the daemon lookups above key on. */
+export const openFile = () => state()?.sessionFile;
+
+/** The daemon id of the session on screen. */
+export const currentDaemonId = () => openDaemonId();
+export const currentSessionDaemonId = currentDaemonId;
+
+/** The daemon's record of the session on screen. */
+export const currentDaemonSession = computed(() => daemonSessionOfId(openDaemonId()));
+
+/** The active project folder in the sidebar (maps open child worktree sessions back to their parent project). */
+export const activeProjectPath = computed(() => {
+  const target = heading();
+  if (target) {
+    const ds = target.daemonId ? daemonSessionOfId(target.daemonId) : daemonSessionByFile(target.file);
+    return projectCwdOf(target.cwd, ds);
+  }
+  return projectCwdOf(workspace(), currentDaemonSession());
+});
+
+/** The session that started the session whose file is `path`, for the title bar's parent tag. */
+export function sessionParentOf(path: string | undefined): { id: string; file?: string; cwd: string; title: string } | undefined {
+  const all = daemonSessionList();
+  const own = all.find((session) => session.file === path);
+  const parent = own?.parentId ? all.find((session) => session.id === own.parentId) : undefined;
+  return parent ? { id: parent.id, file: parent.file, cwd: parent.cwd, title: daemonSessionTitle(parent) } : undefined;
+}
+
+/** The parent of whichever session is currently open on screen (works with or without a session file). */
+export const currentParentSession = computed((): { id: string; file?: string; cwd: string; title: string } | undefined => {
+  const all = daemonSessionList();
+  const target = heading();
+  const own = target
+    ? (target.daemonId ? all.find((s) => s.id === target.daemonId) : target.file ? all.find((s) => s.file === target.file) : undefined)
+    : (daemonSessionOfId(openDaemonId()) ?? (openFile() ? all.find((s) => s.file === openFile()) : undefined));
+  const parent = own?.parentId ? all.find((s) => s.id === own.parentId) : undefined;
+  return parent ? { id: parent.id, file: parent.file, cwd: parent.cwd, title: daemonSessionTitle(parent) } : undefined;
+});
+
+/**
+ * Sessions working under the open one: the open session itself is at rest, so
+ * this is the "waiting on N sessions" the activity line and the Stop affordance use.
+ */
+export const waitingCount = computed(
+  () => descendantSessionsOf(openDaemonId()).filter((session) => session.status === "working" || session.status === "blocked").length,
+);
+
+/** Count of all daemon sessions currently running or waiting on confirmation across the machine. */
+export const activeDaemonSessionCount = computed(
+  () => daemonSessionList().filter((session) => session.status === "working" || session.status === "blocked").length,
+);
+
+/** The highest runtime permission mode the open session is allowed to hold (clamped by all ancestors). */
+export const currentRuntimeCeiling = computed<RuntimeMode>(() => {
+  const all = daemonSessionList();
+  const seen = new Set<string>();
+  let ceiling: RuntimeMode = "full-access";
+  let cur = currentDaemonSession();
+  if (cur) seen.add(cur.id);
+  while (cur?.parentId && !seen.has(cur.parentId)) {
+    seen.add(cur.parentId);
+    const parent = all.find((s) => s.id === cur!.parentId);
+    if (!parent) break;
+    if (runtimeModeRank(parent.runtimeMode) < runtimeModeRank(ceiling)) {
+      ceiling = parent.runtimeMode;
+    }
+    cur = parent;
+  }
+  return ceiling;
+});
 
 // Multi-agent accessors
 export const availableAgents = () => agents();
@@ -482,19 +613,9 @@ const agentCommands = computed<SlashCommand[]>(() => {
  * its templates — so what the menu lists is exactly what `send` runs.
  */
 export const slashCommands = computed<ComposerCommand[]>(() => [...appCommands(), ...agentCommands()]);
-export const delegatedTasks = () => delegated();
-export const runningDelegatedCount = computed(() => delegated().filter((t) => t.status === "running").length);
-export const inspectingTaskId = () => inspectingId();
-export const inspectingTask = computed(() => {
-  const id = inspectingId();
-  return id ? delegated().find((t) => t.id === id) : undefined;
-});
 
-/** Rows shown in the main chat: either the active conversation or an inspected sub-agent's live transcript! */
-export const transcriptRows = computed<Row[]>(() => {
-  const sub = inspectingTask();
-  return sub ? sub.rows : rows();
-});
+/** Rows shown in the main chat. */
+export const transcriptRows = computed<Row[]>(() => rows());
 
 /** Whether a model is selected that the active agent can call. */
 export const hasModel = computed(() => {
@@ -502,12 +623,14 @@ export const hasModel = computed(() => {
   return !!model && model.provider !== "unknown" && models().length > 0;
 });
 
-/** The session's title: its name, else the start of its first message (or the inspected sub-agent's title). */
+/** The session's title: its name, else the start of its first message. */
 export const currentTitle = computed(() => {
-  const sub = inspectingTask();
-  if (sub) return `${sub.agentName} · ${sub.title}`;
   const target = heading();
   if (target && !target.keepTitle) {
+    if (target.daemonId) {
+      const ds = daemonSessionOfId(target.daemonId);
+      if (ds) return daemonSessionTitle(ds);
+    }
     if (!target.file) return tr("New session", "新会话");
     const list = target.cwd === workspace() ? sessions() : (sessionsByWorkspace()[target.cwd] ?? []);
     const found = list.find((s) => s.path === target.file) ?? sessions().find((s) => s.path === target.file);
@@ -516,7 +639,14 @@ export const currentTitle = computed(() => {
   const name = state()?.sessionName;
   if (name) return name;
   const first = rows().find((row) => row.kind === "user");
-  return sessionTitle({ firstMessage: first?.kind === "user" ? first.text : "" }, tr("New session", "新会话"));
+  if (first?.kind === "user" && first.text) {
+    return sessionTitle({ firstMessage: first.text }, tr("New session", "新会话"));
+  }
+  const ds = currentDaemonSession();
+  if (ds && (ds.parentId || ds.initiator === "external") && ds.title) {
+    return ds.title;
+  }
+  return tr("New session", "新会话");
 });
 
 /** What Pip feels: the one place the app's state becomes the mascot's mood. */
@@ -525,7 +655,7 @@ export const pipMood = computed<Mood>(() => {
   if (now.name === "failed") return "error";
   if (now.name === "starting" || leaving() || (isSwitching() && !rows().length && !isDraftAhead())) return "sleep";
   if (cheer()) return "happy";
-  const subRunning = runningDelegatedCount() > 0;
+  const subRunning = waitingCount() > 0;
   if (!running() && !subRunning) return "idle";
   if (!running() && subRunning) return "work";
   const doing = activity();
@@ -541,8 +671,6 @@ const STORE_TEARDOWN_KEY = "__pipiStoreTeardown";
 let client: PiClient | undefined;
 let generation = 0;
 let transcript = new Transcript(() => activeLanguage());
-/** Runs the user has looked away from, by session file. Their agents keep working. */
-const parked = new Map<string, ParkedRun>();
 /**
  * Conversations the reader left at rest, by session file: opening one again
  * shows it with the click instead of after the agent has loaded it.
@@ -555,9 +683,6 @@ let ahead: { transcript: Transcript; file: string } | undefined;
 let early = false;
 /** Settles when the session change under way is over, however it ends. */
 let arrival: Promise<void> | undefined;
-const parkedByClient = new Map<PiClient, ParkedRun>();
-/** The parked run on its way back to the screen: making room off screen must not let go of it. */
-let adopting: ParkedRun | undefined;
 /**
  * When the open agent last went away on its own. One that does is started
  * again under its session (`revive`); one that will not stay up is not
@@ -570,14 +695,17 @@ const REVIVE_WINDOW_MS = 60_000;
 let reopening: Promise<void> | undefined;
 /** Settles once that agent is as the reader left it, model and all: a message waits on it. */
 let revival: Promise<void> | undefined;
-/** One shared orchestrator daemon for the whole app; coordinators carry `?cwd=` in their MCP URL. */
-let orchestrator: OrchestratorHandle | undefined;
-let orchestratorStarting: Promise<OrchestratorHandle | undefined> | undefined;
-const taskTranscripts = new Map<string, Transcript>();
+/**
+ * One shared session daemon for the whole app: it owns every agent process —
+ * the open session's included — so leaving a session only detaches the app's
+ * view of it, never ends it. `clientDaemonId` ties each `PiClient` to the
+ * daemon session it is attached to.
+ */
+let daemonClient: DaemonClient | undefined;
+let daemonStarting: Promise<DaemonClient | undefined> | undefined;
+const clientDaemonId = new Map<PiClient, string>();
 let flushFrame: number | undefined;
 let shownVersion = -1;
-const pendingTaskFlushes = new Set<string>();
-let taskFlushFrame: number | undefined;
 let toastId = 0;
 const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
 /** The reader asked the open run to stop. However it then ends is their doing: Pi settles a retry cancelled mid-wait as not aborted. */
@@ -602,7 +730,8 @@ function flush() {
  * Sets the open conversation aside for `visited` as a session change leaves
  * it, a new transcript taking its place. Its rows stay on screen until the
  * next flush: the chat dims them while the destination loads. A run is not
- * set aside here — it is parked with its process.
+ * set aside here — the daemon keeps its process, and re-opening the session
+ * re-attaches to it with the agent's own history.
  */
 function stashTranscript() {
   const shownAhead = ahead?.transcript === transcript ? ahead : undefined;
@@ -655,24 +784,6 @@ function markTranscriptSeen() {
   markRowsSeen(displayRowIds(transcript.rows()));
 }
 
-function flushTaskSoon(taskId: string) {
-  pendingTaskFlushes.add(taskId);
-  if (taskFlushFrame !== undefined) return;
-  taskFlushFrame = requestAnimationFrame(() => {
-    taskFlushFrame = undefined;
-    if (pendingTaskFlushes.size === 0) return;
-    const dirty = new Set(pendingTaskFlushes);
-    pendingTaskFlushes.clear();
-    delegated.update((list) =>
-      list.map((item) => {
-        if (!dirty.has(item.id)) return item;
-        const subT = taskTranscripts.get(item.id);
-        return subT ? { ...item, rows: subT.rows() } : item;
-      }),
-    );
-  });
-}
-
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 const STARTUP_RPC_TIMEOUT_MS = 20_000;
@@ -706,120 +817,151 @@ function request<C extends CommandType>(
   return client.request(type, ...args);
 }
 
-// ── Orchestrator Daemon Wiring ──────────────────────────────────────────────
+// ── Session Daemon Wiring ───────────────────────────────────────────────────
 
-function withOrchestratorCwd(baseUrl: string, cwd: string): string {
-  const sep = baseUrl.includes("?") ? "&" : "?";
-  return `${baseUrl}${sep}cwd=${encodeURIComponent(cwd)}`;
+/** Daemon sessions the store itself ended — their pushes are expected, not news. */
+const quietSessions = new Set<string>();
+
+/** What a daemon session is called on screen: its file's listing name/first message when there is one. */
+function daemonSessionTitle(session: DaemonSession): string {
+  const summary =
+    (session.cwd === workspace() ? sessions() : (sessionsByWorkspace()[session.cwd] ?? [])).find((s) => s.path === session.file) ??
+    sessions().find((s) => s.path === session.file);
+  return summary ? sessionTitle(summary, session.title) : session.title;
 }
 
-function orchestratorCallbacks(): OrchestratorCallbacks {
-  let created: OrchestratorHandle | undefined;
-  const callbacks: OrchestratorCallbacks & { bind?(h: OrchestratorHandle): void } = {
-    bind(h) {
-      created = h;
-    },
-    onTaskStarted(task) {
-      const subT = new Transcript(() => activeLanguage());
-      subT.load([{ role: "user", content: task.task, timestamp: task.startedAt }]);
-      taskTranscripts.set(task.id, subT);
-      delegated.update((list) => [{ ...task, rows: subT.rows() }, ...list.filter((x) => x.id !== task.id)]);
-    },
-    onTaskUpdated(task) {
-      const subT = taskTranscripts.get(task.id);
-      delegated.update((list) => {
-        const exists = list.some((x) => x.id === task.id);
-        if (!exists) return [{ ...task, rows: subT ? subT.rows() : [] }, ...list];
-        return list.map((item) => (item.id === task.id ? { ...item, ...task, rows: subT ? subT.rows() : item.rows } : item));
-      });
-    },
-    onTaskEvent(taskId, ev) {
-      let subT = taskTranscripts.get(taskId);
-      if (!subT) {
-        subT = new Transcript(() => activeLanguage());
-        taskTranscripts.set(taskId, subT);
-      }
-      // Skip duplicating the initial user prompt we already loaded
-      if (ev.type === "message_start" && ev.message.role === "user" && subT.rows().some((r) => r.kind === "user")) {
-        return;
-      }
-      subT.apply(ev);
-      if (ev.type === "agent_settled") {
-        pendingTaskFlushes.delete(taskId);
-        const nextRows = subT.rows();
-        delegated.update((list) => list.map((item) => (item.id === taskId ? { ...item, rows: nextRows } : item)));
-      } else {
-        flushTaskSoon(taskId);
-      }
-    },
-    onSubagentUiRequest(_taskId, uiReq) {
-      onUiRequest(uiReq);
-    },
-    onExit() {
-      if (created && orchestrator === created) {
-        orchestrator = undefined;
-      }
-    },
-  };
-  return callbacks;
-}
-
-async function ensureOrchestrator(cwd: string, options?: { silent?: boolean }): Promise<OrchestratorHandle | undefined> {
-  const startFn = backend().startOrchestrator;
-  if (!startFn) return undefined;
-  if (!orchestrator) {
-    if (!orchestratorStarting) {
-      orchestratorStarting = (async () => {
-        try {
-          const cbs = orchestratorCallbacks() as OrchestratorCallbacks & { bind?(h: OrchestratorHandle): void };
-          const started = await startFn(cbs);
-          cbs.bind?.(started);
-          orchestrator = started;
-          return started;
-        } catch (error) {
-          if (!options?.silent) {
-            toast("warning", `${tr("The orchestrator could not start", "多智能体编排服务启动失败")}: ${message(error)}`);
-          }
-          return undefined;
-        } finally {
-          orchestratorStarting = undefined;
-        }
-      })();
-    }
-    await orchestratorStarting;
+/**
+ * The daemon's registry replaces its entry for `session.id`, in place. A push is also how a run off
+ * screen reports: a settle, a stop or a question is said once, and its sidebar rows re-read their
+ * workspace list (a file first appearing is how a fresh session gets a row at all).
+ */
+function upsertDaemonSession(session: DaemonSession) {
+  const prev = daemonSessionList().find((known) => known.id === session.id);
+  daemonSessionList.update((list) => {
+    const at = list.findIndex((known) => known.id === session.id);
+    if (at < 0) return [...list, session];
+    const next = list.slice();
+    next[at] = session;
+    return next;
+  });
+  // The open session's rows refresh through its own stream (a settle re-lists, as before); every
+  // other session reports only here — a status, title or file change re-reads its workspace list.
+  const open = client !== undefined && session.id === clientDaemonId.get(client);
+  if (
+    prev
+      ? !open && (session.status !== prev.status || session.title !== prev.title || session.file !== prev.file)
+      : Boolean(session.file)
+  ) {
+    void refreshSessions(session.cwd);
   }
-  orchestrator?.configure({
-    cwd,
-    runtimeMode: currentRuntimeMode(),
+  // The open session speaks through its own stream — but only while a client is attached to it:
+  // one let go of (in the gap before the next attach) reports off screen like any other.
+  if (!prev || open) return;
+  const wasLive = prev.status === "working" || prev.status === "blocked";
+  if (quietSessions.delete(session.id)) return;
+  const title = daemonSessionTitle(session);
+  if (session.status === "idle" && wasLive && session.unread) {
+    toast("success", tr(`${title} finished in the background.`, `${title} 已在后台完成。`));
+  } else if (session.status === "failed" && wasLive) {
+    toast("warning", tr(`${title} stopped in the background.`, `${title} 已在后台停止。`));
+  } else if (session.status === "blocked" && prev.status !== "blocked") {
+    toast("info", tr(`${title} is waiting for you.`, `${title} 正在等待你的确认。`));
+  }
+}
+
+/** Ends a daemon session the store asked to end, so its last push does not read as a death. */
+function quietKill(sessionId: string) {
+  quietSessions.add(sessionId);
+  void daemonClient?.killSession(sessionId).catch(() => undefined);
+}
+
+/**
+ * The one connection to the session daemon, made on first attach. A lost link
+ * clears `daemonClient` so the next connect makes a new one; the sessions
+ * themselves were never the app's, so nothing is recovered for them.
+ */
+async function ensureDaemon(): Promise<DaemonClient | undefined> {
+  if (daemonClient) return daemonClient;
+  if (!daemonStarting) {
+    daemonStarting = (async () => {
+      try {
+        const connect = backend().connectDaemon;
+        if (!connect) return undefined;
+        const started = await connect({
+          onSession: upsertDaemonSession,
+          onExit: () => {
+            daemonClient = undefined;
+          },
+        });
+        daemonClient = started;
+        pushDaemonConfig();
+        return started;
+      } catch (error) {
+        toast("warning", `${tr("The session daemon could not start", "会话守护进程启动失败")}: ${message(error)}`);
+        return undefined;
+      } finally {
+        daemonStarting = undefined;
+      }
+    })();
+  }
+  return daemonStarting;
+}
+
+/** Pushes the agent roster and the session-tree rules the daemon enforces. */
+export function pushDaemonConfig() {
+  daemonClient?.configure({
+    agents: availableAgents(),
     overrides: storedAgentOverrides(),
     customAgents: storedCustomAgents(),
+    allowAgentTools: agentSessionTools(),
+    sendScope: agentSendScope(),
+    maxDepth: sessionTreeDepth(),
+    maxRunning: sessionTreeMax(),
+    worktreeDefault: worktreeIsolationDefault(),
+    linger: runInBackground(),
   });
-  return orchestrator;
 }
 
-/** Applies a setting to the shared orchestrator daemon. */
-function configureOrchestrators(config: { cwd?: string; runtimeMode?: RuntimeMode; overrides?: Record<string, AgentOverride>; customAgents?: CustomAgentConfig[] }) {
-  orchestrator?.configure(config);
+/** Tells the daemon which session file the open process is on, and that the user is looking at it. */
+function reportSessionFile() {
+  const did = openDaemonId();
+  if (!did) return;
+  daemonClient?.reportFile(did, state()?.sessionFile);
+  daemonClient?.markRead(did);
 }
 
-/** Stops every open process owned by this store evaluation (invoked before a hot-reload re-boot). */
+/** The MCP snippet an agent pipi did not start can use to join this machine's session daemon (`Settings → Sessions`). */
+export async function externalMcpConfig(): Promise<string> {
+  const daemon = await ensureDaemon();
+  if (!daemon) throw new Error(tr("The session daemon is not running", "会话守护进程未运行"));
+  const { url, token } = await daemon.externalMcp();
+  return JSON.stringify({ mcpServers: { pipi: { type: "http", url, headers: { Authorization: `Bearer ${token}` } } } }, null, 2);
+}
+
+/** Installs the `pipi` command line tool (sessions from a terminal or script), resolving to where it landed. */
+export async function installPipiCli(): Promise<string> {
+  const daemon = await ensureDaemon();
+  if (!daemon) throw new Error(tr("The session daemon is not running", "会话守护进程未运行"));
+  return daemon.installCli();
+}
+
+let unlistenDaemonPrefs: (() => void) | undefined;
+
+/** Lets go of everything this store evaluation holds (invoked before a hot-reload re-boot). The daemon's sessions are not its to stop. */
 function teardownStore() {
   generation++;
+  unlistenDaemonPrefs?.();
+  unlistenDaemonPrefs = undefined;
   if (flushFrame !== undefined) cancelAnimationFrame(flushFrame);
   flushFrame = undefined;
-  if (taskFlushFrame !== undefined) cancelAnimationFrame(taskFlushFrame);
-  taskFlushFrame = undefined;
   const active = client;
   client = undefined;
+  for (const started of clientDaemonId.keys()) started.close(0);
+  clientDaemonId.clear();
   active?.close(0);
-  const runs = [...parked.values()];
-  parked.clear();
-  parkedByClient.clear();
-  for (const run of runs) run.client.close(0);
-  orchestratorStarting = undefined;
-  const orch = orchestrator;
-  orchestrator = undefined;
-  orch?.close();
+  daemonClient?.close();
+  daemonClient = undefined;
+  daemonStarting = undefined;
 }
 
 // ── Boot & Harness Lifecycle ────────────────────────────────────────────────
@@ -831,6 +973,7 @@ export async function boot() {
   prevTeardown?.();
   killAllSidecars();
   g[STORE_TEARDOWN_KEY] = teardownStore;
+  unlistenDaemonPrefs = onDaemonPrefsChange(() => pushDaemonConfig());
 
   await loadPrefs();
   batch(() => {
@@ -858,10 +1001,7 @@ export async function refreshAgents() {
     });
     if (found.length) {
       agents.set(found);
-      configureOrchestrators({
-        overrides: storedAgentOverrides(),
-        customAgents: storedCustomAgents(),
-      });
+      pushDaemonConfig();
     }
   } catch (error) {
     if (phase().name !== "failed") {
@@ -891,8 +1031,11 @@ function start(
   reopen?: string,
   targetAgentId = currentAgentId(),
   preserveRows?: { previousRows: Row[]; handoffTitle: string; handoffDetail: string },
+  daemonId?: string,
 ) {
-  return headFor({ cwd, file: reopen, keepTitle: Boolean(preserveRows) }, () => launch(cwd, reopen, targetAgentId, preserveRows));
+  return headFor({ cwd, file: reopen, daemonId, keepTitle: Boolean(preserveRows) }, () =>
+    launch(cwd, reopen, targetAgentId, preserveRows, daemonId),
+  );
 }
 
 async function launch(
@@ -900,6 +1043,7 @@ async function launch(
   reopen: string | undefined,
   targetAgentId: string,
   preserveRows?: { previousRows: Row[]; handoffTitle: string; handoffDetail: string },
+  daemonId?: string,
 ) {
   const mine = ++generation;
   closeActive();
@@ -908,7 +1052,6 @@ async function launch(
 
   const spec = agents().find((a) => a.id === targetAgentId);
   const effectiveAgentId = spec ? spec.id : "pi";
-  const driver = spec?.driver ?? (effectiveAgentId === "pi" ? "pi" : "acp");
 
   batch(() => {
     phase.set({ name: "starting" });
@@ -916,7 +1059,7 @@ async function launch(
     // Another agent's commands are not this one's: its own arrive once it has started.
     if (effectiveAgentId !== currentAgentId()) commands.set([]);
     currentAgentId.set(effectiveAgentId);
-    inspectingId.set(undefined);
+    if (!reopen && !daemonId) currentRuntimeMode.set(preferredRuntimeMode());
     state.set(undefined);
     running.set(false);
     activity.set({ kind: "idle" });
@@ -925,7 +1068,8 @@ async function launch(
     statuses.set({});
     widgets.set({});
     if (!preserveRows) {
-      const cached = sessionsByWorkspace()[cwd];
+      const rootCwd = projectCwdOf(cwd, daemonId ? daemonSessionOfId(daemonId) : daemonSessionByFile(reopen));
+      const cached = sessionsByWorkspace()[rootCwd] ?? sessionsByWorkspace()[cwd];
       sessions.set(cached ?? []);
       // A folder listed before (even as empty) stays listed while its agent starts again.
       sessionsLoaded.set(cached !== undefined);
@@ -947,31 +1091,28 @@ async function launch(
 
   try {
     const agentLabel = spec?.name ?? "Pi";
-    const started = await connect(cwd, effectiveAgentId, mine);
+    const started = await connect(cwd, effectiveAgentId, mine, reopen, daemonId);
     if (!started) return;
     const first = await withStartupTimeout(started.request("get_state"), agentLabel);
     if (mine !== generation) return;
-    rememberWorkspace(cwd);
+    rememberWorkspace(projectCwdOf(cwd, currentDaemonSession()));
     batch(() => {
       state.set(first);
       phase.set({ name: "ready" });
     });
     const retry = autoRetryChoice();
     if (retry !== undefined) request("set_auto_retry", { enabled: retry }).catch(() => undefined);
-    if (reopen) {
-      await withStartupTimeout(request("switch_session", { sessionPath: reopen }), agentLabel).catch(() => undefined);
+    if ((reopen || daemonId) && !preserveRows) {
+      // The daemon already put the process on `reopen`'s session file before answering the attach.
+      const [, history] = await Promise.all([
+        refreshState(),
+        withStartupTimeout(request("get_messages"), agentLabel),
+      ]);
       if (mine !== generation) return;
-      if (!preserveRows) {
-        const [, history] = await Promise.all([
-          refreshState(),
-          withStartupTimeout(request("get_messages"), agentLabel),
-        ]);
-        if (mine !== generation) return;
-        landHistory(history.messages);
-        // The conversation is on screen: the session change is over, its pickers fill in behind it.
-        void finishLaunch().catch(failLaunch);
-        return;
-      }
+      landHistory(history.messages);
+      // The conversation is on screen: the session change is over, its pickers fill in behind it.
+      void finishLaunch().catch(failLaunch);
+      return;
     }
     await finishLaunch();
   } catch (error) {
@@ -980,19 +1121,20 @@ async function launch(
 
   /** What the open session supports: models, commands, levels, the lists around it. */
   async function finishLaunch() {
+    const listCwd = projectCwdOf(cwd, currentDaemonSession());
     await Promise.all([
       refreshModels(),
       refreshCommands(),
-      refreshSessions(cwd),
+      refreshSessions(listCwd),
       refreshCredentials(),
       refreshGitWorkspace(cwd),
     ]);
     if (mine !== generation) return;
-    if (!reopen) {
+    if (!reopen && !daemonId) {
       await applySessionChoices();
     }
     if (!preserveRows) {
-      if (reopen) {
+      if (reopen || daemonId) {
         await Promise.all([refreshState(), refreshLevels(), refreshStats()]);
       } else {
         await syncSession();
@@ -1017,32 +1159,40 @@ async function launch(
 }
 
 /**
- * Starts `agentId`'s process in `cwd` and makes it the open agent, not yet
- * asked anything. `undefined` when another start overtook this one (`mine`).
+ * Attaches to a daemon session for `agentId` in `cwd` — the daemon spawns its
+ * process on first attach (and switches it to `reopen`'s session file before
+ * answering) — and makes it the open agent, not yet asked anything.
+ * `undefined` when another start overtook this one (`mine`).
  */
-async function connect(cwd: string, agentId: string, mine: number): Promise<PiClient | undefined> {
+async function connect(cwd: string, agentId: string, mine: number, reopen?: string, daemonId?: string): Promise<PiClient | undefined> {
   const spec = agents().find((a) => a.id === agentId);
   const driver = spec?.driver ?? (agentId === "pi" ? "pi" : "acp");
   const agentLabel = spec?.name ?? "Pi";
-  const orch = await ensureOrchestrator(cwd, { silent: true });
+  const daemon = await ensureDaemon();
   if (mine !== generation) return undefined;
+  if (!daemon) throw new Error(tr("The session daemon is not running", "会话守护进程未运行"));
   const customCfg = storedCustomAgents().find((c) => c.id === agentId);
   const override = storedAgentOverrides()[agentId];
-
-  const startAgentFn = backend().startAgent;
-  const transport = startAgentFn
-    ? await startAgentFn({
-        cwd,
-        agentId,
-        driver,
-        runtimeMode: currentRuntimeMode(),
-        binaryPath: override?.binaryPath,
-        extraArgs: override?.extraArgs,
-        customAgent: customCfg,
-        orchestratorUrl: orch ? withOrchestratorCwd(orch.url, cwd) : undefined,
-        orchestratorToken: orch?.token,
-      })
-    : await backend().startPi(cwd);
+  // A session the daemon already holds is found again by its registry id; its file matches too.
+  const rootCwd = projectCwdOf(cwd, daemonId ? daemonSessionOfId(daemonId) : daemonSessionByFile(reopen));
+  const known = reopen
+    ? (sessions().find((s) => s.path === reopen) ??
+       (sessionsByWorkspace()[rootCwd] ?? []).find((s) => s.path === reopen) ??
+       (sessionsByWorkspace()[cwd] ?? []).find((s) => s.path === reopen))
+    : undefined;
+  const { transport, session } = await daemon.attach({
+    id: daemonId ?? daemonSessionByFile(reopen)?.id,
+    file: reopen,
+    title: known ? sessionTitle(known, "") : undefined,
+    cwd,
+    agentId,
+    agentName: spec?.name ?? agentId,
+    driver,
+    runtimeMode: currentRuntimeMode(),
+    binaryPath: override?.binaryPath,
+    extraArgs: override?.extraArgs,
+    customAgent: customCfg,
+  });
 
   if (mine !== generation) {
     transport.kill();
@@ -1055,6 +1205,12 @@ async function connect(cwd: string, agentId: string, mine: number): Promise<PiCl
     onExit: (exit, stderr) => routeExit(started, exit, stderr, agentLabel),
   });
   client = started;
+  clientDaemonId.set(started, session.id);
+  batch(() => {
+    openDaemonId.set(session.id);
+    currentRuntimeMode.set(session.runtimeMode);
+    if (session.agentId && session.agentId !== currentAgentId()) currentAgentId.set(session.agentId);
+  });
   return started;
 }
 
@@ -1097,14 +1253,12 @@ function revive(agentLabel: string, cutShort: boolean, lost: Extract<Phase, { na
   const work = (async () => {
     let started: PiClient | undefined;
     try {
-      started = await connect(cwd, agentId, mine);
+      started = await connect(cwd, agentId, mine, file, openDaemonId());
       if (!started) return;
       await withStartupTimeout(started.request("get_state"), agentLabel);
       if (mine !== generation) return;
       const retry = autoRetryChoice();
       if (retry !== undefined) started.request("set_auto_retry", { enabled: retry }).catch(() => undefined);
-      if (file) await withStartupTimeout(started.request("switch_session", { sessionPath: file }), agentLabel).catch(() => undefined);
-      if (mine !== generation) return;
       const [next, history] = await Promise.all([
         withStartupTimeout(started.request("get_state"), agentLabel),
         withStartupTimeout(started.request("get_messages"), agentLabel),
@@ -1214,18 +1368,37 @@ export async function switchAgentHarness(nextAgentId: string) {
   focusComposer();
 }
 
-/** Changes the runtime permission ceiling (`Supervised` / `Auto-edit` / `Full access`) live. */
-export async function changeRuntimeMode(mode: RuntimeMode) {
-  currentRuntimeMode.set(mode);
+/** Updates the default runtime permission mode for newly created sessions (`Settings → Sessions`). */
+export function updatePreferredRuntimeMode(mode: RuntimeMode) {
   setPreferredRuntimeMode(mode);
-  configureOrchestrators({ runtimeMode: mode });
+  const ds = currentDaemonSession();
+  const isUntouchedTopDraft =
+    !ds?.parentId &&
+    ds?.initiator !== "external" &&
+    !rows().length &&
+    !(state()?.messageCount) &&
+    !running() &&
+    !bashRunning();
+  if (isUntouchedTopDraft) {
+    void changeRuntimeMode(mode);
+  }
+}
+
+/** Changes the active session's runtime permission mode (`Supervised` / `Auto-edit` / `Full access`), clamped to its ancestor ceiling. */
+export async function changeRuntimeMode(mode: RuntimeMode) {
+  const ceiling = currentRuntimeCeiling();
+  const effective: RuntimeMode = runtimeModeRank(mode) > runtimeModeRank(ceiling) ? ceiling : mode;
+  currentRuntimeMode.set(effective);
+  const did = openDaemonId();
+  // The daemon's record first: it is the ceiling children and raw writes are clamped to.
+  if (did) daemonClient?.setRuntimeMode(did, effective);
   if (phase().name === "ready" && client) {
     if (currentAgentId() === "pi") {
       // Update Pi's injected extension runtime mode live via slash command
-      await request("prompt", { message: `/pipi-runtime-mode ${mode}` }).catch(() => undefined);
+      await request("prompt", { message: `/pipi-runtime-mode ${effective}` }).catch(() => undefined);
     } else {
       (client as unknown as { request(t: string, a: Record<string, unknown>): Promise<unknown> })
-        .request("set_runtime_mode", { mode })
+        .request("set_runtime_mode", { mode: effective })
         .catch(() => undefined);
     }
   }
@@ -1239,15 +1412,26 @@ export function restartPi() {
   pendingHandoff.set(undefined);
   // The reader's own restart is a new start: what went wrong before does not count against it.
   lostAt = [];
+  // A restart ends the process — a mere attach would adopt the live one. Let go of it before the kill,
+  // so the exit that lands back is a detach the store asked for, not a death to revive.
+  const did = openDaemonId();
+  closeActive();
+  if (did) quietSessions.add(did);
+  const gone = did ? daemonClient?.killSession(did).catch(() => undefined) : undefined;
+  if (gone) return gone.then(() => start(workspace(), keep, currentAgentId()));
   return start(workspace(), keep, currentAgentId());
 }
 
 /** Moves the app to another folder (or an isolated Git worktree), optionally opening `sessionPath` right away. */
 export async function openWorkspace(path: string, sessionPath?: string, sessionAgentId?: string) {
-  setWorkspaceCollapsed(path, false);
+  const held = daemonSessionByFile(sessionPath);
+  const projectCwd = projectCwdOf(path, held);
+  if (!sessionPath && isWorkspaceCollapsed(projectCwd)) {
+    setGroupCollapsed("recents", false);
+  }
   markSessionRead(sessionPath);
   if (path === workspace() && phase().name === "ready" && !isSwitching()) {
-    rememberWorkspace(path);
+    rememberWorkspace(projectCwd);
     if (sessionPath) {
       await openSession(sessionPath);
     } else {
@@ -1258,10 +1442,8 @@ export async function openWorkspace(path: string, sessionPath?: string, sessionA
   }
   pendingHandoff.set(undefined);
   view.set({ name: "chat" });
-  // The session is still live somewhere: bring it back instead of reloading its file.
-  if (sessionPath && parked.has(sessionPath)) return adoptParked(sessionPath);
-  if (running() || bashRunning()) return switchInto(path, sessionPath, sessionAgentId ?? currentAgentId());
-  await start(path, sessionPath, sessionAgentId ?? currentAgentId());
+  if (running() || bashRunning()) return switchInto(path, sessionPath, sessionAgentId ?? currentAgentId(), held?.id);
+  await start(path, sessionPath, sessionAgentId ?? currentAgentId(), undefined, held?.id);
 }
 
 /** Starts a fresh session in `cwd`, switching to that project first when needed. */
@@ -1290,17 +1472,9 @@ export async function closeWorkspace(cwd: string) {
     else await start(next, undefined, currentAgentId());
   }
   // Closing a project stops whatever it left running off screen, and drops its list.
-  for (const run of [...parked.values()]) {
-    if (run.cwd !== cwd) continue;
-    removeParked(run);
-    run.client.close();
-  }
-  if (orchestrator) {
-    for (const task of delegated()) {
-      if (task.status === "running" && task.cwd === cwd) {
-        void orchestrator.cancel(task.id).catch(() => undefined);
-      }
-    }
+  for (const known of daemonSessionList()) {
+    if (known.cwd !== cwd || !known.loaded) continue;
+    quietKill(known.id);
   }
   if (!Object.values(archivedSessions()).some((m) => m.cwd === cwd)) {
     sessionsByWorkspace.update((all) => {
@@ -1324,243 +1498,59 @@ export async function createAndOpenWorktree(label = "session") {
 /** Asks for a folder with the system's panel, and opens it. */
 export async function chooseWorkspace() {
   const path = await backend().pickFolder(tr("Choose a folder to work in", "选择工作文件夹"));
-  if (path) await openWorkspace(path);
-}
-
-// ── Multi-Agent Orchestration Actions (User-Driven & Coordinator-Driven) ───
-
-export function setOrchestrateOpen(open: boolean) {
-  orchestrateOpen.set(open);
-}
-
-export function inspectDelegatedTask(taskId: string | undefined) {
-  inspectingId.set(taskId);
-  if (taskId) view.set({ name: "chat" });
-  scrollToEnd.set(0);
-}
-
-/** Launches a single delegated sub-agent task in the background or foreground. */
-export async function launchDelegatedTask(input: DelegateTaskInput) {
-  const orch = await ensureOrchestrator(workspace());
-  if (!orch) {
-    toast("error", tr("Orchestrator is unavailable.", "多智能体编排服务不可用。"));
-    return undefined;
+  if (path) {
+    setWorkspaceCollapsed(path, false);
+    await openWorkspace(path);
   }
-  const safeMode = resolveRuntimeMode(currentRuntimeMode(), input.runtimeMode);
-  return attempt(tr("Could not start sub-agent", "无法启动子智能体"), () =>
-    orch.delegate({
-      ...input,
-      runtimeMode: safeMode,
-      parentRuntimeMode: currentRuntimeMode(),
-      cwd: workspace(),
-      mode: input.mode ?? "async",
-    }),
-  );
+}
+
+// ── Comparing Agents (the user sends one task to several harnesses) ─────────
+
+export function setCompareOpen(open: boolean) {
+  compareOpen.set(open);
 }
 
 /**
- * Launches a **Parallel Multi-Agent Run** across multiple chosen agent harnesses
- * simultaneously (each optionally in its own isolated Git worktree).
+ * Sends one task to several agent harnesses at once: each gets a daemon
+ * session of its own (in an isolated Git worktree when asked and possible),
+ * nested under the session on screen. The daemon runs them; their answers
+ * mark the sidebar rows unread — the app's streams stay unattached.
  */
-export async function launchParallelAgents(options: {
+export async function launchCompareSessions(options: {
   prompt: string;
   agentIds: string[];
-  role?: DelegateRole;
   isolation?: WorkspaceIsolation;
 }) {
   const promptText = options.prompt.trim();
   if (!promptText || options.agentIds.length === 0) return;
-  const orch = await ensureOrchestrator(workspace());
-  if (!orch) {
-    toast("error", tr("Orchestrator is unavailable.", "多智能体编排服务不可用。"));
+  const daemon = await ensureDaemon();
+  if (!daemon) {
+    toast("error", tr("The session daemon is unavailable.", "会话守护进程不可用。"));
     return;
   }
-  const groupId = `parallel_${Date.now().toString(36)}`;
   const isolation: WorkspaceIsolation =
     options.isolation ?? (worktreeIsolationDefault() && gitInfo().isGitRepo ? "worktree" : "shared");
 
-  enableLiveRowEntrance();
-  const names = options.agentIds.map((id) => agents().find((a) => a.id === id)?.name ?? id).join(", ");
-  transcript.summary(
-    tr(`Parallel orchestration · ${names}`, `并行编排 · ${names}`),
-    `**Prompt:** ${promptText}\n\n**Agents:** ${names} (${isolation === "worktree" ? tr("isolated Git worktrees", "独立 Git 工作树隔离") : tr("shared workspace", "共享工作区")})`,
-  );
-  flush();
-  scrollToEnd.set(0);
+  const ceiling = currentRuntimeCeiling();
+  const effectiveMode: RuntimeMode =
+    runtimeModeRank(currentRuntimeMode()) > runtimeModeRank(ceiling) ? ceiling : currentRuntimeMode();
 
   await Promise.all(
     options.agentIds.map((agentId) =>
-      attempt(tr(`Failed on ${agentId}`, `${agentId} 启动失败`), () =>
-        orch.delegate({
-          groupId,
-          workflowKind: "parallel",
-          title: `${agents().find((a) => a.id === agentId)?.name ?? agentId} · Parallel`,
-          task: promptText,
+      attempt(tr(`Failed on ${agentId}`, `${agentId} 启动失败`), async () => {
+        const spec = agents().find((a) => a.id === agentId);
+        await daemon.startSession({
+          title: `${spec?.name ?? agentId} · ${promptText.slice(0, 40)}`,
           agentId,
-          role: options.role ?? "implementer",
-          isolation,
-          runtimeMode: currentRuntimeMode(),
-          parentRuntimeMode: currentRuntimeMode(),
           cwd: workspace(),
-          mode: "async",
-        }),
-      ),
+          message: promptText,
+          parentId: openDaemonId(),
+          runtimeMode: effectiveMode,
+          worktree: isolation === "worktree" && gitInfo().isGitRepo,
+        });
+      }),
     ),
   );
-}
-
-/**
- * Launches a **Plan → Implement → Review** sequential multi-agent pipeline
- * across potentially different coding agents (e.g., Claude Code plans → Codex
- * implements → Pi reviews), passing each stage's output forward cleanly!
- */
-export async function launchAgentPipeline(options: {
-  prompt: string;
-  plannerAgentId: string;
-  implementerAgentId: string;
-  reviewerAgentId: string;
-  isolation?: WorkspaceIsolation;
-}) {
-  const promptText = options.prompt.trim();
-  if (!promptText) return;
-  const orch = await ensureOrchestrator(workspace());
-  if (!orch) {
-    toast("error", tr("Orchestrator is unavailable.", "多智能体编排服务不可用。"));
-    return;
-  }
-  const groupId = `pipeline_${Date.now().toString(36)}`;
-  const isolation: WorkspaceIsolation = options.isolation ?? "shared";
-  const nameOf = (id: string) => agents().find((a) => a.id === id)?.name ?? id;
-
-  enableLiveRowEntrance();
-  transcript.summary(
-    tr(
-      `Pipeline · ${nameOf(options.plannerAgentId)} → ${nameOf(options.implementerAgentId)} → ${nameOf(options.reviewerAgentId)}`,
-      `流水线编排 · ${nameOf(options.plannerAgentId)} 规划 → ${nameOf(options.implementerAgentId)} 实现 → ${nameOf(options.reviewerAgentId)} 审查`,
-    ),
-    promptText,
-  );
-  flush();
-  scrollToEnd.set(0);
-
-  // Run the 3-stage pipeline asynchronously so UI remains completely responsive
-  void (async () => {
-    // Stage 1: Planner
-    const planRes = await attempt(tr("Pipeline planning failed", "流水线规划阶段失败"), () =>
-      orch.delegate({
-        groupId,
-        workflowKind: "pipeline",
-        stepIndex: 1,
-        title: `1/3 Plan · ${nameOf(options.plannerAgentId)}`,
-        task: promptText,
-        agentId: options.plannerAgentId,
-        role: "planner",
-        isolation: "shared",
-        runtimeMode: currentRuntimeMode(),
-        parentRuntimeMode: currentRuntimeMode(),
-        cwd: workspace(),
-        mode: "sync",
-      }),
-    );
-    if (!planRes || planRes.status !== "completed") return;
-
-    // Stage 2: Implementer (uses worktree if requested)
-    const implPrompt = `Original goal:\n${promptText}\n\nApproved implementation plan from ${nameOf(options.plannerAgentId)}:\n${planRes.summary}\n\nImplement this plan cleanly and verify it.`;
-    const implRes = await attempt(tr("Pipeline implementation failed", "流水线实现阶段失败"), () =>
-      orch.delegate({
-        groupId,
-        workflowKind: "pipeline",
-        stepIndex: 2,
-        title: `2/3 Implement · ${nameOf(options.implementerAgentId)}`,
-        task: implPrompt,
-        agentId: options.implementerAgentId,
-        role: "implementer",
-        isolation,
-        runtimeMode: currentRuntimeMode(),
-        parentRuntimeMode: currentRuntimeMode(),
-        cwd: workspace(),
-        mode: "sync",
-      }),
-    );
-    if (!implRes || implRes.status !== "completed") return;
-
-    // Stage 3: Reviewer (runs in the implementer's cwd/worktree!)
-    const reviewPrompt = `Original goal:\n${promptText}\n\nImplementation summary from ${nameOf(options.implementerAgentId)}:\n${implRes.summary}\n\nReview the changes thoroughly for correctness, edge cases, and regressions.`;
-    const revRes = await attempt(tr("Pipeline review failed", "流水线审查阶段失败"), () =>
-      orch.delegate({
-        groupId,
-        workflowKind: "pipeline",
-        stepIndex: 3,
-        title: `3/3 Review · ${nameOf(options.reviewerAgentId)}`,
-        task: reviewPrompt,
-        agentId: options.reviewerAgentId,
-        role: "reviewer",
-        isolation: "shared",
-        runtimeMode: currentRuntimeMode(),
-        parentRuntimeMode: currentRuntimeMode(),
-        cwd: implRes.cwd || workspace(),
-        mode: "sync",
-      }),
-    );
-    if (!revRes) return;
-
-    const report = [
-      `### 1. Plan (${nameOf(options.plannerAgentId)})`,
-      planRes.summary || "_(No summary)_",
-      `### 2. Implementation (${nameOf(options.implementerAgentId)}${implRes.worktree ? ` · \`${implRes.worktree.branch}\`` : ""})`,
-      implRes.summary || "_(No summary)_",
-      `### 3. Review (${nameOf(options.reviewerAgentId)})`,
-      revRes.summary || "_(No summary)_",
-    ].join("\n\n");
-
-    transcript.summary(tr("Pipeline completed", "多智能体流水线已完成"), report);
-    flush();
-    toast("success", tr("Plan → Implement → Review pipeline finished.", "规划 → 实现 → 审查流水线已完成。"));
-  })();
-}
-
-export async function cancelDelegatedTask(taskId: string) {
-  if (!orchestrator) return;
-  await attempt(tr("Could not cancel sub-agent", "无法取消子智能体"), () => orchestrator!.cancel(taskId));
-}
-
-export function clearFinishedDelegatedTasks() {
-  const activeIds = new Set(
-    delegated()
-      .filter((t) => t.status === "running")
-      .map((t) => t.id),
-  );
-  for (const id of taskTranscripts.keys()) {
-    if (!activeIds.has(id)) taskTranscripts.delete(id);
-  }
-  if (inspectingId() && !activeIds.has(inspectingId()!)) inspectingId.set(undefined);
-  delegated.update((list) => list.filter((t) => t.status === "running"));
-}
-
-/** Merges a finished sub-agent's findings into the active conversation context. */
-export function bringTaskResultToChat(taskId: string) {
-  const task = delegated().find((t) => t.id === taskId);
-  if (!task) return;
-  inspectingId.set(undefined);
-  const block = [
-    `Sub-agent result from **${task.agentName}** (${task.role})${task.worktree ? ` on branch \`${task.worktree.branch}\` (\`${task.worktree.path}\`)` : ""}:`,
-    "",
-    task.summary || task.error || tr("(No text summary)", "（无文本摘要）"),
-  ].join("\n");
-  transcript.summary(
-    tr(`Merged from ${task.agentName} · ${task.title}`, `已合并子智能体结果：${task.agentName} · ${task.title}`),
-    block,
-  );
-  flush();
-  const prev = pendingHandoff();
-  const mergedCtx = `<subagent_result agent="${task.agentName}" role="${task.role}"${task.worktree ? ` worktree="${task.worktree.path}" branch="${task.worktree.branch}"` : ""}>\n${task.summary}\n</subagent_result>`;
-  pendingHandoff.set({
-    fromAgent: task.agentName,
-    toAgent: activeAgent().name,
-    context: prev ? `${prev.context}\n\n${mergedCtx}` : mergedCtx,
-  });
-  toast("success", tr("Sub-agent result added to conversation context.", "子智能体结果已并入当前会话上下文。"));
-  focusComposer();
 }
 
 // ── Custom ACP Agents & Overrides Management ────────────────────────────────
@@ -1633,6 +1623,12 @@ export async function removeAgentApiKey(agentId: string) {
 async function refreshState() {
   const next = await request("get_state");
   state.set(next);
+  if (next.sessionFile) reportSessionFile();
+  // A session the daemon kept working — reopened or revived — says so through its state, not an `agent_start` the attach missed.
+  if (next.isStreaming && !running()) {
+    runStartedAt.set(Date.now());
+    running.set(true);
+  }
   return next;
 }
 
@@ -1716,19 +1712,19 @@ export function updateAutoArchiveDays(days: AutoArchiveDays) {
 }
 
 /** Reads the saved sessions of `cwd` (defaults to the active workspace). */
-export async function refreshSessions(cwd = workspace()) {
+export async function refreshSessions(cwd = activeProjectPath()) {
   if (!cwd) return;
   try {
     const found = await backend().listSessions(cwd);
     sessionsByWorkspace.update((all) => ({ ...all, [cwd]: found }));
-    if (cwd === workspace()) sessions.set(found);
+    if (cwd === workspace() || cwd === activeProjectPath()) sessions.set(found);
     applyAutoArchive();
   } catch (error) {
     if (phase().name !== "failed") {
       toast("warning", `${tr("Could not list saved sessions", "无法读取历史会话列表")}: ${message(error)}`);
     }
   } finally {
-    if (cwd === workspace()) sessionsLoaded.set(true);
+    if (cwd === workspace() || cwd === activeProjectPath()) sessionsLoaded.set(true);
   }
 }
 
@@ -1776,6 +1772,7 @@ export async function refreshCredentials() {
 async function syncSession() {
   const [, history] = await Promise.all([refreshState(), request("get_messages")]);
   landHistory(history.messages);
+  reportSessionFile();
   void refreshLevels();
   void refreshStats();
 }
@@ -1963,179 +1960,57 @@ function onUiRequest(ui: ExtensionUiRequest) {
   }
 }
 
-// ── Events from runs in the background ──────────────────────────────────────
+// ── Events from the open agent ──────────────────────────────────────────────
 
-/** Routes a record to the client's owner: the open session, or a parked run. */
+/** Routes a record to the open session's client; a detached client's stream no longer arrives. */
 function routeEvent(source: PiClient | undefined, event: SessionEvent) {
   if (!source) return;
   if (source === client) return onEvent(event);
-  const run = parkedByClient.get(source);
-  if (run) onParkedEvent(run, event);
 }
 
 function routeUiRequest(source: PiClient | undefined, ui: ExtensionUiRequest) {
   if (!source) return;
   if (source === client) return onUiRequest(ui);
-  const run = parkedByClient.get(source);
-  if (run) onParkedUiRequest(run, ui);
 }
 
 function routeExit(source: PiClient | undefined, exit: Exit, stderr: string, agentLabel: string) {
   if (!source) return;
-  if (source === client) {
-    client = undefined;
-    const how = exit.signal
-      ? tr(`signal ${exit.signal}`, `信号 ${exit.signal}`)
-      : tr(`code ${exit.code ?? "unknown"}`, `退出码 ${exit.code ?? "未知"}`);
-    const starting = phase().name === "starting";
-    const title = starting
-      ? tr(`${agentLabel} could not start`, `${agentLabel} 无法启动`)
-      : tr(`${agentLabel} stopped unexpectedly`, `${agentLabel} 意外退出`);
-    const lost = {
-      name: "failed" as const,
-      title,
-      detail: stderr || exit.error || tr(`The process exited with ${how}.`, `进程已退出（${how}）。`),
-    };
-    const now = Date.now();
-    lostAt = [...lostAt.filter((at) => now - at < REVIVE_WINDOW_MS), now];
-    // A session that was open keeps its screen and gets its agent back. One still starting has nothing
-    // to come back to, and one that keeps going away is not started for ever: those say so.
-    if (phase().name === "ready" && lostAt.length <= REVIVE_LIMIT) {
-      void revive(agentLabel, running() || bashRunning() || Boolean(state()?.isCompacting), lost);
-      return;
-    }
-    batch(() => {
-      running.set(false);
-      bashRunning.set(false);
-      activity.set({ kind: "idle" });
-      phase.set(lost);
-    });
-    toast("error", stderr && starting ? `${title} — ${stderr.split("\n").pop()}` : title);
+  clientDaemonId.delete(source);
+  // Only the open session's process ending is news: a detached one is a detach the store asked for.
+  if (source !== client) return;
+  client = undefined;
+  const how = exit.signal
+    ? tr(`signal ${exit.signal}`, `信号 ${exit.signal}`)
+    : tr(`code ${exit.code ?? "unknown"}`, `退出码 ${exit.code ?? "未知"}`);
+  const starting = phase().name === "starting";
+  const title = starting
+    ? tr(`${agentLabel} could not start`, `${agentLabel} 无法启动`)
+    : tr(`${agentLabel} stopped unexpectedly`, `${agentLabel} 意外退出`);
+  const lost = {
+    name: "failed" as const,
+    title,
+    detail: stderr || exit.error || tr(`The process exited with ${how}.`, `进程已退出（${how}）。`),
+  };
+  const now = Date.now();
+  lostAt = [...lostAt.filter((at) => now - at < REVIVE_WINDOW_MS), now];
+  // A session that was open keeps its screen and gets its agent back. One still starting has nothing
+  // to come back to, and one that keeps going away is not started for ever: those say so.
+  if (phase().name === "ready" && lostAt.length <= REVIVE_LIMIT) {
+    void revive(agentLabel, running() || bashRunning() || Boolean(state()?.isCompacting), lost);
     return;
   }
-  const run = parkedByClient.get(source);
-  if (!run) return;
-  const working = run.running || run.bashRunning;
-  removeParked(run);
-  // Only a run that was still going is news: a finished one opens again from its file, on a new process.
-  if (working) toast("warning", tr(`${run.title} stopped in the background.`, `${run.title} 已在后台停止。`));
-  refreshSessions(run.cwd);
+  batch(() => {
+    running.set(false);
+    bashRunning.set(false);
+    activity.set({ kind: "idle" });
+    phase.set(lost);
+  });
+  toast("error", stderr && starting ? `${title} — ${stderr.split("\n").pop()}` : title);
 }
 
-/** Keeps a parked run's own view of its session current, without touching the screen. */
-function onParkedEvent(run: ParkedRun, event: SessionEvent) {
-  switch (event.type) {
-    case "agent_start":
-      if (!run.running) run.runStartedAt = Date.now();
-      run.running = true;
-      if (run.activity.kind !== "retrying") run.activity = { kind: "thinking" };
-      break;
-    case "message_update": {
-      const kind = event.assistantMessageEvent.type;
-      if (kind.startsWith("text")) run.activity = { kind: "writing" };
-      else if (kind.startsWith("thinking")) run.activity = { kind: "thinking" };
-      else if (kind === "toolcall_start") run.activity = { kind: "tool", name: event.assistantMessageEvent.toolName };
-      break;
-    }
-    case "tool_execution_start":
-      run.activity = { kind: "tool", name: event.toolName };
-      break;
-    case "turn_start":
-    case "turn_end":
-      if (run.running && run.activity.kind !== "retrying") run.activity = { kind: "thinking" };
-      break;
-    case "queue_update":
-      run.queue = { steering: event.steering ?? [], followUp: event.followUp ?? [] };
-      break;
-    case "session_info_changed":
-      run.state = run.state && { ...run.state, sessionName: event.name };
-      if (event.name) run.title = event.name;
-      refreshSessions(run.cwd);
-      break;
-    case "thinking_level_changed":
-      run.state = run.state && { ...run.state, thinkingLevel: event.level };
-      break;
-    case "compaction_start":
-      run.state = run.state && { ...run.state, isCompacting: true };
-      run.activity = { kind: "compacting" };
-      break;
-    case "compaction_end":
-      run.state = run.state && { ...run.state, isCompacting: false };
-      run.activity = run.running ? { kind: "thinking" } : { kind: "idle" };
-      break;
-    case "auto_retry_start":
-      run.activity = { kind: "retrying", attempt: event.attempt, maxAttempts: event.maxAttempts, reason: event.errorMessage };
-      break;
-    case "auto_retry_end":
-      if (run.running) run.activity = { kind: "thinking" };
-      break;
-    case "bash_execution_update":
-      if (!event.id || event.id === run.bashRequestId) run.transcript.bashOutput(event.delta);
-      break;
-    case "agent_settled": {
-      const wasRunning = run.running;
-      run.running = false;
-      run.bashRunning = false;
-      run.activity = { kind: "idle" };
-      run.queue = { steering: [], followUp: [] };
-      run.state = run.state && { ...run.state, isStreaming: false };
-      // The transcript settles first: only then is a failure that stood its last row.
-      run.transcript.apply(event);
-      if (wasRunning && !event.aborted) {
-        markSessionUnread(run.path);
-        if (endedInError(run.transcript.rows())) {
-          toast("error", tr(`${run.title} stopped on an error in the background.`, `${run.title} 在后台运行出错，已停止。`));
-        } else {
-          toast("success", tr(`${run.title} finished in the background.`, `${run.title} 已在后台完成。`));
-        }
-      }
-      refreshParkedRunning();
-      refreshSessions(run.cwd);
-      trimParked();
-      return;
-    }
-  }
-  run.transcript.apply(event);
-}
-
-/** Queues an extension prompt from a background run: it waits until the user returns. */
-function onParkedUiRequest(run: ParkedRun, ui: ExtensionUiRequest) {
-  switch (ui.method) {
-    case "select":
-    case "confirm":
-    case "input":
-    case "editor":
-      if (!run.dialogs.some((dialog) => dialog.id === ui.id)) {
-        run.dialogs = [...run.dialogs, ui];
-        toast("info", tr(`${run.title} is waiting for you.`, `${run.title} 正在等待你的确认。`));
-      }
-      break;
-    case "notify":
-      toast(ui.notifyType ?? "info", ui.message);
-      break;
-    case "setStatus":
-      run.statuses = { ...run.statuses };
-      if (ui.statusText) run.statuses[ui.statusKey] = ui.statusText;
-      else delete run.statuses[ui.statusKey];
-      break;
-    case "setWidget":
-      run.widgets = { ...run.widgets };
-      if (ui.widgetLines?.length) run.widgets[ui.widgetKey] = { lines: ui.widgetLines, below: ui.widgetPlacement === "belowEditor" };
-      else delete run.widgets[ui.widgetKey];
-      break;
-    default:
-      break;
-  }
-}
-
-/** Answers the dialog an extension or sub-agent is waiting on. */
+/** Answers the dialog an extension is waiting on. */
 export function answerDialog(id: string, answer: ExtensionUiAnswer) {
-  const orch = id.includes("::") ? orchestrator : undefined;
-  if (orch) {
-    orch.respondUi(id, answer);
-  } else {
-    client?.respond(id, answer);
-  }
+  client?.respond(id, answer);
   dialogs.update((list) => list.filter((dialog) => dialog.id !== id));
 }
 
@@ -2278,22 +2153,16 @@ async function runAppCommand(text: string): Promise<boolean> {
       await exportHtml();
       break;
     case "delegate": {
-      // `/delegate <agent> <task>`: the agent by id or name, with or without an `@`.
+      // `/delegate <agent> <task>`: delegating is comparing now — the sheet asks for the agents, the task stays in the composer.
       const [, token = "", task = ""] = /^@?(\S+)\s*([\s\S]*)$/.exec(rest) ?? [];
       const agent = agents().find((a) => a.id.toLowerCase() === token.toLowerCase() || a.name.toLowerCase() === token.toLowerCase());
-      if (agent && task) {
-        draft.set("");
-        await launchDelegatedTask({ title: `${agent.name} · Delegated`, agentId: agent.id, task, mode: "async" });
-        break;
-      }
-      // No agent it can name, or no task for one: the orchestration sheet asks for what is missing, and keeps the task.
       draft.set(agent ? task : rest);
-      orchestrateOpen.set(true);
+      compareOpen.set(true);
       break;
     }
     case "parallel":
       draft.set(rest);
-      orchestrateOpen.set(true);
+      compareOpen.set(true);
       break;
     case "settings":
       draft.set(rest);
@@ -2308,14 +2177,11 @@ async function runAppCommand(text: string): Promise<boolean> {
  * - `/name …` that is one of pipi's own commands runs in the app (`runAppCommand`),
  *   whatever the session is doing; any other `/name` is the agent's and goes to it.
  * - `!cmd` / `!!cmd` runs a shell command.
- * - If a Portable Context Handoff is pending (from switching agents mid-conversation
- *   or merging a sub-agent's result), prepends the budgeted handoff context to the wire
- *   prompt while keeping the user's clean message in the visible chat bubble!
+ * - If a Portable Context Handoff is pending (from switching agents mid-conversation),
+ *   prepends the budgeted handoff context to the wire prompt while keeping the
+ *   user's clean message in the visible chat bubble!
  */
 export async function send(mode: "steer" | "followUp" = "steer") {
-  // Leaving sub-agent inspection returns to the main conversation when sending
-  if (inspectingId()) inspectingId.set(undefined);
-
   if (attachmentReads.size) await Promise.allSettled([...attachmentReads]);
   // A message written while a session change is under way is for where it lands.
   for (let wait = arrival; heading() && wait; wait = arrival === wait ? undefined : arrival) await wait;
@@ -2376,7 +2242,7 @@ export async function send(mode: "steer" | "followUp" = "steer") {
       ...(images.length ? { images } : {}),
       ...(queued ? { streamingBehavior: mode } : {}),
     });
-    // The user may have switched sessions while Pi was answering: that run now belongs to the parked one.
+    // The user may have switched sessions while the agent was answering: that run is the daemon's now, not this screen's.
     if (client !== activeClient) return;
     if (!queued && disposition === "handled") {
       batch(() => {
@@ -2418,35 +2284,56 @@ async function runBash(command: string, excludeFromContext: boolean) {
     if (client === activeClient) {
       bashRequestId = undefined;
       bashRunning.set(false);
-    } else {
-      // The run was parked while the command ran; let its own record finish too.
-      const parkedRun = parkedByClient.get(activeClient);
-      if (parkedRun) {
-        parkedRun.bashRunning = false;
-        parkedRun.bashRequestId = undefined;
-        refreshParkedRunning();
-      }
     }
     if (runTranscript === transcript) flush();
   }
 }
 
-/** Stops what is running (or cancels an inspected running sub-agent). */
+/** Stops the open run, and every session still working under it (the daemon aborts the tree). */
 export async function stop() {
-  const sub = inspectingTask();
-  if (sub && sub.status === "running") {
-    return void cancelDelegatedTask(sub.id);
-  }
   if (bashRunning()) return void request("abort_bash").catch(() => undefined);
-  if (!running() && !state()?.isCompacting) return;
-  stopAsked = true;
-  if (activity().kind === "retrying") request("abort_retry").catch(() => undefined);
-  try {
-    const cleared = await request("clear_queue");
-    const waiting = [...cleared.steering, ...cleared.followUp].join("\n\n");
-    if (waiting && !draft()) draft.set(waiting);
-  } catch {}
-  await attempt(tr("Could not stop", "无法停止"), () => request("abort"));
+  if (running() || state()?.isCompacting) {
+    stopAsked = true;
+    if (activity().kind === "retrying") request("abort_retry").catch(() => undefined);
+    try {
+      const cleared = await request("clear_queue");
+      const waiting = [...cleared.steering, ...cleared.followUp].join("\n\n");
+      if (waiting && !draft()) draft.set(waiting);
+    } catch {}
+    await attempt(tr("Could not stop", "无法停止"), () => request("abort"));
+  }
+  const did = openDaemonId();
+  if (did) void daemonClient?.stopTree(did).catch(() => undefined);
+}
+
+/** Stops a nested daemon session (and its children) from the sidebar's child row. */
+export async function stopDaemonSession(sessionId: string) {
+  await daemonClient?.stopTree(sessionId).catch(() => undefined);
+}
+
+/** Stops every working or blocked daemon session across all trees (e.g. "Stop All & Quit"). */
+export async function stopAllDaemonSessions() {
+  if (running() || bashRunning() || state()?.isCompacting) {
+    await stop();
+  }
+  await daemonClient?.stopAll().catch(() => undefined);
+}
+
+/** Opens a daemon session — by its saved transcript file when present, else by attaching its daemon id directly. */
+export function openDaemonSession(sessionId: string) {
+  const session = daemonSessionOfId(sessionId);
+  if (!session) return;
+  if (session.id === openDaemonId() && phase().name === "ready" && !isSwitching()) {
+    view.set({ name: "chat" });
+    focusComposer();
+    return;
+  }
+  daemonClient?.markRead(session.id);
+  if (session.file) {
+    void openSession(session.file, projectCwdOf(session.cwd, session));
+    return;
+  }
+  void switchInto(session.cwd, undefined, session.agentId, session.id);
 }
 
 /** Puts the queued messages back in the composer without stopping the run. */
@@ -2461,183 +2348,50 @@ export async function recallQueue() {
 // ── Sessions ────────────────────────────────────────────────────────────────
 
 /**
- * Closes the open agent process: an explicit restart, or a session that is not working.
- * The store lets go of it first — an exit the store asked for is not one to recover from (`routeExit`).
+ * Whether the open daemon session is tied to an active run, a session tree, or
+ * an external caller — if so, leaving it detaches and opens a separate daemon
+ * session rather than switching files inside its process.
  */
-function closeActive() {
-  const current = client;
-  client = undefined;
-  current?.close();
-}
-
-function refreshParkedRunning() {
-  parkedRunning.set([...parked.values()].filter((run) => run.running || run.bashRunning).map((run) => run.path));
-}
-
-function removeParked(run: ParkedRun) {
-  parked.delete(run.path);
-  parkedByClient.delete(run.client);
-  refreshParkedRunning();
-}
-
-/** At most this many runs stay alive off screen; finished ones are let go first, and active ones cap well below nsh's 32-child VM limit. */
-const PARKED_LIMIT = 4;
-const PARKED_HARD_LIMIT = 12;
-
-function trimParked() {
-  while (parked.size > PARKED_LIMIT) {
-    // The run on its way back to the screen is about to leave the list on its own.
-    const others = [...parked.values()].filter((run) => run !== adopting);
-    const finished = others.find((run) => !run.running && !run.bashRunning);
-    const victim = finished ?? (parked.size > PARKED_HARD_LIMIT ? others[0] : undefined);
-    if (!victim) return;
-    removeParked(victim);
-    victim.client.close();
-  }
+function mustDetachOnSwitch(): boolean {
+  if (running() || bashRunning()) return true;
+  const held = currentDaemonSession();
+  if (held?.parentId || held?.initiator === "external") return true;
+  if (held && descendantSessionsOf(held.id).length > 0) return true;
+  return false;
 }
 
 /**
- * Leaves the open session without stopping its run: the agent process keeps
- * running with its own transcript, and the store lets go of it. Pi hosts one
- * session per process, so a switch during a run needs a second process; this
- * is what keeps the first one alive off screen.
+ * Lets go of the open agent's view: the daemon keeps its process — a run in
+ * progress keeps going off screen. The store lets go of it first — an exit
+ * (a detach) the store asked for is not one to recover from (`routeExit`).
  */
-async function parkActive(): Promise<boolean> {
+function closeActive() {
   const current = client;
-  if (!current) return false;
-  if (!running() && !bashRunning()) {
-    closeActive();
-    return false;
-  }
-  let snapshot = state();
-  if (!snapshot?.sessionFile) {
-    snapshot = await current.request("get_state").catch(() => snapshot);
-  }
-  const path = snapshot?.sessionFile;
-  if (!path) {
-    // A run with nothing on disk cannot be found again; stop it rather than orphan the process.
-    closeActive();
-    return false;
-  }
-  const run: ParkedRun = {
-    client: current,
-    transcript,
-    path,
-    cwd: workspace(),
-    agentId: currentAgentId(),
-    runtimeMode: currentRuntimeMode(),
-    title: currentTitle(),
-    state: snapshot,
-    running: running(),
-    bashRunning: bashRunning(),
-    bashRequestId,
-    activity: activity(),
-    runStartedAt: runStartedAt(),
-    queue: queue(),
-    dialogs: dialogs(),
-    statuses: statuses(),
-    widgets: widgets(),
-  };
-  parked.set(path, run);
-  parkedByClient.set(current, run);
+  const leavingCwd = projectCwdOf(workspace(), currentDaemonSession());
   client = undefined;
-  transcript = new Transcript(() => activeLanguage());
-  bashRequestId = undefined;
-  refreshParkedRunning();
-  // The session's file exists now: list it (and its running dot) before the screen moves.
-  void refreshSessions(run.cwd);
-  trimParked();
-  return true;
+  if (current) clientDaemonId.delete(current);
+  current?.close();
+  // A run let go of keeps working off screen: re-list so its sidebar rows exist for the mark.
+  if (running() || bashRunning()) void refreshSessions(leavingCwd);
 }
 
-/** Brings a parked run back to the screen: its process, rows and pending prompts. */
-async function adoptParked(path: string): Promise<boolean> {
-  const run = parked.get(path);
-  if (!run || busy()) return false;
-  busy.set(true);
-  markSessionRead(path);
-  adopting = run;
-  try {
-    if (running() || bashRunning()) await parkActive();
-    else {
-      stashTranscript();
-      closeActive();
-    }
-    if (parked.get(path) !== run || run.client.closed) {
-      // Its process went away while the screen was being cleared for it: its session opens on a new one.
-      if (parked.get(path) === run) removeParked(run);
-      view.set({ name: "chat" });
-      await start(run.cwd, run.path, run.agentId);
-      return true;
-    }
-    ahead = undefined;
-    visited.delete(run.path);
-    parked.delete(run.path);
-    parkedByClient.delete(run.client);
-    generation++;
-    client = run.client;
-    transcript = run.transcript;
-    shownVersion = -1;
-    batch(() => {
-      view.set({ name: "chat" });
-      workspace.set(run.cwd);
-      currentAgentId.set(run.agentId);
-      currentRuntimeMode.set(run.runtimeMode);
-      inspectingId.set(undefined);
-      pendingHandoff.set(undefined);
-      renaming.set(false);
-      attachments.set([]);
-      heading.set(undefined);
-      leaving.set(false);
-      phase.set({ name: "ready" });
-      state.set(run.state);
-      running.set(run.running);
-      bashRunning.set(run.bashRunning);
-      bashRequestId = run.bashRequestId;
-      activity.set(run.activity);
-      runStartedAt.set(run.runStartedAt);
-      queue.set(run.queue);
-      dialogs.set(run.dialogs.slice());
-      statuses.set({ ...run.statuses });
-      widgets.set({ ...run.widgets });
-      const cached = sessionsByWorkspace()[run.cwd];
-      if (cached) {
-        sessions.set(cached);
-        sessionsLoaded.set(true);
-      }
-    });
-    refreshParkedRunning();
-    rememberWorkspace(run.cwd);
-    void refreshGitWorkspace(run.cwd);
-    markTranscriptSeen();
-    flush();
-    landed.update((n) => n + 1);
-    scrollToEnd.set(0);
-    arrived.update((n) => n + 1);
-    void Promise.all([refreshState(), refreshLevels(), refreshModels(), refreshCommands(), refreshStats()]).catch(() => undefined);
-    refreshSessions(run.cwd);
-    focusComposer();
-    return true;
-  } finally {
-    if (adopting === run) adopting = undefined;
-    busy.set(false);
-  }
-}
-
-/** Switches to another session or folder in a new agent process, keeping the current run alive. */
-async function switchInto(cwd: string, sessionPath: string | undefined, agentId = currentAgentId()): Promise<boolean> {
+/**
+ * Switches to another session or folder under a new attach: the open session
+ * is only detached — the daemon keeps its process, run and all, and its row
+ * in the sidebar keeps its working mark.
+ */
+async function switchInto(cwd: string, sessionPath: string | undefined, agentId = currentAgentId(), daemonId?: string): Promise<boolean> {
   if (busy()) return false;
   busy.set(true);
   try {
-    await parkActive();
+    closeActive();
     batch(() => {
       view.set({ name: "chat" });
-      inspectingId.set(undefined);
       pendingHandoff.set(undefined);
       renaming.set(false);
       attachments.set([]);
     });
-    await start(cwd, sessionPath, agentId);
+    await start(cwd, sessionPath, agentId, undefined, daemonId);
     focusComposer();
     return true;
   } finally {
@@ -2671,7 +2425,6 @@ async function changeSession(what: string, action: () => Promise<{ cancelled: bo
     }
     batch(() => {
       view.set({ name: "chat" });
-      inspectingId.set(undefined);
       pendingHandoff.set(undefined);
       renaming.set(false);
       attachments.set([]);
@@ -2697,65 +2450,73 @@ async function changeSession(what: string, action: () => Promise<{ cancelled: bo
   }
 }
 
-/** Starts a fresh session, then puts back the model and thinking the user last picked for this agent. */
+/** Starts a fresh session, then puts back the model, thinking, and initial permission mode for this agent. */
 async function requestNewSession() {
   const result = await request("new_session");
-  if (!result.cancelled) await applySessionChoices();
+  if (!result.cancelled) {
+    currentRuntimeMode.set(preferredRuntimeMode());
+    if (openDaemonId()) daemonClient?.setRuntimeMode(openDaemonId()!, preferredRuntimeMode());
+    await applySessionChoices();
+  }
   return result;
 }
 
 export function newSession() {
-  inspectingId.set(undefined);
   pendingHandoff.set(undefined);
+  const rootCwd = activeProjectPath() || workspace();
   if (phase().name !== "ready") {
     busy.set(false);
     view.set({ name: "chat" });
-    return start(workspace(), undefined, currentAgentId());
+    return start(rootCwd, undefined, currentAgentId());
   }
   if (isSwitching()) {
-    if (!heading()?.file && !busy()) return focusComposer();
+    if (!heading()?.file && !heading()?.daemonId && !busy()) return focusComposer();
     busy.set(false);
     view.set({ name: "chat" });
-    return start(workspace(), undefined, currentAgentId());
+    return start(rootCwd, undefined, currentAgentId());
   }
-  if (!rows().length && !(state()?.messageCount) && view().name === "chat" && !running() && !bashRunning()) {
+  if (!rows().length && !(state()?.messageCount) && !mustDetachOnSwitch() && view().name === "chat") {
     return focusComposer();
   }
-  if (running() || bashRunning()) return switchInto(workspace(), undefined, currentAgentId());
+  if (mustDetachOnSwitch() || rootCwd !== workspace()) {
+    return switchInto(rootCwd, undefined, currentAgentId());
+  }
   return changeSession(tr("Could not start a session", "无法新建会话"), requestNewSession, {});
 }
 
 async function openSessionFile(path: string, ownerAgentId?: string) {
-  // A session whose agent kept working while the user was elsewhere is still live: bring it back.
-  if (parked.has(path)) {
-    view.set({ name: "chat" });
-    return adoptParked(path);
-  }
-  const neededAgent = ownerAgentId || (path.endsWith(".pipi-agent.jsonl") ? sessions().find((s) => s.path === path)?.agentId : "pi") || currentAgentId();
+  const held = daemonSessionByFile(path);
+  const targetCwd = held?.cwd ?? activeProjectPath() ?? workspace();
+  const neededAgent =
+    held?.agentId ||
+    ownerAgentId ||
+    (path.endsWith(".pipi-agent.jsonl") ? sessions().find((s) => s.path === path)?.agentId : "pi") ||
+    currentAgentId();
   const targetSpec = agents().find((a) => a.id === neededAgent);
   const switchHarness =
     neededAgent !== currentAgentId() &&
     Boolean(targetSpec && (targetSpec.available || targetSpec.statusText === "Checking…" || path.endsWith(".pipi-agent.jsonl")));
-  if (switchHarness || phase().name !== "ready" || isSwitching()) {
-    if (running() || bashRunning()) return switchInto(workspace(), path, neededAgent);
+  const own = held !== undefined && held.id === openDaemonId();
+  if (switchHarness || phase().name !== "ready" || isSwitching() || (held !== undefined && !own) || mustDetachOnSwitch() || targetCwd !== workspace()) {
+    if (phase().name === "ready" && !isSwitching()) {
+      return switchInto(targetCwd, path, neededAgent, held?.id);
+    }
     busy.set(false);
     view.set({ name: "chat" });
-    inspectingId.set(undefined);
     pendingHandoff.set(undefined);
-    await start(workspace(), path, neededAgent);
+    await start(targetCwd, path, neededAgent, undefined, held?.id);
     return true;
   }
-  // Switching inside Pi would replace the session and end the run; a second process keeps it.
-  if (running() || bashRunning()) return switchInto(workspace(), path, currentAgentId());
   return changeSession(tr("Could not open the session", "无法打开会话"), () => request("switch_session", { sessionPath: path }), { file: path });
 }
 
 export function openSession(path: string, cwd?: string) {
-  inspectingId.set(undefined);
   markSessionRead(path);
-  if (cwd && cwd !== workspace()) {
-    const summary = (sessionsByWorkspace()[cwd] ?? []).find((s) => s.path === path);
-    return openWorkspace(cwd, path, summary?.agentId);
+  const held = daemonSessionByFile(path);
+  const effectiveCwd = cwd ?? (held ? projectCwdOf(held.cwd, held) : undefined);
+  if (effectiveCwd && effectiveCwd !== activeProjectPath()) {
+    const summary = (sessionsByWorkspace()[effectiveCwd] ?? []).find((s) => s.path === path);
+    return openWorkspace(held?.cwd ?? effectiveCwd, path, held?.agentId ?? summary?.agentId);
   }
   if (path === state()?.sessionFile && phase().name === "ready" && !isSwitching()) {
     view.set({ name: "chat" });
@@ -2830,11 +2591,9 @@ export async function archiveSession(path: string, cwd = workspace(), options?: 
       : summary
         ? sessionTitle(summary, tr("Conversation", "对话"))
         : tr("Conversation", "对话");
-  const parkedRun = parked.get(path);
-  if (parkedRun) {
-    removeParked(parkedRun);
-    parkedRun.client.close();
-  }
+  const held = daemonSessionByFile(path);
+  // A background session holding this file ends with it; the open one moves to a new file instead.
+  if (held?.loaded && held.id !== openDaemonId()) quietKill(held.id);
   // The list moves at once; leaving the open session follows, and puts the row back if it cannot.
   const open = path === state()?.sessionFile;
   setSessionArchived(path, true, cwd);
@@ -2880,11 +2639,8 @@ export async function deleteAllArchivedSessions() {
   const affectedCwds = new Set<string>();
   for (const { session, cwd } of targets) {
     if (!isSessionArchived(session.path)) continue;
-    const parkedRun = parked.get(session.path);
-    if (parkedRun) {
-      removeParked(parkedRun);
-      parkedRun.client.close();
-    }
+    const held = daemonSessionByFile(session.path);
+    if (held?.loaded && held.id !== openDaemonId()) quietKill(held.id);
     try {
       await backend().deleteSession(session.path);
       clearArchivedSessionPref(session.path);
@@ -2928,11 +2684,8 @@ export async function removeSession(path: string, cwd = workspace()) {
     if (!left) return;
   }
   // Deleting a run that is still going off screen stops it first: its file is going away.
-  const parkedRun = parked.get(path);
-  if (parkedRun) {
-    removeParked(parkedRun);
-    parkedRun.client.close();
-  }
+  const held = daemonSessionByFile(path);
+  if (held?.loaded && held.id !== openDaemonId()) quietKill(held.id);
   visited.delete(path);
   await attempt(tr("Could not delete the session", "无法删除会话"), () => backend().deleteSession(path));
   clearArchivedSessionPref(path);

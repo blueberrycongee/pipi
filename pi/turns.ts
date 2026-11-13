@@ -138,11 +138,17 @@ export function classifyTool(rawName: string): { category: ToolCategory; subkind
     lower === "agent" ||
     lower === "subagent" ||
     lower === "invoke_subagent" ||
-    lower === "orchestrator_capabilities" ||
-    lower === "task_status" ||
-    lower === "task_cancel"
+    lower === "session_start" ||
+    lower === "session_stop" ||
+    lower === "session_send" ||
+    lower === "session_read" ||
+    lower === "sessions_list" ||
+    lower === "agents_list"
   ) {
-    return { category: "agent", icon: lower === "task_status" ? "clock" : lower === "task_cancel" ? "stop" : "agents" };
+    return {
+      category: "agent",
+      icon: lower === "session_stop" ? "stop" : lower === "session_read" || lower === "sessions_list" || lower === "agents_list" ? "clock" : "agents",
+    };
   }
   if (lower === "web_search" || lower === "websearch" || lower === "search_web" || lower === "google_search") {
     return { category: "web", icon: "globe" };
@@ -342,20 +348,51 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
     }
 
     case "agent": {
-      const lower = row.name.toLowerCase();
-      if (lower === "orchestrator_capabilities") {
+      const lower = row.name.replace(/^mcp__[^_]+__/i, "").toLowerCase();
+      if (lower === "agents_list" || lower === "sessions_list" || lower === "session_read") {
         return {
           category,
           icon,
-          verb: active ? (zh ? "正在探测" : "Probing") : zh ? "已探测" : "Probed",
-          target: zh ? "可用编码智能体与模型" : "available agents & models",
+          verb: active ? (zh ? "正在查看会话" : "Reading sessions") : zh ? "已查看会话" : "Read sessions",
+          target: lower === "agents_list" ? (zh ? "可用智能体与模型" : "available agents") : pickStr(args, "session", "sessionId", "id") || (zh ? "会话树" : "the session tree"),
           meta: "",
           monoTarget: false,
         };
       }
-      const agent = pickStr(args, "agentId", "agent", "subagent_type", "TypeName");
-      const title = pickStr(args, "title", "description", "Role", "task", "prompt");
-      const verb = active ? (zh ? "正在委派子任务" : "Running subtask") : failed ? (zh ? "子任务失败" : "Subtask failed") : zh ? "完成子任务" : "Subtask";
+      if (lower === "session_send") {
+        return {
+          category,
+          icon,
+          verb: active ? (zh ? "正在发送消息" : "Messaging session") : failed ? (zh ? "发送失败" : "Message failed") : zh ? "已发送至会话" : "Messaged session",
+          target: pickStr(args, "session", "sessionId", "id") || (zh ? "会话" : "session"),
+          meta: "",
+          monoTarget: true,
+        };
+      }
+      if (lower === "session_stop") {
+        return {
+          category,
+          icon,
+          verb: active ? (zh ? "正在停止会话" : "Stopping session") : failed ? (zh ? "停止失败" : "Stop failed") : zh ? "已停止会话" : "Stopped session",
+          target: pickStr(args, "session", "sessionId", "id") || (zh ? "会话" : "session"),
+          meta: "",
+          monoTarget: true,
+        };
+      }
+      const agent = pickStr(args, "agent", "agentId", "subagent_type", "TypeName");
+      const title = pickStr(args, "title", "description", "Role", "task", "prompt", "message");
+      const isStart = lower === "session_start";
+      const verb = isStart
+        ? active
+          ? zh ? "正在启动子会话" : "Starting session"
+          : failed
+            ? zh ? "子会话启动失败" : "Session failed"
+            : zh ? "已启动子会话" : "Started session"
+        : active
+          ? zh ? "正在委派子任务" : "Running subtask"
+          : failed
+            ? zh ? "子任务失败" : "Subtask failed"
+            : zh ? "完成子任务" : "Subtask";
       return {
         category,
         icon,
@@ -501,7 +538,27 @@ function toolLine(tool: ToolRow, running: boolean, zh: boolean): string {
       return `${verb} ${running ? compactCommand(command) : commandProgram(command) || compactCommand(command)}`;
     }
     case "agent": {
-      const title = pickStr(args, "title", "description", "Role", "name", "task", "agentId", "agent", "subagent_type");
+      const lower = tool.name.replace(/^mcp__[^_]+__/i, "").toLowerCase();
+      if (lower === "agents_list" || lower === "sessions_list" || lower === "session_read") {
+        return running ? (zh ? "正在查看会话" : "Reading sessions") : zh ? "已查看会话" : "Read sessions";
+      }
+      if (lower === "session_send") {
+        const target = pickStr(args, "session", "sessionId", "id");
+        return running
+          ? zh ? `正在向 ${target || "会话"} 发送消息` : `Messaging ${target || "session"}`
+          : zh ? `已向 ${target || "会话"} 发送消息` : `Messaged ${target || "session"}`;
+      }
+      if (lower === "session_stop") {
+        const target = pickStr(args, "session", "sessionId", "id");
+        return running
+          ? zh ? `正在停止 ${target || "会话"}` : `Stopping ${target || "session"}`
+          : zh ? `已停止 ${target || "会话"}` : `Stopped ${target || "session"}`;
+      }
+      const title = pickStr(args, "title", "description", "Role", "name", "task", "message", "agent", "agentId", "subagent_type");
+      if (lower === "session_start") {
+        const suffix = title ? ` ${truncate(title, 48)}` : "";
+        return running ? (zh ? `正在启动子会话${suffix}` : `Starting session${suffix}`) : zh ? `已启动子会话${suffix}` : `Started session${suffix}`;
+      }
       return title ? (zh ? `子任务 ${truncate(title, 48)}` : `Subtask ${truncate(title, 48)}`) : zh ? "子任务" : "Subtask";
     }
     case "todo":

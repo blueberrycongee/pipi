@@ -5,7 +5,6 @@ import type {
   AgentOverride,
   AgentProtocol,
   CustomAgentConfig,
-  DelegateRole,
   RuntimeMode,
 } from "./types";
 
@@ -333,15 +332,16 @@ export const BUILTIN_AGENTS: readonly BuiltinAgentSpec[] = [
     name: "Amp",
     driver: "acp",
     protocol: "acp",
-    binary: "amp",
-    acpArgs: ["acp"],
-    descriptionEn: "Sourcegraph's Amp frontier coding agent (`amp acp`).",
-    descriptionZh: "Sourcegraph Amp 编码智能体（`amp acp`）。",
+    binary: "amp-acp",
+    acpArgs: [],
+    descriptionEn: "Sourcegraph's Amp frontier coding agent via the `amp-acp` ACP adapter.",
+    descriptionZh: "Sourcegraph Amp 编码智能体（经 `amp-acp` ACP 适配器）。",
     supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
+    supportsResume: true,
     defaultModels: defaultEngineModels("amp", "Amp"),
     envVar: "AMP_API_KEY",
-    installCommand: "npm install -g @sourcegraph/amp",
-    docsUrl: "https://ampcode.com/manual",
+    installCommand: "npm install -g amp-acp",
+    docsUrl: "https://github.com/tao12345666333/amp-acp",
     category: "acp",
   },
 ];
@@ -422,9 +422,10 @@ export function runtimeModeRank(mode: RuntimeMode): number {
 }
 
 /**
- * Resolves the runtime permission mode for a delegated child agent:
+ * Resolves the runtime permission mode for a child session:
  * - `"inherit"` or `undefined` inherits `parentMode` (clamped to what the target offers).
  * - Explicit escalation above `parentMode` throws an error (`runtime_mode_escalation_denied`).
+ * Mirrored by `clampMode` in `sidecar/pipi-daemon.mjs`, which enforces it at session_start.
  */
 export function resolveRuntimeMode(
   parentMode: RuntimeMode,
@@ -448,19 +449,3 @@ export function resolveRuntimeMode(
   return allowed[0] ?? "approval-required";
 }
 
-/** Wraps a delegated task prompt with its assigned sub-agent role. */
-export function formatRoleTaskPrompt(task: string, role: DelegateRole = "general"): string {
-  const trimmed = task.trim();
-  switch (role) {
-    case "researcher":
-      return `Act as the researcher sub-agent for this task. Investigate thoroughly using read-only inspection, cite exact files and symbols, and return a concise, structured report.\n\n${trimmed}`;
-    case "planner":
-      return `Act as the planner sub-agent for this task. Analyze the codebase, identify constraints and edge cases, and return a concrete step-by-step implementation plan without editing files.\n\n${trimmed}`;
-    case "implementer":
-      return `Act as the implementer sub-agent for this task. Carry out the requested code changes cleanly, run relevant checks/tests, and summarize what changed.\n\n${trimmed}`;
-    case "reviewer":
-      return `Act as the reviewer sub-agent for this task. Audit the code or diff critically for bugs, regressions, security issues, and style violations. Report concrete findings.\n\n${trimmed}`;
-    default:
-      return trimmed;
-  }
-}

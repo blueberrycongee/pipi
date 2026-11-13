@@ -17,6 +17,11 @@ export type Appearance = "system" | "light" | "dark";
 export type Language = "system" | "en" | "zh";
 export const AUTO_ARCHIVE_DAYS = [0, 7, 14, 30, 90] as const;
 export type AutoArchiveDays = (typeof AUTO_ARCHIVE_DAYS)[number];
+export type AgentSendScope = "all" | "children";
+export const SESSION_TREE_DEPTHS = [1, 2, 3] as const;
+export type SessionTreeDepth = (typeof SESSION_TREE_DEPTHS)[number];
+export const SESSION_TREE_MAX = [4, 8, 16] as const;
+export type SessionTreeMax = (typeof SESSION_TREE_MAX)[number];
 
 export interface ArchivedSessionMeta {
   /** Unix timestamp (ms) when the session was archived. */
@@ -61,6 +66,16 @@ interface Prefs {
   runtimeMode: RuntimeMode;
   /** Whether parallel multi-agent orchestrations isolate each agent in its own Git worktree by default. */
   worktreeIsolationDefault: boolean;
+  /** Whether agents inside pipi sessions may call the six session tools (start/read/send/list/stop). */
+  agentSessionTools: boolean;
+  /** Which sessions an agent may message: only sessions it started, or any session in reach. */
+  agentSendScope: AgentSendScope;
+  /** How many generations of agent-started sessions may nest under one session. */
+  sessionTreeDepth: SessionTreeDepth;
+  /** How many sessions one session tree may keep running at once. */
+  sessionTreeMax: SessionTreeMax;
+  /** Whether sessions keep running (the session daemon stays up) after the window closes. */
+  runInBackground: boolean;
   /** Per-agent binary path / launch flag overrides. */
   agentOverrides: Record<string, AgentOverride>;
   /** User-configured custom ACP / CLI coding agents. */
@@ -104,6 +119,11 @@ const DEFAULTS: Prefs = {
   defaultAgentId: "pi",
   runtimeMode: "full-access",
   worktreeIsolationDefault: true,
+  agentSessionTools: true,
+  agentSendScope: "all",
+  sessionTreeDepth: 2,
+  sessionTreeMax: 8,
+  runInBackground: false,
   agentOverrides: {},
   customAgents: [],
   agentSessionChoices: {},
@@ -256,6 +276,11 @@ export const autoRetryChoice = () => prefs().autoRetry;
 export const preferredAgentId = () => prefs().defaultAgentId;
 export const preferredRuntimeMode = () => prefs().runtimeMode;
 export const worktreeIsolationDefault = () => prefs().worktreeIsolationDefault;
+export const agentSessionTools = () => prefs().agentSessionTools;
+export const agentSendScope = () => prefs().agentSendScope;
+export const sessionTreeDepth = () => prefs().sessionTreeDepth;
+export const sessionTreeMax = () => prefs().sessionTreeMax;
+export const runInBackground = () => prefs().runInBackground;
 export const storedAgentOverrides = () => prefs().agentOverrides;
 export const storedCustomAgents = () => prefs().customAgents;
 export const storedSessionChoice = (agentId: string): AgentSessionChoice | undefined => prefs().agentSessionChoices[agentId];
@@ -295,12 +320,52 @@ export function setPreferredAgentId(agentId: string) {
   change({ defaultAgentId: agentId });
 }
 
+const daemonPrefsListeners = new Set<() => void>();
+
+/** Subscribes to preference changes that must be pushed live to the session daemon. */
+export function onDaemonPrefsChange(listener: () => void): () => void {
+  daemonPrefsListeners.add(listener);
+  return () => daemonPrefsListeners.delete(listener);
+}
+
+function notifyDaemonPrefs() {
+  for (const listener of daemonPrefsListeners) listener();
+}
+
 export function setPreferredRuntimeMode(mode: RuntimeMode) {
   change({ runtimeMode: mode });
 }
 
 export function setWorktreeIsolationDefault(enabled: boolean) {
   change({ worktreeIsolationDefault: enabled });
+  notifyDaemonPrefs();
+}
+
+export function setAgentSessionTools(enabled: boolean) {
+  change({ agentSessionTools: enabled });
+  notifyDaemonPrefs();
+}
+
+export function setAgentSendScope(scope: AgentSendScope) {
+  change({ agentSendScope: scope });
+  notifyDaemonPrefs();
+}
+
+export function setSessionTreeDepth(depth: SessionTreeDepth) {
+  if (!SESSION_TREE_DEPTHS.includes(depth)) return;
+  change({ sessionTreeDepth: depth });
+  notifyDaemonPrefs();
+}
+
+export function setSessionTreeMax(max: SessionTreeMax) {
+  if (!SESSION_TREE_MAX.includes(max)) return;
+  change({ sessionTreeMax: max });
+  notifyDaemonPrefs();
+}
+
+export function setRunInBackground(enabled: boolean) {
+  change({ runInBackground: enabled });
+  notifyDaemonPrefs();
 }
 
 export function setAgentOverride(agentId: string, override: AgentOverride) {

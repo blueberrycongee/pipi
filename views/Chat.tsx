@@ -1,7 +1,8 @@
 import { Animated, cleanup, computed, createAnimatedValue, effect, List, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
-import type { JSX, ListRef, ScrollEvent, ViewRef } from "nsh";
+import type { JSX, ListRef, MouseEvent, ScrollEvent, ViewRef } from "nsh";
 import { Button as BaseButton, Popover } from "nsh/base";
 import { titleBar } from "nsh/desktop";
+import { edgeStep, edgeTarget } from "../lib/edge-scroll";
 import { basename, tildePath } from "../lib/format";
 import { tr } from "../lib/i18n";
 import { Pip } from "../mascot/Pip";
@@ -10,8 +11,6 @@ import {
   chooseWorkspace,
   currentActivity,
   hasModel,
-  inspectingTask,
-  inspectingTaskId,
   isDraftAhead,
   isLeavingSession,
   isRunning,
@@ -29,6 +28,7 @@ import {
   showSettings,
   sidecarPhase,
   transcriptRows,
+  waitingCount,
   wallpaper,
   workspacePath,
 } from "../store/app";
@@ -58,21 +58,19 @@ import {
 import { HeaderBand, PaneVeil } from "./Wallpaper";
 import { buildDisplayRows, displayRowIds, stableDisplayRows } from "../pi/turns";
 
-/** Whether the currently displayed conversation (main or inspected sub-agent) is actively running. */
+/** Whether the displayed conversation is actively running. */
 function isChatActive() {
-  const sub = inspectingTask();
-  return sub ? sub.status === "running" : isRunning();
+  return isRunning() || waitingCount() > 0;
 }
 
 /** What the run is doing, in a word or two. */
 function activityLabel() {
-  const sub = inspectingTask();
   const dialog = pendingDialog();
-  if (sub && sub.status === "running") {
-    if (dialog?.id.startsWith(`${sub.id}::`)) return tr("Waiting for confirmation", "等待确认");
-    return tr(`${sub.agentName} working…`, `${sub.agentName} 正在运行…`);
-  }
   if (dialog) return tr("Waiting for confirmation", "等待确认");
+  if (!isRunning()) {
+    const waiting = waitingCount();
+    if (waiting > 0) return tr(`Waiting on ${waiting} ${waiting === 1 ? "session" : "sessions"}`, `等待 ${waiting} 个会话`);
+  }
   const activity = currentActivity();
   switch (activity.kind) {
     case "writing":
@@ -410,19 +408,25 @@ const INPUT_WINDOW_MS = 1500;
 /** After the reader releases the view, how long (ms) a move towards the end is not read as theirs: the list settles its layout once as it is released. */
 const RELEASE_SETTLE_MS = 300;
 
+/** How long (ms) a selection drag that has left the pane goes on scrolling after the selection last grew: the button going up out there is not heard. */
+const EDGE_BEAT_MS = 250;
+
 /**
- * The foot of the conversation, measured up from the pane's lower edge. The composer's top edge rests at 112pt
- * (20 under it, 92 tall), and an inline prompt stands another 128 on top of it. What meets that edge is placed
- * from it, so the three move together:
- * - `pad`: the conversation ends 16 above the edge, a container's pad (`end`, the same in points). The activity
- *   line's 36pt slot is the last thing in it, so a reply at rest stands 52 clear of the composer and Pip, working, about 20.
- * - `pill`: "Jump to latest" stands on that same line.
+ * The foot of the conversation, measured up from the pane's lower edge. What stands there is the composer's
+ * figure as laid out (`figure`, its height): 20 under the composer, the composer, whatever stands on it — the
+ * queue's tray, attachments, an inline prompt — and 12 over that. At rest that is 124 (a 92pt composer), its
+ * top edge at 112; the edge is wherever the figure puts it, and what meets it is placed from it, so the three
+ * move together and nothing the composer grows by covers the reply:
+ * - `end`: the conversation ends 16 above the edge, a container's pad. The activity line's 36pt slot is the last
+ *   thing in it, so a reply at rest stands 52 clear of the composer and Pip, working, about 20.
+ * - "Jump to latest" stands on that same line.
  * - `fade`: rows fade out as they pass under that edge.
  */
-const FOOT = {
-  rest: { pad: "pb-32", end: 128, pill: "bottom-32", fade: "linear-gradient(to top, transparent 56px, black 118px)" },
-  prompt: { pad: "pb-64", end: 256, pill: "bottom-64", fade: "linear-gradient(to top, transparent 170px, black 240px)" },
-} as const;
+const FIGURE_REST = 124;
+function footOf(figure: number) {
+  const edge = (figure || FIGURE_REST) - 12;
+  return { end: edge + 16, fade: `linear-gradient(to top, transparent ${edge - 56}px, black ${edge + 6}px)` };
+}
 
 /**
  * Where the composer stands while there is no conversation: in the middle of the pane, with the stage
@@ -462,7 +466,7 @@ type Screen = "starting" | "failed" | "connect" | "welcome" | "transcript";
 
 /** Floating pill shown when the reader scrolls up past the follow threshold,
  * offering a crisp native spring return to the bottom of the conversation. */
-function ScrollToBottomPill(props: { visible: boolean; promptOpen: boolean; onPress: () => void }) {
+function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: () => void }) {
   const mounted = signal(false);
   const opacity = createAnimatedValue(0);
   const translateY = createAnimatedValue(8);
@@ -509,8 +513,8 @@ function ScrollToBottomPill(props: { visible: boolean; promptOpen: boolean; onPr
   return (
     <If when={mounted()}>
       <View
-        class={`pointer-events-none absolute inset-x-0 z-10 items-center ${FOOT[props.promptOpen ? "prompt" : "rest"].pill}`}
-        style={{ opacity, transform: [{ translateY }, { scale }] }}
+        class="pointer-events-none absolute inset-x-0 z-10 items-center"
+        style={{ bottom: props.bottom, opacity, transform: [{ translateY }, { scale }] }}
       >
         <BaseButton
           onPress={props.onPress}
@@ -621,11 +625,12 @@ export function Chat() {
   /** The stage around the composer: the screen's while it stands in the middle, and that one still while it fades. */
   const stage = signal<Screen | undefined>(untracked(hero) ? untracked(screen) : undefined);
   let paneHeight = 0;
-  let figureHeight = 0;
+  /** The composer's figure as laid out: the composer and what stands on it. The conversation's foot is placed from it (`footOf`). */
+  const figure = signal(0);
   /** How far the pane goes on under the composer in the middle, as laid out: the way down to the dock. */
   let drop = 0;
   /** The same before it is laid out, for the way up: the lower spacer's share of the free height. */
-  const dropAhead = () => HERO.foot + (Math.max(0, paneHeight - figureHeight - HERO.head - HERO.foot) * HERO.sink) / (HERO.rise + HERO.sink);
+  const dropAhead = () => HERO.foot + (Math.max(0, paneHeight - untracked(figure) - HERO.head - HERO.foot) * HERO.sink) / (HERO.rise + HERO.sink);
   /** The travel under way, to start the next one from where this one has got to. */
   let travel: { from: number; at: number } | undefined;
   const slideNow = () => {
@@ -704,12 +709,105 @@ export function Chat() {
     }
     lastY = y;
     lastDistance = distance;
+    lastMax = e.contentSize.height - e.size.height;
   };
   const onInput = () => {
     inputAt = Date.now();
   };
 
-  const foot = () => FOOT[hasInlinePrompt() ? "prompt" : "rest"];
+  /**
+   * A selection dragged to an edge of what can be read — the title bar's band above, the composer's top
+   * below — scrolls the conversation on (`lib/edge-scroll.ts`), as text does everywhere. The platform's own
+   * autoscroll looks for a scroll view around the selectable view, and here the list is inside it, under a
+   * frame that goes on behind both edges: so the pane does it. The pane listens to the mouse only while a
+   * selection is being made (the selection changing says so; the button up, or a move without it, ends it),
+   * and each frame the pointer rests in an edge the list moves by a step, as the reader's own scroll: up
+   * releases the view, down to the end follows again. The platform extends the selection as the pointer
+   * moves, not as the text moves under it: held still, the highlight catches up on the next move.
+   */
+  const selecting = signal(false);
+  let selected = "";
+  let selectedAt = 0;
+  /** Where the pressed pointer is down the pane, once it has moved; and whether that is where it left it. */
+  let pointerY: number | undefined;
+  let pointerOut = false;
+  let lastMax = 0;
+  let edgeFrame: number | undefined;
+  let edgeAt = 0;
+  let edgeFrom: number | undefined;
+  let edgeAim: number | undefined;
+  let edgeAsking = false;
+  const edgeRest = () => {
+    edgeAt = 0;
+    edgeFrom = edgeAim = undefined;
+  };
+  const edgeTick = () => {
+    edgeFrame = undefined;
+    if (!untracked(selecting) || pointerY === undefined) return edgeRest();
+    const top = untracked(() => titleBar().height) || 44;
+    const bottom = paneHeight - (untracked(figure) || FIGURE_REST);
+    const step = edgeStep(pointerY, top, bottom);
+    if (!step || (pointerOut && Date.now() - selectedAt > EDGE_BEAT_MS)) return edgeRest();
+    edgeFrame = requestAnimationFrame(edgeTick);
+    if (lastY === undefined) {
+      // A list that has not scrolled yet has not said where it is: ask it, and step from the row it names. It reports from then on.
+      if (edgeAsking || !list) return;
+      edgeAsking = true;
+      void list.measureScrollPosition().then((at) => {
+        edgeAsking = false;
+        if (!at || lastY !== undefined || !untracked(selecting)) return;
+        onInput();
+        list?.scrollToIndex({ index: at.index, viewOffset: -(at.offset + step), animated: false });
+      });
+      return;
+    }
+    // Frames as long as at 60 Hz move as far, whatever the display's rate.
+    const now = Date.now();
+    const scale = edgeAt ? Math.min(4, Math.max(0.25, ((now - edgeAt) * 60) / 1000)) : 1;
+    edgeAt = now;
+    const target = edgeTarget(step * scale, lastY, lastMax, edgeFrom, edgeAim);
+    // At an end: nothing to ask for again.
+    if (target === (edgeFrom === lastY ? edgeAim : lastY)) return;
+    edgeFrom = lastY;
+    edgeAim = target;
+    onInput();
+    list?.scrollTo({ y: target, animated: false });
+  };
+  const edgeKick = () => {
+    edgeFrame ??= requestAnimationFrame(edgeTick);
+  };
+  const endSelecting = () => {
+    if (untracked(selecting)) selecting.set(false);
+    pointerY = undefined;
+    pointerOut = false;
+    cancelAnimationFrame(edgeFrame);
+    edgeFrame = undefined;
+    edgeRest();
+  };
+  const onSelection = (e: { text: string }) => {
+    // Its box moves with every scroll: only the text changing is the reader selecting.
+    if (e.text === selected) return;
+    selected = e.text;
+    if (!e.text) return endSelecting();
+    selectedAt = Date.now();
+    if (!untracked(selecting)) selecting.set(true);
+    edgeKick();
+  };
+  const onSelectMove = (e: MouseEvent) => {
+    if (e.pressedButton !== "left") return endSelecting();
+    pointerY = e.position.y;
+    pointerOut = false;
+    edgeKick();
+  };
+  const onSelectLeave = (e: MouseEvent) => {
+    if (e.pressedButton !== "left") return endSelecting();
+    pointerY = e.position.y;
+    pointerOut = true;
+    edgeKick();
+  };
+  cleanup(endSelecting);
+
+  const foot = computed(() => footOf(figure()), { equals: (a, b) => a.end === b.end });
 
   // A released view holds its offset, so the list reports no scroll while the
   // reply grows under it, and the distance last reported goes stale: a reader
@@ -775,8 +873,18 @@ export function Chat() {
       following.set(true);
     });
   });
+  // The foot rising moves the end up with it — the queue's tray, a draft growing, an inline prompt — and the list
+  // does not go along by itself (it loses its place, and paints blank): a view that follows is sent to the end again,
+  // at once while the reply can move the end too, gliding under a prompt, which holds it. Sinking, the list clamps
+  // itself; an offset asked for then, before the shorter content is laid out, is past the end.
+  let footEnd = untracked(foot).end;
   effect(() => {
-    if (hasInlinePrompt() && untracked(following)) list?.scrollToEnd({ animated: !reduceMotion() });
+    const end = foot().end;
+    const rose = end > footEnd;
+    footEnd = end;
+    if (!rose || !untracked(following)) return;
+    if (untracked(hasInlinePrompt) && !untracked(reduceMotion)) list?.scrollToEnd({ animated: true });
+    else list?.scrollTo({ y: 1e7, animated: false });
   });
   /**
    * One more mount batch shortly after the transcript's big changes. The
@@ -848,10 +956,9 @@ export function Chat() {
   });
   cleanup(() => void pane.stop());
 
-  // Another conversation's rows are other rows — another session's, an
-  // inspected task's: what was expanded there is not here, and the rows
-  // landing were already on screen, so none of them enters again.
-  const conversation = computed(() => `${sessionState()?.sessionId ?? ""}${inspectingTaskId() ?? ""}`);
+  // Another conversation's rows are other rows: what was expanded there is not
+  // here, and the rows landing were already on screen, so none of them enters again.
+  const conversation = computed(() => sessionState()?.sessionId ?? "");
   // Only the conversation changing runs this. What it reads on the way — the
   // rows, the fold memory — is not what it waits for: tracked, every delta of a
   // reply would follow again and take the view back from a reader who scrolled up.
@@ -860,6 +967,8 @@ export function Chat() {
     untracked(() => {
       inputAt = 0;
       lastY = undefined;
+      selected = "";
+      endSelecting();
       following.set(true);
       distanceFromEnd.set(0);
       swapConversation(key);
@@ -869,12 +978,18 @@ export function Chat() {
   });
 
   return (
-    <View class="relative flex-1">
+    <View
+      class="relative flex-1"
+      onMouseMove={selecting() ? onSelectMove : undefined}
+      onMouseLeave={selecting() ? onSelectLeave : undefined}
+      onMouseUp={selecting() ? endSelecting : undefined}
+    >
       <PaneVeil docked={!hero()} reading={screen() === "transcript"} />
       <View class={`relative flex-1 ${isLeavingSession() ? "pointer-events-none" : ""}`} style={{ opacity: pane }}>
         <If when={screen() === "transcript"}>
           <View
             selectable
+            onSelectionChange={onSelection}
             class="flex-1"
             style={{ maskImage: `linear-gradient(to bottom, transparent 0px, black 40px), ${foot().fade}` }}
           >
@@ -890,14 +1005,15 @@ export function Chat() {
               onMomentumStart={onInput}
               maintainVisibleContentPosition={following() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
               class="flex-1"
-              contentClass={`px-6 pt-14 ${foot().pad}`}
+              contentClass="px-6 pt-14"
+              contentStyle={{ paddingBottom: foot().end }}
               accessibilityLabel={tr("Conversation", "对话")}
               footer={<ActivityLine anchor={(node) => (ending = node)} />}
             >
               {(row) => <TranscriptRow row={row()} />}
             </List>
           </View>
-          <ScrollToBottomPill visible={!following() && distanceFromEnd() > FOLLOW_THRESHOLD} promptOpen={hasInlinePrompt()} onPress={jumpToLatest} />
+          <ScrollToBottomPill visible={!following() && distanceFromEnd() > FOLLOW_THRESHOLD} bottom={foot().end} onPress={jumpToLatest} />
         </If>
         <If when={screen() === "connect"}>
           <Connect />
@@ -911,7 +1027,7 @@ export function Chat() {
       {/* The composer's column: the spacers over and under it are where it stands (`hero`). */}
       <View class="pointer-events-none absolute inset-0 z-10" onLayout={(e) => (paneHeight = e.bounds.size.height)}>
         <View style={{ flexGrow: hero() ? HERO.rise : 1, flexShrink: 1, flexBasis: hero() ? HERO.head : 0 }} />
-        <View class="relative" style={{ transform: [{ translateY: slide }] }} onLayout={(e) => (figureHeight = e.bounds.size.height)}>
+        <View class="relative" style={{ transform: [{ translateY: slide }] }} onLayout={(e) => figure.set(Math.round(e.bounds.size.height))}>
           <View class="absolute inset-0" style={{ transform: [{ translateY: Animated.subtract(stand, slide) }] }}>
             <If when={stage() !== undefined}>
               {/* The stage is the pane's content: it dims and lands with it, and fades on its own once the composer has left it. */}

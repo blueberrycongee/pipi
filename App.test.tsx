@@ -321,25 +321,24 @@ test("switches external coding agent mid-session with portable context handoff",
   expect(app.texts()).toContain("Here is the plan.");
 });
 
-test("orchestrates parallel multi-agent runs in isolated worktrees, inspects a sub-agent, and merges its result", async () => {
+test("runs parallel compare sessions in isolated worktrees and opens one from the sidebar", async () => {
   const app = await launch("welcome");
   await app.waitFor("text:What are we building?");
 
-  // Open the Multi-Agent Orchestration sheet with its shortcut
+  // Open the compare sheet with its shortcut
   await app.keyboard.press("mod+shift+o");
-  await app.waitFor("text:Multi-Agent Orchestration");
-  await app.type("label:Orchestration task", "Audit security and add rate limiting");
-  await app.press("text:Launch Agents");
+  await app.waitFor("text:Compare Agents");
+  await app.type("label:Comparison task", "Audit security and add rate limiting");
+  await app.press("text:Launch Comparison");
 
-  // Sub-agents run in isolated pipi/* worktree branches, complete, and appear in SubagentStrip
-  await app.waitFor("text:Merge to Chat >> nth=0");
-  expect(app.texts().some((t) => t.startsWith("pipi/"))).toBe(true);
+  // Compare sessions nest under the current one in the sidebar — each its own agent's run
+  await app.waitFor("text:Pi · Audit security and add rate limiting", { timeout: 30_000 });
+  await app.waitFor("text:Claude Code · Audit security and add rate limiting");
+  expect(app.texts()).toContain("Codex · Audit security and add rate limiting");
 
-  // Inspect a delegated sub-agent's live transcript and merge its result back to the main chat
-  await app.press("label:Inspect sub-agent >> nth=0");
-  await app.waitFor("text:Back to Chat");
-  await app.press("text:Merge to Chat >> nth=0");
-  await app.waitFor("text:Sub-agent result added to conversation context.");
+  // Finishing marks each row unread — the answers are the user's, not the parent's
+  await app.waitUntil(() => app.count("id:sidebar-child-unread") >= 3 || app.count("id:sidebar-child-running") + app.count("id:sidebar-child-unread") >= 3, { timeout: 60_000 });
+  await app.waitUntil(() => app.count("id:sidebar-child-unread") >= 3, { timeout: 60_000 });
 });
 
 test("configures external coding agents and adds a custom ACP agent in Settings", async () => {
@@ -406,6 +405,30 @@ test("shows tool permission confirmation inline above the composer while keeping
   await app.press("text:Deny");
   await app.waitFor("text:Understood, skipped the shell command.");
   expect(app.texts()).toContain("Here is the plan.");
+});
+
+test("lines up what is sent during a run over the composer, and takes it back as a draft", async () => {
+  const app = await launch("stream");
+  await app.waitFor("text:What are we building?");
+  await app.type("label:Message", "make a long plan");
+  await app.submit("label:Message");
+  await app.waitFor("text:Part 10 of the plan", { timeout: 30000 });
+
+  await app.type("label:Message", "also update the readme");
+  await app.keyboard.press("mod+enter");
+  await app.type("label:Message", "keep the changelog in step");
+  await app.submit("label:Message");
+  await app.waitFor("text:keep the changelog in step");
+  // What steers goes first; the composer is free again, and the reply stays on screen over the tray.
+  const texts = app.texts();
+  expect(texts.indexOf("keep the changelog in step")).toBeLessThan(texts.indexOf("also update the readme"));
+  expect(app.value("label:Message")).toBe("");
+  expect(texts.some((text) => /^Part \d+ of the plan$/.test(text))).toBe(true);
+
+  await app.press("label:Edit queued messages");
+  await app.waitUntil(() => app.value("label:Message") === "keep the changelog in step\n\nalso update the readme");
+  expect(app.count("label:Queued messages")).toBe(0);
+  expect(app.texts().some((text) => /^Part \d+ of the plan$/.test(text))).toBe(true);
 });
 
 test("keeps a run going in the background when switching sessions, and resumes it", async () => {

@@ -1,6 +1,6 @@
 import { computed, locale } from "nsh";
 import { builtinAgentSpec } from "../agents/catalog";
-import type { AgentHarnessStatus, DelegateRole, RuntimeMode } from "../agents/types";
+import type { AgentHarnessStatus, RuntimeMode } from "../agents/types";
 import type { QueueMode, ThinkingLevel } from "../pi/protocol";
 import type { ComposerCommand } from "./slash";
 import { language } from "../store/prefs";
@@ -103,22 +103,6 @@ export function runtimeModeIcon(mode: RuntimeMode): IconName {
       return "shieldHalf";
     case "full-access":
       return "shieldBolt";
-  }
-}
-
-/** Sub-agent role labels in the active language. */
-export function delegateRoleText(role: DelegateRole): string {
-  switch (role) {
-    case "researcher":
-      return tr("Researcher", "调研员");
-    case "planner":
-      return tr("Planner", "规划师");
-    case "implementer":
-      return tr("Implementer", "实现者");
-    case "reviewer":
-      return tr("Reviewer", "审查员");
-    default:
-      return tr("General", "通用");
   }
 }
 

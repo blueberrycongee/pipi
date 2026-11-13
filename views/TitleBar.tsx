@@ -3,18 +3,18 @@ import type { InputRef } from "nsh";
 import { Button as BaseButton, Input } from "nsh/base";
 import { titleBar } from "nsh/desktop";
 import { money } from "../lib/format";
-import { delegateRoleText, tr } from "../lib/i18n";
+import { tr } from "../lib/i18n";
 import { compactNumber } from "../pi/transcript";
 import {
-  bringTaskResultToChat,
   cancelRenaming,
+  currentDaemonSession,
+  currentParentSession,
   currentTitle,
-  inspectDelegatedTask,
-  inspectingTask,
   isCurrentSessionArchived,
   isRenaming,
   isRunning,
   newSession,
+  openDaemonSession,
   openWorkspace,
   renameSession,
   sessionState,
@@ -135,8 +135,10 @@ function SessionTitle() {
  * Over a wallpaper it is no band of its own: the picture runs up behind it to the window's edge,
  * and what it stands on is the chat's veil (`PaneVeil` in `views/Wallpaper.tsx`). */
 export function TitleBar() {
-  const subTask = () => inspectingTask();
-  animateLayoutOn(() => !!subTask(), 220, () => !isRunning());
+  /** The session this one was started under — its label leads back there. */
+  const parent = () => currentParentSession();
+  const worktree = () => currentDaemonSession()?.worktree;
+  animateLayoutOn(() => !!parent(), 220, () => !isRunning());
   return (
     <View
       desktop={{ windowDrag: true }}
@@ -151,58 +153,49 @@ export function TitleBar() {
         <IconButton icon="sidebar" label={tr("Show sidebar", "显示侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(true)} />
         <IconButton icon="pencil" label={tr("New session", "新建会话")} shortcut="mod+n" onPress={() => void newSession()} />
       </Presence>
-      <If
-        when={subTask()}
-        else={
-          <View class="min-w-0 shrink flex-row items-center gap-1">
-            <SessionTitle />
-            <Presence show={isCurrentSessionArchived()}>
-              <Chip
-                testID="titlebar-archived-chip"
-                label={tr("Archived", "已归档")}
-                icon="unarchive"
-                tipText={tr("Unarchive session", "取消归档此会话")}
-                onPress={unarchiveCurrentSession}
-                class="shrink-0 bg-muted text-muted-foreground"
-              />
-            </Presence>
-          </View>
-        }
-      >
-        {(sub) => (
-          <View class="min-w-0 shrink flex-row items-center gap-1.5" style={enter("fadeIn")}>
-            <IconButton icon="arrowLeft" label={tr("Back to main session", "返回主对话")} shortcut="escape" onPress={() => inspectDelegatedTask(undefined)} />
-            <Icon name="agents" size={14} tone="brand-text" />
-            <Text class="shrink-0 text-base font-medium text-foreground">{sub().agentName}</Text>
-            <Text class="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs text-muted-foreground">{delegateRoleText(sub().role)}</Text>
-            <If when={sub().worktree}>
-              {(wt) => (
-                <BaseButton
-                  onPress={() => void openWorkspace(wt().path)}
-                  tooltip={tip(tr(`Open worktree ${wt().path}`, `打开工作树目录 ${wt().path}`))}
-                  class={`h-6 max-w-36 shrink-0 flex-row items-center gap-1 rounded-md bg-muted px-1.5 ${PRESS} hover:bg-accent`}
-                >
-                  <Icon name="fork" size={11} tone="subtle" />
-                  <Text class="shrink truncate font-mono text-2xs text-muted-foreground">{wt().branch}</Text>
-                </BaseButton>
-              )}
-            </If>
-            <Text class="min-w-0 shrink truncate text-sm text-muted-foreground">{sub().title}</Text>
-          </View>
-        )}
-      </If>
+      <View class="min-w-0 shrink flex-row items-center gap-1">
+        <Presence show={!!parent()} class="shrink-0">
+          <If when={parent()}>
+            {(up) => (
+              <BaseButton
+                onPress={() => openDaemonSession(up().id)}
+                tooltip={tip(tr(`Back to ${up().title}`, `回到 ${up().title}`))}
+                class={`h-6 max-w-44 shrink-0 flex-row items-center gap-1 rounded-md bg-muted px-1.5 ${PRESS} hover:bg-accent`}
+              >
+                <Icon name="arrowLeft" size={12} tone="subtle" />
+                <Text class="shrink truncate text-2xs text-muted-foreground">{up().title}</Text>
+              </BaseButton>
+            )}
+          </If>
+        </Presence>
+        <SessionTitle />
+        <Presence show={isCurrentSessionArchived()}>
+          <Chip
+            testID="titlebar-archived-chip"
+            label={tr("Archived", "已归档")}
+            icon="unarchive"
+            tipText={tr("Unarchive session", "取消归档此会话")}
+            onPress={unarchiveCurrentSession}
+            class="shrink-0 bg-muted text-muted-foreground"
+          />
+        </Presence>
+        <Presence show={!!worktree()}>
+          <If when={worktree()}>
+            {(wt) => (
+              <BaseButton
+                onPress={() => void openWorkspace(wt().path)}
+                tooltip={tip(tr(`Open worktree ${wt().path}`, `打开工作树目录 ${wt().path}`))}
+                class={`h-6 max-w-36 shrink-0 flex-row items-center gap-1 rounded-md bg-muted px-1.5 ${PRESS} hover:bg-accent`}
+              >
+                <Icon name="fork" size={11} tone="subtle" />
+                <Text class="shrink truncate font-mono text-2xs text-muted-foreground">{wt().branch}</Text>
+              </BaseButton>
+            )}
+          </If>
+        </Presence>
+      </View>
       <View class="flex-1" />
-      <If when={subTask()}>
-        {(sub) => (
-          <View class="shrink-0 flex-row items-center gap-1.5">
-            <If when={sub().status !== "running" && !!sub().summary}>
-              <Button label={tr("Merge to Chat", "并入主对话")} size="sm" variant="primary" onPress={() => bringTaskResultToChat(sub().id)} />
-            </If>
-            <Button label={tr("Back to Chat", "返回对话")} size="sm" variant="ghost" onPress={() => inspectDelegatedTask(undefined)} />
-          </View>
-        )}
-      </If>
-      <If when={!subTask() && sidecarPhase().name === "ready"}>
+      <If when={sidecarPhase().name === "ready"}>
         <ContextMeter />
       </If>
     </View>

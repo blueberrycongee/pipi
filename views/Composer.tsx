@@ -13,7 +13,6 @@ import {
   extensionStatuses,
   extensionWidgets,
   hasModel,
-  inspectingTask,
   isBashRunning,
   isRunning,
   messageQueue,
@@ -27,18 +26,21 @@ import {
   stop,
   toast,
   trackAttachmentRead,
+  waitingCount,
 } from "../store/app";
 import { IconButton } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import { animateLayoutOn, EASING, enter, keepLast, Reveal, SPRING } from "../ui/motion";
 import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { AgentPicker, PermissionPicker, SubagentStrip } from "./AgentPicker";
+import { AgentPicker, PermissionPicker } from "./AgentPicker";
 import { ExtensionPrompt } from "./ExtensionDialog";
 import { ModelPicker, ThinkingPicker } from "./ModelPicker";
 
 const MIN_HEIGHT = 32;
 const MAX_HEIGHT = 220;
+/** How many waiting messages the queue's tray lists before it counts the rest. */
+const QUEUE_ROWS = 3;
 
 /** The image types Pi's providers take; past its bound a paste stays a path instead. */
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"]);
@@ -287,8 +289,15 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
   );
 }
 
-/** The messages waiting for the run: an icon says what each will do. */
-function Queue() {
+/**
+ * The messages waiting for the run stand in line behind the composer: a tray
+ * like the attachments', risen from behind its top edge, so the composer keeps
+ * its own size and what it sent is not mistaken for what is being written. A
+ * line each, in the order they go — an icon says what each will do — and past
+ * `QUEUE_ROWS` the rest are counted. The pencil is the whole tray's: the queue
+ * is taken back as one (`clear_queue`), so it stands beside the lines, not on one.
+ */
+function QueueTray() {
   const waiting = computed(() => [
     ...messageQueue().steering.map((text) => ({ text, kind: "steer" as const })),
     ...messageQueue().followUp.map((text) => ({ text, kind: "followUp" as const })),
@@ -297,24 +306,31 @@ function Queue() {
     const list = waiting();
     return list.length > 0 ? list : undefined;
   }, [] as { text: string; kind: "steer" | "followUp" }[]);
+  const more = () => Math.max(0, (shown()?.length ?? 0) - QUEUE_ROWS);
   return (
-    <Reveal open={waiting().length > 0}>
-      <View class="gap-1 border-b border-border px-2.5 py-2">
-        <Each of={shown() ?? []} key="index">
-          {(item, index) => (
-            <View
-              class="h-6 flex-row items-center gap-2 px-1.5"
-              accessibilityLabel={item().kind === "steer" ? tr("Steering", "引导") : tr("Follow-up", "追问")}
-              tooltip={tip(item().kind === "steer" ? tr("Steering", "引导") : tr("Follow-up", "追问"))}
-            >
-              <Icon name={item().kind === "steer" ? "steer" : "queue"} size={14} tone="subtle" />
-              <Text class="flex-1 truncate text-sm text-muted-foreground">{item().text}</Text>
-              <If when={index() === 0}>
-                <IconButton icon="pencil" size="sm" label={tr("Edit queued messages", "编辑排队消息")} onPress={() => void recallQueue()} />
-              </If>
-            </View>
-          )}
-        </Each>
+    <Reveal open={waiting().length > 0} offset={6}>
+      <View
+        class="relative mx-4 -mb-2 flex-row items-center gap-1 rounded-t-2xl border-[0.5px] border-b-0 border-hairline bg-card/85 pb-3 pl-3 pr-1.5 pt-1 dark:bg-card/75"
+        accessibilityLabel={tr("Queued messages", "排队消息")}
+      >
+        <View class="min-w-0 flex-1">
+          <Each of={(shown() ?? []).slice(0, QUEUE_ROWS)} key="index">
+            {(item) => (
+              <View
+                class="h-7 flex-row items-center gap-2"
+                accessibilityLabel={item().kind === "steer" ? tr("Steering", "引导") : tr("Follow-up", "追问")}
+                tooltip={tip(item().kind === "steer" ? tr("Steering", "引导") : tr("Follow-up", "追问"))}
+              >
+                <Icon name={item().kind === "steer" ? "steer" : "queue"} size={14} tone="subtle" />
+                <Text class="min-w-0 flex-1 truncate text-sm text-muted-foreground">{item().text}</Text>
+              </View>
+            )}
+          </Each>
+          <If when={more() > 0}>
+            <Text class="h-6 pl-[22px] text-xs leading-6 text-subtle">{tr(`+${more()} more`, `还有 ${more()} 条`)}</Text>
+          </If>
+        </View>
+        <IconButton icon="pencil" size="sm" label={tr("Edit queued messages", "编辑排队消息")} onPress={() => void recallQueue()} />
       </View>
     </Reveal>
   );
@@ -396,7 +412,7 @@ export function Composer() {
   const height = signal(MIN_HEIGHT);
   const slash = useSlashMenu();
   const ready = () => sidecarPhase().name === "ready";
-  const working = () => isRunning() || isBashRunning() || inspectingTask()?.status === "running";
+  const working = () => isRunning() || isBashRunning() || waitingCount() > 0;
   const hasText = () => composerDraft().trim().length > 0 || composerAttachments().length > 0;
   const statusLine = () => Object.values(extensionStatuses()).join("  ·  ");
   const shownStatus = keepLast(() => statusLine() || undefined, "");
@@ -551,12 +567,11 @@ export function Composer() {
   return (
     <View class="px-6 pb-5 pt-3">
       <View class="pointer-events-auto relative w-full max-w-190 self-center">
-        <SubagentStrip />
         <ExtensionPrompt />
         <SlashMenu menu={slash} onChoose={choose} />
+        <QueueTray />
         <AttachmentTray />
         <View class={`rounded-[22px] ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
-          <Queue />
           <ExtensionLines below={false} />
           <Input
             ref={input}

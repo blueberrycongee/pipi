@@ -12,9 +12,11 @@ import {
   untracked,
   View,
 } from "nsh";
-import { isAvailable, Menu, titleBar } from "nsh/desktop";
+import { AlertDialog } from "nsh/base";
+import { Application, currentWindow, isAvailable, Menu, titleBar, Window } from "nsh/desktop";
 import { tr } from "../lib/i18n";
 import {
+  activeDaemonSessionCount,
   canArchiveCurrentSession,
   cancelPendingDialog,
   cancelRenaming,
@@ -23,11 +25,9 @@ import {
   currentView,
   exportHtml,
   focusComposer,
-  inspectDelegatedTask,
-  inspectingTask,
   isBashRunning,
   isCurrentSessionArchived,
-  isOrchestrateOpen,
+  isCompareOpen,
   isPaletteOpen,
   isRenaming,
   isRunning,
@@ -35,15 +35,19 @@ import {
   pendingDialog,
   randomWallpaper,
   restartPi,
-  setOrchestrateOpen,
+  setCompareOpen,
   setPaletteOpen,
   showChat,
   showSettings,
   stop,
+  stopAllDaemonSessions,
   toggleArchiveCurrentSession,
+  waitingCount,
   wallpaper,
 } from "../store/app";
 import {
+  runInBackground,
+  setRunInBackground,
   setSidebarOpen,
   setSidebarWidth,
   SIDEBAR_DEFAULT_WIDTH,
@@ -54,7 +58,7 @@ import {
 } from "../store/prefs";
 import { EASING } from "../ui/motion";
 import { SIDEBAR_GLASS, WALLPAPER_FROST } from "../ui/styles";
-import { OrchestrateDialog } from "./AgentPicker";
+import { CompareDialog } from "./AgentPicker";
 import { Chat } from "./Chat";
 import { ExtensionDialog, hasInlinePrompt } from "./ExtensionDialog";
 import { Palette } from "./Palette";
@@ -95,19 +99,61 @@ const toggleSettings = () => (currentView().name === "settings" ? showChat() : s
 
 /** Escape leaves what is on top: a dialog or inline prompt closes itself; then settings or sub-agent inspection; then the run stops. */
 function escape() {
-  if (isPaletteOpen() || isOrchestrateOpen()) return;
+  if (isPaletteOpen() || isCompareOpen()) return;
   if (pendingDialog()) {
     if (hasInlinePrompt()) cancelPendingDialog();
     return;
   }
   if (isRenaming()) return cancelRenaming();
   if (currentView().name === "settings") return showChat();
-  if (inspectingTask()) return inspectDelegatedTask(undefined);
-  if (isRunning() || isBashRunning()) void stop();
+  if (isRunning() || isBashRunning() || waitingCount() > 0) void stop();
+}
+
+const needsCloseConfirm = () => !runInBackground() && activeDaemonSessionCount() > 0;
+let exitPrompting = false;
+
+async function confirmExit(how: "quit" | "close") {
+  if (exitPrompting) return;
+  const count = activeDaemonSessionCount();
+  if (runInBackground() || count === 0) {
+    if (how === "quit") Application.quit();
+    else Window.get("main")?.close();
+    return;
+  }
+  exitPrompting = true;
+  try {
+    const { action } = await AlertDialog.show({
+      title:
+        count === 1
+          ? tr("1 session is still running.", "仍有 1 个会话正在运行。")
+          : tr(`${count} sessions are still running.`, `仍有 ${count} 个会话正在运行。`),
+      description: tr(
+        "Keep them running in the background so you can come back later, or stop them now.",
+        "让它们在后台继续运行以便稍后回来查看，或立即全部停止。",
+      ),
+      actions: [
+        { label: tr("Cancel", "取消"), role: "cancel", id: "cancel" },
+        { label: tr("Stop All & Quit", "停止并退出"), role: "destructive", id: "stop" },
+        { label: tr("Keep Running in Background", "保留后台运行"), id: "background" },
+      ],
+    });
+    if (action === "background") {
+      setRunInBackground(true);
+    } else if (action === "stop") {
+      await stopAllDaemonSessions();
+    } else {
+      return;
+    }
+    if (how === "quit") Application.quit();
+    else Window.get("main")?.close();
+  } finally {
+    exitPrompting = false;
+  }
 }
 
 /** The application menu: every command has a place in it, and its shortcut lives here. */
 function applicationMenu() {
+  const interceptExit = needsCloseConfirm();
   Menu.setApplicationMenu([
     {
       label: "pipi",
@@ -120,7 +166,9 @@ function applicationMenu() {
         { role: "hideOthers" },
         { role: "showAll" },
         { type: "separator" },
-        { role: "quit" },
+        interceptExit
+          ? { label: tr("Quit pipi", "退出 pipi"), shortcut: "mod+q", onSelect: () => void confirmExit("quit") }
+          : { role: "quit" },
       ],
     },
     {
@@ -131,7 +179,9 @@ function applicationMenu() {
         { type: "separator" },
         { label: tr("Export as HTML", "导出为 HTML"), onSelect: () => void exportHtml() },
         { type: "separator" },
-        { role: "close" },
+        interceptExit
+          ? { label: tr("Close Window", "关闭窗口"), shortcut: "mod+w", onSelect: () => void confirmExit("close") }
+          : { role: "close" },
       ],
     },
     {
@@ -152,8 +202,8 @@ function applicationMenu() {
       label: tr("Session", "会话"),
       submenu: [
         { label: tr("Focus Message", "聚焦输入框"), shortcut: "mod+l", onSelect: () => (showChat(), focusComposer()) },
-        { label: tr("Orchestrate Multiple Agents…", "多智能体协同编排…"), shortcut: "mod+shift+o", onSelect: () => setOrchestrateOpen(!isOrchestrateOpen()) },
-        { label: tr("Stop", "停止"), shortcut: "mod+.", disabled: !isRunning() && !isBashRunning(), onSelect: () => void stop() },
+        { label: tr("Compare Agents…", "智能体并行对比…"), shortcut: "mod+shift+o", onSelect: () => setCompareOpen(!isCompareOpen()) },
+        { label: tr("Stop", "停止"), shortcut: "mod+.", disabled: !isRunning() && !isBashRunning() && waitingCount() === 0, onSelect: () => void stop() },
         { type: "separator" },
         {
           label: isCurrentSessionArchived() ? tr("Unarchive Session", "取消归档会话") : tr("Archive Session", "归档会话"),
@@ -483,13 +533,20 @@ export function Shell() {
   if (isAvailable) {
     // In an effect, the menu follows what it reads: the sidebar's label, whether Stop applies.
     effect(applicationMenu);
+    const win = currentWindow();
+    effect(() => {
+      win.set({ closeOnPress: !needsCloseConfirm() });
+    });
+    win.on("closePress", () => {
+      if (needsCloseConfirm()) void confirmExit("close");
+    });
   } else {
     keymap.bind({
       "mod+n": () => void newSession(),
       "mod+o": () => void chooseWorkspace(),
       "mod+,": toggleSettings,
       "mod+k": () => setPaletteOpen(!isPaletteOpen()),
-      "mod+shift+o": () => setOrchestrateOpen(!isOrchestrateOpen()),
+      "mod+shift+o": () => setCompareOpen(!isCompareOpen()),
       "mod+b": toggleSidebar,
       "mod+u": () => void randomWallpaper(),
       "mod+l": () => (showChat(), focusComposer()),
@@ -504,7 +561,7 @@ export function Shell() {
         <TitleBar />
       </SidebarSplit>
       <Palette />
-      <OrchestrateDialog />
+      <CompareDialog />
       <Settings />
       <ExtensionDialog />
       <Toasts />

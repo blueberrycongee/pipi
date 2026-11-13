@@ -280,6 +280,74 @@ test("a folded project row marks a run still working inside, whichever project i
   expect(app.count("id:sidebar-project-running")).toBe(1);
 });
 
+test("switching between two running sessions across collapsed workspaces keeps both folders collapsed", async () => {
+  const switchDelay = 600;
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: { "harness.scenario": "multi-slow", "harness.startDelay": String(switchDelay) },
+  });
+  await app.waitFor("text:What are we building?");
+
+  const pipiSession = "id:sidebar-recents >> text:Refactor the transcript reducer";
+  const nshSession = "id:sidebar-recents >> text:Fix QuickJS GC mark phase";
+
+  // Start a long run in pipi, then switch to nsh and start a second long run there.
+  await app.press(pipiSession);
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+  await app.type("label:Message", "long work in pipi");
+  await app.submit("label:Message");
+  await app.waitUntil(() => app.count("id:sidebar-recents >> id:sidebar-session-running") === 1);
+
+  await app.press(nshSession);
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+  await app.type("label:Message", "long work in nsh");
+  await app.submit("label:Message");
+  await app.waitUntil(() => app.count("id:sidebar-recents >> id:sidebar-session-running") === 2);
+
+  // Collapse both workspaces in the sidebar.
+  await app.press("label:Collapse pipi");
+  await app.press("label:Collapse nsh");
+  await app.waitUntil(() => app.count("id:sidebar-workspaces >> text:Refactor the transcript reducer") === 0);
+  await app.waitUntil(() => app.count("id:sidebar-workspaces >> text:Fix QuickJS GC mark phase") === 0);
+
+  const probe = () => ({
+    pipiCollapsed: app.count("label:Expand pipi"),
+    nshCollapsed: app.count("label:Expand nsh"),
+    workspaceRows:
+      app.count("id:sidebar-workspaces >> text:Refactor the transcript reducer") +
+      app.count("id:sidebar-workspaces >> text:Fix QuickJS GC mark phase"),
+    recentRunning: app.count("id:sidebar-recents >> id:sidebar-session-running"),
+    pipiWeight: weight(app, pipiSession),
+    nshWeight: weight(app, nshSession),
+  });
+
+  // Switch from nsh's running session to pipi's running session.
+  await app.press(pipiSession);
+  const toPipi = [probe()];
+  for (let elapsed = 0; elapsed < switchDelay * 2; elapsed += 16) {
+    await app.wait(16);
+    toPipi.push(probe());
+  }
+  expect(toPipi.every((f) => f.pipiCollapsed === 1 && f.nshCollapsed === 1 && f.workspaceRows === 0)).toBe(true);
+  expect(toPipi.every((f) => f.recentRunning === 2)).toBe(true);
+  expect(toPipi.every((f) => f.pipiWeight > 400 && f.nshWeight <= 400)).toBe(true);
+
+  // Switch right back to nsh's running session: both folders still stay collapsed.
+  await app.press(nshSession);
+  const toNsh = [probe()];
+  for (let elapsed = 0; elapsed < switchDelay * 2; elapsed += 16) {
+    await app.wait(16);
+    toNsh.push(probe());
+  }
+  expect(toNsh.every((f) => f.pipiCollapsed === 1 && f.nshCollapsed === 1 && f.workspaceRows === 0)).toBe(true);
+  expect(toNsh.every((f) => f.recentRunning === 2)).toBe(true);
+  expect(toNsh.every((f) => f.nshWeight > 400 && f.pipiWeight <= 400)).toBe(true);
+});
+
 test("a session in Recent keeps its place when it takes a message; only a new one goes on top", async () => {
   const app = await launch("welcome");
   await app.waitFor("text:What are we building?");

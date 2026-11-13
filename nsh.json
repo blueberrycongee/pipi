@@ -1,7 +1,7 @@
 {
   "name": "pipi",
   "id": "dev.pipi.app",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "build": 1,
   "icon": "icon.png",
   "theme": "theme.json",
@@ -50,7 +50,7 @@
         "zenity", "kdialog",
         "pi", "claude", "codex", "devin", "opencode", "cursor-agent",
         "gemini", "copilot", "grok", "goose", "kimi", "qwen", "dsh",
-        "agy_acp_server", "agy", "hermes", "kiro-cli", "kiro", "droid", "amp",
+        "agy_acp_server", "agy", "hermes", "kiro-cli", "kiro", "droid", "amp", "amp-acp",
         "npx", "uvx", "uv", "bun", "osascript", "chmod"
       ],
       "env": [

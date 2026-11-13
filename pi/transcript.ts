@@ -16,7 +16,9 @@ export type Row =
   | ToolRow
   | { kind: "bash"; id: string; command: string; output: string; running: boolean; exitCode?: number; cancelled: boolean; truncated: boolean }
   | { kind: "notice"; id: string; tone: "info" | "warning" | "error"; title: string; text: string }
-  | { kind: "summary"; id: string; title: string; text: string };
+  | { kind: "summary"; id: string; title: string; text: string }
+  /** An answer another session delivered back (`<pipi-message>` envelope), shown as a from-session row. */
+  | { kind: "delivery"; id: string; from: string; fromTitle: string; agent: string; status: string; text: string };
 
 /** When the turn a row belongs to started, and on the turn's first row, how long the turn took once it is over. */
 export interface TurnStamp {
@@ -51,6 +53,29 @@ const textOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
 
 const imagesOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
   typeof content === "string" ? 0 : (content ?? []).filter((block) => block.type === "image").length;
+
+/** One `<pipi-message from="s_x" title="…" agent="…" status="…">…</pipi-message>` envelope the daemon delivers. */
+const PIPPI_MESSAGE = /<pipi-message from="([^"]*)" title="([^"]*)" agent="([^"]*)" status="([^"]*)">([\s\S]*?)<\/pipi-message>/g;
+const unattr = (text: string) =>
+  text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+
+/** Splits a delivered-messages prompt into its envelopes; `undefined` when the text is a normal user message. */
+export function pippiDeliveries(text: string): { from: string; fromTitle: string; agent: string; status: string; text: string }[] | undefined {
+  if (!text.includes("<pipi-message")) return undefined;
+  const out: { from: string; fromTitle: string; agent: string; status: string; text: string }[] = [];
+  let matched = false;
+  for (const hit of text.matchAll(PIPPI_MESSAGE)) {
+    matched = true;
+    out.push({
+      from: hit[1],
+      fromTitle: unattr(hit[2]),
+      agent: unattr(hit[3]),
+      status: hit[4],
+      text: hit[5].replace(/^\n+|\n+$/g, ""),
+    });
+  }
+  return matched ? out : undefined;
+}
 
 /** What Pi tells the model about a prompt's image: how it was scaled, what it was converted from. */
 const IMAGE_NOTE_FOR_MODEL =
@@ -540,7 +565,12 @@ export class Transcript {
       case "user": {
         const text = withoutImageNotes(textOf(message.content));
         const images = imagesOf(message.content);
-        if (text || images) this.#push({ kind: "user", id: this.#id("u"), text, images });
+        const deliveries = images ? undefined : pippiDeliveries(text);
+        if (deliveries) {
+          for (const item of deliveries) this.#push({ kind: "delivery", id: this.#id("d"), ...item });
+        } else if (text || images) {
+          this.#push({ kind: "user", id: this.#id("u"), text, images });
+        }
         this.#turnStart = this.#now();
         break;
       }
@@ -645,11 +675,19 @@ export function toolSummary(name: string, args: Record<string, unknown>, lang: L
       const title = pick("title", "task");
       return [target, role, title].filter(Boolean).join(" · ");
     }
-    case "task_status":
-    case "task_cancel":
-      return pick("taskId");
-    case "orchestrator_capabilities":
-      return lang === "zh" ? "探测可用智能体与模型" : "probe available agents & models";
+    case "session_start": {
+      const target = pick("agent", "agentId");
+      const title = pick("title");
+      return [target, title].filter(Boolean).join(" · ");
+    }
+    case "session_send":
+    case "session_read":
+    case "session_stop":
+      return pick("session", "sessionId", "id");
+    case "sessions_list":
+      return lang === "zh" ? "会话树" : "the session tree";
+    case "agents_list":
+      return lang === "zh" ? "可用智能体与模型" : "available agents & models";
     default: {
       const first = pick("path", "file_path", "command", "query", "pattern", "url", "name", "prompt", "description");
       if (first) return first;

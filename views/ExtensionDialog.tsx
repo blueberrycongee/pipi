@@ -17,10 +17,12 @@ const TOOL_ICONS: Record<string, IconName> = {
   grep: "search",
   find: "search",
   ls: "folder",
-  delegate_task: "agents",
-  orchestrator_capabilities: "agents",
-  task_status: "clock",
-  task_cancel: "stop",
+  agents_list: "agents",
+  sessions_list: "agents",
+  session_start: "agents",
+  session_send: "message",
+  session_read: "file",
+  session_stop: "stop",
 };
 
 type ConfirmDetail =

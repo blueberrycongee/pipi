@@ -191,11 +191,23 @@ where their triggers are. The first message docks the composer at the pane's
 foot (see Motion). Connect and failure keep it docked: there the stage's own
 button is the next step, not the composer.
 
-The conversation ends 16 above the composer's top edge (`FOOT`,
+What belongs to the composer but is not the draft stands on it as a tray
+risen from behind its top edge: 16 in from either side, the top corners
+`rounded-2xl`, a hairline on three sides, `bg-card` a step more see-through
+than the composer, tucked 8 under it. Attachments have one, and so do the
+messages sent during a run (`QueueTray`, `views/Composer.tsx`): a 28pt line
+each in `text-sm` `muted-foreground`, in the order they go, an icon saying
+what each will do (steer, follow up), three at most and the rest counted.
+The queue is taken back as one, so its pencil stands beside the lines, not
+on one. The composer itself keeps its size: only the draft grows it.
+
+The conversation ends 16 above the composer's top edge (`footOf`,
 `views/Chat.tsx`), and the activity line's 36pt slot is the last thing in it:
 a reply at rest stands 52 clear of the composer, and Pip, working, about 20.
-"Jump to latest" stands on the same line. An inline prompt raises that edge
-by 128 and all three with it.
+"Jump to latest" stands on the same line, and rows fade out under it. The
+edge is measured, not assumed: a tray, a longer draft or an inline prompt
+raises it and all three with it, so nothing the composer grows by covers the
+end of a reply.
 
 ## Elevation
 
@@ -398,7 +410,7 @@ merging UI work.
 Settings is a floating layer over the chat: a glass `Dialog` panel centered
 in the window over the backdrop every floating layer has (`SCRIM`, see
 Elevation): the chat stays in sight behind it, dimmed, never blurred. Its own nav
-column on the left (caption, five sections — General, Agents, Archive,
+column on the left (caption, six sections — General, Agents, Sessions, Archive,
 Usage, About) sits inside the panel;
 Escape or a backdrop press closes it. The sections are the same whichever
 agent is active: no agent gets a section of its own. What is particular to

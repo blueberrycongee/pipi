@@ -21,9 +21,9 @@ tag must equal `v` + `nsh.json`'s version — bump `nsh.json` first.
 
 ## Signing configuration
 
-The same Developer ID certificate and team that sign wuu sign pipi; the
-secrets live under pipi's own names. Configure these repository Actions
-Secrets, and never commit their values:
+The same Developer ID certificate and team that sign the team's other
+apps sign pipi; the secrets live under pipi's own names. Configure these
+repository Actions Secrets, and never commit their values:
 
 | Secret | Content |
 | --- | --- |
@@ -36,9 +36,9 @@ Secrets, and never commit their values:
 
 One Developer ID Application certificate signs every app in the team — do not
 issue a second one for pipi and do not revoke the shared one (revoking it
-breaks wuu's released builds too). A project-dedicated notarization key is
-worthwhile: App Store Connect → Users and Access → Integrations → Team Keys,
-Developer role, so it can be revoked without touching wuu's.
+breaks the other apps' released builds too). A project-dedicated notarization
+key is worthwhile: App Store Connect → Users and Access → Integrations → Team
+Keys, Developer role, so it can be revoked without touching the other apps'.
 
 On the runner, `scripts/import-release-signing.mjs` imports the P12 into a
 temporary keychain and checks its fingerprint against the pinned

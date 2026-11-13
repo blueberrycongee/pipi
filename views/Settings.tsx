@@ -28,6 +28,8 @@ import {
   currentView,
   deleteAllArchivedSessions,
   deleteCustomAgent,
+  externalMcpConfig,
+  installPipiCli,
   openSession,
   randomWallpaper,
   refreshAgents,
@@ -56,9 +58,11 @@ import {
   sidecarPhase,
   storedProviders,
   switchAgentHarness,
+  toast,
   unarchiveSession,
   updateAgentOverride,
   updateAutoArchiveDays,
+  updatePreferredRuntimeMode,
   usageStats,
   type View as AppView,
   wallpaper,
@@ -68,6 +72,8 @@ import {
 } from "../store/app";
 import { backend } from "../store/backend";
 import {
+  agentSendScope,
+  agentSessionTools,
   type Appearance,
   appearance,
   AUTO_ARCHIVE_DAYS,
@@ -77,9 +83,23 @@ import {
   type Language,
   language,
   pipCoat,
+  preferredRuntimeMode,
+  runInBackground,
+  SESSION_TREE_DEPTHS,
+  SESSION_TREE_MAX,
+  sessionTreeDepth,
+  sessionTreeMax,
+  type SessionTreeDepth,
+  type SessionTreeMax,
+  setAgentSendScope,
+  setAgentSessionTools,
   setAppearance,
   setLanguage,
   setPipCoat,
+  setPreferredRuntimeMode,
+  setRunInBackground,
+  setSessionTreeDepth,
+  setSessionTreeMax,
   setWorktreeIsolationDefault,
   storedAgentOverrides,
   worktreeIsolationDefault,
@@ -96,6 +116,7 @@ import { CroppedWallpaperSurface, WallpaperAdjustDialog } from "./Wallpaper";
 const SECTIONS: { id: SettingsSection; label: () => string; icon: IconName }[] = [
   { id: "general", label: () => tr("General", "常规"), icon: "sliders" },
   { id: "agents", label: () => tr("Agents", "智能体"), icon: "agents" },
+  { id: "sessions", label: () => tr("Sessions", "会话"), icon: "layers" },
   { id: "archive", label: () => tr("Archive", "归档"), icon: "archive" },
   { id: "usage", label: () => tr("Usage", "用量"), icon: "bolt" },
   { id: "about", label: () => tr("About", "关于"), icon: "info" },
@@ -729,30 +750,158 @@ function AgentsPage(props: { focus?: string }) {
         </Reveal>
       </SettingGroup>
 
-      <SettingGroup title={tr("Permissions", "权限")}>
+    </Page>
+  );
+}
+
+// ── Sessions ────────────────────────────────────────────────────────────
+
+const SESSION_DEPTH_VALUES: readonly SessionTreeDepth[] = [...SESSION_TREE_DEPTHS];
+const SESSION_MAX_VALUES: readonly SessionTreeMax[] = [...SESSION_TREE_MAX];
+
+/** How sessions run and how agents collaborate inside them — every row maps to a rule the session daemon enforces. */
+function SessionsPage() {
+  const cliInstalled = signal<string | undefined>(undefined);
+  const cliInstalling = signal(false);
+  const mcpCopied = signal(false);
+
+  const installCli = async () => {
+    cliInstalling.set(true);
+    try {
+      const path = await installPipiCli();
+      cliInstalled.set(path);
+      toast("success", tr(`pipi installed to ${path}`, `pipi 已安装到 ${path}`));
+    } catch {
+      toast("error", tr("Could not install the pipi command", "pipi 命令安装失败"));
+    } finally {
+      cliInstalling.set(false);
+    }
+  };
+
+  const copyMcp = () => {
+    void externalMcpConfig().then((snippet) => {
+      copyText(snippet);
+      mcpCopied.set(true);
+      setTimeout(() => mcpCopied.set(false), 1800);
+    });
+  };
+
+  return (
+    <Page
+      title={tr("Sessions", "会话")}
+      lead={tr(
+        "How sessions run — and whether agents inside them may start, message, and stop sessions of their own.",
+        "会话如何运行，以及会话里的智能体能否开会话、发消息、停止会话。",
+      )}
+    >
+      <SettingGroup title={tr("New session defaults", "新会话默认值")}>
         <SettingRow
-          title={tr("Permission ceiling", "运行权限上限")}
+          title={tr("Permission mode", "运行权限")}
           description={tr(
-            "Applies to the active agent and all delegated sub-agents.",
-            "同时约束当前智能体与所有子智能体，子任务不会超出此上限。",
+            "The default for sessions you open. A session's own children never exceed its mode.",
+            "新开会话的默认权限。会话的子会话不会超出它自己的权限。",
           )}
         >
           <Segmented
-            label={tr("Permission ceiling", "权限上限")}
-            value={runtimeMode()}
+            label={tr("Permission mode", "运行权限")}
+            value={preferredRuntimeMode()}
             options={PERMISSION_MODES.map((m) => ({ value: m, label: runtimeModeText(m).short }))}
-            onChange={(m) => void changeRuntimeMode(m)}
+            onChange={(m) => updatePreferredRuntimeMode(m)}
           />
         </SettingRow>
         <Rule />
         <SettingRow
-          title={tr("Git worktree isolation", "默认启用 Git 工作树隔离")}
+          title={tr("Git worktree isolation", "Git 工作树隔离")}
           description={tr(
-            "Give each parallel agent its own pipi/* branch worktree to prevent edit conflicts.",
-            "并行运行时为每个智能体创建独立的 pipi/* 分支工作树，避免修改冲突。",
+            "Agent-started and comparison sessions each get their own pipi/* branch worktree.",
+            "智能体开出的会话和并行对比的会话各自使用独立的 pipi/* 分支工作树。",
           )}
         >
           <Switch label={tr("Git worktree isolation", "Git 工作树隔离")} checked={worktreeIsolationDefault()} onChange={setWorktreeIsolationDefault} />
+        </SettingRow>
+      </SettingGroup>
+
+      <SettingGroup title={tr("Agent collaboration", "智能体协作")}>
+        <SettingRow
+          title={tr("Let agents drive sessions", "允许智能体操作会话")}
+          description={tr(
+            "Agents get six session tools: list, read, send, start, and stop. Off: the daemon refuses them at once.",
+            "为智能体提供六个会话工具：列出、读取、发消息、开会话、停止。关闭后守护进程立即拒绝调用。",
+          )}
+        >
+          <Switch label={tr("Let agents drive sessions", "允许智能体操作会话")} checked={agentSessionTools()} onChange={setAgentSessionTools} />
+        </SettingRow>
+        <Rule />
+        <SettingRow
+          title={tr("Can message", "可以发消息给")}
+          description={tr("Which sessions an agent may send to.", "智能体可以发消息给哪些会话。")}
+        >
+          <Segmented
+            label={tr("Can message", "可以发消息给")}
+            value={agentSendScope()}
+            options={[
+              { value: "children" as const, label: tr("Its own sessions", "自己开的会话") },
+              { value: "all" as const, label: tr("All sessions", "所有会话") },
+            ]}
+            onChange={setAgentSendScope}
+          />
+        </SettingRow>
+        <Rule />
+        <SettingRow title={tr("Child session depth", "子会话层数")} description={tr("How deep agent-started sessions may nest.", "智能体开出的会话最多嵌套几层。")}>
+          <Segmented
+            label={tr("Child session depth", "子会话层数")}
+            value={String(sessionTreeDepth())}
+            options={SESSION_DEPTH_VALUES.map((d) => ({ value: String(d), label: String(d) }))}
+            onChange={(v) => setSessionTreeDepth(Number(v) as SessionTreeDepth)}
+          />
+        </SettingRow>
+        <Rule />
+        <SettingRow
+          title={tr("Running per tree", "每棵树同时运行的会话")}
+          description={tr("Concurrent sessions in one tree.", "一棵会话树同时运行的会话数。")}
+        >
+          <Segmented
+            label={tr("Running per tree", "同时运行数")}
+            value={String(sessionTreeMax())}
+            options={SESSION_MAX_VALUES.map((m) => ({ value: String(m), label: String(m) }))}
+            onChange={(v) => setSessionTreeMax(Number(v) as SessionTreeMax)}
+          />
+        </SettingRow>
+      </SettingGroup>
+
+      <SettingGroup title={tr("Background", "后台")}>
+        <SettingRow
+          title={tr("Keep running after the window closes", "关闭窗口后继续运行")}
+          description={tr(
+            "Sessions stay alive under the pipi daemon; reopen the window to find them where they were.",
+            "会话由 pipi 守护进程保持运行；重新打开窗口即可回到原处。",
+          )}
+        >
+          <Switch label={tr("Keep running in the background", "后台继续运行")} checked={runInBackground()} onChange={setRunInBackground} />
+        </SettingRow>
+        <Rule />
+        <SettingRow
+          title={tr("Command line tool", "命令行工具")}
+          description={
+            cliInstalled()
+              ? tr(`Installed at ${cliInstalled()}`, `已安装到 ${cliInstalled()}`)
+              : tr("Install the `pipi` command — drive sessions from scripts and other agents.", "安装 `pipi` 命令——从脚本和其他智能体驱动会话。")
+          }
+        >
+          <Button
+            label={cliInstalled() ? tr("Installed", "已安装") : tr("Install", "安装")}
+            variant="secondary"
+            size="sm"
+            disabled={cliInstalling() || !!cliInstalled()}
+            onPress={() => void installCli()}
+          />
+        </SettingRow>
+        <Rule />
+        <SettingRow
+          title={tr("Use in other apps", "在其他应用里使用")}
+          description={tr("Copy the MCP config for agents not started by pipi.", "复制一段 MCP 配置，给不是 pipi 启动的智能体用。")}
+        >
+          <Button label={mcpCopied() ? tr("Copied", "已复制") : tr("Copy config", "复制配置")} variant="secondary" size="sm" icon="copy" onPress={copyMcp} />
         </SettingRow>
       </SettingGroup>
     </Page>
@@ -1583,6 +1732,9 @@ export function Settings() {
               <AgentsPage focus={focusedAgent()} />
             </If>
             <If when={pagedAgent()}>{(agent) => <AgentProvidersPage agent={agent()} />}</If>
+            <If when={section() === "sessions"}>
+              <SessionsPage />
+            </If>
             <If when={section() === "archive"}>
               <ArchivePage />
             </If>
