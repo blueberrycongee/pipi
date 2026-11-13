@@ -17,6 +17,10 @@
 // - `session/cancel` notification resolves the in-flight prompt `cancelled`
 // Prompts containing "cancel" hang until cancelled. Diagnostics go to stderr
 // as `LOG {...}` lines so a driver can assert what the client sent.
+//
+// DSH reports no token usage, and neither does this by default. With
+// `FAKE_ACP_USAGE=1` a finished prompt carries the protocol's per-turn `usage`,
+// as an agent that reports one does (cached tokens counted on top of the input).
 
 import fs from "node:fs";
 
@@ -203,7 +207,8 @@ async function handle(msg) {
       if (outcome !== "wait-for-cancel") {
         if (inflightPrompt?.id === msg.id) {
           inflightPrompt = undefined;
-          reply(msg.id, { stopReason: outcome });
+          const usage = { inputTokens: 2100, outputTokens: 40, cachedReadTokens: 8000, cachedWriteTokens: 0, thoughtTokens: 12, totalTokens: 10140 };
+          reply(msg.id, process.env.FAKE_ACP_USAGE ? { stopReason: outcome, usage } : { stopReason: outcome });
         }
       }
       return;

@@ -4,6 +4,7 @@ import type { Exit, Transport } from "../pi/client";
 import type { DaemonAttachSpec, DaemonCallbacks, DaemonClient, DaemonSession } from "../pi/daemon";
 import type { AgentMessage, ImageContent, Model, SessionState } from "../pi/protocol";
 import type { SessionSummary } from "../pi/sessions";
+import type { UsageStats } from "../pi/usage";
 import type { Backend } from "../store/backend";
 
 /**
@@ -42,6 +43,12 @@ export interface FakeOptions {
   dies?: { after: number; times: number };
   /** Only this many agent processes can start; one asked for after that fails as `failStart` does. */
   starts?: number;
+  /**
+   * An app update for the checker to find: the card comes up on its own.
+   * `rate` is the download's speed in bytes per ms; `unknownSize` streams
+   * progress without a total, the indeterminate track.
+   */
+  update?: { version?: string; notes?: string; canInstall?: boolean; bytes?: number; rate?: number; unknownSize?: boolean };
 }
 
 const MODELS: Model[] = [
@@ -50,6 +57,41 @@ const MODELS: Model[] = [
   { id: "gpt-5.1", name: "GPT-5.1", api: "openai-responses", provider: "openai", reasoning: true, input: ["text", "image"], contextWindow: 400000, maxTokens: 32768, cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 } },
   { id: "deepseek-chat", name: "DeepSeek Chat", api: "openai-completions", provider: "deepseek", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 8192, cost: { input: 0.28, output: 0.42, cacheRead: 0.028, cacheWrite: 0 } },
 ];
+
+const DAY = 86_400_000;
+const dayKey = (back: number) => {
+  const at = new Date(Date.now() - back * DAY);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+};
+const tokens = (input: number, output: number, cacheRead: number, cacheWrite: number) => ({ input, output, cacheRead, cacheWrite, total: input + output + cacheRead + cacheWrite });
+
+/**
+ * Usage as the scanner reports it from a machine with each kind of agent: Pi and
+ * Claude Code name a cost, Codex reports tokens without one, Kimi reports nothing.
+ */
+function sampleUsage(): UsageStats {
+  const pi = tokens(41_200, 96_400, 3_812_000, 268_000);
+  const claude = tokens(1_840, 38_600, 1_944_000, 121_500);
+  const codex = tokens(212_000, 18_400, 1_506_000, 0);
+  const all = tokens(pi.input + claude.input + codex.input, pi.output + claude.output + codex.output, pi.cacheRead + claude.cacheRead + codex.cacheRead, pi.cacheWrite + claude.cacheWrite + codex.cacheWrite);
+  return {
+    scannedAt: Date.now(),
+    totals: { ...all, cost: 7.42, unpriced: codex.total, sessions: 31, userMessages: 148, assistantMessages: 612, toolCalls: 1_904 },
+    agents: [
+      { agentId: "pi", sessions: 17, messages: 498, tokens: pi, cost: 4.31, unpriced: 0 },
+      { agentId: "claude", sessions: 8, messages: 164, tokens: claude, cost: 3.11, unpriced: 0 },
+      { agentId: "codex", sessions: 4, messages: 86, tokens: codex, cost: 0, unpriced: codex.total },
+      { agentId: "kimi", sessions: 2, messages: 12, tokens: tokens(0, 0, 0, 0), cost: 0, unpriced: 0 },
+    ],
+    models: [
+      { provider: "anthropic", model: "claude-sonnet-4-5", messages: 402, tokens: pi, cost: 4.31, unpriced: 0 },
+      { provider: "claude", model: "claude-opus-4-5", messages: 96, tokens: claude, cost: 3.11, unpriced: 0 },
+      { provider: "codex", model: "default", messages: 52, tokens: codex, cost: 0, unpriced: codex.total },
+    ],
+    daily: [9, 8, 6, 5, 4, 2, 1, 0].map((back, index) => ({ day: dayKey(back), tokens: Math.round((all.total / 36) * (index + 1)), cost: 0.2 * (index + 1) })),
+  };
+}
 
 const UNKNOWN: Model = { id: "unknown", name: "unknown", api: "unknown", provider: "unknown", reasoning: false, input: [], contextWindow: 0, maxTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 
@@ -830,6 +872,9 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       defaultThinking = defaultModel.reasoning ? "medium" : "off";
       return transport(startOpts.cwd, startOpts.agentId, startOpts.agentId === "pi" ? (options.history ?? []) : [], startOpts.customAgent);
     },
+    async usageStats() {
+      return sampleUsage();
+    },
     async worktreeStatus(cwd) {
       return {
         isGitRepo: true,
@@ -1051,6 +1096,32 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     },
     pickFolder: async () => options.pickedFolder,
     pickImage: async () => options.pickedImage,
+    async checkAppUpdate() {
+      const u = options.update;
+      if (!u) return null;
+      return {
+        version: u.version ?? "9.9.9",
+        notes: u.notes ?? "A shinier coat, a steadier step, and everything a little quicker.",
+        url: "https://github.com/blueberrycongee/pipi/releases",
+        canInstall: u.canInstall ?? true,
+      };
+    },
+    async downloadAppUpdate(onProgress) {
+      const u = options.update;
+      if (!u) throw new Error("no update found");
+      const total = u.bytes ?? 24_000_000;
+      const rate = u.rate ?? 60_000;
+      const totalArg = u.unknownSize ? undefined : total;
+      let received = 0;
+      while (received < total) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 30));
+        received = Math.min(total, received + rate * 30);
+        onProgress?.({ received, total: totalArg });
+      }
+    },
+    // The real install never resolves: the app restarts first. So does the
+    // fake — the "installing" card is what it leaves on screen.
+    installAppUpdate: () => new Promise<void>(() => {}),
   };
   return api;
 }

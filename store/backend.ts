@@ -1,5 +1,6 @@
 import os from "os";
 import process from "process";
+import { checkForUpdate, downloadUpdate, installAndRestart, type AppUpdate, type UpdateProgress } from "nsh/updater";
 import { defaultAgentStatuses } from "../agents/catalog";
 import type {
   AgentHarnessStatus,
@@ -46,6 +47,12 @@ export interface Backend {
   pickFolder(prompt: string): Promise<string | undefined>;
   /** Shows the system's image file picker; resolves with the selected image path, or `undefined` when cancelled. */
   pickImage?(prompt: string): Promise<string | undefined>;
+  /** Asks the app's update source (`nsh.json` → `updater`) for a newer version; `null` when up to date or updates don't apply here. */
+  checkAppUpdate?(): Promise<AppUpdate | null>;
+  /** Downloads the update the last check found; rejects when there is none or it cannot install here. */
+  downloadAppUpdate?(onProgress?: (progress: UpdateProgress) => void): Promise<void>;
+  /** Replaces the app with the downloaded update and relaunches; settles only on failure. */
+  installAppUpdate?(): Promise<void>;
 }
 
 /** Tries each `[command, args]` picker in order, returning its chosen path or `""`. */
@@ -182,6 +189,9 @@ const system: Backend = {
       return undefined;
     }
   },
+  checkAppUpdate: checkForUpdate,
+  downloadAppUpdate: (onProgress) => downloadUpdate(onProgress),
+  installAppUpdate: () => installAndRestart(),
 };
 
 let current = system;

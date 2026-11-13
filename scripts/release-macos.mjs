@@ -197,6 +197,7 @@ if (tag && tag !== `v${version}`) {
 console.log(`Packaging pipi ${version} (nsh package --target macos)`);
 run("nsh", ["package", "--target", "macos", root], { stdio: "inherit" });
 if (!existsSync(app)) throw new Error(`nsh package did not produce ${app}`);
+run(join(root, "scripts/stamp-macos-sdk.sh"), [app], { stdio: "inherit" });
 
 console.log("Signing with the pinned Developer ID (hardened runtime, timestamp)");
 signApp(identity);

@@ -1,10 +1,11 @@
 {
   "name": "pipi",
   "id": "dev.pipi.app",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "build": 1,
   "icon": "icon.png",
   "theme": "theme.json",
+  "updater": { "github": "blueberrycongee/pipi" },
   "window": {
     "title": "pipi",
     "defaultSize": { "width": 1180, "height": 780 },

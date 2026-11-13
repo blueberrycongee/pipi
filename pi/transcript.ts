@@ -1,5 +1,5 @@
 import type { Lang } from "../lib/i18n";
-import type { AgentMessage, AssistantMessage, AssistantMessageEvent, ImageContent, SessionEvent, TextContent, ToolResult } from "./protocol";
+import type { AgentMessage, AssistantMessage, AssistantMessageEvent, ImageContent, SessionEvent, TextContent, ToolResult, ToolResultMessage } from "./protocol";
 
 /**
  * The transcript: a session's messages as the rows the chat shows.
@@ -28,6 +28,15 @@ export interface TurnStamp {
 
 const isTurnRow = (row: Row): row is Extract<Row, { kind: "text" | "thinking" | "tool" }> =>
   row.kind === "text" || row.kind === "thinking" || row.kind === "tool";
+
+/** Whether the message answered its turn: called no tools without failing, or —
+ * a turn held in one message, as the bridge plays ACP harnesses — ended on
+ * prose after its steps. One still calling tools or that failed answers nothing. */
+const answeredTurn = (message: AssistantMessage): boolean => {
+  if (message.stopReason === "error") return false;
+  if (!message.content.some((block) => block.type === "toolCall")) return true;
+  return message.stopReason !== "toolUse" && message.content.at(-1)?.type === "text";
+};
 
 export interface ToolRow extends TurnStamp {
   kind: "tool";
@@ -196,6 +205,15 @@ export class Transcript {
   #live: { key: string; toolIds: Map<number, string>; toolJson: Map<number, string>; thinkingSince: Map<number, number>; argsAt: Map<number, number> } | undefined;
   /** Start timestamps for running tool executions so external engines without `durationMs` still measure elapsed time. */
   #toolSince = new Map<string, number>();
+  /**
+   * Results read ahead of the call that made them: the bridge lists a turn's
+   * tool results before the one assistant message holding every block (its
+   * calls included), so on a reload a result can land before its call's row
+   * exists. It waits here for the block instead — minting the row on sight
+   * would park every tool at the head of its turn and leave the message's
+   * prose out of order.
+   */
+  #pendingResults = new Map<string, ToolResultMessage>();
   /** Rows that are still open when a run stops, to close them. */
   #bashId: string | undefined;
   /** When the current turn started: the user's message, else its first row. */
@@ -234,6 +252,7 @@ export class Transcript {
     this.#index.clear();
     this.#live = undefined;
     this.#toolSince.clear();
+    this.#pendingResults.clear();
     this.#bashId = undefined;
     this.#turnStart = undefined;
     this.#failure = undefined;
@@ -497,20 +516,25 @@ export class Transcript {
     this.#blocks(message, live.key, true);
     // The answer is in: the turn took this long, whatever the provider still cleans up.
     // (A message that failed is no answer yet: a retry goes on in the same turn.)
-    if (message.stopReason !== "error" && !message.content.some((block) => block.type === "toolCall")) this.#closeTurn();
+    if (answeredTurn(message)) this.#closeTurn();
   }
 
   #blocks(message: AssistantMessage, key: string, keepRuns: boolean) {
     // A later assistant message is the attempt made again: it answers for the one that failed before it.
     this.#failure = undefined;
     const failed = message.stopReason === "error";
-    // A message that calls no tools ends the turn: its prose is the answer. Not one that failed —
-    // what it left becomes the answer only if the failure stands (`#reportFailure`).
-    const final = !failed && !message.content.some((block) => block.type === "toolCall");
+    // A message that calls no tools ends the turn: its prose is the answer. A
+    // turn held in one message (the bridge's play of ACP harnesses) answers
+    // with the prose after its last step — the same trailing run of texts
+    // `#settle` marks when the live run ends. Not one that failed: what it left
+    // becomes the answer only if the failure stands (`#reportFailure`).
+    const hasTools = message.content.some((block) => block.type === "toolCall");
+    const lastStep = message.content.reduce((at, block, index) => (block.type === "text" ? at : index), -1);
+    const final = (index: number) => !failed && (hasTools ? message.stopReason !== "toolUse" && index > lastStep : true);
     message.content.forEach((block, index) => {
       const id = `${key}.${index}`;
       if (block.type === "text") {
-        if (block.text.trim()) this.#set({ kind: "text", id, text: block.text, streaming: false, final });
+        if (block.text.trim()) this.#set({ kind: "text", id, text: block.text, streaming: false, final: final(index) });
       } else if (block.type === "thinking") {
         const before = this.#get(id);
         if (block.thinking.trim() || block.redacted) {
@@ -524,6 +548,12 @@ export class Transcript {
           this.#set({ ...base, name: block.name, args: block.arguments ?? {}, status: "error", output: base.output || this.#tr("Stopped before it finished.", "完成前已停止。") });
         } else {
           this.#set({ ...base, name: block.name, args: block.arguments ?? {}, status: keepRuns && base.status !== "call" ? base.status : "queued" });
+        }
+        // A result read ahead of its call lands on the row now that the call is known.
+        const pending = this.#pendingResults.get(block.id);
+        if (pending) {
+          this.#pendingResults.delete(block.id);
+          this.#tool(block.id, (row) => this.#applyToolResult(row, pending), pending.toolName);
         }
       }
     });
@@ -557,10 +587,33 @@ export class Transcript {
     this.#push({ kind: "notice", id: this.#id("notice"), tone: "error", title: this.#tr("The model returned an error", "模型返回了错误"), text });
   }
 
+  /** A tool's result applied to its call's row: its output, images and outcome. */
+  #applyToolResult(row: ToolRow, message: ToolResultMessage): ToolRow {
+    return {
+      ...row,
+      output: textOf(message.content) || row.output,
+      images: imagesOf(message.content),
+      details: message.details ?? row.details,
+      status: message.isError ? "error" : "done",
+    };
+  }
+
+  /** Results still waiting on their call missed it once the transcript moves on: they land where the wait ended. */
+  #flushResults() {
+    if (!this.#pendingResults.size) return;
+    for (const message of this.#pendingResults.values()) {
+      this.#tool(message.toolCallId, (row) => this.#applyToolResult(row, message), message.toolName);
+    }
+    this.#pendingResults.clear();
+  }
+
   /** A whole message: from history, or one that arrives complete (a user's, a tool's result). */
   #append(message: AgentMessage) {
     // The conversation moves on from a failure nothing took the place of: it is said before what follows.
-    if (message.role !== "assistant") this.#reportFailure();
+    if (message.role !== "assistant") {
+      this.#reportFailure();
+      if (message.role !== "toolResult") this.#flushResults();
+    }
     switch (message.role) {
       case "user": {
         const text = withoutImageNotes(textOf(message.content));
@@ -578,17 +631,9 @@ export class Transcript {
         this.#blocks(message, `m${++seq}`, false);
         break;
       case "toolResult":
-        this.#tool(
-          message.toolCallId,
-          (row) => ({
-            ...row,
-            output: textOf(message.content) || row.output,
-            images: imagesOf(message.content),
-            details: message.details ?? row.details,
-            status: message.isError ? "error" : "done",
-          }),
-          message.toolName,
-        );
+        // A result whose call has a row joins it; one read ahead of it waits for the block.
+        if (this.#get(message.toolCallId)?.kind === "tool") this.#tool(message.toolCallId, (row) => this.#applyToolResult(row, message), message.toolName);
+        else this.#pendingResults.set(message.toolCallId, message);
         break;
       case "bashExecution":
         this.#push({
@@ -623,11 +668,13 @@ export class Transcript {
   #settle() {
     this.#live = undefined;
     this.#toolSince.clear();
-    // Prose a stopped run left at the end is as much of an answer as there will be.
+    this.#flushResults();
+    // Prose a stopped run left at the end is as much of an answer as there will
+    // be — prose a message already classified keeps the place it was given.
     let tail = this.#rows.length;
     while (tail > 0 && this.#rows[tail - 1].kind === "text") tail--;
     this.#rows = this.#rows.map((row, at) => {
-      if (row.kind === "text" && at >= tail && !row.final) return { ...row, streaming: false, final: true };
+      if (row.kind === "text" && at >= tail && row.final === undefined) return { ...row, streaming: false, final: true };
       if ((row.kind === "text" || row.kind === "thinking") && row.streaming) return { ...row, streaming: false };
       if (row.kind === "tool" && (row.status === "call" || row.status === "queued" || row.status === "running"))
         return { ...row, status: "error" as const, output: row.output || this.#tr("Stopped before it finished.", "完成前已停止。") };

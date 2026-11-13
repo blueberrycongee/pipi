@@ -19,6 +19,11 @@ SmartScreen will warn on first launch); a final job publishes all of it as one
 GitHub Release. A manual dispatch runs every gate but publishes nothing. The
 tag must equal `v` + `nsh.json`'s version — bump `nsh.json` first.
 
+The publish job also runs `nsh update-manifest` over the staged archives and
+uploads the `latest.json` it writes beside them: that manifest is what the
+app's updater (`nsh.json` → `updater.github`, `store/update.ts`) reads when it
+checks for a newer version.
+
 ## Signing configuration
 
 The same Developer ID certificate and team that sign the team's other

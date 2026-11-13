@@ -57,6 +57,21 @@ multi-agent orchestration, and settings.
   `stdio: "inherit"`) because its SDK needs a Node/Bun host this QuickJS
   app is not; driving it as a sidecar isolates the agent process the same
   way the external-agent bridge does.
+- Usage is what each engine reports, never an estimate.
+  `sidecar/agent-usage.mjs` reads every engine's own figures (Claude
+  Code's `result.modelUsage` and Codex's `turn.completed.usage` are the
+  session's running total, so a turn is the growth since the last one
+  — the baseline is kept in the session file; OpenCode's `step_finish`;
+  Cursor's `result.usage`; ACP's `session/prompt` `usage`, Devin's
+  per-request `usage_update._meta`, and `usage_update.cost`) into Pi's
+  `usage` shape, stamped on the turn's last assistant message with two
+  additions: `unpriced` (tokens the engine named no cost for) and
+  `models` (the models the engine says did the work).
+  `sidecar/usage-stats.mjs` adds the session files up for Settings →
+  Usage. An agent that reports nothing (Kimi) gets no figures and
+  no row; a cost is shown only where an engine named one. External
+  session files older than header `version` 2 carried a running total
+  per message and are not counted.
 - The compare flow (`views/AgentPicker.tsx` → `CompareDialog`, ⌘⇧O) starts
   the same task in several sibling sessions at once — answers land as
   unread marks for the user, not as deliveries to the parent. Delegation
@@ -90,14 +105,25 @@ multi-agent orchestration, and settings.
 - `nsh test SelectScroll.test.tsx --target macos` — a selection dragged to an
   edge of the conversation scrolls it on (and releases or follows as a scroll
   of the reader's does); `nsh test lib/edge-scroll.test.ts` — how fast
+- `node --test sidecar/*.test.mjs` — the Node side: the daemon, what each
+  engine's usage report reads as (`agent-usage.test.mjs`, on the engines' own
+  payloads), and the bridge writing it through to the scanner
+  (`external-usage.test.mjs`, on `dev/fake-acp.mjs` with `FAKE_ACP_USAGE=1`)
 - `nsh test Shots.test.tsx --target macos` — screenshots of every state in
   `.nsh/shots/` (design review); `Gallery.test.tsx` does Pip and the icons
 - `nsh test QueueLook.test.tsx --target macos` — the queue's tray over the
   composer while a long reply streams, in `.nsh/shots/queue-*.png` (the reply
   must end clear of it)
+- `nsh test UserFold.test.tsx` — a sent message laid out past six lines folds
+  to a fading preview; the chevron at the bubble's foot opens and closes it
+  (`--target macos` films `.nsh/shots/userfold-*.png`)
 - `nsh test WallpaperLook.test.tsx --target macos` — the app under a wallpaper,
   every surface it reaches, in `.nsh/shots/wallpaper-*.png` (`harness.wallpaper`
   lays one; name any image in the test's `PICTURE`)
+- `nsh test Update.test.tsx --target macos` — the update card found,
+  downloading and ready, in `.nsh/shots/update-*.png` (`harness.update`
+  scripts the updater); `UpdateFilm.test.tsx` films it frame by frame into
+  `.nsh/shots/film/` for a GIF
 - `nsh test E2E.test.tsx --target macos` — a real run through the real
   sidecar; needs a model (see below)
 - `nsh package .` — build an installable app package (targets the host OS;
@@ -129,9 +155,16 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   pipi-dev.
 - Releases ride on tags pushed to `public` (`v*` triggers
   `.github/workflows/release.yml`, which ships the signed, notarized
-  macOS DMG plus the Windows installer/zip and the Linux tar.gz). The
-  repo needs the `PIPI_RELEASE_*` / `APPLE_API_*` secrets configured for
+  macOS DMG plus the Windows installer/zip and the Linux tar.gz, and the
+  `latest.json` manifest `nsh update-manifest` writes from the archives).
+  The repo needs the `PIPI_RELEASE_*` / `APPLE_API_*` secrets configured for
   CI releases; `npm run release:macos` is the local fallback.
+- The app updates itself: `nsh.json` `updater.github` names the public
+  repo, and `nsh/updater` (`checkForUpdate` → `downloadUpdate` →
+  `installAndRestart`) reads the release's `latest.json` for what is newer —
+  `store/update.ts` runs the checks (on boot, then every 4h, and About →
+  Check), `views/UpdateCard.tsx` shows them. In dev and tests the check
+  finds nothing; the fake backend scripts it via `harness.update`.
 
 ## Layout
 
@@ -148,11 +181,12 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   (`auth.json`), `providers.ts`
 - `store/` — `app.ts` (all state and actions; signals are private),
   `backend.ts` (everything that touches the machine, swappable in tests),
-  `prefs.ts`
+  `prefs.ts`, `update.ts` (the app's own update checks and the card's state)
 - `views/` — screens; `ui/` — the component kit; `mascot/` — Pip
 - `sidecar/` — Node helpers run as children: `probe-agents.mjs` (PATH
   discovery), `launch-pi.mjs`, `external-agent.mjs` (the universal
-  bridge), `pipi-daemon.mjs` (the session daemon), `daemon-client.mjs`
+  bridge), `agent-usage.mjs` (each engine's usage report, read into Pi's
+  shape), `pipi-daemon.mjs` (the session daemon), `daemon-client.mjs`
   (discovers/starts it), `daemon-link.mjs` (the app's stdio relay),
   `pipi-cli.mjs` (the `pipi` command), `worktree.mjs`,
   `env-paths.mjs`, `list-sessions.mjs` (Pi session `.jsonl` files under

@@ -14,6 +14,8 @@ export interface UsageAgentRow {
   messages: number;
   tokens: TokenTotals;
   cost: number;
+  /** Tokens the engine named no cost for: they are in no cost figure. */
+  unpriced: number;
 }
 
 export interface UsageModelRow {
@@ -22,6 +24,7 @@ export interface UsageModelRow {
   messages: number;
   tokens: TokenTotals;
   cost: number;
+  unpriced: number;
 }
 
 export interface UsageDay {
@@ -30,10 +33,14 @@ export interface UsageDay {
   cost: number;
 }
 
-/** Token use and cost accumulated across every saved session (`sidecar/usage-stats.mjs`). */
+/**
+ * Token use and cost accumulated across every saved session (`sidecar/usage-stats.mjs`):
+ * what each engine reported, nothing estimated. An agent that reports nothing has
+ * sessions and no tokens; one that reports tokens and no cost has them `unpriced`.
+ */
 export interface UsageStats {
   scannedAt: number;
-  totals: TokenTotals & { cost: number; sessions: number; userMessages: number; assistantMessages: number; toolCalls: number };
+  totals: TokenTotals & { cost: number; unpriced: number; sessions: number; userMessages: number; assistantMessages: number; toolCalls: number };
   agents: UsageAgentRow[];
   models: UsageModelRow[];
   daily: UsageDay[];
@@ -41,7 +48,7 @@ export interface UsageStats {
 
 export const EMPTY_USAGE: UsageStats = {
   scannedAt: 0,
-  totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, sessions: 0, userMessages: 0, assistantMessages: 0, toolCalls: 0 },
+  totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, unpriced: 0, sessions: 0, userMessages: 0, assistantMessages: 0, toolCalls: 0 },
   agents: [],
   models: [],
   daily: [],

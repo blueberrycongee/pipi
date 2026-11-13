@@ -83,6 +83,7 @@ export function TextField(props: {
         onChange={({ value }) => props.onChange(value)}
         onSubmit={props.onSubmit}
         masked={props.masked}
+        scrollbar={false}
         autoFocus={props.autoFocus}
         autoCorrect={false}
         autoCapitalize="none"

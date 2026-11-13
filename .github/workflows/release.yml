@@ -139,6 +139,12 @@ jobs:
           pattern: pipi-*
           path: dist
           merge-multiple: true
+      - name: Install nsh
+        env:
+          NSH_VERSION: v0.5.0
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
       - name: Publish verified assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -155,5 +161,8 @@ jobs:
 
           **Linux**: unpack `pipi-*-linux-x64.tar.gz` and run `pipi`. Needs GTK 4.14 or newer (Ubuntu 24.04 and later).
           EOF
+          # The update manifest the app's updater reads (`updater.github` in
+          # nsh.json): written next to the archives, published beside them.
+          nsh update-manifest dist/pipi-* --notes release-notes.md -o dist
           gh release create "$RELEASE_TAG" --verify-tag --title "pipi $RELEASE_TAG" \
             --notes-file release-notes.md dist/*

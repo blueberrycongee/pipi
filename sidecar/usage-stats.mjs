@@ -8,6 +8,13 @@
 // assistant `message` entries carry `usage` + `cost`, `usage` entries record
 // model-attributed work that left no message (cache warming), and `compaction` /
 // `branch_summary` entries carry the usage of their summarizing call.
+//
+// External sessions are written in the same format by `external-agent.mjs`, from
+// what each engine reports (`agent-usage.mjs`), with two additions on `usage`:
+// `unpriced` (tokens the engine named no cost for) and `models` (the models that
+// did the work, when the engine names them). Nothing here is estimated: an agent
+// that reports nothing has sessions and no figures, and `unpriced` tokens are in
+// no cost.
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { agentDirPath } from "./env-paths.mjs";
@@ -40,8 +47,10 @@ function entryMs(entry) {
 }
 
 function blankBucket() {
-  return { tokens: ZERO(), cost: 0, messages: 0, sessions: 0 };
+  return { tokens: ZERO(), cost: 0, unpriced: 0, messages: 0, sessions: 0 };
 }
+
+const totalOf = (usage) => Number(usage?.totalTokens ?? usage?.total) || 0;
 
 /** Fold one session file into the totals. Returns false when it isn't a session. */
 function scanSession(raw, agentId, into) {
@@ -57,6 +66,8 @@ function scanSession(raw, agentId, into) {
   const isExternal = header?.type === "pipi_external_session";
   if (!isPi && !isExternal) return false;
   const owner = isExternal ? header.agentId || header.driver || "external" : agentId;
+  // Before version 2 an external session's messages carried a running total, not their own usage.
+  const unread = isExternal && (header.version ?? 1) < 2;
 
   const agent = into.agents.get(owner) ?? blankBucket();
   into.agents.set(owner, agent);
@@ -71,22 +82,31 @@ function scanSession(raw, agentId, into) {
     }
     const day = dayKey(entryMs(entry));
     const touch = (usage, provider, model) => {
-      const cost = addUsage(into.total.tokens, usage);
-      if (!usage) return;
+      if (!usage || typeof usage !== "object" || unread) return;
       counted = true;
+      const cost = addUsage(into.total.tokens, usage);
+      const unpriced = usage.unpriced ? totalOf(usage) : 0;
       into.total.cost += cost;
+      into.total.unpriced += unpriced;
       addUsage(agent.tokens, usage);
       agent.cost += cost;
-      const key = provider && model ? `${provider}·${model}` : "·unknown";
-      const bucket = into.models.get(key) ?? { provider: provider || "", model: model || "", tokens: ZERO(), cost: 0, messages: 0 };
-      into.models.set(key, bucket);
-      addUsage(bucket.tokens, usage);
-      bucket.cost += cost;
-      bucket.messages++;
+      agent.unpriced += unpriced;
+      // The models the engine named, else the one on the message. Nothing at all is not a model.
+      const named = Array.isArray(usage.models) ? usage.models.filter((part) => part && typeof part.model === "string" && part.model) : [];
+      const parts = named.length ? named.map((part) => ({ model: part.model, usage: { ...part, cost: { total: Number(part.cost) || 0 } } })) : [{ model, usage }];
+      for (const part of parts) {
+        if (!totalOf(part.usage) && !part.usage.cost?.total) continue;
+        const key = provider && part.model ? `${provider}·${part.model}` : "·unknown";
+        const bucket = into.models.get(key) ?? { provider: provider || "", model: part.model || "", tokens: ZERO(), cost: 0, unpriced: 0, messages: 0 };
+        into.models.set(key, bucket);
+        bucket.cost += addUsage(bucket.tokens, part.usage);
+        if (usage.unpriced) bucket.unpriced += totalOf(part.usage);
+        bucket.messages++;
+      }
       if (day) {
         const d = into.daily.get(day) ?? { day, tokens: 0, cost: 0 };
         into.daily.set(day, d);
-        d.tokens += Number(usage.totalTokens ?? usage.total) || 0;
+        d.tokens += totalOf(usage);
         d.cost += cost;
       }
     };
@@ -119,8 +139,7 @@ function scanSession(raw, agentId, into) {
     }
   }
   if (!counted) {
-    into.agents.delete(owner);
-    // `into` may already hold day/model entries? No — nothing was added.
+    if (!agent.sessions) into.agents.delete(owner);
     return false;
   }
   agent.sessions++;
@@ -166,7 +185,7 @@ async function* sessionFiles() {
 }
 
 const into = {
-  total: { tokens: ZERO(), cost: 0, userMessages: 0, assistantMessages: 0, toolCalls: 0 },
+  total: { tokens: ZERO(), cost: 0, unpriced: 0, userMessages: 0, assistantMessages: 0, toolCalls: 0 },
   agents: new Map(),
   models: new Map(),
   daily: new Map(),
@@ -183,9 +202,9 @@ const sortByCost = (a, b) => b.cost - a.cost || b.tokens.total - a.tokens.total;
 process.stdout.write(
   JSON.stringify({
     scannedAt: Date.now(),
-    totals: { ...into.total.tokens, cost: into.total.cost, userMessages: into.total.userMessages, assistantMessages: into.total.assistantMessages, toolCalls: into.total.toolCalls, sessions },
+    totals: { ...into.total.tokens, cost: into.total.cost, unpriced: into.total.unpriced, userMessages: into.total.userMessages, assistantMessages: into.total.assistantMessages, toolCalls: into.total.toolCalls, sessions },
     agents: [...into.agents.entries()]
-      .map(([agentId, a]) => ({ agentId, sessions: a.sessions, messages: a.messages, tokens: a.tokens, cost: a.cost }))
+      .map(([agentId, a]) => ({ agentId, sessions: a.sessions, messages: a.messages, tokens: a.tokens, cost: a.cost, unpriced: a.unpriced }))
       .sort(sortByCost),
     models: [...into.models.values()].sort(sortByCost),
     daily: [...into.daily.values()].sort((a, b) => a.day.localeCompare(b.day)),

@@ -426,6 +426,7 @@ export function ExtensionDialog() {
               <Input
                 multiline
                 autoFocus
+                scrollbar={false}
                 value={text()}
                 onChange={({ value }) => text.set(value)}
                 accessibilityLabel={dialog().title}

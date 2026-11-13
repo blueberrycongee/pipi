@@ -1,10 +1,8 @@
-import { Canvas, effect, Overlay, signal, Text, token, View } from "nsh";
+import { effect, Overlay, signal, Text, View } from "nsh";
 import type { InputRef } from "nsh";
 import { Button as BaseButton, Input } from "nsh/base";
 import { titleBar } from "nsh/desktop";
-import { money } from "../lib/format";
 import { tr } from "../lib/i18n";
-import { compactNumber } from "../pi/transcript";
 import {
   cancelRenaming,
   currentDaemonSession,
@@ -18,10 +16,8 @@ import {
   openWorkspace,
   renameSession,
   sessionState,
-  sessionStats,
   sidecarPhase,
   startRenaming,
-  transcriptRows,
   unarchiveCurrentSession,
   wallpaper,
 } from "../store/app";
@@ -31,59 +27,6 @@ import { Icon } from "../ui/Icon";
 import { animateLayoutOn, enter, Presence } from "../ui/motion";
 import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, HEADER_GLASS, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
-
-/** How full the model's context window is: a ring and a percentage. An engine
- * that reports no window still gets its used count in the tooltip, with the
- * ring left unfilled rather than a made-up share. */
-function ContextMeter() {
-  const usage = () => sessionStats()?.contextUsage;
-  const percent = () => usage()?.percent ?? null;
-  const visible = () => {
-    const context = usage();
-    if (!context || transcriptRows().length === 0) return false;
-    const share = percent();
-    return share === null ? (context.tokens ?? 0) > 0 : share >= 50;
-  };
-  const detail = () => {
-    const stats = sessionStats();
-    const context = usage();
-    if (!stats || !context) return tr("Context", "上下文");
-    const used = context.tokens === null ? "—" : compactNumber(context.tokens);
-    const tokens =
-      context.contextWindow === null
-        ? tr(`${used} tokens in context`, `上下文已用 ${used} tokens`)
-        : tr(
-            `${used} of ${compactNumber(context.contextWindow)} tokens in context`,
-            `上下文已用 ${used} / ${compactNumber(context.contextWindow)} tokens`,
-          );
-    return `${tokens} · ${tr(`${money(stats.cost)} this session`, `本会话 ${money(stats.cost)}`)}`;
-  };
-  return (
-    <Presence show={visible()} scaleFrom={0.85}>
-      <View class="h-6 flex-row items-center gap-1.5 rounded-md px-1.5" tooltip={tip(detail())} accessibilityLabel={detail()}>
-        <Canvas
-          style={{ width: 14, height: 14 }}
-          draw={(cx, { width }) => {
-            const middle = width / 2;
-            const share = Math.min(1, (percent() ?? 0) / 100);
-            cx.lineWidth = 2;
-            cx.lineCap = "round";
-            cx.strokeStyle = token("input");
-            cx.beginPath();
-            cx.arc(middle, middle, middle - 1.5, 0, Math.PI * 2);
-            cx.stroke();
-            if (share > 0) {
-              cx.strokeStyle = token(share > 0.85 ? "warning" : "muted-foreground");
-              cx.beginPath();
-              cx.arc(middle, middle, middle - 1.5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * share);
-              cx.stroke();
-            }
-          }}
-        />
-      </View>
-    </Presence>
-  );
-}
 
 function SessionTitle() {
   const name = signal("");
@@ -120,6 +63,7 @@ function SessionTitle() {
         onSubmit={commit}
         onBlur={commit}
         autoFocus
+        scrollbar={false}
         accessibilityLabel={tr("Session name", "会话名称")}
         placeholder={tr("Name this session", "为会话命名")}
         class={`h-7 w-80 rounded-md px-2 text-base font-medium text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
@@ -195,9 +139,6 @@ export function TitleBar() {
         </Presence>
       </View>
       <View class="flex-1" />
-      <If when={sidecarPhase().name === "ready"}>
-        <ContextMeter />
-      </If>
     </View>
   );
 }

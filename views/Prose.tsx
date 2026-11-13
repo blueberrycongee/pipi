@@ -602,6 +602,8 @@ function FallbackTextViewBlock(props: { block: TextViewBlock; settled: boolean }
       classes={PROSE}
       selectable
       links="open"
+      codeBlockScrollbar={false}
+      tableScrollbar={false}
       codeBlockActions={props.settled ? [{ id: "copy", label: tr("Copy code", "复制代码") }] : undefined}
     />
   );
@@ -968,7 +970,7 @@ export function ProseBlock(props: { row: ProseRow }) {
   return (
     <If
       when={props.row.block}
-      else={<TextView document={{ blocks: [], footnotes: props.row.footnotes ?? [] }} classes={PROSE} selectable links="open" />}
+      else={<TextView document={{ blocks: [], footnotes: props.row.footnotes ?? [] }} classes={PROSE} selectable links="open" codeBlockScrollbar={false} tableScrollbar={false} />}
     >
       <View style={fadeStyle()}>
         <If

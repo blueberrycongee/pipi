@@ -11,6 +11,24 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  acpCostPart,
+  acpMetaSample,
+  acpPromptPart,
+  addInto,
+  claudeAssistantSample,
+  claudeResultParts,
+  codexTurnPart,
+  cursorResultPart,
+  dropLegacyUsage,
+  fromUsage,
+  isBlank,
+  openCodeStepPart,
+  tally,
+  tokensOf,
+  toUsage,
+  ZERO_USAGE,
+} from "./agent-usage.mjs";
 import { agentAuthEnv, childEnv, ensureDir, externalSessionsDir, resolveBinary, shellForCommand, spawnBinary } from "./env-paths.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -26,7 +44,7 @@ const orchestratorUrl = config.orchestratorUrl || process.env.PIPI_ORCHESTRATOR_
 const orchestratorToken = config.orchestratorToken || process.env.PIPI_ORCHESTRATOR_TOKEN || "";
 
 const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { ...zeroCost, total: 0 } };
+const zeroUsage = ZERO_USAGE;
 
 const BUILTIN_ACP_PRESETS = {
   devin: { binary: "devin", args: ["acp"], envVar: "DEVIN_API_KEY" },
@@ -146,9 +164,37 @@ let queuedFollowUp = [];
 // aborted — steering by interrupt-restart for engines without native mid-turn
 // injection.
 let steerInterrupt = false;
-let totalInputTokens = 0;
-let totalOutputTokens = 0;
-let totalCost = 0;
+// What the engine reported for this session (`agent-usage.mjs`): the sum of the
+// usage on its assistant messages and of `sessionUsageEntries`, the Pi-format
+// `usage` entries for work that left no message (a run cut short before any
+// reply, a result that came after the turn's answer).
+let sessionUsage = tally();
+let sessionUsageEntries = [];
+// The engine's own running total for `nativeThreadId` at the last reading — what
+// the next reading is measured against (Claude's per-model session total, Codex's
+// thread total, ACP's session cost). Saved with the session: the engine's total
+// outlives this process.
+let usageBaseline = undefined;
+// What the last model request held in context, and the window an ACP agent
+// reported with it (Claude's is adopted onto the model: `adoptClaudeModelUsage`).
+let contextTokens = undefined;
+let contextWindow = undefined;
+
+function resetSessionUsage() {
+  sessionUsage = tally();
+  sessionUsageEntries = [];
+  usageBaseline = undefined;
+  contextTokens = undefined;
+  contextWindow = undefined;
+  acpUsage = undefined;
+}
+
+/** Usage that belongs to no message: kept as a Pi `usage` entry in the session file. */
+function recordUsageEntry(usage, kind) {
+  if (usage === ZERO_USAGE) return;
+  sessionUsageEntries.push({ type: "usage", timestamp: new Date().toISOString(), kind, provider: currentModel.provider, model: currentModel.id, usage });
+  addInto(sessionUsage, fromUsage(usage));
+}
 
 // Pending UI approval promises (for ACP `session/request_permission`)
 const pendingUiRequests = new Map();
@@ -238,7 +284,7 @@ async function saveExternalSession() {
         : "";
   const header = {
     type: "pipi_external_session",
-    version: 1,
+    version: 2,
     id: sessionId,
     agentId,
     driver,
@@ -248,10 +294,12 @@ async function saveExternalSession() {
     firstMessage: firstText.slice(0, 240),
     model: currentModel,
     thinkingLevel,
+    usageBaseline,
+    context: { tokens: acpUsage?.used ?? contextTokens, window: acpUsage?.size || contextWindow },
     created: messages[0]?.timestamp || Date.now(),
     modified: Date.now(),
   };
-  const lines = [JSON.stringify(header), ...messages.map((m) => JSON.stringify({ type: "message", message: m }))];
+  const lines = [JSON.stringify(header), ...messages.map((m) => JSON.stringify({ type: "message", message: m })), ...sessionUsageEntries.map((entry) => JSON.stringify(entry))];
   await fsp.writeFile(sessionFile, `${lines.join("\n")}\n`, "utf8");
 }
 
@@ -259,6 +307,7 @@ async function loadExternalSession(targetPath) {
   const raw = await fsp.readFile(targetPath, "utf8");
   const lines = raw.split("\n").filter(Boolean);
   const loadedMessages = [];
+  const loadedUsage = [];
   let header = undefined;
   for (const line of lines) {
     const parsed = JSON.parse(line);
@@ -266,6 +315,8 @@ async function loadExternalSession(targetPath) {
       header = parsed;
     } else if (parsed.type === "message" && parsed.message) {
       loadedMessages.push(parsed.message);
+    } else if (parsed.type === "usage" && parsed.usage) {
+      loadedUsage.push(parsed);
     } else if (parsed.type === "session" && parsed.id) {
       // Standard Pi session file opened while an external agent is active!
       header = { id: parsed.id, name: undefined, nativeThreadId: undefined };
@@ -284,6 +335,16 @@ async function loadExternalSession(targetPath) {
   if (typeof header?.thinkingLevel === "string" && header.thinkingLevel) {
     thinkingLevel = header.thinkingLevel;
     thinkingLevelSet = true;
+  }
+  if (header?.type === "pipi_external_session" && (header.version ?? 1) < 2) dropLegacyUsage(loadedMessages);
+  resetSessionUsage();
+  for (const m of loadedMessages) if (m.role === "assistant") addInto(sessionUsage, fromUsage(m.usage));
+  for (const entry of loadedUsage) addInto(sessionUsage, fromUsage(entry.usage));
+  sessionUsageEntries = loadedUsage;
+  if (header?.driver === driver) {
+    usageBaseline = header.usageBaseline && typeof header.usageBaseline === "object" ? header.usageBaseline : undefined;
+    contextTokens = typeof header.context?.tokens === "number" ? header.context.tokens : undefined;
+    contextWindow = typeof header.context?.window === "number" && header.context.window > 0 ? header.context.window : undefined;
   }
   messages = loadedMessages;
 }
@@ -513,10 +574,17 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch) {
   let thinkBuf = "";
   const blocks = [];
   const openTools = new Map();
+  // What the engine reported for this turn: stamped on the turn's last
+  // assistant message, the way Pi stamps each of its own.
+  const usageParts = [];
+  let sampled = false;
+  let lastSample = undefined;
+  let finished = false;
 
   const openMsg = () => {
     if (msgOpen) return;
     msgOpen = true;
+    finished = false; // more of the turn after an early end (Claude's `result` for a background wake)
     emitTurn({
       type: "message_start",
       message: {
@@ -556,6 +624,23 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch) {
     },
     get hasBlocks() {
       return blocks.length > 0;
+    },
+    /** Tokens or cost the engine reported for this turn. After the answer, it is the session's all the same. */
+    usage(part) {
+      if (!part || isBlank(part)) return;
+      if (!finished) usageParts.push(part);
+      else if (sessionEpoch === turnEpoch) recordUsageEntry(toUsage([part]), "late");
+    },
+    /** One model request, from an engine that reports each as it happens; a repeat is dropped. */
+    usageSample(sample) {
+      if (!sample || sample.sig === lastSample) return;
+      lastSample = sample.sig;
+      sampled = true;
+      this.usage(sample);
+    },
+    /** The turn's usage as the engine sums it up — unless its requests were already counted one by one. */
+    usageSummary(part) {
+      if (!sampled) this.usage(part);
     },
     thinkDelta(delta) {
       if (!delta) return;
@@ -608,6 +693,9 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch) {
     finish(stopReason = "stop", errorMessage = undefined) {
       closeThink();
       closeText();
+      const usage = toUsage(usageParts.splice(0));
+      finished = true;
+      const counted = sessionEpoch === turnEpoch;
       if (msgOpen || errorMessage) {
         openMsg();
         const assistantMsg = {
@@ -615,20 +703,18 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch) {
           content: blocks.slice(),
           provider: currentModel.provider,
           model: currentModel.id,
-          usage: {
-            input: totalInputTokens,
-            output: totalOutputTokens,
-            cacheRead: 0,
-            cacheWrite: 0,
-            totalTokens: totalInputTokens + totalOutputTokens,
-            cost: { ...zeroCost, total: totalCost },
-          },
+          usage,
           stopReason,
           ...(errorMessage ? { errorMessage } : {}),
           timestamp: Date.now(),
         };
-        if (sessionEpoch === turnEpoch) messages.push(assistantMsg);
+        if (counted) {
+          messages.push(assistantMsg);
+          addInto(sessionUsage, fromUsage(usage));
+        }
         emitTurn({ type: "message_end", message: assistantMsg });
+      } else if (counted) {
+        recordUsageEntry(usage, "turn");
       }
       emitTurn({ type: "turn_end" });
     },
@@ -769,8 +855,37 @@ function probeClaudeInitialization(bin) {
 const CLAUDE_EFFORT_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh", "max"]);
 const claudeEfforts = (info) =>
   (Array.isArray(info?.supportedEffortLevels) ? info.supportedEffortLevels : []).filter((e) => typeof e === "string" && CLAUDE_EFFORT_LEVELS.has(e));
-// `resolvedModel` carries Claude's `[1m]` context-window suffix.
+// `resolvedModel` carries Claude's `[1m]` context-window suffix — only an
+// estimate until a turn's `result.modelUsage` reports the real window
+// (`adoptClaudeModelUsage`): aliases, Bedrock/Vertex ids and window sizes
+// Anthropic adds later all resolve truthfully there, not here.
 const claudeContextWindow = (info) => (typeof info?.resolvedModel === "string" && info.resolvedModel.endsWith("[1m]") ? 1_000_000 : 200_000);
+
+/**
+ * Adopts the window Claude Code actually ran at — `result.modelUsage` reports
+ * `contextWindow`/`maxOutputTokens` per resolved model. The session's model may
+ * sit behind an alias (`default`, `sonnet`, a settings id), so the entry that
+ * did the most tokens stands for it when no key matches `currentModel.id`.
+ */
+function adoptClaudeModelUsage(modelUsage) {
+  if (!modelUsage || typeof modelUsage !== "object" || !currentModel) return;
+  const usageTotal = (u) =>
+    Number(u?.inputTokens || 0) + Number(u?.outputTokens || 0) + Number(u?.cacheReadInputTokens || 0) + Number(u?.cacheCreationInputTokens || 0);
+  const entries = Object.entries(modelUsage);
+  if (!entries.length) return;
+  const [, usage] = entries.find(([id]) => id === currentModel.id) ?? entries.reduce((a, b) => (usageTotal(b[1]) > usageTotal(a[1]) ? b : a));
+  const win = Number(usage?.contextWindow);
+  const maxOut = Number(usage?.maxOutputTokens);
+  const listed = availableModels.find((m) => m === currentModel || (m.id === currentModel.id && m.provider === currentModel.provider));
+  if (win > 0) {
+    currentModel.contextWindow = win;
+    if (listed && listed !== currentModel) listed.contextWindow = win;
+  }
+  if (maxOut > 0) {
+    currentModel.maxTokens = maxOut;
+    if (listed && listed !== currentModel) listed.maxTokens = maxOut;
+  }
+}
 
 /** Adopts the catalog the probe reported; `default` stays the placeholder (it is a pointer, not a model). */
 function adoptClaudeModels(init) {
@@ -882,6 +997,11 @@ async function runClaudeTurn(bin, promptText, turnEpoch = sessionEpoch) {
 
   const stream = makeTurnStreamHelper(turnEpoch);
   let completed = false;
+  // `modelUsage` is the session's running total, resumed turns included: a turn is
+  // its growth since the last one. A resumed session with nothing to measure
+  // against (saved before this was kept) has only this turn's own requests.
+  let counted = !nativeThreadId ? {} : usageBaseline?.thread === nativeThreadId && usageBaseline.models ? structuredClone(usageBaseline.models) : undefined;
+  const samples = new Map(); // message id → usage, should the run end without a `result`
   const { code, stderr } = await spawnJsonlProcess(bin, args, {}, (rec) => {
     if (sessionEpoch === turnEpoch && typeof rec.session_id === "string" && rec.session_id) nativeThreadId = rec.session_id;
     if (rec.type === "stream_event" && rec.event?.type === "content_block_delta") {
@@ -889,9 +1009,11 @@ async function runClaudeTurn(bin, promptText, turnEpoch = sessionEpoch) {
       if (delta?.type === "text_delta" && delta.text) stream.textDelta(delta.text);
       else if (delta?.type === "thinking_delta" && delta.thinking) stream.thinkDelta(delta.thinking);
     } else if (rec.type === "assistant" && Array.isArray(rec.message?.content)) {
-      if (sessionEpoch === turnEpoch && rec.message.usage) {
-        totalInputTokens += Number(rec.message.usage.input_tokens || 0);
-        totalOutputTokens += Number(rec.message.usage.output_tokens || 0);
+      const sample = claudeAssistantSample(rec);
+      if (sample) {
+        samples.set(sample.id, sample);
+        // The conversation's own request (a subagent's has a parent): what it held is the context.
+        if (!rec.parent_tool_use_id && sessionEpoch === turnEpoch) contextTokens = tokensOf(sample);
       }
       for (const b of rec.message.content) {
         if (b.type === "thinking" && b.thinking && !stream.thinkBuf) stream.thinkDelta(b.thinking);
@@ -907,7 +1029,13 @@ async function runClaudeTurn(bin, promptText, turnEpoch = sessionEpoch) {
       }
     } else if (rec.type === "result") {
       completed = true;
-      if (sessionEpoch === turnEpoch && typeof rec.total_cost_usd === "number") totalCost = rec.total_cost_usd;
+      const total = counted ?? {};
+      const parts = claudeResultParts(rec, total);
+      for (const part of counted ? parts : samples.values()) stream.usage(part);
+      counted = total;
+      samples.clear();
+      if (sessionEpoch === turnEpoch && nativeThreadId) usageBaseline = { thread: nativeThreadId, models: total };
+      if (sessionEpoch === turnEpoch) adoptClaudeModelUsage(rec.modelUsage);
       const isErr = !!rec.is_error;
       if (!isErr && typeof rec.result === "string" && rec.result && !stream.hasBlocks && !stream.textBuf) {
         stream.textDelta(rec.result);
@@ -916,12 +1044,19 @@ async function runClaudeTurn(bin, promptText, turnEpoch = sessionEpoch) {
     }
   });
   if (!completed) {
+    // No `result` (interrupted, or the CLI died). Claude keeps the session's total
+    // through it and the next turn's `result` carries what this one used, cost
+    // included — so it is counted then, not here as well. Only a session with no
+    // total to measure against counts the requests it saw.
+    if (!counted) for (const sample of samples.values()) stream.usage(sample);
+    else if (sessionEpoch === turnEpoch && nativeThreadId) usageBaseline = { thread: nativeThreadId, models: counted };
     stream.finish(abortRequested ? "aborted" : code === 0 ? "stop" : "error", code !== 0 && !abortRequested ? stderr || `Claude exited with code ${code}` : undefined);
   }
 }
 
 async function runCodexTurn(bin, promptText, turnEpoch = sessionEpoch) {
   const args = ["exec"];
+  const resumed = !!nativeThreadId;
   if (nativeThreadId) {
     args.push("resume", nativeThreadId);
   }
@@ -958,7 +1093,11 @@ async function runCodexTurn(bin, promptText, turnEpoch = sessionEpoch) {
   const { code, stderr } = await spawnJsonlProcess(bin, args, {}, (rec) => {
     const t = String(rec.type || "");
     if (t === "thread.started" && rec.thread_id) {
-      if (sessionEpoch === turnEpoch) nativeThreadId = rec.thread_id;
+      if (sessionEpoch === turnEpoch) {
+        nativeThreadId = rec.thread_id;
+        // A thread begun here starts from nothing: its total is all this session's.
+        if (!resumed) usageBaseline = { thread: nativeThreadId, input: 0, cached: 0, output: 0 };
+      }
     } else if ((t === "item.started" || t === "item.updated" || t === "item.completed") && rec.item) {
       const item = rec.item;
       const id = item.id || "item";
@@ -980,9 +1119,17 @@ async function runCodexTurn(bin, promptText, turnEpoch = sessionEpoch) {
       }
     } else if (t === "turn.completed") {
       completed = true;
-      if (sessionEpoch === turnEpoch && rec.usage) {
-        totalInputTokens += Number(rec.usage.input_tokens || 0);
-        totalOutputTokens += Number(rec.usage.output_tokens || 0);
+      if (sessionEpoch === turnEpoch) {
+        // A turn interrupted before this record is not lost: the thread's total still holds it for the next reading.
+        const known = usageBaseline?.thread === nativeThreadId ? usageBaseline : undefined;
+        const read = codexTurnPart(rec.usage, known);
+        if (read) {
+          // A thread resumed with nothing to measure against (a session saved before
+          // usage was read per turn): its total is mostly earlier turns, so this one
+          // goes uncounted rather than counted many times over.
+          if (known) stream.usage(read.part);
+          usageBaseline = { thread: nativeThreadId, ...read.total };
+        }
       }
       stream.finish(abortRequested ? "aborted" : "stop");
     } else if (t === "turn.failed" || t === "error") {
@@ -1008,7 +1155,13 @@ async function runOpenCodeTurn(bin, promptText, turnEpoch = sessionEpoch) {
     if (sessionEpoch === turnEpoch && rec.sessionID) nativeThreadId = rec.sessionID;
     if (rec.type === "text" && rec.part?.text) stream.textDelta(rec.part.text);
     else if (rec.type === "reasoning" && rec.part?.text) stream.thinkDelta(rec.part.text);
-    else if (rec.type === "tool_use" && rec.part) {
+    else if (rec.type === "step_finish" || rec.part?.type === "step-finish") {
+      const part = openCodeStepPart(rec.part);
+      if (part) {
+        stream.usage(part);
+        if (sessionEpoch === turnEpoch) contextTokens = tokensOf(part);
+      }
+    } else if (rec.type === "tool_use" && rec.part) {
       const id = rec.part.callID || rec.part.id || `oc_${Date.now()}`;
       stream.toolStart(id, rec.part.tool || "tool", rec.part.state?.input || {});
       if (rec.part.state?.status === "completed" || rec.part.state?.status === "error") {
@@ -1035,6 +1188,8 @@ async function runCursorTurn(bin, promptText, turnEpoch = sessionEpoch) {
     } else if (rec.type === "tool_call" && rec.call_id) {
       if (rec.subtype === "started") stream.toolStart(rec.call_id, rec.name || "tool", rec.args || {});
       else if (rec.subtype === "completed") stream.toolEnd(rec.call_id, rec.output || "", !!rec.is_error);
+    } else if (rec.type === "result") {
+      stream.usage(cursorResultPart(rec));
     }
   });
   stream.finish(abortRequested ? "aborted" : code === 0 ? "stop" : "error", code !== 0 && !abortRequested ? stderr || `Cursor agent exited with code ${code}` : undefined);
@@ -1405,6 +1560,17 @@ function handleAcpUpdate(u) {
     }
   } else if (kind === "usage_update") {
     acpUsage = { used: Number(u.used ?? 0), size: Number(u.size ?? 0) };
+    acpStream?.usageSample(acpMetaSample(u._meta));
+    // The session's running cost: what it grew by since the last reading. A session
+    // resumed with nothing to measure against only sets the mark for the next one.
+    const known = usageBaseline?.thread === acpSessionId ? usageBaseline : undefined;
+    const cost = acpCostPart(u.cost, known);
+    if (cost) {
+      usageBaseline = { thread: acpSessionId, ...cost.total };
+      // Between prompts there is no turn to put it on: it is the session's all the same.
+      if (known && acpStream) acpStream.usage(cost.part);
+      else if (known && !isBlank(cost.part)) recordUsageEntry(toUsage([cost.part]), "late");
+    }
   } else if (kind === "config_option_update") {
     adoptConfigOptions(u.configOptions);
   } else if (kind === "available_commands_update") {
@@ -1621,8 +1787,10 @@ async function negotiateAcpRound(bin, epoch) {
           sess = await acpRequest("session/load", { sessionId: nativeThreadId, cwd, mcpServers }, 15_000).catch(() => undefined);
         }
       }
+      let begun = false;
       if (!sess && !stale()) {
         sess = await acpRequest("session/new", { cwd, mcpServers }, 20_000);
+        begun = true;
       }
       if (stale()) {
         // Opened for the session the user left: keep its id only so the next round closes it.
@@ -1631,6 +1799,8 @@ async function negotiateAcpRound(bin, epoch) {
         return undefined;
       }
       acpSessionId = sess?.sessionId || nativeThreadId || sessionId;
+      // A session begun here starts from nothing: its running cost is all this session's.
+      if (begun) usageBaseline = { thread: acpSessionId, cost: 0 };
       const learnedNativeId = nativeThreadId !== acpSessionId;
       nativeThreadId = acpSessionId;
       acpReset = false;
@@ -1667,6 +1837,7 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
   acpStream = stream;
   try {
     const res = await acpRequest("session/prompt", { sessionId: acpId, prompt: [{ type: "text", text: promptText }, ...images] }, 0);
+    stream.usageSummary(acpPromptPart(res?.usage));
     stream.finish(abortRequested ? "aborted" : ACP_STOP_REASONS[res?.stopReason] || "stop");
   } catch (err) {
     stream.finish(abortRequested ? "aborted" : "error", !abortRequested ? (err instanceof Error ? err.message : String(err)) || acpStderrTail() : undefined);
@@ -1802,10 +1973,15 @@ async function handleCommand(cmd) {
       const userCount = messages.filter((m) => m.role === "user").length;
       const assistantCount = messages.filter((m) => m.role === "assistant").length;
       const toolResults = messages.filter((m) => m.role === "toolResult").length;
-      const used = acpUsage ? acpUsage.used : totalInputTokens + totalOutputTokens;
-      // The window is only what the engine reported (`usage_update.size`) or
-      // advertised per model — never assumed. No percent without it.
-      const win = acpUsage?.size || currentModel?.contextWindow || null;
+      // What is in context is what the engine said the last request held — never
+      // the session's running total, which only grows. An engine that says
+      // neither (Codex) gets no figure rather than a wrong one.
+      const used = acpUsage ? acpUsage.used : contextTokens ?? null;
+      // The window is only what the engine reported (`usage_update.size`, a Claude
+      // `result.modelUsage` window) or advertised per model — never assumed. No
+      // percent without it.
+      const win = acpUsage?.size || contextWindow || currentModel?.contextWindow || null;
+      const total = tokensOf(sessionUsage);
       return {
         sessionFile,
         sessionId,
@@ -1814,12 +1990,14 @@ async function handleCommand(cmd) {
         toolCalls: toolResults,
         toolResults,
         totalMessages: messages.length,
-        tokens: { input: totalInputTokens, output: totalOutputTokens, cacheRead: 0, cacheWrite: 0, total: used },
-        cost: totalCost,
+        tokens: { input: sessionUsage.input, output: sessionUsage.output, cacheRead: sessionUsage.cacheRead, cacheWrite: sessionUsage.cacheWrite, total },
+        cost: sessionUsage.cost,
+        // Tokens without a cost: the engine names none, so there is none to show.
+        costReported: sessionUsage.priced || total === 0,
         contextUsage: {
           tokens: used,
           contextWindow: win,
-          percent: win ? Math.min(100, (used / win) * 100) : null,
+          percent: win && used !== null ? Math.min(100, (used / win) * 100) : null,
         },
       };
     }
@@ -1867,9 +2045,7 @@ async function handleCommand(cmd) {
         sessionFile = undefined;
         sessionName = undefined;
         nativeThreadId = undefined;
-        totalInputTokens = 0;
-        totalOutputTokens = 0;
-        totalCost = 0;
+        resetSessionUsage();
       });
       return { cancelled: false };
     case "switch_session":
@@ -1880,6 +2056,9 @@ async function handleCommand(cmd) {
         sessionId = crypto.randomUUID();
         sessionFile = undefined;
         nativeThreadId = undefined;
+        // The clone starts a fresh native thread: the engine's context is the
+        // next prompt alone, so the last fill no longer stands for it.
+        contextTokens = undefined;
         await saveExternalSession();
       });
       return { cancelled: false };

@@ -66,6 +66,7 @@ import { Settings } from "./Settings";
 import { Sidebar } from "./Sidebar";
 import { TitleBar } from "./TitleBar";
 import { Toasts } from "./Toasts";
+import { UpdateCard } from "./UpdateCard";
 import { WallpaperUnderlay } from "./Wallpaper";
 
 /**
@@ -564,6 +565,7 @@ export function Shell() {
       <CompareDialog />
       <Settings />
       <ExtensionDialog />
+      <UpdateCard />
       <Toasts />
     </View>
   );

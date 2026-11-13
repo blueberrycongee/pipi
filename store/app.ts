@@ -49,6 +49,7 @@ import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
 import { backend } from "./backend";
+import { startAppUpdateChecks, stopAppUpdateChecks } from "./update";
 import {
   addCustomAgentPref,
   agentSendScope,
@@ -962,6 +963,7 @@ function teardownStore() {
   daemonClient?.close();
   daemonClient = undefined;
   daemonStarting = undefined;
+  stopAppUpdateChecks();
 }
 
 // ── Boot & Harness Lifecycle ────────────────────────────────────────────────
@@ -989,6 +991,7 @@ export async function boot() {
   if (phase().name !== "failed") {
     void refreshAllWorkspaceSessions();
   }
+  startAppUpdateChecks();
 }
 
 export async function refreshAgents() {

@@ -13,6 +13,7 @@ fi
 NOTARY_PROFILE="${PIPI_NOTARY_PROFILE:-${APPLE_NOTARY_PROFILE:-}}"
 
 nsh package --target macos
+./scripts/stamp-macos-sdk.sh "$OUT/pipi.app"
 
 if [ -n "$IDENTITY" ]; then
   codesign --force --deep --sign "$IDENTITY" --options runtime --timestamp "$OUT/pipi.app"

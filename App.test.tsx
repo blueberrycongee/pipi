@@ -101,6 +101,22 @@ test("without a provider, leads to the agent's providers and connects one", asyn
   expect(app.texts().some((text) => text.startsWith("API key · "))).toBe(true);
 });
 
+test("Usage shows what each agent reported: a cost only where one was named, no zeros for an agent that reported nothing", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  await app.press("label:Settings");
+  await app.press("id:settings-nav-usage");
+  await app.waitFor("text:By agent");
+  const texts = app.texts();
+  // Pi and Claude Code named a cost; Codex reported tokens and none.
+  expect(texts.some((text) => text.endsWith(" · $4.31"))).toBe(true);
+  expect(texts.some((text) => text.endsWith(" · $3.11"))).toBe(true);
+  expect(texts.some((text) => text.includes("$0.00"))).toBe(false);
+  expect(texts.some((text) => text.includes("tokens came with no cost from their agent"))).toBe(true);
+  // Kimi reported nothing: named once below the list, with no row of its own.
+  expect(texts.filter((text) => text.includes("Kimi"))).toEqual(["Not counted: 2 sessions from Kimi CLI. The agent reported no usage for them, or they were saved before pipi recorded it."]);
+});
+
 test("Settings keeps the same sections whichever agent is active; Pi's providers sit under Agents", async () => {
   const app = await launch();
   await app.waitFor("text:What are we building?");

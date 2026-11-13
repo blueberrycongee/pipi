@@ -378,7 +378,7 @@ need it.
 
 | Row | Look |
 |---|---|
-| User | Right-aligned bubble, `secondary`, max 70% |
+| User | Right-aligned bubble, `secondary`, max 70%; a message laid out past six lines folds to a preview that fades into a chevron at the bubble's foot — the press opens it, the chevron folds it back |
 | Reply | Unboxed Markdown, selectable, streams with a brand caret |
 | Thinking | One line: sparkle + "Thought for 4s"; collapsed by default, the reader opens it |
 | Tool call | One line: status mark, tool icon, **name**, mono summary; opens to sunken output or a diff |

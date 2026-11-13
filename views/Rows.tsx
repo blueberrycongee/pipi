@@ -330,12 +330,29 @@ export function swapConversation(key: string) {
   clearProseState();
 }
 
+/** A sent message lays out past this many lines and the bubble folds to a preview. */
+const USER_FOLD_LINES = 6;
+/**
+ * The laid-out height of each user bubble's text, by row id. The text's own
+ * layout reports it while it runs free; a folded pass reports at most the
+ * clamp, so only a count under it (the real count again) is taken then — a
+ * wrong first guess corrects itself.
+ */
+const userLineCounts = signal<Record<string, number>>({});
+
+/** A rough line count before the text's first layout: a clearly long message starts already folded. */
+const roughLines = (text: string) => Math.max(text.split("\n").length, Math.ceil(text.length / 52));
+
 function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   // The fork command names a message by its place among the user's messages on screen.
   const ordinal = () =>
     transcriptRows()
       .filter((row) => row.kind === "user")
       .findIndex((row) => row.id === props.row.id);
+  const open = () => isOpen(props.row.id, false);
+  const foldable = () => (userLineCounts()[props.row.id] ?? roughLines(props.row.text)) > USER_FOLD_LINES;
+  const folded = () => foldable() && !open();
+  const fold = () => toggle(props.row.id, false);
   return (
     <View class="group items-end">
       <View
@@ -352,8 +369,25 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
         }
       >
         <If when={props.row.text}>
-          <View>
-            <Text class="text-md text-secondary-foreground">{props.row.text}</Text>
+          {/* While folded the whole message takes the press; while open it is plain selectable text again. */}
+          <View
+            role={folded() ? "button" : undefined}
+            onPress={folded() ? fold : undefined}
+            accessibilityState={folded() ? { expanded: false } : undefined}
+          >
+            <Text
+              class={`text-md text-secondary-foreground ${folded() ? "line-clamp-6" : ""}`}
+              style={folded() ? { maskImage: "linear-gradient(to bottom, black 64%, transparent 94%)" } : undefined}
+              onTextLayout={(e) => {
+                const n = e.lines.length;
+                // Fewer lines than the text's own breaks is not a real layout pass (the headless engine reports one box).
+                if (n < props.row.text.split("\n").length) return;
+                if (folded() && n >= USER_FOLD_LINES) return;
+                if (n !== userLineCounts()[props.row.id]) userLineCounts.update((all) => ({ ...all, [props.row.id]: n }));
+              }}
+            >
+              {props.row.text}
+            </Text>
           </View>
         </If>
         <If when={props.row.images > 0}>
@@ -362,6 +396,21 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
             <Text class="text-xs text-muted-foreground">
               {tr(props.row.images === 1 ? "1 image" : `${props.row.images} images`, `${props.row.images} 张图片`)}
             </Text>
+          </View>
+        </If>
+        <If when={foldable()}>
+          <View
+            role="button"
+            onPress={fold}
+            accessibilityState={{ expanded: open() }}
+            accessibilityLabel={open() ? tr("Collapse message", "收起消息") : tr("Expand message", "展开消息")}
+            class={`-mx-1 -mb-1 h-5 select-none items-center justify-center rounded-md ${PRESS} ${FOCUS_RING}`}
+          >
+            <View
+              class={`transition-transform duration-200 ease-out-quint motion-reduce:transition-none ${open() ? "rotate-180" : ""}`}
+            >
+              <Icon name="chevronDown" size={12} tone="muted-foreground" />
+            </View>
           </View>
         </If>
       </View>
@@ -663,6 +712,7 @@ function ToolDetail(props: { row: ToolRow; insetClass?: string }) {
           <TextView
             markdown={`\`\`\`diff\n${clip(diff(), 400).text}\n\`\`\``}
             selectable
+            codeBlockScrollbar={false}
             classes={{ codeBlock: PROSE.codeBlock, codeBlockCode: "p-3 text-xs" }}
           />
         </View>
@@ -934,7 +984,7 @@ function SummaryRow(props: { row: Extract<Row, { kind: "summary" }> }) {
       reveal
       content={
         <View class="mt-2 rounded-lg border border-border bg-card px-3 py-2.5">
-          <TextView markdown={props.row.text} selectable classes={{ ...PROSE, root: "gap-2 text-sm text-muted-foreground" }} />
+          <TextView markdown={props.row.text} selectable codeBlockScrollbar={false} tableScrollbar={false} classes={{ ...PROSE, root: "gap-2 text-sm text-muted-foreground" }} />
         </View>
       }
     >
@@ -963,7 +1013,7 @@ function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
       reveal
       content={
         <View class="mt-2 rounded-lg border border-border bg-card px-3 py-2.5">
-          <TextView markdown={props.row.text} selectable classes={{ ...PROSE, root: "gap-2 text-sm text-muted-foreground" }} />
+          <TextView markdown={props.row.text} selectable codeBlockScrollbar={false} tableScrollbar={false} classes={{ ...PROSE, root: "gap-2 text-sm text-muted-foreground" }} />
         </View>
       }
     >

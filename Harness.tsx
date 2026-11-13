@@ -18,6 +18,8 @@
 // `harness.starts` (a count) lets only that many agent processes start: the next one cannot be spawned.
 // `harness.wallpaper` (JSON: `{}`, or `{ "path": "<absolute path>", "width": …, "height": … }`) lays a wallpaper:
 // the repository's own picture, or any image on disk — a wallpaper is a file, and a test cannot name one here.
+// `harness.update` (JSON of FakeOptions.update) has the update checker find a new version: the card, its
+// track and its sparkles.
 import { mount, Storage } from "nsh";
 import wallpaperPicture from "./assets/brand/dmg-background@2x.png";
 import { fakeBackend, sampleHistory } from "./dev/fake-pi";
@@ -100,6 +102,7 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       reply,
       dies,
       starts: startsAllowed ? Number(startsAllowed) : undefined,
+      update: JSON.parse((await Storage.getItem("harness.update")) ?? "null") ?? undefined,
     }),
   );
   void boot();

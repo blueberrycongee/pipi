@@ -2,7 +2,7 @@ import { cleanup, computed, createAnimatedValue, effect, openUrl, reduceMotion, 
 import type { JSX } from "nsh";
 import { AlertDialog, Button as BaseButton, Popover } from "nsh/base";
 import type { AcpDistribution, AgentHarnessStatus, RuntimeMode } from "../agents/types";
-import pkg from "../package.json";
+import manifest from "../nsh.json";
 import { basename, compactPath, money, relativeTime, tildePath } from "../lib/format";
 import { activeLanguage, agentDescription, formatAgentMeta, queueModeLabel, runtimeModeText, tr } from "../lib/i18n";
 import { WALLPAPER_EFFECTS, type WallpaperEffect } from "../lib/wallpaper";
@@ -71,6 +71,7 @@ import {
   wallpaperThemeColors,
 } from "../store/app";
 import { backend } from "../store/backend";
+import { appUpdate, checkForAppUpdate } from "../store/update";
 import {
   agentSendScope,
   agentSessionTools,
@@ -1465,64 +1466,100 @@ function Usage() {
   const totals = () => data().totals;
   const maxDay = () => Math.max(1, ...trailingDays().map((day) => day.tokens));
   const agentName = (id: string) => availableAgents().find((agent) => agent.id === id)?.name ?? id;
+  // A model's source is a Pi provider, or the engine that ran it.
+  const sourceName = (id: string) => availableAgents().find((agent) => agent.id === id && agent.id !== "pi")?.name ?? providerName(id);
   const share = (tokens: number) => (totals().total ? Math.round((tokens / totals().total) * 100) : 0);
+  // Only what an engine reported is shown. Tokens it named no cost for carry none,
+  // and an agent that reported nothing is named below the list, not given a row of zeros.
+  const figures = (row: { tokens: { total: number }; cost: number; unpriced: number }) =>
+    row.cost > 0 || row.unpriced < row.tokens.total ? `${compactNumber(row.tokens.total)} · ${money(row.cost)}` : compactNumber(row.tokens.total);
+  const reporting = () => data().agents.filter((agent) => agent.tokens.total > 0 || agent.cost > 0);
+  const silent = () => data().agents.filter((agent) => agent.tokens.total === 0 && agent.cost === 0);
+  const silentNames = () => silent().map((agent) => agentName(agent.agentId)).join(tr(", ", "、"));
+  const silentSessions = () => silent().reduce((sum, agent) => sum + agent.sessions, 0);
+  const empty = () => totals().total === 0 && totals().cost === 0;
   return (
     <Page
       title={tr("Usage", "用量")}
       lead={tr(
-        "Token use and cost accumulated across every agent and saved session on this machine.",
-        "本机全部智能体与已保存会话累计的 token 消耗与费用。",
+        "Token use and cost as each agent reports them, across every saved session on this machine.",
+        "本机全部已保存会话中，各智能体自己上报的 token 消耗与费用。",
       )}
     >
-      <SettingGroup title={tr("Total", "总计")}>
-        <SettingRow
-          title="Tokens"
-          description={tr(
-            `${compactNumber(totals().input)} in · ${compactNumber(totals().output)} out · ${compactNumber(totals().cacheRead + totals().cacheWrite)} cached`,
-            `输入 ${compactNumber(totals().input)} · 输出 ${compactNumber(totals().output)} · 缓存 ${compactNumber(totals().cacheRead + totals().cacheWrite)}`,
-          )}
-        >
-          <Value text={compactNumber(totals().total)} />
-        </SettingRow>
-        <Rule />
-        <SettingRow title={tr("Estimated cost", "估算费用")}>
-          <Value text={money(totals().cost)} />
-        </SettingRow>
-        <Rule />
-        <SettingRow title={tr("Sessions", "会话")}>
-          <Value
-            text={tr(
-              `${totals().sessions} sessions · ${totals().userMessages + totals().assistantMessages} messages · ${totals().toolCalls} tool calls`,
-              `${totals().sessions} 个会话 · ${totals().userMessages + totals().assistantMessages} 条消息 · ${totals().toolCalls} 次工具调用`,
+      <If when={empty()}>
+        <View class="gap-1 py-2">
+          <Text class="text-base text-foreground">{tr("No usage reported yet", "还没有上报的用量")}</Text>
+          <Text class="text-sm text-muted-foreground">
+            {tr(
+              "Figures appear here once an agent that reports its token use has run a turn.",
+              "上报 token 用量的智能体跑过一轮后，数字会出现在这里。",
             )}
-          />
-        </SettingRow>
-      </SettingGroup>
-      <SettingGroup title={tr("Last 30 days", "近 30 天")}>
-        <View class="gap-2 py-3">
-          <View class="h-20 flex-row items-end gap-1">
-            <Each of={trailingDays()}>
-              {(day) => (
-                <View
-                  class={`min-w-0 flex-1 rounded-sm ${day().tokens ? "bg-primary" : "bg-input"}`}
-                  style={{ height: day().tokens ? `${Math.max(4, Math.round((day().tokens / maxDay()) * 100))}%` : 3 }}
-                  tooltip={tip(`${day().day} · ${compactNumber(day().tokens)} tokens · ${money(day().cost)}`)}
-                />
-              )}
-            </Each>
-          </View>
-          <View class="flex-row items-center justify-between">
-            <Text class="text-2xs text-subtle">{trailingDays()[0]?.day ?? ""}</Text>
-            <View class="flex-row items-center gap-1.5">
-              <Text class="text-2xs text-subtle">{tr("today", "今天")}</Text>
-              <IconButton icon="refresh" size="sm" label={tr("Re-scan saved sessions", "重新扫描已保存会话")} onPress={() => void refreshUsageStats()} />
-            </View>
-          </View>
+          </Text>
         </View>
-      </SettingGroup>
-      <If when={data().agents.length > 0}>
+      </If>
+      <If when={!empty()}>
+        <View class="gap-6">
+          <SettingGroup title={tr("Total", "总计")}>
+            <SettingRow
+              title="Tokens"
+              description={tr(
+                `${compactNumber(totals().input)} in · ${compactNumber(totals().output)} out · ${compactNumber(totals().cacheRead + totals().cacheWrite)} cached`,
+                `输入 ${compactNumber(totals().input)} · 输出 ${compactNumber(totals().output)} · 缓存 ${compactNumber(totals().cacheRead + totals().cacheWrite)}`,
+              )}
+            >
+              <Value text={compactNumber(totals().total)} />
+            </SettingRow>
+            <Rule />
+            <SettingRow
+              title={tr("Cost", "费用")}
+              description={
+                totals().unpriced > 0
+                  ? tr(
+                      `${compactNumber(totals().unpriced)} tokens came with no cost from their agent and are not in this figure`,
+                      `另有 ${compactNumber(totals().unpriced)} tokens 所属智能体未上报费用，不含在内`,
+                    )
+                  : undefined
+              }
+            >
+              <Value text={money(totals().cost)} />
+            </SettingRow>
+            <Rule />
+            <SettingRow title={tr("Sessions", "会话")}>
+              <Value
+                text={tr(
+                  `${totals().sessions} sessions · ${totals().userMessages + totals().assistantMessages} messages · ${totals().toolCalls} tool calls`,
+                  `${totals().sessions} 个会话 · ${totals().userMessages + totals().assistantMessages} 条消息 · ${totals().toolCalls} 次工具调用`,
+                )}
+              />
+            </SettingRow>
+          </SettingGroup>
+          <SettingGroup title={tr("Last 30 days", "近 30 天")}>
+            <View class="gap-2 py-3">
+              <View class="h-20 flex-row items-end gap-1">
+                <Each of={trailingDays()}>
+                  {(day) => (
+                    <View
+                      class={`min-w-0 flex-1 rounded-sm ${day().tokens ? "bg-primary" : "bg-input"}`}
+                      style={{ height: day().tokens ? `${Math.max(4, Math.round((day().tokens / maxDay()) * 100))}%` : 3 }}
+                      tooltip={tip(`${day().day} · ${compactNumber(day().tokens)} tokens${day().cost > 0 ? ` · ${money(day().cost)}` : ""}`)}
+                    />
+                  )}
+                </Each>
+              </View>
+              <View class="flex-row items-center justify-between">
+                <Text class="text-2xs text-subtle">{trailingDays()[0]?.day ?? ""}</Text>
+                <View class="flex-row items-center gap-1.5">
+                  <Text class="text-2xs text-subtle">{tr("today", "今天")}</Text>
+                  <IconButton icon="refresh" size="sm" label={tr("Re-scan saved sessions", "重新扫描已保存会话")} onPress={() => void refreshUsageStats()} />
+                </View>
+              </View>
+            </View>
+          </SettingGroup>
+        </View>
+      </If>
+      <If when={reporting().length > 0}>
         <SettingGroup title={tr("By agent", "按智能体")}>
-          <Each of={data().agents} key={(agent) => agent.agentId}>
+          <Each of={reporting()} key={(agent) => agent.agentId}>
             {(agent, index) => (
               <View>
                 <If when={index() > 0}>
@@ -1537,7 +1574,7 @@ function Usage() {
                         {tr(`${agent().sessions} sessions · ${agent().messages} messages`, `${agent().sessions} 个会话 · ${agent().messages} 条消息`)}
                       </Text>
                     </View>
-                    <Value text={`${compactNumber(agent().tokens.total)} · ${money(agent().cost)}`} />
+                    <Value text={figures(agent())} />
                   </View>
                   <View class="h-1 overflow-hidden rounded-full bg-input">
                     <View class="h-1 rounded-full bg-primary" style={{ width: `${share(agent().tokens.total)}%` }} />
@@ -1548,6 +1585,14 @@ function Usage() {
           </Each>
         </SettingGroup>
       </If>
+      <If when={silent().length > 0}>
+        <Text class="text-sm text-subtle">
+          {tr(
+            `Not counted: ${silentSessions()} sessions from ${silentNames()}. The agent reported no usage for them, or they were saved before pipi recorded it.`,
+            `未计入：${silentNames()} 的 ${silentSessions()} 个会话。智能体没有为它们上报用量，或保存于 pipi 开始记录用量之前。`,
+          )}
+        </Text>
+      </If>
       <If when={data().models.length > 0}>
         <SettingGroup title={tr("By model", "按模型")}>
           <Each of={data().models} key={(m) => `${m.provider}·${m.model}`}>
@@ -1557,10 +1602,10 @@ function Usage() {
                   <Rule />
                 </If>
                 <SettingRow
-                  title={model().model || tr("Unattributed", "未归属")}
-                  description={model().provider ? `${providerName(model().provider)} · ${tr(`${model().messages} calls`, `${model().messages} 次调用`)}` : undefined}
+                  title={model().model === "default" ? tr("Default model", "默认模型") : model().model || tr("Unattributed", "未归属")}
+                  description={model().provider ? `${sourceName(model().provider)} · ${tr(`${model().messages} calls`, `${model().messages} 次调用`)}` : undefined}
                 >
-                  <Value text={`${compactNumber(model().tokens.total)} · ${money(model().cost)}`} />
+                  <Value text={figures(model())} />
                 </SettingRow>
               </View>
             )}
@@ -1569,6 +1614,25 @@ function Usage() {
       </If>
     </Page>
   );
+}
+
+/** What the Updates row in About says about the update checker right now. */
+function updateStatus() {
+  const s = appUpdate();
+  switch (s.phase) {
+    case "checking":
+      return tr("Checking…", "检查中…");
+    case "available":
+      return tr(`Version ${s.update.version} is available`, `发现新版本 ${s.update.version}`);
+    case "downloading":
+      return tr("Downloading…", "下载中…");
+    case "ready":
+      return tr(`Version ${s.update.version} is ready to install`, `版本 ${s.update.version} 已就绪`);
+    case "installing":
+      return tr("Installing…", "安装中…");
+    default:
+      return tr("Checked automatically while pipi runs", "pipi 运行时会自动检查");
+  }
 }
 
 function About() {
@@ -1590,7 +1654,7 @@ function About() {
         <Pip size={88} />
         <View class="items-center gap-1">
           <Text class="text-xl font-semibold tracking-tight text-foreground">pipi</Text>
-          <Text class="text-sm text-muted-foreground">{tr(`Version ${pkg.version}`, `版本 ${pkg.version}`)}</Text>
+          <Text class="text-sm text-muted-foreground">{tr(`Version ${manifest.version}`, `版本 ${manifest.version}`)}</Text>
         </View>
         <Text class="max-w-100 text-center text-sm text-muted-foreground">
           {tr(
@@ -1600,6 +1664,15 @@ function About() {
         </Text>
       </View>
       <SettingGroup>
+        <SettingRow title={tr("Updates", "更新")} description={updateStatus()}>
+          <Button
+            label={tr("Check", "检查")}
+            size="sm"
+            disabled={appUpdate().phase === "checking"}
+            onPress={() => void checkForAppUpdate(true)}
+          />
+        </SettingRow>
+        <Rule />
         <SettingRow title={tr("Active engine", "当前引擎")}>
           <Value text={`${activeAgent().name} · ${processStatus()}`} />
         </SettingRow>

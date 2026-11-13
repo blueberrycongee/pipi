@@ -45,6 +45,10 @@ export interface Usage {
   cacheWrite: number;
   totalTokens: number;
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+  /** The bridge's (`sidecar/agent-usage.mjs`): the engine reported these tokens and no cost. */
+  unpriced?: boolean;
+  /** The bridge's: the models the engine says did the work, when it names them. */
+  models?: { model: string; input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: number }[];
 }
 
 export interface UserMessage {
@@ -168,6 +172,8 @@ export interface SessionStats {
   totalMessages: number;
   tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
   cost: number;
+  /** The bridge's: `false` when the engine reports tokens and no cost — there is none to show. Pi always has one. */
+  costReported?: boolean;
   contextUsage?: { tokens: number | null; contextWindow: number | null; percent: number | null };
 }
 

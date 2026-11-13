@@ -106,6 +106,117 @@ test("a turn's process folds once, when its answer is known, and prose never cha
   expect(buildDisplayRows(t.rows(), false, () => true).map((row) => row.kind)).toEqual(["user", "turn", "text", "activity", "text"]);
 });
 
+test("a turn held in one message (the bridge's play of ACP harnesses) marks its answer final, live and on reload", () => {
+  const t = new Transcript();
+  const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
+  // One assistant message holding the whole turn: reasoning, commentary and a
+  // call, then the answer — how external agents arrive over `get_messages` too.
+  const merged = (answer: string) =>
+    ({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Let me look." },
+        { type: "text", text: "Checking first." },
+        { type: "toolCall", id: "c1", name: "read", arguments: { path: "a.ts" } },
+        { type: "thinking", thinking: "Found it." },
+        { type: "text", text: answer },
+      ],
+      stopReason: "stop",
+      timestamp: 2,
+    }) as never;
+
+  // Live: the process stays open while the turn works; once the message ends,
+  // the prose after its last step is the answer and the process folds.
+  t.apply({ type: "message_start", message: { role: "user", content: "hi", timestamp: 1 } });
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  update({ type: "thinking_start", contentIndex: 0 });
+  update({ type: "thinking_end", contentIndex: 0, content: "Let me look." });
+  update({ type: "text_start", contentIndex: 1 });
+  update({ type: "text_end", contentIndex: 1, content: "Checking first." });
+  update({ type: "toolcall_start", contentIndex: 2, id: "c1", toolName: "read" });
+  update({ type: "toolcall_end", contentIndex: 2, toolCall: { id: "c1", name: "read", arguments: { path: "a.ts" } } });
+  t.apply({ type: "tool_execution_start", toolCallId: "c1", toolName: "read", args: { path: "a.ts" } });
+  t.apply({ type: "tool_execution_end", toolCallId: "c1", toolName: "read", result: { content: [{ type: "text", text: "ok" }] }, isError: false });
+  update({ type: "thinking_start", contentIndex: 3 });
+  update({ type: "thinking_end", contentIndex: 3, content: "Found it." });
+  update({ type: "text_start", contentIndex: 4 });
+  update({ type: "text_end", contentIndex: 4, content: "The answer." });
+  t.apply({ type: "message_end", message: merged("The answer.") });
+
+  expect(t.rows()).toMatchObject([
+    { kind: "user" },
+    { kind: "thinking" },
+    { kind: "text", text: "Checking first." },
+    { kind: "tool" },
+    { kind: "thinking" },
+    { kind: "text", text: "The answer.", final: true },
+  ]);
+  const projected = buildDisplayRows(t.rows(), false);
+  expect(projected.map((row) => row.kind)).toEqual(["user", "turn", "text"]);
+  expect(projected[1]).toMatchObject({ open: false, hasDetails: true });
+
+  // Reloaded from `get_messages`: a settled turn before the last one never reopens.
+  const t2 = new Transcript();
+  t2.load([
+    { role: "user", content: "hi", timestamp: 1 },
+    { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 2 } as never,
+    merged("The answer."),
+    { role: "user", content: "next", timestamp: 3 },
+    { role: "assistant", content: [{ type: "text", text: "Second answer." }], stopReason: "stop", timestamp: 4 } as never,
+  ]);
+  const reloaded = buildDisplayRows(t2.rows(), false);
+  expect(reloaded.map((row) => row.kind)).toEqual(["user", "turn", "text", "user", "turn", "text"]);
+  expect(reloaded.filter((row) => row.kind === "turn")).toMatchObject([{ open: false }, { open: false }]);
+});
+
+test("tool results read ahead of the merged message do not scramble its blocks on reload", () => {
+  // The bridge writes a turn's tool results as their own messages, ahead of the
+  // one assistant message holding every block (calls included). A result waits
+  // for its call's row instead of minting one at the head of the turn — or the
+  // turn's prose would settle out of order and commentary land in the answer.
+  const result = (id: string) =>
+    ({ role: "toolResult", toolCallId: id, toolName: "bash", content: [{ type: "text", text: `out ${id}` }], isError: false, timestamp: 2 }) as never;
+  const merged = {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "look first" },
+      { type: "text", text: "Checking." },
+      { type: "toolCall", id: "c1", name: "bash", arguments: {} },
+      { type: "thinking", thinking: "more" },
+      { type: "text", text: "Between the steps." },
+      { type: "toolCall", id: "c2", name: "bash", arguments: {} },
+      { type: "text", text: "The answer." },
+    ],
+    stopReason: "stop",
+    timestamp: 3,
+  } as never;
+
+  const t = new Transcript();
+  t.load([{ role: "user", content: "go", timestamp: 1 } as never, result("c1"), result("c2"), merged]);
+  expect(t.rows()).toMatchObject([
+    { kind: "user" },
+    { kind: "thinking" },
+    { kind: "text", text: "Checking." },
+    { kind: "tool", id: "c1", status: "done", output: "out c1" },
+    { kind: "thinking" },
+    { kind: "text", text: "Between the steps." },
+    { kind: "tool", id: "c2", status: "done", output: "out c2" },
+    { kind: "text", text: "The answer.", final: true },
+  ]);
+  const projected = buildDisplayRows(t.rows(), false);
+  expect(projected.map((row) => row.kind)).toEqual(["user", "turn", "text"]);
+  expect(projected[2]).toMatchObject({ kind: "text", text: "The answer.", final: true });
+
+  // A result whose call was never recorded still stands as a row, where the transcript caught up with it.
+  const t2 = new Transcript();
+  t2.load([
+    { role: "user", content: "go", timestamp: 1 } as never,
+    result("orphan"),
+    { role: "user", content: "next", timestamp: 4 } as never,
+  ]);
+  expect(t2.rows()).toMatchObject([{ kind: "user" }, { kind: "tool", id: "orphan", status: "done", output: "out orphan" }, { kind: "user" }]);
+});
+
 test("groups interleaved reasoning and tool calls between commentary boundaries into one collapsed activity row", () => {
   const t = new Transcript();
   const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);

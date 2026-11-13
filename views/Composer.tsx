@@ -1,9 +1,11 @@
 import { readFile } from "fs/promises";
-import { cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
+import { Canvas, cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
 import type { InputRef, PasteEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input } from "nsh/base";
+import { money } from "../lib/format";
 import { commandSourceLabel, tr } from "../lib/i18n";
 import { matchCommands, matchOptions, readSlashInput } from "../lib/slash";
+import { compactNumber } from "../pi/transcript";
 import {
   activeAgent,
   addAttachment,
@@ -20,17 +22,19 @@ import {
   removeAttachment,
   send,
   sessionState,
+  sessionStats,
   setDraft,
   sidecarPhase,
   slashCommands,
   stop,
   toast,
   trackAttachmentRead,
+  transcriptRows,
   waitingCount,
 } from "../store/app";
 import { IconButton } from "../ui/Button";
 import { Icon } from "../ui/Icon";
-import { animateLayoutOn, EASING, enter, keepLast, Reveal, SPRING } from "../ui/motion";
+import { animateLayoutOn, EASING, enter, keepLast, Presence, Reveal, SPRING } from "../ui/motion";
 import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { AgentPicker, PermissionPicker } from "./AgentPicker";
@@ -404,6 +408,64 @@ function ExtensionLines(props: { below: boolean }) {
   );
 }
 
+/** How full the model's context window is: a ring and a percentage. An engine
+ * that reports no window still gets its used count in the tooltip, with the
+ * ring left unfilled rather than a made-up share. */
+function ContextMeter() {
+  const usage = () => sessionStats()?.contextUsage;
+  const percent = () => usage()?.percent ?? null;
+  const visible = () => {
+    const context = usage();
+    if (!context || transcriptRows().length === 0) return false;
+    const share = percent();
+    return share === null ? (context.tokens ?? 0) > 0 : share >= 50;
+  };
+  const detail = () => {
+    const stats = sessionStats();
+    const context = usage();
+    if (!stats || !context) return tr("Context", "上下文");
+    const used = context.tokens === null ? "—" : compactNumber(context.tokens);
+    const tokens =
+      context.contextWindow === null
+        ? tr(`${used} tokens in context`, `上下文已用 ${used} tokens`)
+        : tr(
+            `${used} of ${compactNumber(context.contextWindow)} tokens in context`,
+            `上下文已用 ${used} / ${compactNumber(context.contextWindow)} tokens`,
+          );
+    // An engine that names no cost gets none: the tokens it did report, instead.
+    if (stats.costReported === false) {
+      const spent = compactNumber(stats.tokens.total);
+      return `${tokens} · ${tr(`${spent} tokens this session`, `本会话 ${spent} tokens`)}`;
+    }
+    return `${tokens} · ${tr(`${money(stats.cost)} this session`, `本会话 ${money(stats.cost)}`)}`;
+  };
+  return (
+    <Presence show={visible()} scaleFrom={0.85}>
+      <View class="h-6 flex-row items-center gap-1.5 rounded-md px-1.5" tooltip={tip(detail())} accessibilityLabel={detail()}>
+        <Canvas
+          style={{ width: 14, height: 14 }}
+          draw={(cx, { width }) => {
+            const middle = width / 2;
+            const share = Math.min(1, (percent() ?? 0) / 100);
+            cx.lineWidth = 2;
+            cx.lineCap = "round";
+            cx.strokeStyle = token("input");
+            cx.beginPath();
+            cx.arc(middle, middle, middle - 1.5, 0, Math.PI * 2);
+            cx.stroke();
+            if (share > 0) {
+              cx.strokeStyle = token(share > 0.85 ? "warning" : "muted-foreground");
+              cx.beginPath();
+              cx.arc(middle, middle, middle - 1.5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * share);
+              cx.stroke();
+            }
+          }}
+        />
+      </View>
+    </Presence>
+  );
+}
+
 /** Where the user writes to Pi: the message, the model that answers, and send or stop. */
 export function Composer() {
   let input: InputRef | undefined;
@@ -577,6 +639,7 @@ export function Composer() {
             ref={input}
             multiline
             autoFocus
+            scrollbar={false}
             value={composerDraft()}
             onChange={({ value }) => {
               const before = trackedDraft.length;
@@ -612,6 +675,9 @@ export function Composer() {
               <ThinkingPicker />
             </View>
             <View class="shrink-0 flex-row items-center gap-1.5">
+              <If when={ready()}>
+                <ContextMeter />
+              </If>
               <PermissionPicker />
               <View style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
                 <If

@@ -210,6 +210,7 @@ export function CompareDialog() {
         <Input
           multiline
           autoFocus
+          scrollbar={false}
           value={taskPrompt()}
           onChange={({ value }) => taskPrompt.set(value)}
           placeholder={
