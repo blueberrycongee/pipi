@@ -1005,8 +1005,7 @@ export function Chat() {
               onMomentumStart={onInput}
               maintainVisibleContentPosition={following() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
               class="flex-1"
-              contentClass="px-6 pt-14"
-              contentStyle={{ paddingBottom: foot().end }}
+              contentStyle={{ paddingHorizontal: 24, paddingTop: (titleBar().height || 44) + 12, paddingBottom: foot().end }}
               accessibilityLabel={tr("Conversation", "对话")}
               footer={<ActivityLine anchor={(node) => (ending = node)} />}
             >
