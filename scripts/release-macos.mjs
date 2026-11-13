@@ -133,8 +133,9 @@ async function notarize(archive, receiptFile) {
       submission = JSON.parse(run("xcrun", ["notarytool", "submit", archive, "--no-wait", ...notaryAuth()], {
         stdio: ["ignore", "pipe", "pipe"], timeout: 10 * 60_000,
       }));
-    } catch {
-      throw new Error("Notarization upload failed or its outcome is unknown; inspect Apple history before retrying");
+    } catch (error) {
+      const detail = `${error.stderr || ""}${error.stdout || ""}${error.message || error}`.trim().slice(0, 2000);
+      throw new Error(`Notarization upload failed or its outcome is unknown; inspect Apple history before retrying${detail ? `\n${detail}` : ""}`);
     }
     receipt = { id: submission.id, sha256: hash, archive: basename(archive), status: "Submitted" };
     save(receipt);
