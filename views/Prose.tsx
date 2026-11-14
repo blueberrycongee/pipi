@@ -955,6 +955,8 @@ export function ProseBlock(props: { row: ProseRow }) {
   // Keep `StreamingCodeCard` mounted not only while it is the tail block, but also while
   // its trailing chunks finish dissolving — once the last chunk reaches alpha 1, hand off
   // seamlessly to `TextView` syntax highlighting + Copy button without snapping mid-fade!
+  // (That last frame ends this condition and runs the card once more, in either order: the
+  // card reads its block null-safe, as by then there may be none to read.)
   const asStreamingCode = () => {
     const b = item();
     if (b.type !== "codeBlock") return undefined;
@@ -989,7 +991,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                           when={asTable()}
                           else={
                             <If when={asStreamingCode()} else={<FallbackTextViewBlock block={item()} settled={!props.row.tail} />}>
-                              {(codeBlock) => <StreamingCodeCard code={codeBlock().code} chunks={chunksOf(`code:${index()}`)} />}
+                              {(codeBlock) => <StreamingCodeCard code={codeBlock()?.code ?? ""} chunks={chunksOf(`code:${index()}`)} />}
                             </If>
                           }
                         >

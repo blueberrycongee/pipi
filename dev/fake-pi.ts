@@ -34,6 +34,8 @@ export interface FakeOptions {
   distinctHistories?: boolean;
   /** Each saved session's history ends on a reply longer than the window (`LONG_REPLY`): where a conversation lands shows. */
   longHistories?: boolean;
+  /** Each saved session's history opens on turns that never got an answer: one a message was sent into, one stopped, one that failed. */
+  cutHistories?: boolean;
   /** The reply a run streams: the answer text instead of `REPLY`/`STEPS_REPLY`. */
   reply?: string;
   /**
@@ -133,11 +135,45 @@ export function sampleHistory(): AgentMessage[] {
   ];
 }
 
+/**
+ * Turns that ended with no answer, as sessions hold them: the agent at work when a message was sent
+ * into the run, a run the reader stopped, and one that failed. Each is over, and reads as any finished turn.
+ */
+export function cutHistory(): AgentMessage[] {
+  const working = (id: string, said: string, path: string): AgentMessage[] => [
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: said },
+        { type: "toolCall", id, name: "read", arguments: { path } },
+      ],
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      usage,
+      stopReason: "toolUse",
+      timestamp: 2,
+    },
+    { role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 3 },
+  ];
+  return [
+    { role: "user", content: "Start on the sidebar", timestamp: 1 },
+    ...working("cut_1", "Looking at the sidebar first.", "views/Sidebar.tsx"),
+    { role: "user", content: "Do the composer instead", timestamp: 4 },
+    ...working("cut_2", "Switching to the composer.", "views/Composer.tsx"),
+    { role: "assistant", content: [], provider: "anthropic", model: "claude-sonnet-4-5", usage, stopReason: "aborted", timestamp: 5 } as unknown as AgentMessage,
+    { role: "user", content: "Now try the settings", timestamp: 6 },
+    ...working("cut_3", "Opening the settings.", "views/Settings.tsx"),
+    { role: "assistant", content: [], provider: "anthropic", model: "claude-sonnet-4-5", usage, stopReason: "error", errorMessage: "529 overloaded", timestamp: 8 } as unknown as AgentMessage,
+  ];
+}
+
 export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record<string, unknown>[] } {
   const sent: Record<string, unknown>[] = [];
   let sessions = options.sessions ?? [];
   /** What each session file holds, as Pi's session files do: a session keeps its messages across opens. */
   const sessionMessages = new Map<string, AgentMessage[]>();
+  /** The id each session file names, as Pi's header does: a session is the same one however often it is opened. */
+  const sessionIds = new Map<string, string>();
   const byWorkspace: Record<string, SessionSummary[]> = { ...(options.workspaceSessions ?? {}) };
   let activeCwd = "/Users/pip";
   // Settings the app changes live; each process reads them, like Pi's shared config.
@@ -159,8 +195,11 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     let sessionFile: string | undefined = initial.length ? "/sessions/one.jsonl" : undefined;
     // A session opened on history carries the name its file was saved with.
     let sessionName: string | undefined = sessionFile ? sessions.find((s) => s.path === sessionFile)?.name : undefined;
-    let sessionId = `session-${++sessionSeq}`;
+    let sessionId = (sessionFile && sessionIds.get(sessionFile)) || `session-${++sessionSeq}`;
+    if (sessionFile) sessionIds.set(sessionFile, sessionId);
     let isStreaming = false;
+    /** Calls made so far: each has an id of its own, as an engine's do. */
+    let calls = 0;
     const queued = { steering: [] as string[], followUp: [] as string[] };
     let isCompacting = false;
     const snapshotState = (): SessionState => ({
@@ -200,12 +239,30 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     async function runSteps(user: AgentMessage, step: (record: object) => Promise<void>, update: (event: object) => Promise<void>) {
       isStreaming = true;
       const pieces = (text: string) => text.match(/[\s\S]{1,24}/g) ?? [];
-      const sent: AgentMessage[] = [user];
-      let call = 0;
+      const before = messages;
+      const sent: AgentMessage[] = [];
+      /** A message is on file once it has ended, as Pi writes it: a session opened again mid-run has the run so far. */
+      const file = (message: AgentMessage) => {
+        if (aborted) return;
+        sent.push(message);
+        messages = [...before, ...sent];
+        if (sessionFile) sessionMessages.set(sessionFile, messages);
+      };
+      /** A message sent into the run goes in between the agent's own, as Pi delivers it: after the calls of the one before. */
+      const steer = async () => {
+        const text = queued.steering.shift();
+        if (text === undefined || aborted) return;
+        emit({ type: "queue_update", steering: queued.steering, followUp: queued.followUp });
+        const steered: AgentMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+        await step({ type: "message_start", message: steered });
+        await step({ type: "message_end", message: steered });
+        file(steered);
+      };
       /** One assistant message: optional thinking, prose, then its tool calls, which run after it ends. */
       const message = async (parts: { thinking?: string; text?: string; tools?: { name: string; args: Record<string, unknown>; out: string }[] }) => {
+        await steer();
         const content: Record<string, unknown>[] = [];
-        const tools = (parts.tools ?? []).map((tool) => ({ ...tool, id: `call_s${++call}` }));
+        const tools = (parts.tools ?? []).map((tool) => ({ ...tool, id: `call_s${++calls}` }));
         const base = { role: "assistant", provider: "anthropic", model: "claude-sonnet-4-5", usage, timestamp: Date.now() };
         await step({ type: "message_start", message: { ...base, content: [], stopReason: "pending" } });
         if (parts.thinking) {
@@ -232,14 +289,14 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         }
         const done = { ...base, content, stopReason: tools.length ? "toolUse" : "stop" } as unknown as AgentMessage;
         await step({ type: "message_end", message: done });
-        sent.push(done);
+        file(done);
         for (const tool of tools) {
           await step({ type: "tool_execution_start", toolCallId: tool.id, toolName: tool.name, args: tool.args });
           await step({ type: "tool_execution_end", toolCallId: tool.id, toolName: tool.name, result: { content: [{ type: "text", text: tool.out }] }, isError: false, durationMs: 40 });
           const result = { role: "toolResult", toolCallId: tool.id, toolName: tool.name, content: [{ type: "text", text: tool.out }], isError: false, timestamp: Date.now() } as unknown as AgentMessage;
           await step({ type: "message_start", message: result });
           await step({ type: "message_end", message: result });
-          sent.push(result);
+          file(result);
         }
         await step({ type: "turn_end" });
       };
@@ -247,6 +304,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       await step({ type: "turn_start" });
       await step({ type: "message_start", message: user });
       await step({ type: "message_end", message: user });
+      file(user);
       await message({
         thinking: "The user wants this done in steps. I will look at the project first.",
         text: "I'll start by looking at how the project is laid out.",
@@ -268,13 +326,10 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         ],
       });
       await message({ thinking: options.reply ? "The user asked a follow-up; let me write the answer in full." : undefined, text: options.reply ?? STEPS_REPLY });
-      if (!aborted) {
-        messages = [...messages, ...sent];
-        if (sessionFile) sessionMessages.set(sessionFile, messages);
-      }
       isStreaming = false;
       emit({ type: "agent_end", willRetry: false });
       emit({ type: "agent_settled", aborted });
+      aborted = false;
     }
 
     /**
@@ -441,11 +496,12 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       const user: AgentMessage = { role: "user", content: [{ type: "text", text: prompt }, ...(images ?? [])], timestamp: Date.now() };
       const toolName = needsConfirm ? "bash" : "read";
       const toolArgs = needsConfirm ? { command: bashCmd } : { path: "package.json" };
+      const callId = `call_${9 + calls++}`;
       const first: AgentMessage = {
         role: "assistant",
         content: [
           { type: "thinking", thinking: "The user wants a plan. I will check the manifest first." },
-          { type: "toolCall", id: "call_9", name: toolName, arguments: toolArgs },
+          { type: "toolCall", id: callId, name: toolName, arguments: toolArgs },
         ],
         provider: "anthropic",
         model: "claude-sonnet-4-5",
@@ -460,6 +516,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       isStreaming = true;
       // Pi writes the session file as soon as the run starts, so a session can be found again.
       if (!sessionFile) sessionFile = `/sessions/${encodeURIComponent(cwd)}-${sessionId}.jsonl`;
+      sessionIds.set(sessionFile, sessionId);
       // The listing is newest first by last message (`sidecar/list-sessions.mjs`): a session that takes one leads it.
       const listed = byWorkspace[cwd] ?? sessions;
       const known = listed.find((s) => s.path === sessionFile);
@@ -490,11 +547,11 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       await update({ type: "thinking_delta", contentIndex: 0, delta: "The user wants a plan. " });
       await update({ type: "thinking_delta", contentIndex: 0, delta: "I will check the manifest first." });
       await update({ type: "thinking_end", contentIndex: 0, content: "The user wants a plan. I will check the manifest first." });
-      await update({ type: "toolcall_start", contentIndex: 1, id: "call_9", toolName });
+      await update({ type: "toolcall_start", contentIndex: 1, id: callId, toolName });
       await update({ type: "toolcall_delta", contentIndex: 1, delta: JSON.stringify(toolArgs) });
       await update({ type: "toolcall_end", contentIndex: 1, toolCall: first.content[1] });
       await step({ type: "message_end", message: first });
-      await step({ type: "tool_execution_start", toolCallId: "call_9", toolName, args: toolArgs });
+      await step({ type: "tool_execution_start", toolCallId: callId, toolName, args: toolArgs });
       if (needsConfirm && !aborted) {
         const uiId = `ui-${Date.now()}`;
         const response = await new Promise<Record<string, unknown>>((resolve) => {
@@ -510,10 +567,10 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         approved = response.confirmed === true;
       }
       const outText = approved ? '{ "name": "pipi" }' : "bash was declined by the user in pipi.";
-      const result: AgentMessage = { role: "toolResult", toolCallId: "call_9", toolName, content: [{ type: "text", text: outText }], isError: !approved, timestamp: Date.now() };
+      const result: AgentMessage = { role: "toolResult", toolCallId: callId, toolName, content: [{ type: "text", text: outText }], isError: !approved, timestamp: Date.now() };
       const finalReply = approved ? reply : "Understood, skipped the shell command.";
       const second: AgentMessage = { role: "assistant", content: [{ type: "text", text: finalReply }], provider: "anthropic", model: "claude-sonnet-4-5", usage, stopReason: "stop", timestamp: Date.now() };
-      await step({ type: "tool_execution_end", toolCallId: "call_9", toolName, result: { content: [{ type: "text", text: outText }] }, isError: !approved, durationMs: 3 });
+      await step({ type: "tool_execution_end", toolCallId: callId, toolName, result: { content: [{ type: "text", text: outText }] }, isError: !approved, durationMs: 3 });
       await step({ type: "message_start", message: result });
       await step({ type: "message_end", message: result });
       await step({ type: "turn_end" });
@@ -605,7 +662,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           sessionMessages.set(sessionFile, messages);
           const allKnown = [...sessions, ...Object.values(byWorkspace).flat()];
           sessionName = allKnown.find((s) => s.path === command.sessionPath)?.name;
-          sessionId = `session-${++sessionSeq}`;
+          sessionId = sessionIds.get(sessionFile) ?? `session-${++sessionSeq}`;
+          sessionIds.set(sessionFile, sessionId);
           return { cancelled: false };
         }
         case "set_model": {
@@ -684,10 +742,10 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     const history = options.longHistories
       ? sample.map((message, at) => (at === sample.length - 1 ? ({ ...message, content: [{ type: "text", text: LONG_REPLY }] } as AgentMessage) : message))
       : sample;
-    if (!options.distinctHistories) return history;
     const summary = [...sessions, ...Object.values(byWorkspace).flat()].find((s) => s.path === file);
-    const asked = summary?.name || summary?.firstMessage;
-    return asked ? [{ ...history[0], content: asked } as AgentMessage, ...history.slice(1)] : history;
+    const asked = options.distinctHistories ? summary?.name || summary?.firstMessage : undefined;
+    const own = asked ? [{ ...history[0], content: asked } as AgentMessage, ...history.slice(1)] : history;
+    return options.cutHistories ? [...cutHistory(), ...own] : own;
   };
 
   const startup = () => (options.startDelay ? new Promise<void>((resolve) => setTimeout(resolve, options.startDelay)) : Promise.resolve());

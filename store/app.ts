@@ -157,6 +157,8 @@ const sessions = signal<SessionSummary[]>([]);
 const sessionsByWorkspace = signal<Record<string, SessionSummary[]>>({});
 const sessionsLoaded = signal(false);
 const rows = signal<Row[]>([]);
+/** Which conversation `rows` are: set with them, so nothing reads one conversation's rows as another's. */
+const conversation = signal(0);
 const running = signal(false);
 /** Stream deltas push the same activity dozens of times a second; only a real change broadcasts. */
 const sameActivity = (a: Activity, b: Activity): boolean => {
@@ -623,6 +625,15 @@ export const slashCommands = computed<ComposerCommand[]>(() => [...appCommands()
 /** Rows shown in the main chat. */
 export const transcriptRows = computed<Row[]>(() => rows());
 
+/**
+ * The conversation those rows belong to. It changes with them, in the same
+ * turn, and only when they become another conversation's: the same one loaded
+ * again (a session opened again, its agent restarted) keeps its key, and its
+ * rows their ids (`Transcript.adopt`). What the chat keeps per conversation —
+ * the reader's folds — is kept under it.
+ */
+export const conversationKey = () => conversation();
+
 /** Whether a model is selected that the active agent can call. */
 export const hasModel = computed(() => {
   const model = state()?.model;
@@ -677,6 +688,19 @@ const STORE_TEARDOWN_KEY = "__pipiStoreTeardown";
 let client: PiClient | undefined;
 let generation = 0;
 let transcript = new Transcript(() => activeLanguage());
+/** The key of the conversation each transcript holds (`conversationKey`). */
+const conversationOf = new WeakMap<Transcript, number>();
+let conversationSeq = 0;
+function keyOf(held: Transcript) {
+  let key = conversationOf.get(held);
+  if (key === undefined) conversationOf.set(held, (key = ++conversationSeq));
+  return key;
+}
+/** `next` is `before`'s conversation, loaded again: it goes on under its key, its rows under their ids. */
+function succeed(before: Transcript, next: Transcript) {
+  next.adopt(before.rows());
+  conversationOf.set(next, keyOf(before));
+}
 /**
  * Conversations the reader left at rest, by session file: opening one again
  * shows it with the click instead of after the agent has loaded it.
@@ -729,7 +753,10 @@ function flush() {
   flushFrame = undefined;
   if (transcript.version === shownVersion) return;
   shownVersion = transcript.version;
-  rows.set(transcript.rows());
+  batch(() => {
+    conversation.set(keyOf(transcript));
+    rows.set(transcript.rows());
+  });
 }
 
 /**
@@ -775,24 +802,34 @@ function sameRows(a: Row[], b: Row[]) {
  * include the in-progress message yet, so it has fewer rows than what the
  * stash showed. Keep the stash in that case — the re-attached event stream
  * will fill in what happens next without a visible gap.
+ *
+ * Replaced, the conversation is still the same one: it keeps its key, and the
+ * rows both hold keep their ids (`succeed`), so what the reader folded and
+ * unfolded there is as they left it.
  */
 function landHistory(messages: AgentMessage[]) {
+  const known = state();
+  const file = known?.sessionFile;
   const shown = ahead?.transcript === transcript;
   ahead = undefined;
   early = false;
-  if (shown) {
-    const fresh = new Transcript(() => activeLanguage());
-    fresh.load(messages);
-    if (sameRows(fresh.rows(), transcript.rows())) return;
-    // The agent's history lags the stashed view: an in-progress run has not
-    // yet written its streaming message to the session file. Keep showing the
-    // stash so the thinking rows stay on screen while the stream catches up.
-    if (fresh.rows().length < transcript.rows().length) return;
-    transcript = fresh;
-    shownVersion = -1;
+  const fresh = new Transcript(() => activeLanguage());
+  // A session the daemon kept working is still on its last turn: nothing in it has stopped.
+  fresh.load(messages, Boolean(known?.isStreaming));
+  // The conversation as it last stood on screen, when it is still held: shown ahead, or set aside under its file.
+  const before = shown ? transcript : file ? visited.get(file) : undefined;
+  if (before && !shown && file) visited.delete(file);
+  if (before && (sameRows(fresh.rows(), before.rows()) || fresh.rows().length < before.rows().length)) {
+    // The same rows, or the agent's history lags the stashed view: an in-progress
+    // run has not yet written its streaming message to the session file. Keep
+    // showing the stash so the thinking rows stay on screen while the stream catches up.
+    if (shown) return;
+    transcript = before;
   } else {
-    transcript.load(messages);
+    if (before) succeed(before, fresh);
+    transcript = fresh;
   }
+  shownVersion = -1;
   markTranscriptSeen();
   flush();
   landed.update((n) => n + 1);
@@ -1291,8 +1328,10 @@ function revive(agentLabel: string, cutShort: boolean, lost: Extract<Phase, { na
       // no file has, and a session that could not be opened again is not the one shown: then the file speaks.
       if (!ahead && (cutShort || (file !== undefined && next.sessionFile !== file))) {
         const fresh = new Transcript(() => activeLanguage());
-        fresh.load(history.messages);
+        fresh.load(history.messages, Boolean(next.isStreaming));
         if (!sameRows(fresh.rows(), transcript.rows())) {
+          // The session opened again is the conversation on screen: the reader's folds stay on it.
+          if (next.sessionFile === file) succeed(transcript, fresh);
           transcript = fresh;
           shownVersion = -1;
           markTranscriptSeen();
@@ -2445,6 +2484,12 @@ async function switchInto(cwd: string, sessionPath: string | undefined, agentId 
 async function stayPut() {
   if (!early) return;
   early = false;
+  // The destination shown ahead goes back where it was kept; the session that stays comes back from there too (`landHistory`).
+  if (ahead?.transcript === transcript) {
+    visited.set(ahead.file, ahead.transcript);
+    transcript = new Transcript(() => activeLanguage());
+    shownVersion = -1;
+  }
   ahead = undefined;
   await syncSession().catch(() => undefined);
 }

@@ -2,7 +2,7 @@ import { expect, test } from "nsh/test";
 import { PiClient, type Transport } from "./client";
 import { createLineSplitter } from "./jsonl";
 import { Transcript, toolSummary, withoutImageNotes } from "./transcript";
-import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, displayRowIds } from "./turns";
+import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, displayRowIds, type TurnHeaderRow } from "./turns";
 
 test("splits records on LF only, across chunks, keeping U+2028", () => {
   const lines: string[] = [];
@@ -103,7 +103,7 @@ test("a turn's process folds once, when its answer is known, and prose never cha
   expect(rows[1]).toMatchObject({ kind: "turn", running: false, open: false, hasDetails: true });
   expect(rows[2]).toMatchObject({ kind: "text", text: "Done.", final: true });
   // The reader's toggle shows it again, in order.
-  expect(buildDisplayRows(t.rows(), false, () => true).map((row) => row.kind)).toEqual(["user", "turn", "text", "activity", "text"]);
+  expect(buildDisplayRows(t.rows(), false, { chosen: () => true }).map((row) => row.kind)).toEqual(["user", "turn", "text", "activity", "text"]);
 });
 
 test("a turn held in one message (the bridge's play of ACP harnesses) marks its answer final, live and on reload", () => {
@@ -288,11 +288,13 @@ test("groups interleaved reasoning and tool calls between commentary boundaries 
   const t2 = new Transcript();
   t2.apply({ type: "message_start", message: assistant([{ type: "thinking", thinking: "Step one." }]) });
   t2.apply({ type: "message_end", message: assistant([{ type: "thinking", thinking: "Step one." }]) });
-  const firstOnly = buildDisplayRows(t2.rows(), true)[1] as ActivityRow;
+  // (Each message here calls nothing, so it ends its turn: the reader's own unfold shows what the fold holds.)
+  const unfolded = () => buildDisplayRows(t2.rows(), true, { chosen: () => true });
+  const firstOnly = unfolded()[1] as ActivityRow;
   expect(firstOnly.steps).toHaveLength(1);
   t2.apply({ type: "message_start", message: assistant([{ type: "thinking", thinking: "Step two." }]) });
   t2.apply({ type: "message_end", message: assistant([{ type: "thinking", thinking: "Step two." }]) });
-  const twoThinkings = buildDisplayRows(t2.rows(), true)[1] as ActivityRow;
+  const twoThinkings = unfolded()[1] as ActivityRow;
   expect(twoThinkings.id).toBe(firstOnly.id);
   expect(twoThinkings.steps).toHaveLength(2);
   expect(describeActivity(twoThinkings, "zh")).toBe("查看思考过程");
@@ -300,6 +302,231 @@ test("groups interleaved reasoning and tool calls between commentary boundaries 
   expect(classifyTool("Read file").category).toBe("read");
   expect(classifyTool("Run command").category).toBe("command");
   expect(classifyTool("Edit-file").category).toBe("edit");
+});
+
+/** A message that works on: prose, then a call (its result follows). */
+const working = (id: string, text: string, at = 2) =>
+  ({ role: "assistant", content: [{ type: "text", text }, { type: "toolCall", id, name: "read", arguments: {} }], stopReason: "toolUse", timestamp: at }) as never;
+const called = (id: string, at = 3) => ({ role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: at }) as never;
+const asked = (text: string, at = 1) => ({ role: "user", content: text, timestamp: at }) as never;
+const answer = (text: string, at = 5) => ({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: at }) as never;
+const turnsOf = (rows: ReturnType<typeof buildDisplayRows>) => rows.filter((row) => row.kind === "turn") as TurnHeaderRow[];
+
+test("a turn that is over is folded however it ended: answered, cut by a message, stopped, failed", () => {
+  const t = new Transcript();
+  t.load([
+    // A message was sent into the run: what came before it never got an answer.
+    asked("one"),
+    working("c1", "Looking."),
+    called("c1"),
+    asked("steer", 4),
+    working("c2", "Looking elsewhere."),
+    called("c2"),
+    answer("Done."),
+    // Stopped on a call.
+    asked("two", 6),
+    working("c3", "Trying."),
+    called("c3"),
+    // Failed with nothing written.
+    asked("three", 8),
+    working("c4", "Again."),
+    called("c4"),
+    { role: "assistant", content: [], stopReason: "error", errorMessage: "529 overloaded", timestamp: 9 } as never,
+  ]);
+  // At rest, and with the session working on something else (its sub-sessions): none of them is the run's.
+  for (const running of [false, true]) {
+    const rows = buildDisplayRows(t.rows(), running);
+    expect(rows.map((row) => row.kind)).toEqual(["user", "turn", "user", "turn", "text", "user", "turn", "user", "turn", "notice"]);
+    expect(turnsOf(rows)).toMatchObject([
+      { open: false, running: false, hasDetails: true },
+      { open: false, running: false, hasDetails: true },
+      { open: false, running: false, hasDetails: true },
+      { open: false, running: false, hasDetails: true },
+    ]);
+  }
+});
+
+test("the turn the run is on shows its process; one a run left closed is not it, though it is the last", () => {
+  const t = new Transcript();
+  const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
+  t.apply({ type: "message_start", message: asked("go") });
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  update({ type: "text_delta", contentIndex: 0, delta: "Looking." });
+  update({ type: "toolcall_start", contentIndex: 1, id: "c1", toolName: "read" });
+  expect(turnsOf(buildDisplayRows(t.rows(), true))).toMatchObject([{ running: true, open: true }]);
+
+  // Stopped: the turn is closed with no answer, and folds.
+  t.apply({ type: "agent_settled", aborted: true });
+  expect(turnsOf(buildDisplayRows(t.rows(), false))).toMatchObject([{ running: false, open: false }]);
+  // The next message is sent — the session runs — and its row is not here yet: that turn does not start working again.
+  expect(turnsOf(buildDisplayRows(t.rows(), true))).toMatchObject([{ running: false, open: false }]);
+  t.apply({ type: "message_start", message: asked("again", 2) });
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  update({ type: "text_delta", contentIndex: 0, delta: "Once more." });
+  expect(turnsOf(buildDisplayRows(t.rows(), true))).toMatchObject([
+    { running: false, open: false },
+    { running: true, open: true },
+  ]);
+
+  // A turn a message closed that goes on without a word from the reader is working again, its length not known yet.
+  const t2 = new Transcript();
+  t2.apply({ type: "message_start", message: asked("go") });
+  t2.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  t2.apply({ type: "message_end", message: { role: "assistant", content: [{ type: "thinking", thinking: "Hm." }], stopReason: "stop", timestamp: 2 } as never });
+  expect(turnsOf(buildDisplayRows(t2.rows(), true))).toMatchObject([{ running: false, open: false }]);
+  t2.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  t2.apply({ type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, id: "c9", toolName: "read" } } as never);
+  const [again] = turnsOf(buildDisplayRows(t2.rows(), true));
+  expect(again).toMatchObject({ running: true, open: true });
+  expect(again.durationMs).toBeUndefined();
+});
+
+test("the reader's say on a turn holds; folding a working turn folds the work as it goes on past a message", () => {
+  const t = new Transcript();
+  const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
+  const turn = new Map<string, boolean>();
+  const work = new Map<string, boolean>();
+  const shown = (running = true) => turnsOf(buildDisplayRows(t.rows(), running, { chosen: (id) => turn.get(id), said: (id) => work.get(id) }));
+  /** The reader's press on a turn's header: on the one the run is on, it is their say on the work too. */
+  const press = (row: TurnHeaderRow) => {
+    turn.set(row.id, !row.open);
+    if (row.running) work.set(row.id, !row.open);
+  };
+  const more = (id: string, text: string) => {
+    t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+    update({ type: "text_delta", contentIndex: 0, delta: text });
+    update({ type: "toolcall_start", contentIndex: 1, id, toolName: "read" });
+    t.apply({ type: "message_end", message: working(id, text) });
+    t.apply({ type: "tool_execution_end", toolCallId: id, toolName: "read", result: { content: [] }, isError: false });
+  };
+  t.apply({ type: "message_start", message: asked("go") });
+  more("c1", "Looking.");
+  expect(shown()).toMatchObject([{ running: true, open: true }]);
+
+  // Folded by the reader while it works: it stays folded, working or over.
+  press(shown()[0]);
+  expect(shown()).toMatchObject([{ running: true, open: false }]);
+
+  // A message sent into the run: the work goes on as a turn of its own, folded as the reader had it — twice over.
+  t.apply({ type: "message_start", message: asked("steer", 2) });
+  more("c2", "Looking elsewhere.");
+  expect(shown()).toMatchObject([{ running: false, open: false }, { running: true, open: false }]);
+  t.apply({ type: "message_start", message: asked("steer again", 3) });
+  more("c3", "And here.");
+  expect(shown()).toMatchObject([{ open: false }, { open: false }, { running: true, open: false }]);
+
+  // A look inside a part that is over opens that part alone, and closing it again changes nothing either.
+  press(shown()[0]);
+  expect(shown()).toMatchObject([{ open: true }, { open: false }, { running: true, open: false }]);
+  press(shown()[0]);
+  expect(shown()).toMatchObject([{ open: false }, { open: false }, { running: true, open: false }]);
+
+  // Their press on the working one opens it, and the work shows from there on.
+  press(shown()[2]);
+  expect(shown()).toMatchObject([{ open: false }, { open: false }, { running: true, open: true }]);
+  t.apply({ type: "message_start", message: asked("steer once more", 4) });
+  more("c4", "And there.");
+  expect(shown()).toMatchObject([{ open: false }, { open: false }, { running: false, open: true }, { running: true, open: true }]);
+  // What they opened stays open once over; what they said nothing on folds.
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  t.apply({ type: "message_end", message: answer("Done.") });
+  t.apply({ type: "agent_settled", aborted: false });
+  expect(shown(false)).toMatchObject([{ open: false }, { open: false }, { open: true }, { running: false, open: false }]);
+
+  // An answer ends the work: the next run's turn shows its process, whatever was folded before.
+  work.set(shown(false)[3].id, false);
+  t.apply({ type: "message_start", message: asked("next", 6) });
+  more("c5", "A new thing.");
+  expect(shown().at(-1)).toMatchObject({ running: true, open: true });
+
+  // Not so a run that was stopped: what comes next carries on work that got no answer, folded if the reader folded it.
+  press(shown().at(-1)!);
+  t.apply({ type: "agent_settled", aborted: true });
+  t.apply({ type: "message_start", message: asked("go on", 7) });
+  more("c6", "Going on.");
+  expect(shown().slice(-2)).toMatchObject([{ running: false, open: false }, { running: true, open: false }]);
+});
+
+test("a conversation loaded again keeps its rows' ids, so what is kept by row finds them", () => {
+  // As it streamed: the rows the reader folded and unfolded.
+  const live = new Transcript();
+  const update = (assistantMessageEvent: object) => live.apply({ type: "message_update", assistantMessageEvent } as never);
+  const first = { role: "assistant", content: [{ type: "thinking", thinking: "Hm." }, { type: "text", text: "Looking." }, { type: "toolCall", id: "c1", name: "read", arguments: {} }], stopReason: "toolUse", timestamp: 2 } as never;
+  live.apply({ type: "message_start", message: asked("go") });
+  live.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  update({ type: "thinking_start", contentIndex: 0 });
+  update({ type: "thinking_end", contentIndex: 0, content: "Hm." });
+  update({ type: "text_delta", contentIndex: 1, delta: "Looking." });
+  update({ type: "toolcall_start", contentIndex: 2, id: "c1", toolName: "read" });
+  live.apply({ type: "message_end", message: first });
+  live.apply({ type: "tool_execution_end", toolCallId: "c1", toolName: "read", result: { content: [{ type: "text", text: "ok" }] }, isError: false, durationMs: 12 });
+  live.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  update({ type: "text_delta", contentIndex: 0, delta: "Do" });
+  const ids = (rows: { id: string }[]) => rows.map((row) => row.id);
+  const displayed = (t: Transcript, running: boolean) => ids(buildDisplayRows(t.rows(), running, { chosen: () => true }));
+
+  // The session's file, read while the run goes on: the answer is further along there than it was on screen.
+  const history = [asked("go"), first, called("c1"), answer("Done.")];
+  const fresh = new Transcript();
+  fresh.load(history);
+  expect(ids(fresh.rows())).not.toEqual(ids(live.rows()));
+  fresh.adopt(live.rows());
+  expect(ids(fresh.rows())).toEqual(ids(live.rows()));
+  // The same rows, as the file has them: the measured times of a live run are not on file, and nothing streams.
+  expect(fresh.rows()).toMatchObject([{ kind: "user" }, { kind: "thinking" }, { kind: "text" }, { kind: "tool", status: "done" }, { kind: "text", text: "Done.", final: true, streaming: false }]);
+  // So the turn, its groups and the reply's actions are named as they were.
+  expect(displayed(fresh, false)).toEqual(displayed(live, true));
+  expect(displayRowIds(fresh.rows())).toEqual(displayRowIds(live.rows()));
+
+  // It goes on from there under ids of its own: none of the adopted ones is handed out twice.
+  fresh.apply({ type: "message_start", message: asked("more", 6) });
+  fresh.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  fresh.apply({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "More." } } as never);
+  expect(new Set(ids(fresh.rows())).size).toBe(fresh.rows().length);
+
+  // What only one of them holds pairs with nothing and breaks no pair after it: a notice of the client's own,
+  // an attempt the agent retried and did not keep, a message the file gained since.
+  const noted = new Transcript();
+  noted.load([asked("go"), answer("Half an ans", 2), answer("Done.", 3)]);
+  noted.note("info", "A note of the client's own");
+  const reloaded = new Transcript();
+  reloaded.load([asked("go"), answer("Done.", 3), asked("and then", 4), answer("Then this.", 5)]);
+  reloaded.adopt(noted.rows());
+  const before = noted.rows();
+  expect(reloaded.rows().map((row) => row.id).slice(0, 2)).toEqual([before[0].id, before[2].id]);
+  expect(reloaded.rows().slice(2).some((row) => before.some((old) => old.id === row.id))).toBe(false);
+
+  // Words repeated in a conversation pair in order, each once.
+  const twice = new Transcript();
+  twice.load([asked("continue"), answer("Ok."), asked("continue", 6), answer("Ok.", 7)]);
+  const twiceAgain = new Transcript();
+  twiceAgain.load([asked("continue"), answer("Ok."), asked("continue", 6), answer("Ok.", 7)]);
+  twiceAgain.adopt(twice.rows());
+  expect(ids(twiceAgain.rows())).toEqual(ids(twice.rows()));
+});
+
+test("the history of a session still working leaves its last turn open and its calls running", () => {
+  const history = [asked("go"), working("c1", "Looking."), called("c1"), working("c2", "Looking elsewhere.", 4)];
+
+  // At rest, a call with no result was interrupted and the turn is over.
+  const rest = new Transcript();
+  rest.load(history);
+  expect(rest.rows().at(-1)).toMatchObject({ kind: "tool", id: "c2", status: "error" });
+  expect(turnsOf(buildDisplayRows(rest.rows(), false))).toMatchObject([{ running: false, open: false }]);
+
+  // Working, the call is still to run, and the turn is the run's: open, as if watched from its start.
+  const busy = new Transcript();
+  busy.load(history, true);
+  expect(busy.rows().at(-1)).toMatchObject({ kind: "tool", id: "c2", status: "queued" });
+  expect(turnsOf(buildDisplayRows(busy.rows(), true))).toMatchObject([{ running: true, open: true }]);
+  // What happens next lands on those rows, and the turn ends as any does.
+  busy.apply({ type: "tool_execution_end", toolCallId: "c2", toolName: "read", result: { content: [{ type: "text", text: "ok" }] }, isError: false });
+  busy.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  busy.apply({ type: "message_end", message: answer("Done.") });
+  expect(busy.rows().at(-2)).toMatchObject({ kind: "tool", id: "c2", status: "done", output: "ok" });
+  const [turn] = turnsOf(buildDisplayRows(busy.rows(), true));
+  expect(turn).toMatchObject({ running: false, open: false });
+  expect(turn.durationMs).toBeGreaterThan(0);
 });
 
 test("displayRowIds names every row a transcript can project", () => {
@@ -329,7 +556,7 @@ test("displayRowIds names every row a transcript can project", () => {
   // A landing marks them all seen: whatever the fold state projects, its id was named.
   const markable = new Set(displayRowIds(t.rows()));
   for (const open of [true, false]) {
-    for (const row of buildDisplayRows(t.rows(), false, () => open)) {
+    for (const row of buildDisplayRows(t.rows(), false, { chosen: () => open })) {
       expect(markable.has(row.id)).toBe(true);
     }
   }

@@ -98,6 +98,12 @@ multi-agent orchestration, and settings.
 - `nsh test Recover.test.tsx` — an agent process lost at rest, under a run,
   or again and again (`harness.dies`, or a prompt containing "crash"): what
   stays on screen, what is said, and when the app stops starting it again
+- `nsh test Fold.test.tsx` — what folds and who says so, on a manual clock: a
+  turn that is over is folded however it ended (answered, stopped, failed, a
+  message sent into the run) and however the reader came to it, and what they
+  pressed holds through the run, the next message, and a session change and
+  back (`harness.cut` opens saved sessions on turns that got no answer; the
+  scripted run "in steps" takes a steering message mid-run)
 - `nsh test Switch.test.tsx` — a session change from the press on: what is
   shown with the click, and that nothing passes through while the agent loads;
   `nsh test SwitchFilm.test.tsx --target macos` films the changes into
@@ -245,8 +251,28 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
 - The message flow (`pi/turns.ts`): a turn is a header, its
   process (reasoning, prose between steps, consecutive tool calls as one
   activity row) and its answer. Rows never change place while a run goes on;
-  the process folds once, when the answer is known (the message that called
-  no tools ended), and only for a reader who is following.
+  the process folds once, when the turn is over: its answer is known (the
+  message that called no tools ended), or it was cut short — stopped, failed,
+  or a message sent into the run took the end from it. Only the turn the run
+  is on is open by default (`running` in `buildDisplayRows`: the last one,
+  unanswered, not closed — `turnMs`), so a turn that is over is folded
+  however it ended and however the reader came to it. The fold is made before
+  a reader who is following; one reading elsewhere keeps the process, and the
+  fold is owed — made when they follow again, gone when they leave
+  (`turnDefault`, `foldOwedTurns` in `views/Rows.tsx`), never held for good.
+- Past that the folds are the reader's (`choices` in `views/Rows.tsx`): a press
+  is the only thing that writes one, and it holds through the run and its end,
+  the next message, a session change and back. A press on the working turn is
+  also their say on the work (`turnSay`): folded, it stays folded as the run
+  goes on past a message sent into it (`hushed`), until it is answered; a
+  press on a turn that is over opens or closes that turn alone. Folds are
+  kept by conversation and row id. The
+  conversation is `conversationKey()` (`store/app.ts`), set in the same batch
+  as the rows — never the agent's `sessionId`, which lags a session change
+  (the conversation shown ahead would wear another's folds, then jump). The
+  same conversation loaded again keeps its key and its rows' ids (`succeed`,
+  `Transcript.adopt`: rows pair up by what they say), so a transcript that
+  replaces one on screen must go through `succeed`, or every fold there is lost.
 - A reply is one list row per Markdown block (`proseRows` in
   `views/Prose.tsx`), never one row: a row taller than the viewport makes the
   list lay everything out again on each delta and paint a blank frame.

@@ -10,6 +10,7 @@
 // `harness.startDelay` (ms) makes agents start and load sessions as slowly as real CLIs.
 // `harness.distinct` gives each saved session a history of its own, so a switch shows.
 // `harness.long` ends each saved session's history on a reply longer than the window, so where it lands shows.
+// `harness.cut` opens each saved session's history on turns that got no answer (steered, stopped, failed).
 // `harness.then` (`"<ms>:<session file>"`, `"<ms>:<file>@<folder>"` or `"<ms>:new"`, `;`-separated) changes session on
 // its own that long after boot: a test films the change from its first frame, which a
 // `press` (it resolves once the app is quiet) hides.
@@ -50,6 +51,7 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
   const reply = (await Storage.getItem("harness.reply")) || undefined;
   const distinctHistories = Boolean(await Storage.getItem("harness.distinct"));
   const longHistories = Boolean(await Storage.getItem("harness.long"));
+  const cutHistories = Boolean(await Storage.getItem("harness.cut"));
   const [diesAfter, diesTimes] = ((await Storage.getItem("harness.dies")) ?? "").split("x");
   const dies = diesAfter ? { after: Number(diesAfter), times: Number(diesTimes ?? 1) } : undefined;
   const startsAllowed = await Storage.getItem("harness.starts");
@@ -99,6 +101,7 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       startDelay,
       distinctHistories,
       longHistories,
+      cutHistories,
       reply,
       dies,
       starts: startsAllowed ? Number(startsAllowed) : undefined,

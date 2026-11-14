@@ -16,8 +16,10 @@ import type { Row, ToolRow } from "./transcript";
  * While the turn works its process is open, so commentary streams where it
  * will stay, while intermediate reasoning/tool groups stay compact by default
  * until clicked. The turn's process folds under the header once, when the
- * answer is known; nothing else folds or unfolds on its own, and a reader's
- * own toggle holds from then on.
+ * turn is over: its answer is known, or it was cut short — stopped, failed, or
+ * a message sent into the run took its place at the end. So a turn that is
+ * over is folded however it ended and however the reader came to it; nothing
+ * else folds or unfolds on its own, and a reader's own toggle holds from then on.
  */
 
 export type ToolCategory = "read" | "edit" | "create" | "search" | "list" | "command" | "agent" | "web" | "todo" | "other";
@@ -700,22 +702,34 @@ function activityOf(steps: ProcessStep[]): ActivityRow {
   };
 }
 
+/** Who says whether a turn's process shows. None given, the defaults stand: open while it works, folded once over. */
+export interface TurnFolds {
+  /** The reader's own say on a turn, once they pressed its header: it holds from then on. */
+  chosen?: (id: string) => boolean | undefined;
+  /** Their say on the work, by the turn they pressed while the run was on it: whether the work shows as it goes on. */
+  said?: (id: string) => boolean | undefined;
+  /** A turn the reader said nothing on: shown while the run is still `working` on it, folded once it is over. */
+  byDefault?: (id: string, working: boolean, hasDetails: boolean) => boolean;
+  /** Keeps a closing turn's process rows in the projection until its collapse animation settles. */
+  keepMounted?: (id: string) => boolean;
+}
+
 /**
  * Projects the transcript's flat rows into the rows the chat shows.
  *
- * `isOpen(id, fallback)` is the reader's say on a turn's fold: `fallback`
- * (open until the answer is known) unless they toggled it.
+ * A turn's process shows as the reader left it (`folds.chosen`), else by
+ * default: open while the run is on it, folded once it is over.
  */
 export function buildDisplayRows(
   rows: readonly Row[],
   sessionRunning = false,
-  isOpen: (id: string, fallback: boolean, hasDetails: boolean) => boolean = (_, fallback) => fallback,
+  folds: TurnFolds = {},
   /** Filled with the turn each shown process row belongs to, by row id, when given. */
   processOf?: Map<string, string>,
-  /** Keeps a closing turn's process rows in the projection until its collapse animation settles. */
-  keepProcessMounted?: (id: string) => boolean,
 ): DisplayRow[] {
   const out: DisplayRow[] = [];
+  /** The reader folded the work the next turn carries on. */
+  let hushed = false;
   let i = 0;
   while (i < rows.length) {
     const row = rows[i];
@@ -751,10 +765,20 @@ export function buildDisplayRows(
     flushSteps();
 
     const answered = answer.length > 0;
-    const running = sessionRunning && i === rows.length && !answered;
+    // The turn the run is on: the last one, with no answer yet, and not closed. A run that
+    // stopped or failed closed its turn (`turnMs`): the next run is not that turn going on,
+    // though for a moment — the message sent, its row not here yet — it is still the last.
+    const running = sessionRunning && i === rows.length && !answered && first.turnMs === undefined;
     const hasDetails = process.length > 0;
     const id = `turn:${first.id}`;
-    const open = isOpen(id, !answered, hasDetails);
+    const chosen = folds.chosen?.(id);
+    const working = running && !hushed;
+    const open = chosen ?? (folds.byDefault ? folds.byDefault(id, working, hasDetails) : working);
+    // A turn cut short is carried on by the one after it (a message sent into the run, a notice in
+    // its middle). A reader who folded it while it worked has folded the work: it stays folded as
+    // it goes on, until they unfold the turn it is on by then, or it is answered.
+    const said = folds.said?.(id);
+    hushed = !answered && (said === undefined ? hushed : !said);
     if (hasDetails || running || first.turnMs !== undefined) {
       out.push({
         kind: "turn",
@@ -768,7 +792,7 @@ export function buildDisplayRows(
         activeStep: running && !open ? activeStep : undefined,
       });
     }
-    if (open || (hasDetails && keepProcessMounted?.(id))) {
+    if (open || (hasDetails && folds.keepMounted?.(id))) {
       out.push(...process);
       if (processOf) for (const row of process) processOf.set(row.id, id);
     }

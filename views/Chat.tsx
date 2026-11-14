@@ -9,6 +9,7 @@ import { Pip } from "../mascot/Pip";
 import {
   activeAgent,
   chooseWorkspace,
+  conversationKey,
   currentActivity,
   hasModel,
   isDraftAhead,
@@ -45,15 +46,18 @@ import { hasInlinePrompt } from "./ExtensionDialog";
 import { proseRows } from "./Prose";
 import {
   type ChatRow,
+  enterConversation,
+  foldOwedTurns,
   isTurnClosing,
   onFoldSettled,
   onFoldToggle,
   replyActions,
   setProcessTurns,
-  swapConversation,
   trackFoldState,
   TranscriptRow,
-  turnOpen,
+  turnChoice,
+  turnDefault,
+  turnSay,
 } from "./Rows";
 import { HeaderBand, PaneVeil } from "./Wallpaper";
 import { buildDisplayRows, displayRowIds, stableDisplayRows } from "../pi/turns";
@@ -581,9 +585,13 @@ export function Chat() {
     const projected = buildDisplayRows(
       transcriptRows(),
       isChatActive(),
-      (id, fallback, hasDetails) => turnOpen(id, fallback, untracked(following), hasDetails),
+      {
+        chosen: turnChoice,
+        said: turnSay,
+        byDefault: (id, working, hasDetails) => turnDefault(id, working, untracked(following), hasDetails),
+        keepMounted: isTurnClosing,
+      },
       processOf,
-      isTurnClosing,
     );
     const rows = (following() ? stable(projected) : projected).flatMap((row): ChatRow[] =>
       row.kind !== "text" ? [row] : row.final && !row.streaming ? [...proseRows(row), replyActions(row)] : proseRows(row),
@@ -849,6 +857,11 @@ export function Chat() {
     pokeRepaint();
     measureEnd();
   });
+  // A turn that ended while the reader was reading elsewhere kept its process open for them. Following
+  // again — back at the end, the pill, a message sent — they are done there: it folds as it would have.
+  effect(() => {
+    if (following()) untracked(foldOwedTurns);
+  });
 
   // A reply still growing moves the end under an animated scroll: go there at once.
   const jumpToLatest = () => follow(!reduceMotion() && !isChatActive());
@@ -963,14 +976,15 @@ export function Chat() {
   });
   cleanup(() => void pane.stop());
 
-  // Another conversation's rows are other rows: what was expanded there is not
+  // Another conversation's rows are other rows: what was in motion there is not
   // here, and the rows landing were already on screen, so none of them enters again.
-  const conversation = computed(() => sessionState()?.sessionId ?? "");
+  // The key is the rows' own (`conversationKey`), not the agent's session: it changes
+  // with the rows, and not when the same conversation is only loaded again.
   // Only the conversation changing runs this. What it reads on the way — the
-  // rows, the fold memory — is not what it waits for: tracked, every delta of a
-  // reply would follow again and take the view back from a reader who scrolled up.
+  // rows — is not what it waits for: tracked, every delta of a reply would
+  // follow again and take the view back from a reader who scrolled up.
   effect(() => {
-    const key = conversation();
+    const key = conversationKey();
     untracked(() => {
       inputAt = 0;
       lastY = undefined;
@@ -978,7 +992,7 @@ export function Chat() {
       endSelecting();
       following.set(true);
       distanceFromEnd.set(0);
-      swapConversation(key);
+      enterConversation(key);
       markRowsSeen(displayRowIds(transcriptRows()));
       pokeRepaint();
     });

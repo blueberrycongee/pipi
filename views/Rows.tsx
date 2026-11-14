@@ -17,7 +17,7 @@ import {
   thinkingLabel,
   type TurnHeaderRow,
 } from "../pi/turns";
-import { copyMessage, copyText, daemonSessionOfId, forkFrom, openDaemonSession, transcriptRows } from "../store/app";
+import { conversationKey, copyMessage, copyText, daemonSessionOfId, forkFrom, openDaemonSession, transcriptRows } from "../store/app";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
@@ -31,10 +31,29 @@ import { clearProseState, PROSE, ProseBlock, type ProseRow } from "./Prose";
  * module-level maps keyed by stable row or fold ID.
  */
 
-const expanded = signal<Record<string, boolean>>({});
+/**
+ * What the reader folded and unfolded, by conversation and by row. A press is
+ * the only thing that writes here, and what it wrote holds: through the run
+ * going on and ending, the next message, a change of session and back.
+ *
+ * The conversation is the one the rows on screen belong to (`conversationKey`,
+ * set in the same turn as the rows), never the agent's word on its session,
+ * which lags a session change: no conversation is shown under another's folds,
+ * and one shown again has its own with the click. Its rows are found again by
+ * their ids, which a conversation keeps when it is loaded again (`Transcript.adopt`).
+ */
+const choices = signal<Record<number, Record<string, boolean>>>({});
+
+/** What the reader said on a fold, if they pressed it. */
+const chosen = (id: string): boolean | undefined => choices()[conversationKey()]?.[id];
+
+function choose(id: string, open: boolean, also?: string) {
+  const key = untracked(conversationKey);
+  choices.update((all) => ({ ...all, [key]: { ...all[key], [id]: open, ...(also ? { [also]: open } : {}) } }));
+}
 
 /** Whether a disclosure shows its body: explicit user choice wins, else `fallback`. */
-const isOpen = (id: string, fallback: boolean) => expanded()[id] ?? fallback;
+const isOpen = (id: string, fallback: boolean) => chosen(id) ?? fallback;
 /**
  * What the chat does before a fold the reader pressed opens or closes: it lets
  * go of the end, so the list keeps its offset and the row pressed stays under
@@ -48,7 +67,7 @@ export function onFoldToggle(anchor: () => void) {
 
 const toggle = (id: string, fallback: boolean) => {
   anchorFold();
-  expanded.update((all) => ({ ...all, [id]: !(all[id] ?? fallback) }));
+  choose(id, !untracked(() => isOpen(id, fallback)));
 };
 
 let foldSettled: () => void = () => {};
@@ -81,10 +100,13 @@ const closingTurns = signal<Record<string, "arming" | "collapsing">>({});
 const openingTurns = signal<Record<string, "arming" | "expanding">>({});
 const pendingAutoClose = new Set<string>();
 const foldTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
+/** Ticks when a fold was decided outside the projection (one owed to the reader, made): it runs again. */
+const foldTick = signal(0);
 
 /** Read inside `displayRows` so projection re-runs when a turn finishes collapsing. */
 export function trackFoldState() {
   closingTurns();
+  foldTick();
 }
 
 /** Whether `id`'s process rows stay mounted in `displayRows` while collapsing to 0pt. */
@@ -122,14 +144,23 @@ function scheduleAutoFold(id: string) {
  * Opens or closes a turn's fold (the process fold): opening, its rows mount
  * at 0pt and spring open with staggered opacity/glide; closing, they spring to
  * 0pt and fade out before leaving the list, so nothing pops or blinks out.
+ *
+ * The press is the reader's say on the turn. On the turn the run is on it is
+ * also their say on the work (`turnSay`): folded, the work stays folded as it
+ * goes on past a message sent into it. A press on a turn that is over says
+ * nothing on the work: a look inside an earlier part opens that part alone.
  */
-function toggleTurn(id: string, open: boolean) {
+function toggleTurn(id: string, open: boolean, running: boolean) {
   anchorFold();
   clearTurnTimers(id);
+  // The turn is the reader's from here on: no fold of its own is left to make.
+  watched.seen.delete(id);
+  watched.owed.delete(id);
+  const work = running ? workOf(id) : undefined;
   if (reduceMotion()) {
     closingTurns.update(({ [id]: _, ...rest }) => rest);
     openingTurns.update(({ [id]: _, ...rest }) => rest);
-    expanded.update((all) => ({ ...all, [id]: !open }));
+    choose(id, !open, work);
     return;
   }
   if (!open) {
@@ -137,7 +168,7 @@ function toggleTurn(id: string, open: boolean) {
     closingTurns.update(({ [id]: _, ...rest }) => rest);
     if (wasClosing) {
       openingTurns.update((all) => ({ ...all, [id]: "expanding" }));
-      expanded.update((all) => ({ ...all, [id]: true }));
+      choose(id, true, work);
       const tDone = setTimeout(() => {
         clearTurnTimers(id);
         openingTurns.update(({ [id]: _, ...rest }) => rest);
@@ -147,7 +178,7 @@ function toggleTurn(id: string, open: boolean) {
       return;
     }
     openingTurns.update((all) => ({ ...all, [id]: "arming" }));
-    expanded.update((all) => ({ ...all, [id]: true }));
+    choose(id, true, work);
     const tExpand = setTimeout(() => {
       openingTurns.update((all) => (all[id] ? { ...all, [id]: "expanding" } : all));
     }, 20);
@@ -161,7 +192,7 @@ function toggleTurn(id: string, open: boolean) {
   }
   openingTurns.update(({ [id]: _, ...rest }) => rest);
   closingTurns.update((all) => ({ ...all, [id]: "collapsing" }));
-  expanded.update((all) => ({ ...all, [id]: false }));
+  choose(id, false, work);
   const tDone = setTimeout(() => {
     clearTurnTimers(id);
     closingTurns.update(({ [id]: _, ...rest }) => rest);
@@ -265,65 +296,87 @@ function useProcessFold(id: () => string) {
 }
 
 /**
- * What a conversation's folds remember: the reader's disclosures and each seen
- * turn's held-open choice. Row ids collide across conversations, so the memory
- * swaps with the conversation on screen — an inspected task's and the main
- * session's stay apart, and coming back restores what was left open.
+ * The turns of the conversation on screen as the reader watched them: those
+ * `seen` working, whose process was open under their eyes and so folds before
+ * them when the turn is over, and those whose fold is `owed`. Nothing here
+ * outlives the conversation's stay on screen: one the reader comes back to
+ * shows each turn as it stands by then, with no fold left to play.
  */
-interface FoldMemory {
-  expanded: Record<string, boolean>;
-  seenOpen: Set<string>;
-  held: Map<string, boolean>;
-}
-const foldMemories = new Map<string, FoldMemory>();
-let foldKey = "";
-let foldMemory: FoldMemory = { expanded: {}, seenOpen: new Set(), held: new Map() };
-let turnsSeenOpen = foldMemory.seenOpen;
-let turnsHeld = foldMemory.held;
+let watched = { key: -1, seen: new Set<string>(), owed: new Set<string>() };
+
+/** The reader's own say on a turn's fold, if they pressed its header. */
+export const turnChoice = chosen;
+
+/** Under what a press on the working turn is kept as the reader's say on the work, beside their say on the turn. */
+const workOf = (id: string) => `work:${id}`;
+
+/** What the reader said on the work while the run was on this turn, if they pressed its header then. */
+export const turnSay = (id: string) => chosen(workOf(id));
 
 /**
- * Whether a turn's process shows: the reader's toggle, else `fallback` (open
- * until its answer is known). The fold at the answer happens for a reader who
- * is following the reply; one who scrolled away is reading what would fold,
- * so for them it stays, and the choice made at that moment is kept.
+ * Whether a turn's process shows when the reader said nothing on it: open
+ * while the run is `working` on it, folded once it is over. The fold happens
+ * before a reader who is following the reply. One who scrolled away is reading
+ * what would fold: for them it stays, and the fold is owed — made once they
+ * follow again (`foldOwedTurns`), not kept from them for good.
  */
-export function turnOpen(id: string, fallback: boolean, following: boolean, hasDetails = true): boolean {
-  const chosen = expanded()[id];
-  if (chosen !== undefined) return chosen;
-  if (fallback) {
-    if (hasDetails) turnsSeenOpen.add(id);
+export function turnDefault(id: string, working: boolean, following: boolean, hasDetails = true): boolean {
+  const key = conversationKey();
+  if (watched.key !== key) watched = { key, seen: new Set(), owed: new Set() };
+  if (working) {
+    if (hasDetails) watched.seen.add(id);
     return true;
   }
-  if (!turnsSeenOpen.has(id)) return false;
-  let held = turnsHeld.get(id);
-  if (held === undefined) {
-    turnsHeld.set(id, (held = !following));
-    if (!held && hasDetails && !untracked(reduceMotion)) scheduleAutoFold(id);
+  if (!watched.seen.has(id)) return false;
+  if (watched.owed.has(id)) return true;
+  if (!following) {
+    watched.owed.add(id);
+    return true;
   }
-  return held;
+  watched.seen.delete(id);
+  if (hasDetails && !untracked(reduceMotion)) scheduleAutoFold(id);
+  return false;
 }
 
+/** The reader follows the conversation again: the turns that ended while they read elsewhere fold now. */
+export function foldOwedTurns() {
+  if (!watched.owed.size || watched.key !== untracked(conversationKey)) return;
+  const reduced = untracked(reduceMotion);
+  for (const id of watched.owed) {
+    watched.seen.delete(id);
+    if (!reduced) scheduleAutoFold(id);
+  }
+  watched.owed.clear();
+  foldTick.update((n) => n + 1);
+}
+
+/** How many conversations' folds are kept: those left longest ago go first. */
+const CHOICES_KEPT = 32;
+let shownKeys: number[] = [];
+
 /**
- * The conversation about to fill the list (`key`): its fold memory replaces the
- * current one, which stays under its own key for when the reader comes back.
- * Everything else keyed by row id — running folds, the veil, the prose cache —
- * clears, since those ids mean other rows in another conversation.
+ * Another conversation fills the list (`key`). The reader's folds are kept by
+ * conversation and need no swap; what is keyed by row id alone — folds in
+ * motion, the veil, the prose cache — clears, since those ids mean other rows
+ * in another conversation.
  */
-export function swapConversation(key: string) {
+export function enterConversation(key: number) {
   for (const id of [...foldTimers.keys()]) clearTurnTimers(id);
   pendingAutoClose.clear();
   closingTurns.set({});
   openingTurns.set({});
+  // What was watched in the conversation left is not watched any more (one with no turn to show, an empty
+  // chat, asks `turnDefault` nothing and would leave it standing): coming back finds no fold owed or to play.
+  if (watched.key !== key) watched = { key: -1, seen: new Set(), owed: new Set() };
 
-  if (key !== foldKey) {
-    foldMemory.expanded = expanded();
-    foldMemories.set(foldKey, foldMemory);
-    foldKey = key;
-    foldMemory = foldMemories.get(key) ?? { expanded: {}, seenOpen: new Set(), held: new Map() };
-    foldMemories.set(key, foldMemory);
-    turnsSeenOpen = foldMemory.seenOpen;
-    turnsHeld = foldMemory.held;
-    expanded.set(foldMemory.expanded);
+  shownKeys = [...shownKeys.filter((shown) => shown !== key), key];
+  if (shownKeys.length > CHOICES_KEPT) {
+    const gone = shownKeys.splice(0, shownKeys.length - CHOICES_KEPT);
+    choices.update((all) => {
+      const kept = { ...all };
+      for (const old of gone) delete kept[old];
+      return kept;
+    });
   }
 
   replyActionRows.clear();
@@ -907,7 +960,7 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
     <View class="border-b border-hairline pb-1.5">
       <ProcessLine
         open={props.row.open}
-        onPress={props.row.hasDetails ? () => toggleTurn(props.row.id, props.row.open) : undefined}
+        onPress={props.row.hasDetails ? () => toggleTurn(props.row.id, props.row.open, props.row.running) : undefined}
       >
         <View style={{ opacity: settleOpacity }}>
           <RollingText

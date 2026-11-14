@@ -29,6 +29,27 @@ export interface TurnStamp {
 const isTurnRow = (row: Row): row is Extract<Row, { kind: "text" | "thinking" | "tool" }> =>
   row.kind === "text" || row.kind === "thinking" || row.kind === "tool";
 
+/** What a row says, apart from its id: two loads of a conversation pair their rows up by it (`adopt`). */
+const signature = (row: Row): string => {
+  switch (row.kind) {
+    case "user":
+      return `user\n${row.images}\n${row.text}`;
+    case "text":
+    case "thinking":
+      return `${row.kind}\n${row.text}`;
+    case "tool":
+      return `tool\n${row.id}`;
+    case "bash":
+      return `bash\n${row.command}`;
+    case "notice":
+      return `notice\n${row.title}\n${row.text}`;
+    case "summary":
+      return `summary\n${row.text}`;
+    case "delivery":
+      return `delivery\n${row.from}\n${row.text}`;
+  }
+};
+
 /** Whether the message answered its turn: called no tools without failing, or —
  * a turn held in one message, as the bridge plays ACP harnesses — ended on
  * prose after its steps. One still calling tools or that failed answers nothing. */
@@ -218,6 +239,8 @@ export class Transcript {
   #bashId: string | undefined;
   /** When the current turn started: the user's message, else its first row. */
   #turnStart: number | undefined;
+  /** The turn at the end of the rows was closed (`#closeTurn`): a row that joins it opens it again. */
+  #closed = false;
   /** While loading history: the time of the message being read (`null` when it has none). */
   #clock: number | null | undefined;
   /**
@@ -246,8 +269,12 @@ export class Transcript {
     return this.#rows.slice();
   }
 
-  /** Replaces everything with a session's messages (`get_messages`). */
-  load(messages: AgentMessage[]) {
+  /**
+   * Replaces everything with a session's messages (`get_messages`).
+   * `working`: its run is still going (a session the daemon kept working, opened
+   * again) — nothing in it has stopped, and its last turn is not over.
+   */
+  load(messages: AgentMessage[], working = false) {
     this.#rows = [];
     this.#index.clear();
     this.#live = undefined;
@@ -255,6 +282,7 @@ export class Transcript {
     this.#pendingResults.clear();
     this.#bashId = undefined;
     this.#turnStart = undefined;
+    this.#closed = false;
     this.#failure = undefined;
     for (const message of messages) {
       if (message.role === "user") this.#closeTurn();
@@ -262,10 +290,65 @@ export class Transcript {
       this.#clock = typeof at === "number" ? at : null;
       this.#append(message);
     }
-    // A call with no recorded result was interrupted; history never shows it as running.
-    this.#settle();
+    if (working) {
+      this.#flushResults();
+    } else {
+      // A call with no recorded result was interrupted; history never shows it as running.
+      this.#settle();
+      this.#turnStart = undefined;
+    }
     this.#clock = undefined;
-    this.#turnStart = undefined;
+    this.version++;
+  }
+
+  /**
+   * Takes the ids of `before` — the same conversation as it last stood on
+   * screen — for the rows both hold. Loading a session again mints its rows
+   * anew, and what is kept by row (a fold the reader opened, the list's cell)
+   * would lose them: with their ids back, it finds them where it left them.
+   *
+   * Rows pair up in order, by what they say; a row `before` was still
+   * streaming pairs with the one that begins as it did. A row with no pair
+   * keeps its new id, so the worst a mismatch costs is that row's default look.
+   */
+  adopt(before: readonly Row[]) {
+    const waiting = new Map<string, number[]>();
+    const streaming: number[] = [];
+    before.forEach((row, at) => {
+      const key = signature(row);
+      const list = waiting.get(key);
+      if (list) list.push(at);
+      else waiting.set(key, [at]);
+      if ((row.kind === "text" || row.kind === "thinking") && row.streaming) streaming.push(at);
+    });
+    const taken = new Set(this.#rows.map((row) => row.id));
+    // A conversation's order does not change: a pair is looked for after the last one made.
+    let from = 0;
+    let changed = false;
+    this.#rows = this.#rows.map((row) => {
+      const list = waiting.get(signature(row));
+      while (list?.length && list[0] < from) list.shift();
+      let at = list?.shift();
+      if (at === undefined && (row.kind === "text" || row.kind === "thinking")) {
+        at = streaming.find((index) => {
+          const old = before[index];
+          if (index < from || old.kind !== row.kind) return false;
+          // Nothing written yet begins anything: only the row next in line is taken for it.
+          return old.text ? row.text.startsWith(old.text) : index === from;
+        });
+      }
+      if (at === undefined) return row;
+      from = at + 1;
+      const id = before[at].id;
+      if (id === row.id || taken.has(id)) return row;
+      taken.delete(row.id);
+      taken.add(id);
+      changed = true;
+      return { ...row, id };
+    });
+    if (!changed) return;
+    this.#index.clear();
+    this.#rows.forEach((row, at) => this.#index.set(row.id, at));
     this.version++;
   }
 
@@ -398,9 +481,22 @@ export class Transcript {
   }
 
   #push(row: Row) {
-    if (isTurnRow(row) && row.t0 === undefined) row = { ...row, t0: this.#turnStart ?? this.#now() };
+    if (isTurnRow(row)) {
+      if (row.t0 === undefined) row = { ...row, t0: this.#turnStart ?? this.#now() };
+      // A closed turn that a row joins goes on: it is not over, and how long it took is not known yet.
+      if (this.#closed) this.#stampTurn(undefined);
+    }
+    this.#closed = false;
     this.#index.set(row.id, this.#rows.length);
     this.#rows.push(row);
+  }
+
+  /** Writes how long the turn at the end of the rows took on its first row; `undefined` takes it back. */
+  #stampTurn(turnMs: number | undefined) {
+    let first = this.#rows.length;
+    while (first > 0 && isTurnRow(this.#rows[first - 1])) first--;
+    const row = this.#rows[first];
+    if (row && isTurnRow(row) && row.turnMs !== turnMs) this.#rows[first] = { ...row, turnMs };
   }
 
   #set(row: Row) {
@@ -424,6 +520,7 @@ export class Transcript {
     if (row && isTurnRow(row) && row.turnMs === undefined && row.t0 !== undefined && now !== undefined) {
       this.#rows[first] = { ...row, turnMs: Math.max(0, now - row.t0) };
     }
+    this.#closed = row !== undefined && isTurnRow(row);
     this.#turnStart = undefined;
   }
 
