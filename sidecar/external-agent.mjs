@@ -99,6 +99,13 @@ const AGENT_NAMES = {
 };
 
 /**
+ * Drivers whose prompt transport carries image content blocks: ACP sends them
+ * in `session/prompt`, Claude Code takes them in a stream-json user message on
+ * stdin. Codex, OpenCode and Cursor still go out as a text-only CLI argument.
+ */
+const IMAGE_DRIVERS = new Set(["acp", "claude"]);
+
+/**
  * The only honest pre-connect entry: "the engine's own configured default".
  * Real model catalogs are adopted at runtime — ACP agents advertise them on
  * `session/new` (`models.availableModels`, or Devin-style `configOptions` also
@@ -114,7 +121,7 @@ function engineDefaultModel() {
     api: driver === "acp" ? "acp" : agentId,
     provider: agentId,
     reasoning: false,
-    input: driver === "acp" ? ["text", "image"] : ["text"],
+    input: IMAGE_DRIVERS.has(driver) ? ["text", "image"] : ["text"],
     cost: zeroCost,
   };
 }
@@ -327,10 +334,13 @@ async function loadExternalSession(targetPath) {
   sessionName = header?.name;
   nativeThreadId = header?.driver === driver ? header?.nativeThreadId : undefined;
   if (header?.model && typeof header.model.id === "string" && header.model.id) {
-    if (!availableModels.some((m) => m.id === header.model.id && m.provider === header.model.provider)) {
-      availableModels.push(header.model);
+    // Claude's image reach is the transport's, not the model entry's — a file
+    // saved before the stream-json prompt still reads as text-only.
+    const restored = driver === "claude" ? { ...header.model, input: ["text", "image"] } : header.model;
+    if (!availableModels.some((m) => m.id === restored.id && m.provider === restored.provider)) {
+      availableModels.push(restored);
     }
-    currentModel = header.model;
+    currentModel = restored;
   }
   if (typeof header?.thinkingLevel === "string" && header.thinkingLevel) {
     thinkingLevel = header.thinkingLevel;
@@ -508,7 +518,7 @@ async function runTurn(promptText, images = []) {
 
   try {
     if (driver === "claude") {
-      await runClaudeTurn(bin, promptText, turnEpoch);
+      await runClaudeTurn(bin, promptText, images, turnEpoch);
     } else if (driver === "codex") {
       await runCodexTurn(bin, promptText, turnEpoch);
     } else if (driver === "opencode") {
@@ -721,7 +731,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch) {
   };
 }
 
-function spawnJsonlProcess(bin, args, extraEnv, onLine) {
+function spawnJsonlProcess(bin, args, extraEnv, onLine, stdinPayload) {
   return new Promise((resolve, reject) => {
     const child = spawnBinary(bin, args, {
       cwd,
@@ -731,6 +741,12 @@ function spawnJsonlProcess(bin, args, extraEnv, onLine) {
     });
     guardStdin(child);
     activeChild = child;
+    if (stdinPayload !== undefined) {
+      try {
+        child.stdin.write(stdinPayload);
+        child.stdin.end();
+      } catch {}
+    }
     let stdoutBuf = "";
     let stderrBuf = "";
     child.stdout.setEncoding("utf8");
@@ -908,7 +924,7 @@ function adoptClaudeModels(init) {
       provider: "claude",
       reasoning: m?.supportsEffort === true,
       effortLevels: claudeEfforts(m),
-      input: ["text"],
+      input: ["text", "image"],
       contextWindow: claudeContextWindow(m),
       maxTokens: 16384,
       cost: zeroCost,
@@ -917,7 +933,7 @@ function adoptClaudeModels(init) {
   // A selection the probe no longer reports (a stale alias, a removed custom
   // model) stays listed rather than silently snapping the session to default.
   if (currentModel && currentModel.id !== "default" && !discovered.some((m) => m.id === currentModel.id)) {
-    discovered.push(currentModel);
+    discovered.push({ ...currentModel, input: ["text", "image"] });
   }
   const sig = (m) => `${m.provider}/${m.id}:${m.name}:${m.reasoning}`;
   if (availableModels.length === discovered.length && availableModels.every((m, i) => sig(m) === sig(discovered[i]))) return;
@@ -956,7 +972,7 @@ function ensureClaudeCatalog() {
   return claudeCatalogPromise ?? Promise.resolve();
 }
 
-async function runClaudeTurn(bin, promptText, turnEpoch = sessionEpoch) {
+async function runClaudeTurn(bin, promptText, images = [], turnEpoch = sessionEpoch) {
   const permMap = {
     "approval-required": "default",
     "auto-accept-edits": "acceptEdits",
@@ -967,6 +983,8 @@ async function runClaudeTurn(bin, promptText, turnEpoch = sessionEpoch) {
     "-p",
     "--verbose",
     "--output-format",
+    "stream-json",
+    "--input-format",
     "stream-json",
     "--include-partial-messages",
     "--permission-mode",
@@ -993,7 +1011,13 @@ async function runClaudeTurn(bin, promptText, turnEpoch = sessionEpoch) {
     args.push("--mcp-config", mcpJson, "--append-system-prompt", EXTERNAL_ORCHESTRATION_PROMPT);
   }
   if (Array.isArray(config.extraArgs)) args.push(...config.extraArgs);
-  args.push(promptText);
+  // The prompt goes on stdin as one stream-json user message — the only way
+  // image blocks reach the engine; a trailing CLI argument is text-only.
+  const content = [
+    ...(promptText ? [{ type: "text", text: promptText }] : []),
+    ...imageBlocks(images).map((i) => ({ type: "image", source: { type: "base64", media_type: i.mimeType, data: i.data } })),
+  ];
+  const stdinPayload = `${JSON.stringify({ type: "user", message: { role: "user", content } })}\n`;
 
   const stream = makeTurnStreamHelper(turnEpoch);
   let completed = false;
@@ -1042,7 +1066,7 @@ async function runClaudeTurn(bin, promptText, turnEpoch = sessionEpoch) {
       }
       stream.finish(abortRequested ? "aborted" : isErr ? "error" : "stop", isErr ? String(rec.result || stderr || "Claude Code failed") : undefined);
     }
-  });
+  }, stdinPayload);
   if (!completed) {
     // No `result` (interrupted, or the CLI died). Claude keeps the session's total
     // through it and the next turn's `result` carries what this one used, cost

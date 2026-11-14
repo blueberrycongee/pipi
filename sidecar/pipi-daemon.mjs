@@ -1766,8 +1766,18 @@ async function externalToken() {
 async function installCli() {
   const homeDir = process.env.HOME || process.env.USERPROFILE || home;
   const binDir = path.join(homeDir, ".local", "bin");
-  const target = path.join(binDir, "pipi");
   // The shim names THIS daemon's home: `pipi` talks to the same registry the app does.
+  if (process.platform === "win32") {
+    // A `pipi` file with no extension is not executable on Windows — the shim is
+    // a .cmd, and it runs the CLI on the daemon's own node (`process.execPath`)
+    // so it does not depend on `node` being on PATH.
+    const target = path.join(binDir, "pipi.cmd");
+    const script = `@echo off\r\n"${process.execPath}" "${PIPI_CLI}" --home "${home}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
+    await fsp.mkdir(binDir, { recursive: true });
+    await fsp.writeFile(target, script);
+    return target;
+  }
+  const target = path.join(binDir, "pipi");
   const script = `#!/bin/sh\nexec node ${JSON.stringify(PIPI_CLI)} --home ${JSON.stringify(home)} "$@"\n`;
   await fsp.mkdir(binDir, { recursive: true });
   await fsp.writeFile(target, script, { mode: 0o755 });

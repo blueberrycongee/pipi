@@ -43,9 +43,9 @@ export interface Backend {
   storedCredentials(): Promise<Record<string, CredentialKind>>;
   saveApiKey(provider: string, key: string): Promise<void>;
   removeCredential(provider: string): Promise<void>;
-  /** Shows the system's folder panel; resolves with the folder, or `undefined` when cancelled or unavailable. */
+  /** Shows the system's folder panel; resolves with the folder, or `undefined` when cancelled or unavailable. Throws `NoPickerError` when no picker tool exists. */
   pickFolder(prompt: string): Promise<string | undefined>;
-  /** Shows the system's image file picker; resolves with the selected image path, or `undefined` when cancelled. */
+  /** Shows the system's image file picker; resolves with the selected image path, or `undefined` when cancelled. Throws `NoPickerError` when no picker tool exists. */
   pickImage?(prompt: string): Promise<string | undefined>;
   /** Asks the app's update source (`nsh.json` → `updater`) for a newer version; `null` when up to date or updates don't apply here. */
   checkAppUpdate?(): Promise<AppUpdate | null>;
@@ -55,17 +55,32 @@ export interface Backend {
   installAppUpdate?(): Promise<void>;
 }
 
+/**
+ * Thrown by the desktop pickers when no picker tool could be launched at all
+ * (Linux without zenity or kdialog) — distinct from a cancelled pick, which
+ * resolves `undefined`.
+ */
+export class NoPickerError extends Error {
+  constructor() {
+    super("no desktop picker available");
+    this.name = "NoPickerError";
+  }
+}
+
 /** Tries each `[command, args]` picker in order, returning its chosen path or `""`. */
 async function runDesktopPicker(candidates: Array<[string, string[]]>): Promise<string> {
+  let launched = false;
   for (const [command, args] of candidates) {
     try {
       const { code, stdout } = await process.run(command, args, { timeoutMs: 600_000 });
+      launched = true;
       const path = stdout.trim().split(/\r?\n/).pop()?.trim() ?? "";
       if (code === 0 && path) return path;
     } catch {
       // Picker binary not installed — try the next one.
     }
   }
+  if (!launched) throw new NoPickerError();
   return "";
 }
 
@@ -153,7 +168,8 @@ const system: Backend = {
         return out || undefined;
       }
       return undefined;
-    } catch {
+    } catch (error) {
+      if (error instanceof NoPickerError) throw error;
       return undefined;
     }
   },
@@ -185,7 +201,8 @@ const system: Backend = {
         return out || undefined;
       }
       return undefined;
-    } catch {
+    } catch (error) {
+      if (error instanceof NoPickerError) throw error;
       return undefined;
     }
   },

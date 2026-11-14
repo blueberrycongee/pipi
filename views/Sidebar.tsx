@@ -553,7 +553,11 @@ const sessionRowClass = (indent: boolean, reserveTrailing: boolean, reserveHover
   } ${PRESS} active:scale-[0.99] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-sidebar-accent group-hover:bg-sidebar-accent active:bg-sidebar-accent selected:bg-sidebar-accent`;
 
 const sessionTitleClass = (selected: boolean) =>
-  `min-w-0 flex-1 truncate text-base ${PRESS} ${selected ? "font-medium text-sidebar-foreground" : "text-muted-foreground group-hover:text-sidebar-foreground"}`;
+  // `transition-colors` only: font-weight is a discrete/variable-font property that cannot
+  // animate gracefully with a generic `transition`, which makes the text width drift during
+  // the 150ms window and shifts the truncation point — the visible "shake". Colour still
+  // fades smoothly while the weight snaps at the moment of the click instead.
+  `min-w-0 flex-1 truncate text-base transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${selected ? "font-medium text-sidebar-foreground" : "text-muted-foreground group-hover:text-sidebar-foreground"}`;
 
 /** Fades its content in after the shared patience delay, so a state that ends sooner (a quick restart) never shows at all. */
 function FadeIn(props: { children: JSX.Element }) {

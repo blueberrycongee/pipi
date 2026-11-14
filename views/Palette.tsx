@@ -29,12 +29,10 @@ import {
   isCurrentSessionArchived,
   isPaletteOpen,
   newSession,
-  newSessionInWorkspace,
   openDaemonSession,
   openSession,
   openWorkspace,
   projectCwdOf,
-  randomWallpaper,
   restartPi,
   runtimeMode,
   savedSessions,
@@ -42,8 +40,6 @@ import {
   sessionState,
   setCompareOpen,
   setPaletteOpen,
-  showAgentSettings,
-  showSettings,
   startRenaming,
   switchAgentHarness,
   thinkingLevels,
@@ -52,7 +48,7 @@ import {
   workspaceSessions,
 } from "../store/app";
 import { backend } from "../store/backend";
-import { type Appearance, language, type Language, recentWorkspaces, setAppearance, setLanguage, setSidebarOpen, sidebarOpen } from "../store/prefs";
+import { recentWorkspaces } from "../store/prefs";
 import { Icon, type IconName } from "../ui/Icon";
 import { DIALOG_RISE } from "../ui/motion";
 import { runtimeModeIcon, runtimeModeText, thinkingText, tr } from "../lib/i18n";
@@ -68,29 +64,10 @@ export function Palette() {
   const actions = computed<Action[]>(() => {
     const model = sessionState()?.model;
     const current = model ? `${model.provider}/${model.id}` : "";
-    const viewGroup = tr("View", "视图");
     const sessionGroup = tr("Session", "会话");
     const agentsGroup = tr("Agents & Orchestration", "多智能体与编排");
     const workspaceGroup = tr("Workspace", "工作区");
     const permissionModes: RuntimeMode[] = ["approval-required", "auto-accept-edits", "full-access"];
-    const theme = (value: Appearance, label: string, keywords: string[]): Action => ({
-      id: `theme:${value}`,
-      label: tr(`Appearance: ${label}`, `外观：${label}`),
-      group: viewGroup,
-      keywords,
-      icon: "eye",
-      checked: false,
-      run: () => setAppearance(value),
-    });
-    const lang = (value: Language, label: string, keywords: string[]): Action => ({
-      id: `language:${value}`,
-      label: tr(`Language: ${label}`, `语言：${label}`),
-      group: viewGroup,
-      keywords,
-      icon: "sliders",
-      checked: language() === value,
-      run: () => setLanguage(value),
-    });
     return [
       { id: "new", label: tr("New Session", "新建会话"), group: sessionGroup, keywords: ["new session"], shortcut: "mod+n", icon: "pencil", run: () => void newSession() },
       { id: "rename", label: tr("Rename Session…", "重命名会话…"), group: sessionGroup, keywords: ["rename session"], icon: "pencil", run: startRenaming },
@@ -120,7 +97,6 @@ export function Palette() {
       { id: "copy", label: tr("Copy Last Reply", "复制最后一条回复"), group: sessionGroup, keywords: ["copy last reply"], icon: "copy", run: () => void copyLastReply() },
       { id: "export", label: tr("Export as HTML", "导出为 HTML"), group: sessionGroup, keywords: ["export html"], icon: "download", run: () => void exportHtml() },
       { id: "orchestrate", label: tr("Compare Agents…", "智能体并行对比…"), group: agentsGroup, keywords: ["orchestrate", "parallel", "compare", "subagent", "swarm", "编排", "并行", "对比", "子智能体"], shortcut: "mod+shift+o", icon: "fork", run: () => setCompareOpen(true) },
-      { id: "agents-settings", label: tr("Configure External Coding Agents…", "配置外部编码智能体…"), group: agentsGroup, keywords: ["claude", "codex", "opencode", "cursor", "acp", "agents", "智能体"], icon: "agents", run: () => showSettings("agents") },
       ...availableAgents()
         .filter((a) => a.available)
         .map(
@@ -161,40 +137,19 @@ export function Palette() {
           ]
         : []),
       { id: "restart", label: tr(`Restart ${activeAgent().name}`, `重启 ${activeAgent().name}`), group: workspaceGroup, keywords: ["restart", "pi", "agent"], icon: "refresh", run: () => void restartPi() },
-      ...[...new Set([workspacePath(), ...recentWorkspaces()].filter(Boolean))].flatMap((cwd): Action[] => {
+      ...[...new Set([workspacePath(), ...recentWorkspaces()].filter(Boolean))].map((cwd): Action => {
         const name = basename(cwd) || cwd;
         const short = tildePath(cwd, backend().home());
-        return [
-          {
-            id: `workspace:${cwd}`,
-            label: `${name} (${short})`,
-            group: workspaceGroup,
-            keywords: [name, short, "project", "workspace", "项目"],
-            icon: "folder",
-            checked: cwd === workspacePath(),
-            run: () => void openWorkspace(cwd),
-          },
-          {
-            id: `workspace-new:${cwd}`,
-            label: tr(`New Session in ${name}`, `在 ${name} 中新建会话`),
-            group: workspaceGroup,
-            keywords: [name, "new session", "新建会话"],
-            icon: "pencil",
-            run: () => void newSessionInWorkspace(cwd),
-          },
-        ];
+        return {
+          id: `workspace:${cwd}`,
+          label: `${name} (${short})`,
+          group: workspaceGroup,
+          keywords: [name, short, "project", "workspace", "项目"],
+          icon: "folder",
+          checked: cwd === workspacePath(),
+          run: () => void openWorkspace(cwd),
+        };
       }),
-      { id: "settings", label: tr("Settings", "设置"), group: viewGroup, keywords: ["settings", "preferences", "language", "语言"], shortcut: "mod+,", icon: "sliders", run: () => showSettings() },
-      { id: "archive-settings", label: tr("Archive", "归档管理"), group: viewGroup, keywords: ["archive", "conversation", "restore", "delete", "归档", "会话", "恢复", "删除"], icon: "archive", run: () => showSettings("archive") },
-      { id: "agent-settings", label: tr(`Configure ${activeAgent().name}…`, `配置 ${activeAgent().name}…`), group: viewGroup, keywords: ["providers", "api key", "credentials", "login", "密钥", "服务商"], icon: "plug", run: () => showAgentSettings() },
-      { id: "sidebar", label: sidebarOpen() ? tr("Hide Sidebar", "隐藏侧边栏") : tr("Show Sidebar", "显示侧边栏"), group: viewGroup, keywords: ["sidebar", "侧边栏"], shortcut: "mod+b", icon: "sidebar", run: () => setSidebarOpen(!sidebarOpen()) },
-      { id: "random-wallpaper", label: tr("Random Wallpaper", "随机壁纸"), group: viewGroup, keywords: ["wallpaper", "background", "random", "shuffle", "壁纸", "背景", "随机壁纸"], shortcut: "mod+u", icon: "shuffle", run: () => void randomWallpaper() },
-      theme("system", tr("System", "跟随系统"), ["theme", "appearance", "system"]),
-      theme("light", tr("Light", "浅色"), ["theme", "appearance", "light"]),
-      theme("dark", tr("Dark", "深色"), ["theme", "appearance", "dark"]),
-      lang("system", tr("System", "跟随系统"), ["language", "locale", "system", "语言", "跟随系统"]),
-      lang("en", "English", ["language", "locale", "english", "英文", "英语", "语言"]),
-      lang("zh", "中文", ["language", "locale", "chinese", "zh", "中文", "汉语", "语言"]),
       ...thinkingLevels().map(
         (level): Action => ({
           id: `thinking:${level}`,
@@ -222,7 +177,7 @@ export function Palette() {
           const list = cwd === activeProjectPath() ? savedSessions() : (workspaceSessions()[cwd] ?? []);
           return list.map((session) => ({ cwd, session }));
         })
-        .slice(0, 60)
+        .slice(0, 20)
         .map(({ cwd, session }): Action => {
           const folder = basename(cwd);
           const multi = recentWorkspaces().length > 1;
@@ -259,7 +214,7 @@ export function Palette() {
           };
         }),
       ...archivedSessionItems()
-        .slice(0, 40)
+        .slice(0, 15)
         .map(({ cwd, session }): Action => {
           const folder = basename(cwd);
           const multi = recentWorkspaces().length > 1;

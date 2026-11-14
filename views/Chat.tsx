@@ -948,8 +948,15 @@ export function Chat() {
       arrivedAt = tick;
       if (reduceMotion()) pane.set(1);
       else {
-        if (!dimmed) pane.set(0);
-        void pane.timing(1, { duration: ARRIVE_MS, easing: EASING.out });
+        // Only snap to 0 and fade in when the pane was actually dimmed by a
+        // leaving animation. For sessions shown immediately (visited cache or
+        // welcome), the pane is already at 1 — snapping it to 0 first causes
+        // a visible flash/flicker before fading back in.
+        if (dimmed) {
+          void pane.timing(1, { duration: ARRIVE_MS, easing: EASING.out });
+        } else {
+          pane.set(1);
+        }
       }
       dimmed = false;
     });

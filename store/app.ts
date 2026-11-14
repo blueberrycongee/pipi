@@ -48,7 +48,7 @@ import { type Row, Transcript, withoutImageNotes } from "../pi/transcript";
 import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
-import { backend } from "./backend";
+import { backend, NoPickerError } from "./backend";
 import { startAppUpdateChecks, stopAppUpdateChecks } from "./update";
 import {
   addCustomAgentPref,
@@ -347,9 +347,14 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
       shownVersion = -1;
       markTranscriptSeen();
     }
+    // Only dim out the old content when there is actual content to leave behind.
+    // A welcome/empty screen has nothing to fade — the new session's loading state
+    // shows immediately instead, preventing a confusing blank white flash that
+    // looks like a new session was created.
+    const hadContent = rows().length > 0;
     batch(() => {
       heading.set(target);
-      leaving.set(!shown && (leaving() || warm));
+      leaving.set(!shown && hadContent && (leaving() || warm));
       if (shown) {
         flush();
         landed.update((n) => n + 1);
@@ -730,23 +735,28 @@ function flush() {
 /**
  * Sets the open conversation aside for `visited` as a session change leaves
  * it, a new transcript taking its place. Its rows stay on screen until the
- * next flush: the chat dims them while the destination loads. A run is not
- * set aside here — the daemon keeps its process, and re-opening the session
- * re-attaches to it with the agent's own history.
+ * next flush: the chat dims them while the destination loads. Running sessions
+ * are stashed too — the daemon keeps the process, and when the user switches
+ * back the stashed rows (including any in-progress thinking) are shown at once
+ * while the re-attached event stream catches up.
  */
 function stashTranscript() {
   const shownAhead = ahead?.transcript === transcript ? ahead : undefined;
   ahead = undefined;
   const file = shownAhead ? shownAhead.file : phase().name === "ready" ? state()?.sessionFile : undefined;
-  if (!file || running() || bashRunning() || !transcript.rows().length) return;
+  // Always give the next session a fresh transcript; keep the previous one for
+  // immediate restore. bashRunning is not stashed — a shell task has no rows
+  // of its own to preserve. An empty transcript is not worth caching.
+  const previous = transcript;
+  transcript = new Transcript(() => activeLanguage());
+  shownVersion = -1;
+  if (!file || bashRunning() || !previous.rows().length) return;
   visited.delete(file);
-  visited.set(file, transcript);
+  visited.set(file, previous);
   for (const oldest of visited.keys()) {
     if (visited.size <= VISITED_LIMIT) break;
     visited.delete(oldest);
   }
-  transcript = new Transcript(() => activeLanguage());
-  shownVersion = -1;
 }
 
 /** Whether two transcripts show the same conversation (row ids are minted per transcript and never match). */
@@ -760,6 +770,11 @@ function sameRows(a: Row[], b: Row[]) {
  * Puts the open session's messages on screen. A conversation shown ahead from
  * `visited` that the agent's history matches stays as it is — the same rows,
  * nothing for the list to do; one that moved on since is replaced.
+ *
+ * When switching back to a still-running session the agent's history does not
+ * include the in-progress message yet, so it has fewer rows than what the
+ * stash showed. Keep the stash in that case — the re-attached event stream
+ * will fill in what happens next without a visible gap.
  */
 function landHistory(messages: AgentMessage[]) {
   const shown = ahead?.transcript === transcript;
@@ -769,6 +784,10 @@ function landHistory(messages: AgentMessage[]) {
     const fresh = new Transcript(() => activeLanguage());
     fresh.load(messages);
     if (sameRows(fresh.rows(), transcript.rows())) return;
+    // The agent's history lags the stashed view: an in-progress run has not
+    // yet written its streaming message to the session file. Keep showing the
+    // stash so the thinking rows stay on screen while the stream catches up.
+    if (fresh.rows().length < transcript.rows().length) return;
     transcript = fresh;
     shownVersion = -1;
   } else {
@@ -1498,9 +1517,29 @@ export async function createAndOpenWorktree(label = "session") {
   await openWorkspace(wt.path);
 }
 
+/**
+ * Runs a desktop pick; resolves `undefined` on cancel, and toasts the one
+ * failure worth naming — a Linux box with neither zenity nor kdialog, where
+ * the panel silently cannot appear.
+ */
+async function pickOrToast(pick: Promise<string | undefined>): Promise<string | undefined> {
+  try {
+    return await pick;
+  } catch (error) {
+    if (error instanceof NoPickerError) {
+      toast(
+        "warning",
+        tr("No file picker found — install zenity or kdialog to choose files.", "找不到文件选择器——请安装 zenity 或 kdialog。"),
+      );
+      return undefined;
+    }
+    throw error;
+  }
+}
+
 /** Asks for a folder with the system's panel, and opens it. */
 export async function chooseWorkspace() {
-  const path = await backend().pickFolder(tr("Choose a folder to work in", "选择工作文件夹"));
+  const path = await pickOrToast(backend().pickFolder(tr("Choose a folder to work in", "选择工作文件夹")));
   if (path) {
     setWorkspaceCollapsed(path, false);
     await openWorkspace(path);
@@ -2903,7 +2942,7 @@ async function applyWallpaperFile(sourcePath: string, recordInHistory = true): P
 export async function chooseWallpaperImage(): Promise<boolean> {
   const picker = backend().pickImage;
   if (!picker) return false;
-  const picked = await picker(tr("Choose wallpaper", "选择壁纸图片"));
+  const picked = await pickOrToast(picker(tr("Choose wallpaper", "选择壁纸图片")));
   if (!picked) return false;
   const ok = await attempt(tr("Could not set background image", "无法设置背景图片"), () =>
     applyWallpaperFile(picked, isPathInsideFolder(picked, wallpaperFolder())),
@@ -2941,7 +2980,7 @@ export function setWallpaperThemeColors(enabled: boolean) {
 }
 
 export async function chooseWallpaperFolder() {
-  const picked = await backend().pickFolder(tr("Choose wallpaper folder", "选择壁纸文件夹"));
+  const picked = await pickOrToast(backend().pickFolder(tr("Choose wallpaper folder", "选择壁纸文件夹")));
   if (!picked) return;
   setWallpaperFolderPref(picked);
   await randomWallpaper(picked);
