@@ -15,6 +15,7 @@ import {
 import { AlertDialog } from "nsh/base";
 import { Application, currentWindow, isAvailable, Menu, titleBar, Window } from "nsh/desktop";
 import { tr } from "../lib/i18n";
+import { DYNAMIC_WALLPAPER_ENABLED } from "../lib/wallpaper";
 import {
   activeDaemonSessionCount,
   canArchiveCurrentSession,
@@ -67,7 +68,12 @@ import { Sidebar } from "./Sidebar";
 import { TitleBar } from "./TitleBar";
 import { Toasts } from "./Toasts";
 import { UpdateCard } from "./UpdateCard";
-import { WallpaperUnderlay } from "./Wallpaper";
+import {
+  notifyWallpaperClick,
+  notifyWallpaperPointerLeave,
+  notifyWallpaperPointerMove,
+  WallpaperUnderlay,
+} from "./Wallpaper";
 
 /**
  * Minimum horizontal room to the right of `titleBar().left` (macOS traffic
@@ -556,7 +562,37 @@ export function Shell() {
   keymap.bind("escape", escape);
 
   return (
-    <View class="flex-1 flex-row bg-background">
+    <View
+      class="flex-1 flex-row bg-background"
+      onMouseMove={
+        DYNAMIC_WALLPAPER_ENABLED
+          ? (e) => {
+              notifyWallpaperPointerMove(e.pagePosition.x, e.pagePosition.y);
+            }
+          : undefined
+      }
+      onMouseLeave={
+        DYNAMIC_WALLPAPER_ENABLED
+          ? () => {
+              notifyWallpaperPointerLeave();
+            }
+          : undefined
+      }
+      onMouseUp={
+        DYNAMIC_WALLPAPER_ENABLED
+          ? (e) => {
+              if (
+                currentView().name === "chat" &&
+                !isPaletteOpen() &&
+                !isCompareOpen() &&
+                !pendingDialog()
+              ) {
+                notifyWallpaperClick(e.pagePosition.x, e.pagePosition.y);
+              }
+            }
+          : undefined
+      }
+    >
       <SidebarSplit>
         <Chat />
         <TitleBar />

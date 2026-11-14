@@ -3,6 +3,7 @@ import { Command, type CommandItem, Dialog } from "nsh/base";
 import { runtimeModeRank } from "../agents/catalog";
 import type { RuntimeMode } from "../agents/types";
 import { basename, tildePath } from "../lib/format";
+import { DYNAMIC_WALLPAPER_ENABLED, WALLPAPER_PRESET_META, WALLPAPER_PRESETS } from "../lib/wallpaper";
 import { sessionTitle } from "../pi/sessions";
 import {
   activeAgent,
@@ -33,6 +34,7 @@ import {
   openSession,
   openWorkspace,
   projectCwdOf,
+  randomWallpaper,
   restartPi,
   runtimeMode,
   savedSessions,
@@ -40,10 +42,14 @@ import {
   sessionState,
   setCompareOpen,
   setPaletteOpen,
+  setWallpaperPreset,
   startRenaming,
   switchAgentHarness,
   thinkingLevels,
+  toggleWallpaperPaused,
   unarchiveCurrentSession,
+  wallpaper,
+  wallpaperPaused,
   workspacePath,
   workspaceSessions,
 } from "../store/app";
@@ -137,6 +143,37 @@ export function Palette() {
           ]
         : []),
       { id: "restart", label: tr(`Restart ${activeAgent().name}`, `重启 ${activeAgent().name}`), group: workspaceGroup, keywords: ["restart", "pi", "agent"], icon: "refresh", run: () => void restartPi() },
+      { id: "wallpaper-random", label: tr("Random Wallpaper", "随机切换壁纸"), group: workspaceGroup, keywords: ["wallpaper", "random", "shuffle", "壁纸", "随机"], shortcut: "mod+u", icon: "shuffle", run: () => void randomWallpaper() },
+      ...(DYNAMIC_WALLPAPER_ENABLED && wallpaper()
+        ? [
+            {
+              id: "wallpaper-toggle-pause",
+              label: wallpaperPaused()
+                ? tr("Resume Dynamic Wallpaper", "继续播放动态壁纸")
+                : tr("Pause Dynamic Wallpaper", "暂停动态壁纸"),
+              group: workspaceGroup,
+              keywords: ["wallpaper", "pause", "resume", "video", "dynamic", "壁纸", "暂停", "动态壁纸"],
+              icon: "image" as const,
+              run: toggleWallpaperPaused,
+            },
+          ]
+        : []),
+      ...(DYNAMIC_WALLPAPER_ENABLED
+        ? WALLPAPER_PRESETS.map(
+            (preset): Action => ({
+              id: `wallpaper-preset:${preset}`,
+              label: tr(
+                `Live Wallpaper: ${WALLPAPER_PRESET_META[preset].name}`,
+                `动态壁纸：${WALLPAPER_PRESET_META[preset].name}`,
+              ),
+              group: workspaceGroup,
+              keywords: ["wallpaper", "live", "dynamic", "shader", preset, WALLPAPER_PRESET_META[preset].name, "动态壁纸"],
+              icon: "image",
+              checked: wallpaper()?.kind === "shader" && wallpaper()?.preset === preset,
+              run: () => void setWallpaperPreset(preset),
+            }),
+          )
+        : []),
       ...[...new Set([workspacePath(), ...recentWorkspaces()].filter(Boolean))].map((cwd): Action => {
         const name = basename(cwd) || cwd;
         const short = tildePath(cwd, backend().home());

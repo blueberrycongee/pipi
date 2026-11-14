@@ -1,0 +1,213 @@
+{
+  "sets": [
+    {
+      "id": "nocturnes",
+      "title": "Nocturnes",
+      "pictures": [
+        {
+          "id": "rhone",
+          "title": "Starry Night Over the Rhône",
+          "by": "Vincent van Gogh, 1888",
+          "page": "https://artvee.com/dl/starry-night-over-the-rhone/",
+          "license": "Public domain",
+          "coat": "black"
+        },
+        {
+          "id": "road",
+          "title": "The Turn of the Road",
+          "by": "John Atkinson Grimshaw, c. 1884",
+          "page": "https://artvee.com/dl/the-turn-of-the-road/",
+          "license": "Public domain",
+          "coat": "ghost"
+        },
+        {
+          "id": "rookery",
+          "title": "The Rookery",
+          "by": "John Atkinson Grimshaw",
+          "page": "https://artvee.com/dl/the-rookery/",
+          "license": "Public domain",
+          "coat": "ghost"
+        },
+        {
+          "id": "whistler",
+          "title": "Nocturne: Palaces",
+          "by": "James Abbott McNeill Whistler, 1879–80",
+          "page": "https://artvee.com/dl/nocturne-palaces/",
+          "license": "Public domain",
+          "coat": "ghost"
+        },
+        {
+          "id": "turner",
+          "title": "Keelmen Heaving in Coals by Moonlight",
+          "by": "J. M. W. Turner, 1835",
+          "page": "https://artvee.com/dl/keelmen-heaving-in-coals-by-moonlight/",
+          "license": "Public domain",
+          "coat": "ghost"
+        },
+        {
+          "id": "blakelock",
+          "title": "Moonlight, Indian Encampment",
+          "by": "Ralph Albert Blakelock",
+          "page": "https://artvee.com/dl/moonlight-indian-encampment/",
+          "license": "Public domain",
+          "coat": "ghost"
+        }
+      ]
+    },
+    {
+      "id": "ukiyo-e",
+      "title": "Ukiyo-e",
+      "pictures": [
+        {
+          "id": "ohashi",
+          "title": "Ohashi Atake no Yūdachi",
+          "by": "Utagawa Hiroshige, 1857",
+          "page": "https://artvee.com/dl/ohashi-atake-no-yudachi/",
+          "license": "Public domain",
+          "coat": "ghost",
+          "effect": "halftone"
+        },
+        {
+          "id": "karasaki",
+          "title": "Night Rain at Karasaki",
+          "by": "Utagawa Hiroshige, 1834",
+          "page": "https://artvee.com/dl/night-rain-at-karasaki/",
+          "license": "Public domain",
+          "coat": "ghost",
+          "effect": "halftone"
+        },
+        {
+          "id": "waterwheel",
+          "title": "The Waterwheel at Onden",
+          "by": "Katsushika Hokusai, c. 1831–34",
+          "page": "https://artvee.com/dl/the-waterwheel-at-onden/",
+          "license": "Public domain",
+          "coat": "ghost",
+          "effect": "halftone"
+        }
+      ]
+    },
+    {
+      "id": "anime",
+      "title": "Anime Nights",
+      "pictures": [
+        {
+          "id": "kimi-no-na-wa",
+          "title": "Kimi no Na Wa — Night Sky",
+          "by": "Makoto Shinkai",
+          "src": "https://w.wallhaven.cc/full/5d/wallhaven-5d8jq3.png",
+          "license": "fan art",
+          "coat": "ghost"
+        },
+        {
+          "id": "kimi-stars",
+          "title": "Kimi no Na Wa — Starry Low Angle",
+          "by": "Makoto Shinkai",
+          "src": "https://w.wallhaven.cc/full/eo/wallhaven-eo1prk.png",
+          "license": "fan art",
+          "coat": "ghost",
+          "focalX": 0.5,
+          "focalY": 0.3
+        },
+        {
+          "id": "yoasobi-stars",
+          "title": "YOASOBI — Starry Night",
+          "by": "YOASOBI anime artwork",
+          "src": "https://w.wallhaven.cc/full/l8/wallhaven-l8zly2.png",
+          "license": "fan art",
+          "coat": "ghost",
+          "focalX": 0.5,
+          "focalY": 0.4
+        },
+        {
+          "id": "rain-crosswalk",
+          "title": "Rain at the Crosswalk",
+          "by": "catzz",
+          "src": "https://w.wallhaven.cc/full/md/wallhaven-md3wd9.jpg",
+          "license": "fan art",
+          "coat": "ghost"
+        },
+        {
+          "id": "fireworks-sea",
+          "title": "Fireworks over the Sea",
+          "by": "anime artwork",
+          "src": "https://w.wallhaven.cc/full/zm/wallhaven-zm721v.png",
+          "license": "fan art",
+          "coat": "ghost"
+        }
+      ]
+    },
+    {
+      "id": "cyberpunk",
+      "title": "Cyberpunk & Neon",
+      "pictures": [
+        {
+          "id": "edgerunners",
+          "title": "Cyberpunk: Edgerunners — Neon Night",
+          "by": "Trigger / Studio Orange",
+          "src": "https://w.wallhaven.cc/full/ex/wallhaven-ex6zmw.png",
+          "license": "fan art",
+          "coat": "black"
+        },
+        {
+          "id": "rain-city",
+          "title": "Rain Night City",
+          "by": "anime artwork",
+          "src": "https://w.wallhaven.cc/full/96/wallhaven-96pzpw.jpg",
+          "license": "fan art",
+          "coat": "ghost"
+        },
+        {
+          "id": "night-city-stars",
+          "title": "Night City & Stars",
+          "by": "anime artwork",
+          "src": "https://w.wallhaven.cc/full/8x/wallhaven-8xrg1o.jpg",
+          "license": "fan art",
+          "coat": "ghost"
+        }
+      ]
+    },
+    {
+      "id": "cosmic",
+      "title": "Cosmic",
+      "pictures": [
+        {
+          "id": "jwst-deep",
+          "title": "Webb's First Deep Field",
+          "by": "NASA / ESA / CSA, 2022",
+          "src": "https://upload.wikimedia.org/wikipedia/commons/b/bf/Webb%27s_First_Deep_Field.jpg",
+          "license": "Public domain",
+          "coat": "ghost"
+        },
+        {
+          "id": "pillars",
+          "title": "Pillars of Creation",
+          "by": "NASA / ESA / CSA / STScI, 2022",
+          "src": "https://upload.wikimedia.org/wikipedia/commons/f/f1/Pillars_of_Creation_%28NIRCam_Image%29.jpg",
+          "license": "Public domain",
+          "coat": "ghost",
+          "focalX": 0.5,
+          "focalY": 0.4
+        },
+        {
+          "id": "hubble-deep",
+          "title": "Hubble Ultra Deep Field",
+          "by": "NASA / ESA, 2004",
+          "src": "https://upload.wikimedia.org/wikipedia/commons/2/2f/Hubble_ultra_deep_field.jpg",
+          "license": "Public domain",
+          "coat": "ghost"
+        },
+        {
+          "id": "andromeda",
+          "title": "Andromeda Galaxy",
+          "by": "Adam Evans (CC BY 2.0)",
+          "src": "https://upload.wikimedia.org/wikipedia/commons/9/98/Andromeda_Galaxy_%28with_h-alpha%29.jpg",
+          "license": "CC BY 2.0",
+          "coat": "ghost",
+          "focalX": 0.5,
+          "focalY": 0.6
+        }
+      ]
+    }
+  ]
+}

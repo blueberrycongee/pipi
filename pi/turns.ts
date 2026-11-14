@@ -76,6 +76,10 @@ export interface TurnHeaderRow {
   hasDetails: boolean;
   /** The step the turn is on, for the header of a folded running turn. */
   activeStep?: Extract<Row, { kind: "thinking" }> | ToolRow;
+  /** A background task still running after the turn settled, shown on a folded settled header. */
+  backgroundStep?: ToolRow;
+  /** Tools run in a settled, folded turn that ended without a prose answer, so its header says what was done. */
+  summaryTools?: readonly ToolRow[];
 }
 
 export type DisplayRow = Exclude<Row, ToolRow> | ActivityRow | TurnHeaderRow;
@@ -205,8 +209,8 @@ export function extractDiffStats(row: ToolRow): DiffStats | undefined {
     }
     if (added > 0 || removed > 0) return { added, removed };
   }
-  const oldStr = pickStr(row.args, "oldText", "old_string", "old_str");
-  const newStr = pickStr(row.args, "newText", "new_string", "new_str", "content");
+  const oldStr = pickStr(row.args, "oldText", "old_string", "old_str", "Target");
+  const newStr = pickStr(row.args, "newText", "new_string", "new_str", "content", "Replacement", "Content");
   if (oldStr || newStr) {
     const oldLines = oldStr ? oldStr.split("\n").length : 0;
     const newLines = newStr ? newStr.split("\n").length : 0;
@@ -252,7 +256,7 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
 
   switch (category) {
     case "read": {
-      const rawPath = pickStr(args, "path", "file_path", "filePath", "file", "target_file");
+      const rawPath = pickStr(args, "path", "Path", "file_path", "filePath", "file", "target_file");
       const offset = pickNum(args, "offset", "start_line", "startLine", "StartLine");
       const limit = pickNum(args, "limit", "end_line", "endLine", "EndLine");
       let range = "";
@@ -274,7 +278,7 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
     }
 
     case "edit": {
-      const rawPath = pickStr(args, "path", "file_path", "filePath", "file", "target_file");
+      const rawPath = pickStr(args, "path", "Path", "file_path", "filePath", "file", "target_file");
       const verb = active ? (zh ? "正在更新" : "Updating") : failed ? (zh ? "更新失败" : "Failed to update") : zh ? "更新" : "Updated";
       return {
         category,
@@ -288,7 +292,7 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
     }
 
     case "create": {
-      const rawPath = pickStr(args, "path", "file_path", "filePath", "file", "target_file");
+      const rawPath = pickStr(args, "path", "Path", "file_path", "filePath", "file", "target_file");
       const verb = active ? (zh ? "正在写入" : "Writing") : failed ? (zh ? "写入失败" : "Failed to write") : zh ? "写入" : "Wrote";
       return {
         category,
@@ -302,8 +306,8 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
     }
 
     case "search": {
-      const pattern = pickStr(args, "pattern", "query", "search", "regex", "glob");
-      const scope = shortFileTarget(pickStr(args, "path", "dir", "directory", "include", "glob"));
+      const pattern = pickStr(args, "pattern", "Pattern", "query", "Query", "search", "regex", "glob");
+      const scope = shortFileTarget(pickStr(args, "path", "Path", "SearchPath", "SearchDirectory", "dir", "directory", "include", "glob"));
       const isFind = subkind === "find";
       const verb = isFind
         ? active
@@ -323,7 +327,7 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
     }
 
     case "list": {
-      const dir = shortFileTarget(pickStr(args, "path", "dir", "directory"));
+      const dir = shortFileTarget(pickStr(args, "path", "Path", "DirectoryPath", "dir", "directory"));
       const verb = active ? (zh ? "正在查看目录" : "Listing") : zh ? "查看目录" : "Listed";
       return {
         category,
@@ -406,7 +410,7 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
     }
 
     case "web": {
-      const query = pickStr(args, "query", "url", "q", "prompt");
+      const query = pickStr(args, "query", "Query", "url", "Url", "q", "prompt");
       const isFetch = subkind === "fetch";
       const verb = isFetch
         ? active
@@ -494,7 +498,7 @@ const verbOf = (key: SegmentKey, running: boolean, zh: boolean) => {
 
 const truncate = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
-const toolPath = (tool: ToolRow) => pickStr(tool.args ?? {}, "path", "file_path", "filePath", "file", "target_file", "notebook_path");
+const toolPath = (tool: ToolRow) => pickStr(tool.args ?? {}, "path", "Path", "file_path", "filePath", "file", "target_file", "notebook_path");
 
 /** The program a command line runs, for a settled row: `cd x && git status | head` reads as `git`. */
 function commandProgram(command: string): string {
@@ -510,7 +514,7 @@ function commandProgram(command: string): string {
 }
 
 function searchTarget(tool: ToolRow): string {
-  const pattern = pickStr(tool.args ?? {}, "pattern", "query", "search", "regex", "glob", "q", "url").replace(/^\*\*\//, "");
+  const pattern = pickStr(tool.args ?? {}, "pattern", "Pattern", "query", "Query", "search", "regex", "glob", "q", "url", "Url").replace(/^\*\*\//, "");
   return pattern ? truncate(pattern, 48) : "";
 }
 
@@ -527,7 +531,7 @@ function toolLine(tool: ToolRow, running: boolean, zh: boolean): string {
       return `${verb} ${path ? basename(path) : zh ? "文件" : "file"}`;
     }
     case "list": {
-      const dir = pickStr(args, "path", "dir", "directory");
+      const dir = pickStr(args, "path", "Path", "DirectoryPath", "dir", "directory");
       return `${verb} ${dir && dir !== "." ? basename(dir) : zh ? "当前目录" : "current directory"}`;
     }
     case "search": {
@@ -620,17 +624,24 @@ function currentLine(steps: readonly ProcessStep[], zh: boolean): string {
   return toolLine(last, false, zh);
 }
 
+/** Compact summary of settled tool calls by kind, in first-seen order ("Ran git, Read 3 files"). */
+export function describeToolsSummary(tools: readonly ToolRow[], lang: Lang): string {
+  if (tools.length === 0) return "";
+  const zh = lang === "zh";
+  const groups = new Map<SegmentKey, ToolRow[]>();
+  for (const tool of tools) {
+    const key = segmentKey(classifyTool(tool.name).category);
+    groups.set(key, [...(groups.get(key) ?? []), tool]);
+  }
+  return [...groups].map(([key, list]) => segmentLine(key, list, zh)).join(zh ? "，" : ", ");
+}
+
 /** The line of a grouped process run: the step under way while it works, what it did by kind once settled. */
 export function describeActivity(row: ActivityRow, lang: Lang): string {
   const zh = lang === "zh";
   if (row.running) return currentLine(row.steps, zh);
   if (row.tools.length === 0) return zh ? "查看思考过程" : "View reasoning";
-  const groups = new Map<SegmentKey, ToolRow[]>();
-  for (const tool of row.tools) {
-    const key = segmentKey(classifyTool(tool.name).category);
-    groups.set(key, [...(groups.get(key) ?? []), tool]);
-  }
-  return [...groups].map(([key, tools]) => segmentLine(key, tools, zh)).join(zh ? "，" : ", ");
+  return describeToolsSummary(row.tools, lang);
 }
 
 /** Single-line snippet from reasoning text for collapsed previews. */
@@ -742,8 +753,12 @@ export function buildDisplayRows(
     const first = row;
     const process: DisplayRow[] = [];
     const answer: DisplayRow[] = [];
+    const turnTools: ToolRow[] = [];
     let steps: ProcessStep[] = [];
     let activeStep: TurnHeaderRow["activeStep"];
+    let backgroundStep: ToolRow | undefined;
+    let totalTurnMs = first.turnMs;
+    let tailClosed = first.turnMs !== undefined;
     const flushSteps = () => {
       if (steps.length) process.push(activityOf(steps));
       steps = [];
@@ -751,10 +766,24 @@ export function buildDisplayRows(
     for (; i < rows.length; i++) {
       const cur = rows[i];
       if (!isTurnRow(cur)) break;
-      if (cur !== first && cur.turnStart) break;
+      // A promptless wake (`turnStart`) opens its own visual turn once the preceding
+      // turn has answered; consecutive unanswered slices belong to one continuous wake.
+      if (cur !== first && cur.turnStart) {
+        if (answer.length > 0) break;
+        if (cur.turnMs !== undefined) {
+          totalTurnMs = (totalTurnMs ?? 0) + cur.turnMs;
+          tailClosed = true;
+        } else {
+          tailClosed = false;
+        }
+      }
       if (cur.kind === "tool" || cur.kind === "thinking") {
         steps.push(cur);
         activeStep = cur;
+        if (cur.kind === "tool") {
+          turnTools.push(cur);
+          if (cur.background && isToolActive(cur.status)) backgroundStep = cur;
+        }
         continue;
       }
       // Prose with nothing to read yet (a provider's placeholder) takes no row and breaks no run of steps.
@@ -766,10 +795,13 @@ export function buildDisplayRows(
     flushSteps();
 
     const answered = answer.length > 0;
+    const durationMs = tailClosed ? totalTurnMs : undefined;
     // The turn the run is on: the last one, with no answer yet, and not closed. A run that
     // stopped or failed closed its turn (`turnMs`): the next run is not that turn going on,
     // though for a moment — the message sent, its row not here yet — it is still the last.
-    const running = sessionRunning && i === rows.length && !answered && first.turnMs === undefined;
+    // Bubbles the queue still holds trail the end but were not sent into the run: they
+    // cut nothing short — the turn goes on until their echo lands them among the rows.
+    const running = sessionRunning && rows.slice(i).every((rest) => rest.kind === "user" && rest.queued) && !answered && !tailClosed;
     const hasDetails = process.length > 0;
     const id = `turn:${first.id}`;
     const chosen = folds.chosen?.(id);
@@ -780,17 +812,19 @@ export function buildDisplayRows(
     // it goes on, until they unfold the turn it is on by then, or it is answered.
     const said = folds.said?.(id);
     hushed = !answered && (said === undefined ? hushed : !said);
-    if (hasDetails || running || first.turnMs !== undefined) {
+    if (hasDetails || running || durationMs !== undefined) {
       out.push({
         kind: "turn",
         id,
         running,
         startedAt: first.t0,
-        durationMs: first.turnMs,
+        durationMs,
         open,
         hasDetails,
         // Only a folded running turn shows its step; left out otherwise, the header does not change with every delta.
         activeStep: running && !open ? activeStep : undefined,
+        backgroundStep: !running && !open ? backgroundStep : undefined,
+        summaryTools: !running && !open && !answered && !backgroundStep && turnTools.length > 0 ? turnTools : undefined,
       });
     }
     if (open || (hasDetails && folds.keepMounted?.(id))) {
@@ -808,7 +842,16 @@ function sameRow(a: DisplayRow, b: DisplayRow): boolean {
   if (a === b) return true;
   if (a.kind === "activity" && b.kind === "activity") return sameList(a.steps, b.steps);
   if (a.kind === "turn" && b.kind === "turn") {
-    return a.running === b.running && a.startedAt === b.startedAt && a.durationMs === b.durationMs && a.open === b.open && a.hasDetails === b.hasDetails && a.activeStep === b.activeStep;
+    return (
+      a.running === b.running &&
+      a.startedAt === b.startedAt &&
+      a.durationMs === b.durationMs &&
+      a.open === b.open &&
+      a.hasDetails === b.hasDetails &&
+      a.activeStep === b.activeStep &&
+      a.backgroundStep === b.backgroundStep &&
+      sameList(a.summaryTools ?? [], b.summaryTools ?? [])
+    );
   }
   return false;
 }

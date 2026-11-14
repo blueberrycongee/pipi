@@ -70,6 +70,17 @@ function checkDevinAuth() {
   return "ACP ready";
 }
 
+function checkAntigravityAuth() {
+  const key = resolveAgentApiKey("antigravity", "GEMINI_API_KEY") || resolveAgentApiKey("antigravity", "GOOGLE_API_KEY");
+  if (key) return key.source === "auth" ? "API key saved" : "API key in env";
+  const dir = process.env.ANTIGRAVITY_CLI_HOME || path.join(os.homedir(), ".gemini", "antigravity-cli");
+  const authMarkers = ["oauth_creds.json", "google_accounts.json", "credentials.json", "auth.json", "token.json", "state.json", "brain"];
+  if (authMarkers.some((name) => fs.existsSync(path.join(dir, name)))) return "Signed in";
+  const sharedGeminiAuth = path.join(os.homedir(), ".gemini", "oauth_creds.json");
+  if (fs.existsSync(sharedGeminiAuth)) return "Signed in";
+  return "Installed (run `agy acp --login` to sign in)";
+}
+
 function checkGenericAuth(id, envVar, configDir) {
   return () => {
     const key = envVar ? resolveAgentApiKey(id, envVar) : undefined;
@@ -294,13 +305,13 @@ const SPECS = [
     protocol: "acp",
     binary: "agy",
     fallbackBinaries: ["agy_acp_server"],
-    description: "Google Antigravity agent harness (`agy acp` / `agy_acp_server`).",
+    description: "Google Antigravity agent harness (`agy acp --process-per-session` / `agy_acp_server`).",
     models: defaultModelEntry("antigravity", "Antigravity"),
     supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
     supportsResume: true,
-    docsUrl: "https://antigravity.google/docs/ide/extensions",
+    docsUrl: "https://antigravity.google/docs",
     category: "acp",
-    authFn: checkGenericAuth("antigravity", undefined, path.join(os.homedir(), ".gemini", "antigravity-cli")),
+    authFn: checkAntigravityAuth,
   },
   {
     id: "hermes",

@@ -214,7 +214,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       sessionName,
       autoCompactionEnabled,
       messageCount: messages.length,
-      pendingMessageCount: 0,
+      pendingMessageCount: queued.steering.length + queued.followUp.length,
     });
     let out: (chunk: string) => void = () => undefined;
     let exit: (exit: Exit) => void = () => undefined;
@@ -234,6 +234,73 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
 
     /** One run: thinking, a tool call that "executes", then streamed prose. */
     const uiWaiters = new Map<string, (response: Record<string, unknown>) => void>();
+
+    const dequeueNextBatch = (): string[] => {
+      if (queued.steering.length > 0) {
+        return steeringMode === "all" ? queued.steering.splice(0) : [queued.steering.shift()!];
+      }
+      if (queued.followUp.length > 0) {
+        return followUpMode === "all" ? queued.followUp.splice(0) : [queued.followUp.shift()!];
+      }
+      return [];
+    };
+
+    const bumpListedSession = () => {
+      if (!sessionFile) return;
+      const listed = byWorkspace[cwd] ?? sessions;
+      const known = listed.find((s) => s.path === sessionFile);
+      if (!known) return;
+      const updated = { ...known, messageCount: known.messageCount + 1, modified: Date.now() };
+      const relisted = [updated, ...listed.filter((s) => s.path !== sessionFile)];
+      if (byWorkspace[cwd]) byWorkspace[cwd] = relisted;
+      else sessions = relisted;
+    };
+
+    async function drainQueuedTurns(
+      step: (record: object) => Promise<void>,
+      update: (event: object) => Promise<void>,
+      recordMessage: (msg: AgentMessage) => void,
+    ) {
+      while (!aborted) {
+        const batch = dequeueNextBatch();
+        if (batch.length === 0) break;
+        emit({ type: "queue_update", steering: [...queued.steering], followUp: [...queued.followUp] });
+        await step({ type: "agent_start" });
+        await step({ type: "turn_start" });
+        for (const text of batch) {
+          if (aborted) break;
+          bumpListedSession();
+          const queuedUser: AgentMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+          await step({ type: "message_start", message: queuedUser });
+          await step({ type: "message_end", message: queuedUser });
+          recordMessage(queuedUser);
+        }
+        if (aborted) break;
+        const replyText = options.reply ?? REPLY;
+        const queuedReply: AgentMessage = {
+          role: "assistant",
+          content: [{ type: "text", text: replyText }],
+          provider: "anthropic",
+          model: "claude-sonnet-4-5",
+          usage,
+          stopReason: "stop",
+          timestamp: Date.now(),
+        };
+        await step({ type: "message_start", message: { ...queuedReply, content: [], stopReason: "pending" } });
+        await update({ type: "text_start", contentIndex: 0 });
+        for (const piece of replyText.match(/[\s\S]{1,24}/g) ?? []) await update({ type: "text_delta", contentIndex: 0, delta: piece });
+        await update({ type: "text_end", contentIndex: 0, content: replyText });
+        await step({ type: "message_end", message: queuedReply });
+        await step({ type: "turn_end" });
+        recordMessage(queuedReply);
+        emit({ type: "agent_end", willRetry: false });
+      }
+      if (aborted && (queued.steering.length > 0 || queued.followUp.length > 0)) {
+        queued.steering.length = 0;
+        queued.followUp.length = 0;
+        emit({ type: "queue_update", steering: [], followUp: [] });
+      }
+    }
 
     /** A longer run, as agents work: prose between steps, several tool calls at a time, then the answer. */
     async function runSteps(user: AgentMessage, step: (record: object) => Promise<void>, update: (event: object) => Promise<void>) {
@@ -326,8 +393,9 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         ],
       });
       await message({ thinking: options.reply ? "The user asked a follow-up; let me write the answer in full." : undefined, text: options.reply ?? STEPS_REPLY });
-      isStreaming = false;
       emit({ type: "agent_end", willRetry: false });
+      await drainQueuedTurns(step, update, file);
+      isStreaming = false;
       emit({ type: "agent_settled", aborted });
       aborted = false;
     }
@@ -585,8 +653,13 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         messages = [...messages, user, first, result, second];
         if (sessionFile) sessionMessages.set(sessionFile, messages);
       }
-      isStreaming = false;
       emit({ type: "agent_end", willRetry: false });
+      await drainQueuedTurns(step, update, (msg) => {
+        if (aborted) return;
+        messages = [...messages, msg];
+        if (sessionFile) sessionMessages.set(sessionFile, messages);
+      });
+      isStreaming = false;
       emit({ type: "agent_settled", aborted });
       aborted = false;
     }
@@ -637,6 +710,11 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           return { disposition: "started" };
         case "abort":
           aborted = isStreaming;
+          if (queued.steering.length > 0 || queued.followUp.length > 0) {
+            queued.steering.length = 0;
+            queued.followUp.length = 0;
+            emit({ type: "queue_update", steering: [], followUp: [] });
+          }
           return undefined;
         case "abort_retry":
           cancelRetry?.();
@@ -650,6 +728,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         }
         case "new_session":
           messages = [];
+          queued.steering.length = 0;
+          queued.followUp.length = 0;
           sessionFile = undefined;
           sessionName = undefined;
           sessionId = `session-${++sessionSeq}`;
@@ -657,6 +737,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           defaultThinking = engineThinking;
           return { cancelled: false };
         case "switch_session": {
+          queued.steering.length = 0;
+          queued.followUp.length = 0;
           sessionFile = String(command.sessionPath);
           messages = sessionMessages.get(sessionFile) ?? historyOf(sessionFile);
           sessionMessages.set(sessionFile, messages);
@@ -783,13 +865,15 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       exit: Array<(e: Exit) => void>;
     };
     custom?: CustomAgentConfig;
+    pendingQueue?: { steering: string[]; followUp: string[] };
+    pendingDialogs?: Map<string, Record<string, unknown>>;
   }
 
   const daemonSessions = new Map<string, FakeDaemonSession>();
   let daemonCallbacks: DaemonCallbacks | undefined;
 
   const daemonInfo = (s: FakeDaemonSession): DaemonSession => {
-    const { inner: _inner, viewers: _viewers, custom: _custom, ...rest } = s;
+    const { inner: _inner, viewers: _viewers, custom: _custom, pendingQueue: _pendingQueue, pendingDialogs: _pendingDialogs, ...rest } = s;
     return { ...rest };
   };
 
@@ -841,15 +925,27 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
               pushDaemon(s);
             }
           }
+        } else if (record?.type === "queue_update") {
+          const qu = record as { steering?: unknown; followUp?: unknown };
+          s.pendingQueue = {
+            steering: Array.isArray(qu.steering) ? qu.steering.map(String) : [],
+            followUp: Array.isArray(qu.followUp) ? qu.followUp.map(String) : [],
+          };
         } else if (record?.type === "agent_settled") {
           s.status = "idle";
           s.lastActive = Date.now();
+          s.pendingQueue = { steering: [], followUp: [] };
+          s.pendingDialogs?.clear();
           // An aborted turn reports nothing: it stopped because it was told to.
           if (!s.viewers && !record.aborted) s.unread = true;
           pushDaemon(s);
         } else if (record?.type === "extension_ui_request") {
           s.status = "blocked";
           s.lastActive = Date.now();
+          if (typeof record.id === "string") {
+            if (!s.pendingDialogs) s.pendingDialogs = new Map();
+            s.pendingDialogs.set(record.id, record as Record<string, unknown>);
+          }
           pushDaemon(s);
         }
         for (const h of s.viewers?.out ?? []) h(`${line}\n`);
@@ -861,6 +957,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     inner.onExit((e) => {
       s.inner = undefined;
       s.loaded = false;
+      s.pendingQueue = { steering: [], followUp: [] };
+      s.pendingDialogs?.clear();
       s.status = s.status === "working" || s.status === "blocked" ? "failed" : "interrupted";
       pushDaemon(s);
       for (const h of s.viewers?.exit ?? []) h({ code: e.code ?? null, signal: e.signal ?? undefined });
@@ -1012,6 +1110,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           const viewers = { out: [] as Array<(chunk: string) => void>, err: [] as Array<(chunk: string) => void>, exit: [] as Array<(e: Exit) => void> };
           s.viewers = viewers;
           let ended = false;
+          let replayed = false;
           const detach = () => {
             if (ended) return;
             ended = true;
@@ -1026,20 +1125,54 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
               // The daemon watches writes too: an answer un-blocks a session waiting on it.
               for (const line of text.split("\n")) {
                 if (!line) continue;
-                let record: { type?: string } | undefined;
+                let record: { type?: string; id?: unknown; sessionPath?: unknown } | undefined;
                 try {
                   record = JSON.parse(line) as typeof record;
                 } catch {
                   record = undefined;
                 }
-                if (record?.type === "extension_ui_response" && s.status === "blocked") {
-                  s.status = "working";
+                if (record?.type === "extension_ui_response") {
+                  if (typeof record.id === "string") s.pendingDialogs?.delete(record.id);
+                  if (s.status === "blocked" && (!s.pendingDialogs || s.pendingDialogs.size === 0)) {
+                    s.status = "working";
+                    pushDaemon(s);
+                  }
+                } else if (record?.type === "clear_queue") {
+                  s.pendingQueue = { steering: [], followUp: [] };
+                } else if (record?.type === "new_session") {
+                  s.file = undefined;
+                  s.title = "New session";
+                  s.pendingQueue = { steering: [], followUp: [] };
+                  s.pendingDialogs?.clear();
+                  pushDaemon(s);
+                } else if (record?.type === "switch_session" && typeof record.sessionPath === "string") {
+                  s.file = record.sessionPath;
+                  s.pendingQueue = { steering: [], followUp: [] };
+                  s.pendingDialogs?.clear();
                   pushDaemon(s);
                 }
               }
               s.inner.write(text);
             },
-            onStdout: (h: (chunk: string) => void) => void viewers.out.push(h),
+            onStdout: (h: (chunk: string) => void) => {
+              viewers.out.push(h);
+              if (!replayed) {
+                replayed = true;
+                const pq = s.pendingQueue;
+                const dialogs = s.pendingDialogs ? [...s.pendingDialogs.values()] : [];
+                if ((pq && (pq.steering.length > 0 || pq.followUp.length > 0)) || dialogs.length > 0) {
+                  queueMicrotask(() => {
+                    if (ended) return;
+                    if (pq && (pq.steering.length > 0 || pq.followUp.length > 0)) {
+                      h(`${JSON.stringify({ type: "queue_update", steering: pq.steering, followUp: pq.followUp })}\n`);
+                    }
+                    for (const d of dialogs) {
+                      h(`${JSON.stringify(d)}\n`);
+                    }
+                  });
+                }
+              }
+            },
             onStderr: (h: (chunk: string) => void) => void viewers.err.push(h),
             onExit: (h: (e: Exit) => void) => void viewers.exit.push(h),
             end: detach,
@@ -1054,11 +1187,17 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         async stopTree(sessionId: string) {
           const own = daemonSessions.get(sessionId);
           for (const s of [own, ...daemonTree(sessionId)]) {
-            if (s) daemonWrite(s, { type: "abort" });
+            if (s) {
+              s.pendingQueue = { steering: [], followUp: [] };
+              daemonWrite(s, { type: "clear_queue" });
+              daemonWrite(s, { type: "abort" });
+            }
           }
         },
         async stopAll() {
           for (const s of daemonSessions.values()) {
+            s.pendingQueue = { steering: [], followUp: [] };
+            daemonWrite(s, { type: "clear_queue" });
             daemonWrite(s, { type: "abort" });
           }
         },
@@ -1078,8 +1217,9 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         },
         reportFile(sessionId: string, file?: string) {
           const s = daemonSessions.get(sessionId);
-          if (s && file && s.file !== file) {
-            s.file = file;
+          const next = file || undefined;
+          if (s && s.file !== next) {
+            s.file = next;
             pushDaemon(s);
           }
         },

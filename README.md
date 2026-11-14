@@ -49,4 +49,4 @@ Pi · Claude Code · Codex · Devin · Cursor · OpenCode · Gemini CLI · GitHu
 
 ## 反馈
 
-欢迎通过 [Issues](https://github.com/blueberrycongee/pipi/issues) 提交 Bug 与建议。开发者请见 [AGENTS.md](AGENTS.md)（架构）与 [DESIGN.md](DESIGN.md)（设计）。
+欢迎通过 [Issues](https://github.com/blueberrycongee/pipi/issues) 提交 Bug 与建议。开发者请见 [AGENTS.md](AGENTS.md) 与 [DESIGN.md](DESIGN.md)。

@@ -16,7 +16,12 @@ type Scheme = "dark" | "light";
 /** `{}`: the repository's picture (`Harness.tsx` → `harness.wallpaper`). */
 const PICTURE: { path?: string; width?: number; height?: number } = {};
 
-const launch = (scenario: string, colorScheme: Scheme, prefs: Record<string, unknown> = {}) =>
+const launch = (
+  scenario: string,
+  colorScheme: Scheme,
+  prefs: Record<string, unknown> = {},
+  extraStorage: Record<string, string> = {},
+) =>
   open("./Harness.tsx", {
     width: 1180,
     height: 780,
@@ -27,6 +32,7 @@ const launch = (scenario: string, colorScheme: Scheme, prefs: Record<string, unk
       "harness.scenario": scenario,
       "harness.wallpaper": JSON.stringify(PICTURE),
       "pipi.prefs.v1": JSON.stringify({ appearance: colorScheme, ...prefs }),
+      ...extraStorage,
     },
   });
 
@@ -53,6 +59,12 @@ test("the app under a wallpaper", async () => {
     await shot(app, `chat-${scheme}`);
     await app.press("label:Settings");
     await shot(app, `settings-${scheme}`);
+
+    // A long conversation scrolled mid-stream: rows pass under both the title bar and the composer.
+    app = await launch("history", scheme, {}, { "harness.long": "1", "harness.then": "50:/sessions/two.jsonl" });
+    await app.waitFor("text:Part 24 of the plan");
+    await app.scroll("label:Conversation", -240);
+    await shot(app, `chat-scrolled-${scheme}`);
 
     // The theme tinted from the picture: the page's wash follows the tinted background.
     app = await launch("history", scheme, { wallpaperThemeColors: true });

@@ -95,6 +95,28 @@ test("a message written during the change is sent where it lands", async () => {
   expect(shows(app, REFACTOR)).toBe(true);
 });
 
+test("multiple messages submitted during a slow session change are delivered in order without dropping any", async () => {
+  const app = await launch("welcome");
+  await app.waitFor("text:What are we building?");
+
+  await app.press(row(REFACTOR));
+  expect(shows(app, REFACTOR)).toBe(false);
+  await app.type("label:Message", "first in flight");
+  await app.submit("label:Message");
+  expect(app.value("label:Message") ?? "").toBe("");
+  await app.type("label:Message", "second in flight");
+  await app.submit("label:Message");
+  expect(app.value("label:Message") ?? "").toBe("");
+
+  await app.waitUntil(
+    () => app.texts().includes("first in flight") && app.texts().includes("second in flight"),
+    { timeout: DELAY * 6 },
+  );
+  const texts = app.texts();
+  expect(shows(app, REFACTOR)).toBe(true);
+  expect(texts.indexOf("first in flight")).toBeLessThan(texts.indexOf("second in flight"));
+});
+
 test("starting a new session in another project keeps the chosen model without flashing defaults or waking", async () => {
   const app = await launch("multi");
   await app.waitFor("text:What are we building?");

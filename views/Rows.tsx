@@ -10,6 +10,7 @@ import {
   describeActiveStep,
   describeActivity,
   describeToolCall,
+  describeToolsSummary,
   describeTurn,
   classifyTool,
   type DiffStats,
@@ -393,8 +394,23 @@ const USER_FOLD_LINES = 6;
  */
 const userLineCounts = signal<Record<string, number>>({});
 
-/** A rough line count before the text's first layout: a clearly long message starts already folded. */
-const roughLines = (text: string) => Math.max(text.split("\n").length, Math.ceil(text.length / 52));
+/** Visual column width of a line (wide CJK/emoji glyphs count as two narrow columns). */
+function visualColumns(line: string): number {
+  let cols = 0;
+  for (let i = 0; i < line.length; i++) {
+    cols += line.charCodeAt(i) >= 0x2e80 ? 2 : 1;
+  }
+  return cols;
+}
+
+/** A rough line count before the text's first layout: wraps per paragraph so CJK and Latin bubbles start already folded without a second-frame jump. */
+function roughLines(text: string): number {
+  let total = 0;
+  for (const line of text.split("\n")) {
+    total += Math.max(1, Math.ceil(visualColumns(line) / 68));
+  }
+  return total;
+}
 
 function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   // The fork command names a message by its place among the user's messages on screen.
@@ -953,8 +969,15 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
     cleanup(() => clearInterval(timer));
   });
   const elapsed = () => (props.row.running && props.row.startedAt !== undefined ? Math.max(0, now() - props.row.startedAt) : undefined);
-  const livePreview = () => (props.row.running && !props.row.open && props.row.activeStep ? describeActiveStep(props.row.activeStep, activeLanguage()) : "");
-  const shownPreview = keepLast(() => livePreview() || undefined, "");
+  const preview = () => {
+    if (props.row.open) return "";
+    const lang = activeLanguage();
+    if (props.row.running) return props.row.activeStep ? describeActiveStep(props.row.activeStep, lang) : "";
+    if (props.row.backgroundStep) return describeActiveStep(props.row.backgroundStep, lang);
+    if (props.row.summaryTools?.length) return describeToolsSummary(props.row.summaryTools, lang);
+    return "";
+  };
+  const shownPreview = keepLast(() => preview() || undefined, "");
   return (
     // The hairline under the header stays in both live and settled states, so the handoff cannot jump.
     <View class="border-b border-hairline pb-1.5">
@@ -973,8 +996,11 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
         <If when={elapsed() !== undefined && (elapsed() ?? 0) >= 1000}>
           <Text class="shrink-0 text-md tabular-nums text-subtle">{(elapsed() ?? 0) < 60_000 ? `${Math.floor((elapsed() ?? 0) / 1000)}s` : duration(elapsed() ?? 0)}</Text>
         </If>
-        <Presence show={Boolean(livePreview())} scaleFrom={0.97} class="min-w-0 shrink">
-          <RollingText id={() => props.row.id} text={() => shownPreview() ?? ""} class="min-w-0 shrink truncate text-md text-subtle" />
+        <Presence show={Boolean(preview())} scaleFrom={0.97} class="min-w-0 shrink flex-row items-center gap-1.5">
+          <If when={!props.row.running}>
+            <Text class="shrink-0 text-md text-subtle">·</Text>
+          </If>
+          <RollingText id={() => `${props.row.id}:preview`} text={() => shownPreview() ?? ""} class="min-w-0 shrink truncate text-md text-subtle" />
         </Presence>
       </ProcessLine>
     </View>
@@ -1125,6 +1151,7 @@ export function TranscriptRow(props: { row: ChatRow }) {
     () => props.row.id,
     isStreamingRow,
     () => props.row.kind === "prose" || fold.isFolding(), // streamed text settles through its veil; folding rows animate via fold
+    () => props.row.kind === "user",
   );
   const of = <K extends ChatRow["kind"]>(kind: K) => (props.row.kind === kind ? (props.row as Extract<ChatRow, { kind: K }>) : undefined);
   return (

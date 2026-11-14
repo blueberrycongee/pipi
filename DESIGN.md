@@ -260,7 +260,7 @@ bar to the window's edge. Each region is a depth of the same glass over it:
 | Composer in the middle (welcome, starting) | The picture itself, the whole height of the pane, under a wash the same from either edge: 58% of `background` at the top and at the foot, 42% between. Under the figure in the middle it gathers once more — a pool, densest behind the words and gone before the pane's edges — so the title reads on a bright picture in dark and a dark one in light |
 | Composer docked, nothing to read (connect, failed) | Over that wash, the page: from where the wash is thinnest, gone into solid `background` by 72% of the pane, before the composer |
 | Conversation | Over both, the sidebar's frost again along the top (`PAGE_GLASS`), gone into `background` within 240pt: the reading column stands on the page's own color |
-| Title bar | No band and no hairline: it stands on the pane's veil. Windows draws no mask to fade rows out under it, so there it keeps its glass band over a conversation |
+| Title bar | No band and no hairline: it stands on the pane's veil while a single top-to-bottom scroll mask fades conversation rows to transparent before they reach the bar. Windows and Linux draw no mask to fade rows out under it, so Windows keeps its glass band and Linux its solid band over a conversation |
 | Composer, popups, Settings | Their own glass, unchanged |
 
 The washes are gradients of the `background` token (`PaneVeil`,
@@ -346,7 +346,7 @@ need it.
 - **IconButton**: always has `label` (accessibility) and a tooltip with its
   shortcut.
 - **Chip**: shows a current choice and opens something to change it.
-- **Switch**, **Segmented**, **TextField**.
+- **Switch**, **Segmented** (`Tabs` native spring pill indicator), **TextField**.
 - **SettingGroup / SettingRow / Rule**: titled card of ruled rows; label and
   help left, control right.
 - **Icon**: one family, drawn for pipi on a 16pt grid, 1.5pt round stroke,
@@ -367,8 +367,12 @@ need it.
   `alert`, or unread `brand` dot). Hover tooltips carry the engine name and
   workspace/branch; a row whose engine is gone greys the mark.
 - **tip()**: the tooltip.
-- **Reveal / Presence** (`ui/Reveal.tsx`, re-exported from `ui/motion.ts`): the
-  standardized enter + exit primitives for flow rows/sections and inline marks.
+- **Reveal / Presence / FloatingLayer / ViewDeck** (`ui/Reveal.tsx`, re-exported from
+  `ui/motion.ts`): the standardized enter + exit primitives for flow
+  rows/sections and inline marks, plus `FloatingLayer` (in-window glass sheet
+  over `SCRIM` with smooth mid-close reversal) and `ViewDeck` (keeps visited
+  panes mounted at steady `opacity: 1` so switching sections never flashes or
+  cold-remounts canvases).
 - **Slash menu** (`views/Composer.tsx`, `lib/slash.ts`): a `/` that starts the
   draft — or what that key types under a Chinese input method (`、`, `／`) —
   lists what can be run from here. pipi is a shell over many engines, so the
@@ -426,12 +430,13 @@ merging UI work.
 
 ## Settings
 
-Settings is a floating layer over the chat: a glass `Dialog` panel centered
-in the window over the backdrop every floating layer has (`SCRIM`, see
-Elevation): the chat stays in sight behind it, dimmed, never blurred. Its own nav
-column on the left (caption, six sections — General, Agents, Sessions, Archive,
-Usage, About) sits inside the panel;
-Escape or a backdrop press closes it. The sections are the same whichever
+Settings is a `FloatingLayer` over the chat: a glass panel centered in the
+window over the backdrop every floating layer has (`SCRIM`, see Elevation): the
+chat stays in sight behind it, dimmed, never blurred. Its own nav column on the
+left (caption, six sections — General, Agents, Sessions, Archive, Usage, About —
+using `Tabs`'s native sliding indicator) sits inside the panel alongside a
+`ViewDeck` that keeps visited sections and subpages mounted at `opacity: 1` so
+switching never flashes; Escape or a backdrop press closes it. The sections are the same whichever
 agent is active: no agent gets a section of its own. What is particular to
 one agent (Pi's providers and run knobs) is a page inside Agents, opened from
 that agent's row and led back by the page's back button. The page keeps a ~640pt measure: a

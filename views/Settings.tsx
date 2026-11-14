@@ -1,11 +1,21 @@
-import { cleanup, computed, createAnimatedValue, effect, openUrl, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
+import { computed, effect, openUrl, Scroll, signal, Text, untracked, View } from "nsh";
 import type { JSX } from "nsh";
-import { AlertDialog, Button as BaseButton, Popover } from "nsh/base";
+import { AlertDialog, Button as BaseButton, Popover, Tab, Tabs } from "nsh/base";
 import type { AcpDistribution, AgentHarnessStatus, RuntimeMode } from "../agents/types";
 import manifest from "../nsh.json";
 import { basename, compactPath, money, relativeTime, tildePath } from "../lib/format";
 import { activeLanguage, agentDescription, formatAgentMeta, queueModeLabel, runtimeModeText, tr } from "../lib/i18n";
-import { WALLPAPER_EFFECTS, type WallpaperEffect } from "../lib/wallpaper";
+import {
+  AVAILABLE_WALLPAPER_EFFECTS,
+  DYNAMIC_WALLPAPER_ENABLED,
+  WALLPAPER_PAUSE_MODES,
+  WALLPAPER_PRESETS,
+  WALLPAPER_VIDEO_CLICK_ACTIONS,
+  type WallpaperEffect,
+  type WallpaperPauseMode,
+  type WallpaperPreset,
+  type WallpaperVideoClickAction,
+} from "../lib/wallpaper";
 import { COAT_IDS, COATS } from "../mascot/geometry";
 import { Pip } from "../mascot/Pip";
 import { agentDir } from "../pi/credentials";
@@ -30,6 +40,7 @@ import {
   deleteCustomAgent,
   externalMcpConfig,
   installPipiCli,
+  isRunning,
   openSession,
   randomWallpaper,
   refreshAgents,
@@ -50,8 +61,13 @@ import {
   setAutoRetry,
   setFollowUpMode,
   setSteeringMode,
+  setWallpaperAgentReactive,
   setWallpaperEffect,
+  setWallpaperInteractive,
+  setWallpaperPauseMode,
+  setWallpaperPreset,
   setWallpaperThemeColors,
+  setWallpaperVideoClickAction,
   showAgentSettings,
   showChat,
   showSettings,
@@ -59,16 +75,25 @@ import {
   storedProviders,
   switchAgentHarness,
   toast,
+  toggleWallpaperMuted,
+  toggleWallpaperPaused,
   unarchiveSession,
   updateAgentOverride,
   updateAutoArchiveDays,
   updatePreferredRuntimeMode,
+  usageReady,
   usageStats,
   type View as AppView,
   wallpaper,
+  wallpaperAgentReactive,
   wallpaperEffect,
   wallpaperFolder,
+  wallpaperInteractive,
+  wallpaperMuted,
+  wallpaperPaused,
+  wallpaperPauseMode,
   wallpaperThemeColors,
+  wallpaperVideoClickAction,
 } from "../store/app";
 import { backend } from "../store/backend";
 import { appUpdate, checkForAppUpdate } from "../store/update";
@@ -109,8 +134,8 @@ import { AgentLogo } from "../ui/AgentLogo";
 import { Button, Chip, IconButton } from "../ui/Button";
 import { Rule, Segmented, SettingGroup, SettingRow, Switch, TextField } from "../ui/Controls";
 import { Icon, type IconName } from "../ui/Icon";
-import { animateNextLayout, EASING, enterStagger, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, SPRING } from "../ui/motion";
-import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, SCRIM } from "../ui/styles";
+import { animateNextLayout, delayedFade, FloatingLayer, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, ViewDeck } from "../ui/motion";
+import { FOCUS_RING, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { CroppedWallpaperSurface, WallpaperAdjustDialog } from "./Wallpaper";
 
@@ -127,7 +152,7 @@ const SECTIONS: { id: SettingsSection; label: () => string; icon: IconName }[] =
 function Page(props: { title: string; lead?: string; action?: JSX.Element; back?: { label: string; onPress: () => void }; children?: JSX.Element }) {
   return (
     <Scroll class="flex-1" contentClass="items-center px-8 pb-10 pt-6">
-      <View class="w-full max-w-160 gap-6" style={enterStagger(0)}>
+      <View class="w-full max-w-160 gap-6">
         <View class="flex-row items-start justify-between gap-4">
           <View class="min-w-0 flex-1 gap-1">
             <If when={props.back}>
@@ -145,7 +170,7 @@ function Page(props: { title: string; lead?: string; action?: JSX.Element; back?
           </View>
           {props.action}
         </View>
-        <View class="gap-6" style={enterStagger(1)}>
+        <View class="gap-6">
           {props.children}
         </View>
       </View>
@@ -442,43 +467,41 @@ function AgentHarnessRow(props: { agent: AgentHarnessStatus; editing: boolean; o
             </If>
           </View>
         </View>
-        <If when={!props.editing}>
-          <View class="shrink-0 flex-row items-center gap-1.5">
-            <If when={props.agent.available && enabled() && !active()}>
-              <Button
-                label={tr("Switch", "切换")}
-                size="sm"
-                onPress={() => {
-                  showChat();
-                  void switchAgentHarness(props.agent.id);
-                }}
-              />
-            </If>
-            <If when={managesProviders(props.agent)}>
-              <Button label={tr("Providers", "服务商")} size="sm" icon="plug" onPress={() => showAgentSettings(props.agent.id)} />
-            </If>
-            <IconButton
-              icon="sliders"
-              label={tr(`Configure ${props.agent.name}`, `配置 ${props.agent.name}`)}
+        <Presence show={!props.editing} class="shrink-0 flex-row items-center gap-1.5">
+          <If when={props.agent.available && enabled() && !active()}>
+            <Button
+              label={tr("Switch", "切换")}
+              size="sm"
               onPress={() => {
-                binPath.set(override()?.binaryPath ?? "");
-                extraFlags.set((override()?.extraArgs ?? []).join(" "));
-                apiKeyInput.set("");
-                props.onEdit(true);
+                showChat();
+                void switchAgentHarness(props.agent.id);
               }}
             />
-            <If when={props.agent.id !== "pi" && !props.agent.isCustom}>
-              <Switch
-                label={tr(`Show ${props.agent.name} in picker`, `在选择器中启用 ${props.agent.name}`)}
-                checked={enabled()}
-                onChange={(on) => void updateAgentOverride(props.agent.id, { enabled: on })}
-              />
-            </If>
-            <If when={props.agent.isCustom}>
-              <Button label={tr("Remove", "移除")} variant="danger" size="sm" onPress={() => void deleteCustomAgent(props.agent.id)} />
-            </If>
-          </View>
-        </If>
+          </If>
+          <If when={managesProviders(props.agent)}>
+            <Button label={tr("Providers", "服务商")} size="sm" icon="plug" onPress={() => showAgentSettings(props.agent.id)} />
+          </If>
+          <IconButton
+            icon="sliders"
+            label={tr(`Configure ${props.agent.name}`, `配置 ${props.agent.name}`)}
+            onPress={() => {
+              binPath.set(override()?.binaryPath ?? "");
+              extraFlags.set((override()?.extraArgs ?? []).join(" "));
+              apiKeyInput.set("");
+              props.onEdit(true);
+            }}
+          />
+          <If when={props.agent.id !== "pi" && !props.agent.isCustom}>
+            <Switch
+              label={tr(`Show ${props.agent.name} in picker`, `在选择器中启用 ${props.agent.name}`)}
+              checked={enabled()}
+              onChange={(on) => void updateAgentOverride(props.agent.id, { enabled: on })}
+            />
+          </If>
+          <If when={props.agent.isCustom}>
+            <Button label={tr("Remove", "移除")} variant="danger" size="sm" onPress={() => void deleteCustomAgent(props.agent.id)} />
+          </If>
+        </Presence>
       </View>
       <Reveal open={props.editing}>
         <View class="gap-2.5 pb-1 pl-6 pt-3">
@@ -949,13 +972,19 @@ function wallpaperEffectLabel(effect: WallpaperEffect) {
       return tr("Halftone", "半调网点");
     case "scanlines":
       return tr("Scanlines", "扫描线");
+    case "ripple":
+      return tr("Ripple", "水波");
+    case "rain":
+      return tr("Rain", "雨滴");
   }
 }
 
 function wallpaperEffectDescription(effect: WallpaperEffect) {
   switch (effect) {
     case "none":
-      return tr("Render the original image without a shader pass.", "直接显示原图，不叠加着色器滤镜。");
+      return DYNAMIC_WALLPAPER_ENABLED
+        ? tr("Render the original media without a shader pass.", "直接显示原画面，不叠加着色器滤镜。")
+        : tr("Render the original image without a shader pass.", "直接显示原图，不叠加着色器滤镜。");
     case "dither":
       return tr("Ordered Bayer matrix dithering with crisp ink contrast.", "使用有序 Bayer 矩阵抖动，呈现复古墨点质感。");
     case "ascii":
@@ -964,6 +993,45 @@ function wallpaperEffectDescription(effect: WallpaperEffect) {
       return tr("Print-style halftone dots sized by tone.", "按明暗阶调缩放的印刷半调圆点。");
     case "scanlines":
       return tr("Subtle horizontal CRT scanline modulation.", "细腻的水平 CRT 扫描线纹理。");
+    case "ripple":
+      return tr("Interactive water refraction and cursor-driven caustic waves.", "实时水波折射与跟随鼠标的焦散波纹。");
+    case "rain":
+      return tr("Animated raindrops with cursor-clearing refraction.", "动态滑落雨滴与鼠标周围的清澈折射区。");
+  }
+}
+
+function wallpaperPresetLabel(preset: WallpaperPreset) {
+  switch (preset) {
+    case "aurora":
+      return tr("Aurora", "极光");
+    case "fluid":
+      return tr("Silk", "流光");
+    case "cosmos":
+      return tr("Cosmos", "星云");
+    case "matrix":
+      return tr("Matrix", "代码雨");
+  }
+}
+
+function wallpaperVideoClickLabel(action: WallpaperVideoClickAction) {
+  switch (action) {
+    case "burst":
+      return tr("Speed surge", "加速脉冲");
+    case "seek":
+      return tr("Next scene", "切换片段");
+    case "pause":
+      return tr("Play / Pause", "播放/暂停");
+  }
+}
+
+function wallpaperPauseModeLabel(mode: WallpaperPauseMode) {
+  switch (mode) {
+    case "inactive":
+      return tr("Unfocused", "失焦时");
+    case "background":
+      return tr("Minimized", "后台时");
+    case "never":
+      return tr("Never", "从不");
   }
 }
 
@@ -985,8 +1053,19 @@ function General() {
           title={tr("Wallpaper", "壁纸")}
           description={
             wallpaper()
-              ? `${wallpaper()!.name} · ${wallpaper()!.width}×${wallpaper()!.height}`
-              : tr("A picture behind the whole window.", "铺在整个窗口之下的图片。")
+              ? `${wallpaper()!.name} · ${wallpaper()!.width}×${wallpaper()!.height}${
+                  DYNAMIC_WALLPAPER_ENABLED && wallpaper()!.kind === "video"
+                    ? ` · ${tr("Video", "视频")}`
+                    : DYNAMIC_WALLPAPER_ENABLED && wallpaper()!.kind === "shader"
+                      ? ` · ${tr("Live Shader", "实时着色器")}`
+                      : ""
+                }`
+              : DYNAMIC_WALLPAPER_ENABLED
+                ? tr(
+                    "An image, video (.mp4 / .mov / .webm), or Wallpaper Engine project.json behind the window.",
+                    "支持静态图片、动态视频（.mp4 / .mov / .webm）或 Wallpaper Engine project.json。",
+                  )
+                : tr("A picture behind the whole window.", "铺在整个窗口之下的图片。")
           }
         >
           <View class="flex-row items-center gap-2">
@@ -994,7 +1073,7 @@ function General() {
               when={wallpaper()}
               else={
                 <Button
-                  label={tr("Choose image", "选择图片")}
+                  label={DYNAMIC_WALLPAPER_ENABLED ? tr("Choose wallpaper", "选择壁纸") : tr("Choose image", "选择图片")}
                   icon="image"
                   size="sm"
                   onPress={() => void chooseWallpaperImage()}
@@ -1011,15 +1090,30 @@ function General() {
                     <CroppedWallpaperSurface
                       config={wp()}
                       effect={wallpaperEffect()}
+                      paused
                     />
                   </BaseButton>
+                  <If when={DYNAMIC_WALLPAPER_ENABLED && (wp().kind === "video" || wp().kind === "shader" || wallpaperEffect() === "ripple" || wallpaperEffect() === "rain")}>
+                    <Button
+                      label={wallpaperPaused() ? tr("Resume", "继续") : tr("Pause", "暂停")}
+                      size="sm"
+                      onPress={toggleWallpaperPaused}
+                    />
+                  </If>
+                  <If when={DYNAMIC_WALLPAPER_ENABLED && wp().kind === "video"}>
+                    <Button
+                      label={wallpaperMuted() ? tr("Unmute", "开启声音") : tr("Mute", "静音")}
+                      size="sm"
+                      onPress={toggleWallpaperMuted}
+                    />
+                  </If>
                   <Button
                     label={tr("Adjust", "调整")}
                     size="sm"
                     onPress={() => adjustOpen.set(true)}
                   />
                   <Button
-                    label={tr("Replace image", "更换图片")}
+                    label={DYNAMIC_WALLPAPER_ENABLED ? tr("Replace", "更换") : tr("Replace image", "更换图片")}
                     size="sm"
                     onPress={() => void chooseWallpaperImage()}
                   />
@@ -1034,13 +1128,42 @@ function General() {
             </If>
           </View>
         </SettingRow>
+        <If when={DYNAMIC_WALLPAPER_ENABLED}>
+          <View>
+            <Rule />
+            <SettingRow
+              title={tr("Live wallpaper presets", "内置动态壁纸")}
+              description={tr(
+                "Built-in GPU procedural wallpapers with real-time cursor & agent reactivity.",
+                "无需本地文件即可启用的内置 GPU 实时交互动态壁纸。",
+              )}
+            >
+              <View class="flex-row items-center gap-1.5">
+                {WALLPAPER_PRESETS.map((preset) => (
+                  <Button
+                    label={wallpaperPresetLabel(preset)}
+                    variant={wallpaper()?.kind === "shader" && wallpaper()?.preset === preset ? "primary" : "secondary"}
+                    size="sm"
+                    onPress={() => void setWallpaperPreset(preset)}
+                  />
+                ))}
+              </View>
+            </SettingRow>
+          </View>
+        </If>
         <Rule />
         <SettingRow
           title={tr("Wallpaper folder", "壁纸文件夹")}
           description={
             wallpaperFolder()
-              ? `${tildePath(wallpaperFolder()!, backend().home())} · ${tr("⌘U picks a random image from this folder.", "按 ⌘U 从此文件夹随机切换壁纸。")}`
-              : tr("Choose a folder so ⌘U can rotate random wallpapers.", "选择一个壁纸文件夹，随时按 ⌘U 随机切换背景。")
+              ? `${tildePath(wallpaperFolder()!, backend().home())} · ${
+                  DYNAMIC_WALLPAPER_ENABLED
+                    ? tr("⌘U rotates images, videos & Wallpaper Engine folders.", "按 ⌘U 随机切换图片、视频或 Wallpaper Engine 文件夹。")
+                    : tr("⌘U picks a random image from this folder.", "按 ⌘U 从此文件夹随机切换壁纸。")
+                }`
+              : DYNAMIC_WALLPAPER_ENABLED
+                ? tr("Choose a folder (or Wallpaper Engine Workshop folder) so ⌘U can rotate wallpapers.", "选择壁纸或 Wallpaper Engine 创意工坊目录，随时按 ⌘U 随机切换。")
+                : tr("Choose a folder so ⌘U can rotate random wallpapers.", "选择一个壁纸文件夹，随时按 ⌘U 随机切换背景。")
           }
         >
           <View class="flex-row items-center gap-2">
@@ -1068,37 +1191,113 @@ function General() {
             </If>
           </View>
         </SettingRow>
-        <If when={wallpaper()}>
-          <Rule />
-          <SettingRow
-            title={tr("Wallpaper effect", "壁纸效果")}
-            description={wallpaperEffectDescription(wallpaperEffect())}
-          >
-            <Segmented
-              label={tr("Wallpaper effect", "壁纸效果")}
-              value={wallpaperEffect()}
-              options={WALLPAPER_EFFECTS.map((eff) => ({
-                value: eff,
-                label: wallpaperEffectLabel(eff),
-              }))}
-              onChange={setWallpaperEffect}
-            />
-          </SettingRow>
-          <Rule />
-          <SettingRow
-            title={tr("Match wallpaper colors", "匹配壁纸配色")}
-            description={tr(
-              "Tint window surfaces and brand accents using the wallpaper's dominant color.",
-              "根据当前壁纸的主色调微调界面背景与强调色。",
-            )}
-          >
-            <Switch
-              label={tr("Match wallpaper colors", "匹配壁纸配色")}
-              checked={wallpaperThemeColors()}
-              onChange={setWallpaperThemeColors}
-            />
-          </SettingRow>
-        </If>
+        <Reveal open={Boolean(wallpaper())}>
+          <View>
+            <Rule />
+            <SettingRow
+              title={tr("Wallpaper effect", "壁纸效果")}
+              description={wallpaperEffectDescription(wallpaperEffect())}
+            >
+              <Segmented
+                label={tr("Wallpaper effect", "壁纸效果")}
+                value={wallpaperEffect()}
+                options={AVAILABLE_WALLPAPER_EFFECTS.map((eff) => ({
+                  value: eff,
+                  label: wallpaperEffectLabel(eff),
+                }))}
+                onChange={setWallpaperEffect}
+              />
+            </SettingRow>
+            <If when={DYNAMIC_WALLPAPER_ENABLED}>
+              <View>
+                <Rule />
+                <SettingRow
+                  title={tr("Interactive wallpaper", "鼠标视差与点击交互")}
+                  description={tr(
+                    "3D depth parallax, cursor water ripples, and interactive click responses.",
+                    "跟随鼠标产生 3D 景深视差、水波光影与点击交互响应。",
+                  )}
+                >
+                  <Switch
+                    label={tr("Interactive wallpaper", "鼠标视差与点击交互")}
+                    checked={wallpaperInteractive()}
+                    onChange={setWallpaperInteractive}
+                  />
+                </SettingRow>
+                <Rule />
+                <SettingRow
+                  title={tr("React to agent activity", "随智能体状态律动")}
+                  description={tr(
+                    "Boost shader flow and video playback speed while an agent is thinking or coding.",
+                    "当智能体思考、调用工具或编码时，自动加快动态壁纸流速与能量。",
+                  )}
+                >
+                  <Switch
+                    label={tr("React to agent activity", "随智能体状态律动")}
+                    checked={wallpaperAgentReactive()}
+                    onChange={setWallpaperAgentReactive}
+                  />
+                </SettingRow>
+                <If when={wallpaper()?.kind === "video"}>
+                  <View>
+                    <Rule />
+                    <SettingRow
+                      title={tr("Video click action", "视频点击交互")}
+                      description={tr(
+                        "How video wallpapers react when you click inside the workspace.",
+                        "在主界面点击时交互式视频壁纸的反馈方式。",
+                      )}
+                    >
+                      <Segmented
+                        label={tr("Video click action", "视频点击交互")}
+                        value={wallpaperVideoClickAction()}
+                        options={WALLPAPER_VIDEO_CLICK_ACTIONS.map((act) => ({
+                          value: act,
+                          label: wallpaperVideoClickLabel(act),
+                        }))}
+                        onChange={setWallpaperVideoClickAction}
+                      />
+                    </SettingRow>
+                  </View>
+                </If>
+                <Rule />
+                <SettingRow
+                  title={tr("Auto-pause", "智能省电暂停")}
+                  description={tr(
+                    "Pause dynamic shaders and video decoding to save GPU/battery when the window is inactive.",
+                    "在窗口失焦或最小化时自动暂停动态渲染与视频解码，降低 GPU 与电量消耗。",
+                  )}
+                >
+                  <Segmented
+                    label={tr("Auto-pause", "智能省电暂停")}
+                    value={wallpaperPauseMode()}
+                    options={WALLPAPER_PAUSE_MODES.map((m) => ({
+                      value: m,
+                      label: wallpaperPauseModeLabel(m),
+                    }))}
+                    onChange={setWallpaperPauseMode}
+                  />
+                </SettingRow>
+              </View>
+            </If>
+            <Rule />
+            <SettingRow
+              title={tr("Match wallpaper colors", "匹配壁纸配色")}
+              description={
+                tr(
+                  "Tint window surfaces and brand accents using the wallpaper's dominant color.",
+                  "根据当前壁纸的主色调微调界面背景与强调色。",
+                )
+              }
+            >
+              <Switch
+                label={tr("Match wallpaper colors", "匹配壁纸配色")}
+                checked={wallpaperThemeColors()}
+                onChange={setWallpaperThemeColors}
+              />
+            </SettingRow>
+          </View>
+        </Reveal>
       </SettingGroup>
       <WallpaperAdjustDialog open={adjustOpen()} onClose={() => adjustOpen.set(false)} />
       <SettingGroup title="pipi">
@@ -1200,7 +1399,6 @@ function ArchivePage() {
       ],
     });
     if (action === "delete") {
-      animateNextLayout(180);
       await removeSession(session.path, cwd);
     }
   };
@@ -1419,7 +1617,7 @@ function ArchivePage() {
                                 variant="ghost"
                                 disabled={deletingAll()}
                                 onPress={() => {
-                                  animateNextLayout(180);
+                                  if (!isRunning()) animateNextLayout(180);
                                   unarchiveSession(entry().session.path);
                                 }}
                               />
@@ -1486,7 +1684,12 @@ function Usage() {
         "本机全部已保存会话中，各智能体自己上报的 token 消耗与费用。",
       )}
     >
-      <If when={empty()}>
+      <If when={!usageReady() && empty()}>
+        <View class="py-2" style={{ opacity: delayedFade() }}>
+          <Text class="text-sm text-muted-foreground">{tr("Reading saved sessions…", "正在读取已保存会话的用量…")}</Text>
+        </View>
+      </If>
+      <If when={usageReady() && empty()}>
         <View class="gap-1 py-2">
           <Text class="text-base text-foreground">{tr("No usage reported yet", "还没有上报的用量")}</Text>
           <Text class="text-sm text-muted-foreground">
@@ -1693,25 +1896,34 @@ function SettingsNav(props: { section: SettingsSection }) {
         <Text class="px-2.5 pb-2 pt-2 text-xs font-medium text-subtle" role="header">
           {tr("Settings", "设置")}
         </Text>
-        <Each of={SECTIONS}>
-          {(item) => (
-            <BaseButton
-              testID={`settings-nav-${item().id}`}
-              selected={props.section === item().id}
-              onPress={() => showSettings(item().id)}
-              class={`h-8 flex-row items-center gap-2 rounded-lg px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-accent selected:bg-accent`}
-            >
-              <Icon name={item().icon} tone={props.section === item().id ? "foreground" : "muted-foreground"} />
-              <Text class={`shrink truncate text-base ${props.section === item().id ? "font-medium text-foreground" : "text-muted-foreground"}`}>{item().label()}</Text>
-            </BaseButton>
-          )}
-        </Each>
+        <Tabs class="gap-0.5" indicatorClass="inset-x-0 rounded-lg bg-accent">
+          <Each of={SECTIONS}>
+            {(item) => {
+              const active = () => props.section === item().id;
+              return (
+                <Tab
+                  testID={`settings-nav-${item().id}`}
+                  selected={active()}
+                  onPress={() => showSettings(item().id)}
+                  class={`h-8 flex-row items-center gap-2 rounded-lg px-2.5 transition-colors duration-150 ${FOCUS_RING} ${active() ? "" : "hover:bg-accent/60"}`}
+                >
+                  <Icon name={item().icon} tone={active() ? "foreground" : "muted-foreground"} />
+                  <Text class={`shrink truncate text-base transition-colors duration-150 ${active() ? "font-medium text-foreground" : "text-muted-foreground"}`}>
+                    {item().label()}
+                  </Text>
+                </Tab>
+              );
+            }}
+          </Each>
+        </Tabs>
       </View>
     </View>
   );
 }
 
-/** Settings floats over the chat: an in-window layer over the backdrop every floating layer has (`SCRIM`), the window still in sight behind it; Escape or a press outside closes it. */
+type SettingsPaneId = SettingsSection | "providers";
+
+/** Settings floats over the chat via `FloatingLayer`, keeping visited sections alive in `ViewDeck` so switching never flashes or cold-remounts canvases. */
 export function Settings() {
   const open = () => currentView().name === "settings";
   const shown = keepLast<Extract<AppView, { name: "settings" }>>(() => {
@@ -1726,100 +1938,32 @@ export function Settings() {
     const agent = id ? availableAgents().find((a) => a.id === id) : undefined;
     return agent && managesProviders(agent) ? agent : undefined;
   };
+  const inlineAgent = () => (pagedAgent() ? undefined : focusedAgent());
+  const heldAgent = keepLast(pagedAgent);
+  const activePane = (): SettingsPaneId => (pagedAgent() ? "providers" : section());
 
-  const mounted = signal(untracked(open));
-  const scrimOpacity = createAnimatedValue(untracked(open) ? 1 : 0);
-  const panelOpacity = createAnimatedValue(untracked(open) ? 1 : 0);
-  const panelScale = createAnimatedValue(untracked(open) ? 1 : 0.97);
-  const panelY = createAnimatedValue(untracked(open) ? 0 : 10);
-  let wasOpen = untracked(open);
-  let exitTimer: ReturnType<typeof setTimeout> | undefined;
-
-  effect(() => {
-    const isOpen = open();
-    if (isOpen === wasOpen) return;
-    wasOpen = isOpen;
-    const reduced = reduceMotion();
-    untracked(() => {
-      clearTimeout(exitTimer);
-      void scrimOpacity.stop();
-      void panelOpacity.stop();
-      void panelScale.stop();
-      void panelY.stop();
-      if (isOpen) {
-        mounted.set(true);
-        if (reduced) {
-          scrimOpacity.set(1);
-          panelOpacity.set(1);
-          panelScale.set(1);
-          panelY.set(0);
-        } else {
-          scrimOpacity.set(0);
-          panelOpacity.set(0);
-          panelScale.set(0.97);
-          panelY.set(10);
-          void scrimOpacity.timing(1, { duration: 180, easing: EASING.out });
-          void panelOpacity.timing(1, { duration: 200, easing: EASING.smoothOut });
-          void panelScale.spring(1, SPRING.snappy);
-          void panelY.spring(0, SPRING.snappy);
-        }
-      } else if (mounted()) {
-        if (reduced) {
-          scrimOpacity.set(0);
-          panelOpacity.set(0);
-          mounted.set(false);
-        } else {
-          void scrimOpacity.timing(0, { duration: 150, easing: EASING.out });
-          void panelOpacity.timing(0, { duration: 150, easing: EASING.out });
-          void panelScale.timing(0.98, { duration: 150, easing: EASING.out });
-          void panelY.timing(6, { duration: 150, easing: EASING.out });
-          exitTimer = setTimeout(() => mounted.set(false), 155);
-        }
-      }
-    });
-  });
-
-  cleanup(() => {
-    clearTimeout(exitTimer);
-    void scrimOpacity.stop();
-    void panelOpacity.stop();
-    void panelScale.stop();
-    void panelY.stop();
-  });
+  const panes: readonly { id: SettingsPaneId; render: () => JSX.Element }[] = [
+    { id: "general", render: () => <General /> },
+    { id: "agents", render: () => <AgentsPage focus={inlineAgent()} /> },
+    {
+      id: "providers",
+      render: () => <If when={heldAgent()}>{(agent) => <AgentProvidersPage agent={agent()} />}</If>,
+    },
+    { id: "sessions", render: () => <SessionsPage /> },
+    { id: "archive", render: () => <ArchivePage /> },
+    { id: "usage", render: () => <Usage /> },
+    { id: "about", render: () => <About /> },
+  ];
 
   return (
-    <If when={mounted()}>
-      <View class={`absolute inset-0 z-40 items-center justify-center p-6${open() ? "" : " pointer-events-none"}`}>
-        <View class={`absolute inset-0 ${SCRIM}`} style={{ opacity: scrimOpacity }} />
-        <BaseButton onPress={showChat} accessibilityLabel={tr("Close settings", "关闭设置")} class="absolute inset-0" />
-        <View
-          class={`h-full max-h-160 w-full max-w-220 min-h-0 flex-row overflow-hidden ${POPUP}`}
-          style={{ ...GLASS_REGULAR, opacity: panelOpacity, transform: [{ translateY: panelY }, { scale: panelScale }] }}
-        >
-          <SettingsNav section={section()} />
-          <View class="min-h-0 min-w-0 flex-1">
-            <If when={section() === "general"}>
-              <General />
-            </If>
-            <If when={section() === "agents" && !pagedAgent()}>
-              <AgentsPage focus={focusedAgent()} />
-            </If>
-            <If when={pagedAgent()}>{(agent) => <AgentProvidersPage agent={agent()} />}</If>
-            <If when={section() === "sessions"}>
-              <SessionsPage />
-            </If>
-            <If when={section() === "archive"}>
-              <ArchivePage />
-            </If>
-            <If when={section() === "usage"}>
-              <Usage />
-            </If>
-            <If when={section() === "about"}>
-              <About />
-            </If>
-          </View>
-        </View>
-      </View>
-    </If>
+    <FloatingLayer
+      open={open()}
+      onClose={showChat}
+      closeLabel={tr("Close settings", "关闭设置")}
+      panelClass="h-full max-h-160 w-full max-w-220 min-h-0 flex-row"
+    >
+      <SettingsNav section={section()} />
+      <ViewDeck active={activePane()} panes={panes} />
+    </FloatingLayer>
   );
 }

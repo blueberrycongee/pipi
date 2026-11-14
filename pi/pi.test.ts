@@ -1,8 +1,9 @@
 import { expect, test } from "nsh/test";
 import { PiClient, type Transport } from "./client";
+import { DaemonClient } from "./daemon";
 import { createLineSplitter } from "./jsonl";
-import { Transcript, toolSummary, withoutImageNotes } from "./transcript";
-import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, displayRowIds, type TurnHeaderRow } from "./turns";
+import { Transcript, toolSummary, withoutHandoff, withoutImageNotes } from "./transcript";
+import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, describeToolsSummary, displayRowIds, type TurnHeaderRow } from "./turns";
 
 test("splits records on LF only, across chunks, keeping U+2028", () => {
   const lines: string[] = [];
@@ -445,6 +446,60 @@ test("the reader's say on a turn holds; folding a working turn folds the work as
   t.apply({ type: "message_start", message: asked("go on", 7) });
   more("c6", "Going on.");
   expect(shown().slice(-2)).toMatchObject([{ running: false, open: false }, { running: true, open: false }]);
+});
+
+test("unanswered turnStart continuation slices coalesce into one summarized turn while background and answered turns stay clear", () => {
+  const t = new Transcript();
+  t.load([
+    asked("build feature", 1000),
+    // Initial turn spawns a background command and answers "Waiting...".
+    {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "bg1", name: "run_command", arguments: { CommandLine: "npm test" }, background: true },
+        { type: "text", text: "Waiting on test run." },
+      ],
+      stopReason: "stop",
+      timestamp: 3000,
+    } as never,
+    // Later saved sessions with fragmented unanswered `turnStart: true` wake slices coalesce into one turn.
+    {
+      role: "assistant",
+      turnStart: true,
+      content: [
+        { type: "thinking", thinking: "Checking logs." },
+        { type: "toolCall", id: "w1", name: "edit_file", arguments: { Path: "/repo/a.ts" } },
+      ],
+      stopReason: "stop",
+      timestamp: 10_000,
+    } as never,
+    { role: "toolResult", toolCallId: "w1", toolName: "edit_file", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 19_000 } as never,
+    {
+      role: "assistant",
+      turnStart: true,
+      content: [
+        { type: "thinking", thinking: "Pushing changes." },
+        { type: "toolCall", id: "w2", name: "run_command", arguments: { CommandLine: "git status" } },
+      ],
+      stopReason: "stop",
+      timestamp: 20_000,
+    } as never,
+    { role: "toolResult", toolCallId: "w2", toolName: "run_command", content: [{ type: "text", text: "clean" }], isError: false, timestamp: 32_000 } as never,
+    // A subsequent wake turn after an answer still begins its own turn once an answer separates them.
+  ]);
+
+  const rows = buildDisplayRows(t.rows(), false);
+  const turns = turnsOf(rows);
+  expect(turns).toHaveLength(2);
+  // First turn has an active background tool (`bg1`), exposed on the folded header as `backgroundStep`.
+  expect(turns[0].open).toBe(false);
+  expect(turns[0].backgroundStep?.name).toBe("run_command");
+  expect(turns[0].summaryTools).toBeUndefined();
+  // Second turn coalesces both unanswered `turnStart: true` slices into one header with summed duration & tool summary.
+  expect(turns[1].open).toBe(false);
+  expect(turns[1].durationMs).toBe(21_000);
+  expect(turns[1].summaryTools?.map((s) => s.name)).toEqual(["edit_file", "run_command"]);
+  expect(describeToolsSummary(turns[1].summaryTools!, "zh")).toBe("已更新 a.ts，已运行 git");
 });
 
 test("a conversation loaded again keeps its rows' ids, so what is kept by row finds them", () => {
@@ -953,5 +1008,198 @@ test("Transcript and buildDisplayRows keep background tools running across idle 
   expect(reloadedBg).toMatchObject({ id: "bg1", status: "done" });
   expect(reloadedBg && "background" in reloadedBg ? reloadedBg.background : undefined).toBeUndefined();
 });
+
+test("DaemonClient.attach delivers queue_update and blocked dialogs arriving in the same chunk as attached, and reportFile clears empty paths", async () => {
+  const written: string[] = [];
+  let pushStdout: (chunk: string) => void = () => undefined;
+  const link: Transport = {
+    write: (text) => void written.push(text),
+    onStdout: (handler) => void (pushStdout = handler),
+    onStderr: () => undefined,
+    onExit: () => undefined,
+    end: () => undefined,
+    kill: () => undefined,
+  };
+
+  const connectPromise = DaemonClient.connect(link, { onSession: () => undefined });
+  pushStdout(`${JSON.stringify({ type: "hello", pid: 42, sessions: [] })}\n`);
+  const daemon = await connectPromise;
+
+  const attachPromise = daemon.attach({ cwd: "/repo", agentId: "pi" });
+  const attachReq = JSON.parse(written.at(-1)!);
+  const session = {
+    id: "s1",
+    title: "Queued run",
+    cwd: "/repo",
+    agentId: "pi",
+    agentName: "Pi",
+    driver: "pi",
+    runtimeMode: "full-access" as const,
+    status: "blocked" as const,
+    unread: false,
+    loaded: true,
+    depth: 0,
+    createdAt: 1,
+    lastActive: 2,
+  };
+
+  // Coalesce `attached` + replayed `queue_update` + replayed `extension_ui_request` into a single stdout chunk.
+  pushStdout(
+    [
+      JSON.stringify({ id: attachReq.id, type: "attached", session }),
+      JSON.stringify({
+        type: "out",
+        sessionId: "s1",
+        line: JSON.stringify({ type: "queue_update", steering: ["steer-1"], followUp: ["follow-1", "follow-2"] }),
+      }),
+      JSON.stringify({
+        type: "out",
+        sessionId: "s1",
+        line: JSON.stringify({ type: "extension_ui_request", id: "dlg1", method: "confirm", title: "Allow?", message: "ls" }),
+      }),
+      "",
+    ].join("\n"),
+  );
+
+  const attached = await attachPromise;
+  const events: Array<Record<string, unknown>> = [];
+  const dialogs: Array<Record<string, unknown>> = [];
+  const client = new PiClient(attached.transport, {
+    onEvent: (event) => events.push(event as unknown as Record<string, unknown>),
+    onUiRequest: (req) => dialogs.push(req as unknown as Record<string, unknown>),
+    onExit: () => undefined,
+  });
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+  expect(events).toEqual([{ type: "queue_update", steering: ["steer-1"], followUp: ["follow-1", "follow-2"] }]);
+  expect(dialogs).toEqual([{ type: "extension_ui_request", id: "dlg1", method: "confirm", title: "Allow?", message: "ls" }]);
+
+  daemon.reportFile("s1", "/sessions/one.jsonl");
+  expect(JSON.parse(written.at(-1)!)).toEqual({ type: "file", sessionId: "s1", file: "/sessions/one.jsonl" });
+  daemon.reportFile("s1", undefined);
+  expect(JSON.parse(written.at(-1)!)).toEqual({ type: "file", sessionId: "s1", file: null });
+
+  client.close();
+});
+
+test("stageUser shows the user bubble immediately, preserves its row and id on echo, strips handoff context, and keeps pre-echo wake turns ahead of it", () => {
+  const t = new Transcript();
+  const stagedId = t.stageUser("你好，先显示气泡", 0);
+  expect(stagedId).toBeDefined();
+  const stagedRow = t.rows()[0];
+  expect(stagedRow).toEqual({ kind: "user", id: stagedId, text: "你好，先显示气泡", images: 0 });
+  expect(t.hasStagedUser()).toBe(true);
+
+  // An Antigravity idle-wake turn (`turnStart: true`) arriving before `message_start(user)` lands ahead of the staged prompt.
+  const wakeMsg = {
+    role: "assistant",
+    turnStart: true,
+    content: [{ type: "text", text: "后台任务已完成。" }],
+    stopReason: "stop",
+    timestamp: 10,
+  } as never;
+  t.apply({ type: "message_start", message: { role: "assistant", turnStart: true, content: [] } as never });
+  t.apply({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } } as never);
+  t.apply({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "后台任务已完成。" } } as never);
+  t.apply({ type: "message_end", message: wakeMsg });
+  t.apply({ type: "agent_settled", aborted: false });
+
+  expect(t.hasStagedUser()).toBe(true);
+  expect(t.rows().map((r) => ({ kind: r.kind, text: "text" in r ? r.text : "" }))).toEqual([
+    { kind: "text", text: "后台任务已完成。" },
+    { kind: "user", text: "你好，先显示气泡" },
+  ]);
+
+  // Echoing with Portable Context Handoff + Pi image notes keeps the exact same staged row object and id.
+  const echoedWire = [
+    '<conversation_handoff from="Pi" to="Claude Code">',
+    "Portable context handoff from Pi to Claude Code.",
+    "</conversation_handoff>",
+    "",
+    "User message:",
+    "你好，先显示气泡",
+    "",
+    "[Image: original 1914x2040, displayed at 1876x2000. Multiply coordinates by 1.02 to map to original image.]",
+  ].join("\n");
+  expect(withoutHandoff(withoutImageNotes(echoedWire))).toBe("你好，先显示气泡");
+
+  t.apply({ type: "message_start", message: { role: "user", content: echoedWire, timestamp: 20 } });
+  expect(t.hasStagedUser()).toBe(false);
+  expect(t.rows()[1]).toBe(stagedRow);
+  expect(t.rows()[1].id).toBe(stagedId);
+  // Once confirmed, `dropStagedUser` is a no-op.
+  expect(t.dropStagedUser(stagedId)).toBe(false);
+
+  // Template expansion updates the staged row in-place under the same id; refused prompts drop cleanly.
+  const cmdId = t.stageUser("/fix-tests", 0);
+  t.apply({ type: "message_start", message: { role: "user", content: "Run tests and fix failures.", timestamp: 30 } });
+  expect(t.rows().at(-1)).toEqual({ kind: "user", id: cmdId, text: "Run tests and fix failures.", images: 0 });
+
+  const refusedId = t.stageUser("refuse this", 0);
+  expect(t.rows()).toHaveLength(4);
+  expect(t.dropStagedUser(refusedId)).toBe(true);
+  expect(t.rows()).toHaveLength(3);
+
+  // Reloading from disk also strips `<conversation_handoff>` from saved user messages.
+  const reloaded = new Transcript();
+  reloaded.load([{ role: "user", content: echoedWire, timestamp: 20 }]);
+  expect(reloaded.rows()).toEqual([{ kind: "user", id: reloaded.rows()[0].id, text: "你好，先显示气泡", images: 0 }]);
+});
+
+test("a queued staged bubble reconciles with the agent's queue: delivered echoes keep it, recalls withdraw it", () => {
+  const t = new Transcript();
+  const first = t.stageUser("steer this", 0);
+  const second = t.stageUser("follow up on this", 0);
+  t.markStagedQueued(first);
+  t.markStagedQueued(second);
+  expect(t.hasPendingUser()).toBe(true);
+
+  // Both queued: the queue covers them, nothing is marked for withdrawal.
+  t.reconcileQueue(["steer this"], ["follow up on this"]);
+  expect(t.dropDeadline()).toBeUndefined();
+  expect(t.rows().filter((r) => r.kind === "user")).toHaveLength(2);
+
+  // The steering one is delivered first though it was queued second-in-line:
+  // its echo finds its own bubble by content, out of send order.
+  t.reconcileQueue([], ["follow up on this"]);
+  expect(t.dropDeadline()).toBeGreaterThan(Date.now());
+  t.apply({ type: "message_start", message: { role: "user", content: "steer this", timestamp: 10 } });
+  // The echo committed its own bubble under the same id; the still-queued one stays staged behind it.
+  expect(t.rows()[0]).toMatchObject({ kind: "user", id: first, text: "steer this" });
+  expect(t.dropDeadline()).toBeUndefined();
+  expect(t.rows().filter((r) => r.kind === "user")).toHaveLength(2);
+
+  // The follow-up's turn ends the run with its bubble still staged and queued:
+  // `commitStagedUsers` must not promote it — its own echo does.
+  t.commitStagedUsers();
+  expect(t.rows().filter((r) => r.kind === "user")).toHaveLength(2);
+  expect(t.hasStagedUser()).toBe(true);
+
+  // Recalled before delivery: the queue's `clear_queue` answer drops its bubble at once.
+  t.reconcileQueue([], []);
+  t.dropQueuedMatching(["follow up on this"]);
+  expect(t.hasStagedUser()).toBe(false);
+  const users = t.rows().filter((r) => r.kind === "user");
+  expect(users).toHaveLength(1);
+  expect(users[0]).toMatchObject({ id: first, text: "steer this" });
+
+  // A dequeue whose echo never lands (the run died between them) withdraws after the grace.
+  const orphan = t.stageUser("lost message", 0);
+  t.markStagedQueued(orphan);
+  t.reconcileQueue([], []);
+  expect(t.hasPendingUser()).toBe(false);
+  expect(t.rows().some((r) => r.kind === "user" && "text" in r && r.text === "lost message")).toBe(true);
+  const past = Date.now() + 3100;
+  const realNow = Date.now;
+  Date.now = () => past;
+  try {
+    expect(t.sweepDrops()).toBe(true);
+  } finally {
+    Date.now = realNow;
+  }
+  expect(t.rows().some((r) => r.kind === "user" && "text" in r && r.text === "lost message")).toBe(false);
+});
+
+
 
 

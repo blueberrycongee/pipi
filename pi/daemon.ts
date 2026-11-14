@@ -55,6 +55,13 @@ interface VirtualStream {
   out: Array<(chunk: string) => void>;
   err: Array<(chunk: string) => void>;
   exit: Array<(e: Exit) => void>;
+  bufOut: string[];
+  bufErr: string[];
+  bufExit?: Exit;
+  readyOut: boolean;
+  readyErr: boolean;
+  readyExit: boolean;
+  ended: boolean;
 }
 
 /**
@@ -69,6 +76,7 @@ interface VirtualStream {
 export class DaemonClient {
   private seq = 0;
   private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  private pendingAttaches = new Set<string>();
   private streams = new Map<string, Set<VirtualStream>>();
   private sessions = new Map<string, DaemonSession>();
 
@@ -94,9 +102,14 @@ export class DaemonClient {
     transport.onExit((exit) => {
       for (const [, w] of client.pending) w.reject(new Error("daemon link stopped"));
       client.pending.clear();
+      client.pendingAttaches.clear();
       for (const set of client.streams.values()) {
         for (const stream of set) {
-          for (const h of stream.exit.splice(0)) h(exit);
+          if (stream.readyExit) {
+            for (const h of stream.exit.splice(0)) h(exit);
+          } else {
+            stream.bufExit = exit;
+          }
         }
       }
       client.streams.clear();
@@ -130,8 +143,13 @@ export class DaemonClient {
       case "out": {
         const set = this.streams.get(String(msg.sessionId));
         if (set) {
+          const chunk = `${msg.line}\n`;
           for (const stream of [...set]) {
-            for (const h of stream.out) h(`${msg.line}\n`);
+            if (stream.readyOut) {
+              for (const h of stream.out) h(chunk);
+            } else {
+              stream.bufOut.push(chunk);
+            }
           }
         }
         return;
@@ -139,8 +157,13 @@ export class DaemonClient {
       case "err": {
         const set = this.streams.get(String(msg.sessionId));
         if (set) {
+          const chunk = String(msg.text);
           for (const stream of [...set]) {
-            for (const h of stream.err) h(String(msg.text));
+            if (stream.readyErr) {
+              for (const h of stream.err) h(chunk);
+            } else {
+              stream.bufErr.push(chunk);
+            }
           }
         }
         return;
@@ -150,8 +173,13 @@ export class DaemonClient {
         const set = this.streams.get(sessionId);
         if (set) {
           this.streams.delete(sessionId);
+          const exitPayload: Exit = { code: msg.code as number | null, signal: msg.signal as string | undefined };
           for (const stream of [...set]) {
-            for (const h of stream.exit.splice(0)) h({ code: msg.code as number | null, signal: msg.signal as string | undefined });
+            if (stream.readyExit) {
+              for (const h of stream.exit.splice(0)) h(exitPayload);
+            } else {
+              stream.bufExit = exitPayload;
+            }
           }
         }
         return;
@@ -161,17 +189,45 @@ export class DaemonClient {
       }
       default: {
         if (typeof msg.id === "string" && this.pending.has(msg.id)) {
+          const isAttach = this.pendingAttaches.delete(msg.id);
           const w = this.pending.get(msg.id)!;
           this.pending.delete(msg.id);
-          if (msg.type === "error") w.reject(new Error(String(msg.error ?? "daemon error")));
-          else w.resolve(msg);
+          if (msg.type === "error") {
+            w.reject(new Error(String(msg.error ?? "daemon error")));
+          } else if (isAttach && msg.type === "attached" && msg.session && typeof (msg.session as DaemonSession).id === "string") {
+            const session = msg.session as DaemonSession;
+            this.sessions.set(session.id, session);
+            // Register the stream synchronously inside `onRecord` before `splitter.push`
+            // advances to replayed `out` lines (`queue_update`, `pendingDialogs`) in the same chunk.
+            const stream: VirtualStream = {
+              out: [],
+              err: [],
+              exit: [],
+              bufOut: [],
+              bufErr: [],
+              readyOut: false,
+              readyErr: false,
+              readyExit: false,
+              ended: false,
+            };
+            let set = this.streams.get(session.id);
+            if (!set) {
+              set = new Set();
+              this.streams.set(session.id, set);
+            }
+            set.add(stream);
+            w.resolve({ session, stream });
+          } else {
+            w.resolve(msg);
+          }
         }
       }
     }
   }
 
-  private call<T>(type: string, payload: Record<string, unknown> = {}): Promise<T> {
+  private call<T>(type: string, payload: Record<string, unknown> = {}, registerStream = false): Promise<T> {
     const id = `a${++this.seq}`;
+    if (registerStream) this.pendingAttaches.add(id);
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, {
         resolve: (msg) => resolve(msg as T),
@@ -180,10 +236,12 @@ export class DaemonClient {
       try {
         void Promise.resolve(this.transport.write(`${JSON.stringify({ id, type, ...payload })}\n`)).catch((error) => {
           this.pending.delete(id);
+          this.pendingAttaches.delete(id);
           reject(error instanceof Error ? error : new Error(String(error)));
         });
       } catch (error) {
         this.pending.delete(id);
+        this.pendingAttaches.delete(id);
         reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
@@ -211,21 +269,15 @@ export class DaemonClient {
    * drive it with plus the session record.
    */
   async attach(spec: DaemonAttachSpec): Promise<{ transport: VirtualTransport; session: DaemonSession }> {
-    const res = await this.call<{ session: DaemonSession }>("attach", { session: spec });
-    const session = res.session;
+    const { session, stream } = await this.call<{ session: DaemonSession; stream: VirtualStream }>("attach", { session: spec }, true);
     const client = this;
-    const stream: VirtualStream = { out: [], err: [], exit: [] };
-    let set = this.streams.get(session.id);
-    if (!set) {
-      set = new Set();
-      this.streams.set(session.id, set);
-    }
-    set.add(stream);
-    let ended = false;
     let writeBuf = "";
     const detachStream = () => {
-      if (ended) return;
-      ended = true;
+      if (stream.ended) return;
+      stream.ended = true;
+      stream.bufOut.length = 0;
+      stream.bufErr.length = 0;
+      stream.bufExit = undefined;
       const active = client.streams.get(session.id);
       if (active) {
         active.delete(stream);
@@ -239,7 +291,7 @@ export class DaemonClient {
     const virtual: VirtualTransport = {
       sessionId: session.id,
       write(text) {
-        if (ended) throw new Error("Session detached");
+        if (stream.ended) throw new Error("Session detached");
         writeBuf += text;
         let at = writeBuf.indexOf("\n");
         while (at !== -1) {
@@ -249,9 +301,46 @@ export class DaemonClient {
           if (line) client.notify("in", { sessionId: session.id, line });
         }
       },
-      onStdout: (handler) => void stream.out.push(handler),
-      onStderr: (handler) => void stream.err.push(handler),
-      onExit: (handler) => void stream.exit.push(handler),
+      onStdout(handler) {
+        stream.out.push(handler);
+        if (!stream.readyOut) {
+          queueMicrotask(() => {
+            if (stream.ended || stream.readyOut) return;
+            stream.readyOut = true;
+            for (const chunk of stream.bufOut.splice(0)) {
+              if (stream.ended) return;
+              for (const h of stream.out) h(chunk);
+            }
+          });
+        }
+      },
+      onStderr(handler) {
+        stream.err.push(handler);
+        if (!stream.readyErr) {
+          queueMicrotask(() => {
+            if (stream.ended || stream.readyErr) return;
+            stream.readyErr = true;
+            for (const chunk of stream.bufErr.splice(0)) {
+              if (stream.ended) return;
+              for (const h of stream.err) h(chunk);
+            }
+          });
+        }
+      },
+      onExit(handler) {
+        stream.exit.push(handler);
+        if (!stream.readyExit) {
+          queueMicrotask(() => {
+            if (stream.ended || stream.readyExit) return;
+            stream.readyExit = true;
+            if (stream.bufExit !== undefined) {
+              const exitPayload = stream.bufExit;
+              stream.bufExit = undefined;
+              for (const h of stream.exit.splice(0)) h(exitPayload);
+            }
+          });
+        }
+      },
       end: detachStream,
       kill: detachStream,
     };
@@ -282,9 +371,9 @@ export class DaemonClient {
     this.notify("set_runtime_mode", { sessionId, mode });
   }
 
-  /** Tells the daemon which session file an attached process is on now. */
+  /** Tells the daemon which session file an attached process is on now (`undefined` clears it on `new_session`). */
   reportFile(sessionId: string, file: string | undefined) {
-    if (file) this.notify("file", { sessionId, file });
+    this.notify("file", { sessionId, file: file ?? null });
   }
 
   /** Starts a detached-or-child session (the compare flow): its answer goes to the user. */

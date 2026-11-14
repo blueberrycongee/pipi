@@ -241,6 +241,9 @@ function createSession(spec) {
     id: `s_${(++seq).toString(36)}${crypto.randomBytes(3).toString("hex")}`,
     token: newToken(),
     title: spec.title || "New session",
+    // A name handed in (`session_start`/`start_session`) belongs to the task, not
+    // whatever file the process lands on — it survives `setFile` resyncs.
+    titleLocked: spec.titleLocked === true,
     cwd: spec.cwd || process.cwd(),
     file: spec.file,
     agentId: spec.agentId || "pi",
@@ -265,8 +268,10 @@ function createSession(spec) {
     attached: new Set(),
     proc: undefined,
     starting: undefined,
+    discoveringFile: undefined,
     internalPending: new Map(),
     pendingDialogs: new Map(),
+    pendingQueue: { steering: [], followUp: [] },
     deliverQueue: [],
     lastAnswer: "",
     pendingAnswer: "",
@@ -275,19 +280,24 @@ function createSession(spec) {
     exitExpected: false,
     waiters: [],
   };
+  if (session.file && !session.titleLocked && session.title === "New session") {
+    session.title = titleOfFile(session.file) || session.title;
+  }
   sessions.set(session.id, session);
   if (session.file) sessionsByFile.set(session.file, session.id);
-  persist({ type: "session", info: { ...sessionInfo(session), token: session.token }, launch: session.launch });
+  persist({ type: "session", info: { ...sessionInfo(session), token: session.token, titleLocked: session.titleLocked || undefined }, launch: session.launch });
   pushSession(session);
   return session;
 }
 
 function setFile(session, file) {
-  if (!file || session.file === file) return;
+  const next = file || undefined;
+  if (session.file === next) return;
   if (session.file && sessionsByFile.get(session.file) === session.id) sessionsByFile.delete(session.file);
-  session.file = file;
-  sessionsByFile.set(file, session.id);
-  persist({ type: "session_update", id: session.id, info: { file } });
+  session.file = next;
+  if (next) sessionsByFile.set(next, session.id);
+  persist({ type: "session_update", id: session.id, info: { file: next ?? null } });
+  syncTitle(session);
   pushSession(session);
 }
 
@@ -487,6 +497,7 @@ async function startProcess(session) {
       if (session.proc === child) session.proc = undefined;
       session.loaded = false;
       session.pendingDialogs.clear();
+      session.pendingQueue = { steering: [], followUp: [] };
       const expected = session.exitExpected;
       session.exitExpected = false;
       for (const entry of session.internalPending.values()) {
@@ -514,17 +525,26 @@ async function startProcess(session) {
   }
 }
 
-/** Asks the process which session file it is on — the way unattached sessions get theirs. */
-async function discoverFile(session) {
-  for (let attempt = 0; attempt < 6 && !session.file; attempt++) {
-    const state = await daemonCommand(session, "get_state");
-    if (state?.sessionFile) {
-      setFile(session, state.sessionFile);
-      return;
+/** Asks the process which session file it is on — single-flight across startup and turn starts. */
+function discoverFile(session) {
+  if (session.file || session.discoveringFile) return session.discoveringFile;
+  const p = (async () => {
+    for (let attempt = 0; attempt < 6 && !session.file; attempt++) {
+      const state = await daemonCommand(session, "get_state");
+      // Discovery only fills a void: a file named while the ask was in flight wins.
+      if (session.file) return;
+      if (state?.sessionFile) {
+        setFile(session, state.sessionFile);
+        return;
+      }
+      if (!session.proc || session.proc.killed) return;
+      await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 150 : 1000));
     }
-    if (!session.proc || session.proc.killed) return;
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-  }
+  })().finally(() => {
+    if (session.discoveringFile === p) session.discoveringFile = undefined;
+  });
+  session.discoveringFile = p;
+  return p;
 }
 
 function killProcess(session) {
@@ -616,10 +636,14 @@ function observeRecord(session, record) {
       session.turnFailed = false;
       session.pendingDialogs.clear();
       setStatus(session, "working");
+      if (!session.file) void discoverFile(session);
       break;
     case "message_end": {
       const message = record.message;
-      if (message?.role === "user") learnTitle(session, message);
+      if (message?.role === "user") {
+        learnTitle(session, message);
+        if (!session.file) void discoverFile(session);
+      }
       if (message?.role === "assistant") {
         session.turnFailed = message.stopReason === "error";
         if (message.stopReason === "error" && typeof message.errorMessage === "string" && message.errorMessage.trim()) {
@@ -637,6 +661,12 @@ function observeRecord(session, record) {
       }
       break;
     }
+    case "queue_update":
+      session.pendingQueue = {
+        steering: Array.isArray(record.steering) ? record.steering.map(String) : [],
+        followUp: Array.isArray(record.followUp) ? record.followUp.map(String) : [],
+      };
+      break;
     case "extension_ui_request":
       if (typeof record.id === "string") {
         if (record.method !== "notify" && record.method !== "setStatus" && record.method !== "setWidget" && record.method !== "setTitle" && record.method !== "set_editor_text") {
@@ -654,17 +684,72 @@ function observeRecord(session, record) {
   }
 }
 
+function textOfMessage(message) {
+  const content = message?.content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((block) => block?.type === "text" && typeof block.text === "string")
+      .map((block) => block.text)
+      .join(" ");
+  }
+  return typeof content === "string" ? content : "";
+}
+
+function clippedTitle(text) {
+  const title = typeof text === "string" ? clip(text.replace(/\s+/g, " ").trim(), 48) : "";
+  return title || undefined;
+}
+
+/** The title a session file would list for itself — its `session_info` name when
+ *  it has one, else its first user message — the same precedence the session
+ *  list uses. `undefined` when the file is missing, empty, or has no title yet. */
+function titleOfFile(file) {
+  let lines;
+  try {
+    lines = fs.readFileSync(file, "utf8").split("\n");
+  } catch {
+    return undefined;
+  }
+  let header;
+  try {
+    header = JSON.parse(lines[0] ?? "");
+  } catch {}
+  if (header?.type === "pipi_external_session") {
+    return clippedTitle(header.name || header.firstMessage);
+  }
+  let name;
+  let firstMessage;
+  for (const line of lines) {
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (entry?.type === "session_info" && typeof entry.name === "string" && entry.name) name = entry.name;
+    if (!firstMessage && entry?.type === "message" && entry.message?.role === "user") {
+      const text = textOfMessage(entry.message);
+      if (!text.trimStart().startsWith("<pipi-message")) firstMessage = text;
+    }
+    if (name && firstMessage) break;
+  }
+  return clippedTitle(name || firstMessage);
+}
+
+/** The title follows the file: a session whose process moved conversations is
+ *  re-named from the file it is on now — a locked (given) name keeps standing. */
+function syncTitle(session) {
+  if (session.titleLocked) return;
+  const title = (session.file && titleOfFile(session.file)) || "New session";
+  if (session.title === title) return;
+  session.title = title;
+  persist({ type: "session_update", id: session.id, info: { title } });
+}
+
 /** A session nobody named takes its title from its first user message — what the session list shows. */
 function learnTitle(session, message) {
   if (session.title && session.title !== "New session") return;
-  const text = Array.isArray(message?.content)
-    ? message.content
-        .filter((block) => block?.type === "text" && typeof block.text === "string")
-        .map((block) => block.text)
-        .join(" ")
-    : typeof message?.content === "string"
-      ? message.content
-      : "";
+  const text = textOfMessage(message);
   if (text.trimStart().startsWith("<pipi-message")) return;
   const title = clip(text.replace(/\s+/g, " ").trim(), 48);
   if (!title) return;
@@ -686,7 +771,27 @@ function observeWrite(session, line) {
     if (session.pendingDialogs.size === 0 && session.status === "blocked") setStatus(session, "working");
     return;
   }
-  if (record.type === "prompt") {
+  if (record.type === "new_session") {
+    session.pendingQueue = { steering: [], followUp: [] };
+    setFile(session, undefined);
+    if (session.title !== "New session" || session.titleLocked) {
+      session.title = "New session";
+      session.titleLocked = false;
+      persist({ type: "session_update", id: session.id, info: { title: session.title, titleLocked: false } });
+      pushSession(session);
+    }
+    return;
+  }
+  if (record.type === "switch_session") {
+    session.pendingQueue = { steering: [], followUp: [] };
+    if (typeof record.sessionPath === "string" && record.sessionPath) setFile(session, record.sessionPath);
+    return;
+  }
+  if (record.type === "clear_queue") {
+    session.pendingQueue = { steering: [], followUp: [] };
+    return;
+  }
+  if (record.type === "prompt" || record.type === "steer" || record.type === "follow_up") {
     // A prompt written by an attached client (the UI) or the daemon itself.
     if (!String(record.id ?? "").startsWith(INTERNAL_PREFIX)) {
       session.initiator = "user";
@@ -701,6 +806,7 @@ function observeWrite(session, line) {
 
 function onSettled(session, record) {
   session.pendingDialogs.clear();
+  session.pendingQueue = { steering: [], followUp: [] };
   const aborted = record.aborted === true || record.outcome === "aborted";
   const failed = !aborted && (session.turnFailed === true || record.outcome === "error" || Boolean(record.errorMessage));
   session.turnFailed = false;
@@ -1116,6 +1222,7 @@ async function callSessionTool(caller, name, args = {}) {
       const wantWorktree = args.worktree === true || (args.worktree === undefined && config.worktreeDefault === true);
       const session = createSession({
         title: args.title,
+        titleLocked: Boolean(args.title),
         agentId: agent.id,
         agentName: agent.name,
         driver: agent.driver,
@@ -1207,6 +1314,10 @@ async function stopTree(session) {
         writeLine(target, JSON.stringify({ type: "extension_ui_response", id: dialogId, cancelled: true }));
       }
       target.pendingDialogs.clear();
+      if (target.pendingQueue.steering.length > 0 || target.pendingQueue.followUp.length > 0) {
+        target.pendingQueue = { steering: [], followUp: [] };
+        await daemonCommand(target, "clear_queue", {});
+      }
       await daemonCommand(target, "abort", {});
     }),
   );
@@ -1371,6 +1482,19 @@ async function controlOp(conn, msg) {
       session.attached.add(conn);
       conn.attachedSessions.add(session.id);
       respond(conn, id, "attached", { session: sessionInfo(session) });
+      // Replay queued steering / follow-up messages so reattaching mid-run
+      // restores the QueueTray immediately.
+      if (session.pendingQueue.steering.length > 0 || session.pendingQueue.followUp.length > 0) {
+        send(conn, {
+          type: "out",
+          sessionId: session.id,
+          line: JSON.stringify({
+            type: "queue_update",
+            steering: session.pendingQueue.steering,
+            followUp: session.pendingQueue.followUp,
+          }),
+        });
+      }
       // Replay dialogs still waiting on an answer — a session blocked in the
       // background hands its question to whoever attaches.
       for (const dialog of session.pendingDialogs.values()) {
@@ -1399,7 +1523,9 @@ async function controlOp(conn, msg) {
     }
     case "file": {
       const session = sessions.get(msg.sessionId);
-      if (session && typeof msg.file === "string") setFile(session, msg.file);
+      if (session && (typeof msg.file === "string" || msg.file === null)) {
+        setFile(session, msg.file || undefined);
+      }
       return;
     }
     case "mark_read": {
@@ -1486,6 +1612,7 @@ async function controlOp(conn, msg) {
         const runtimeMode = fitAgentModes(rawMode, agent.supportedRuntimeModes);
         const session = createSession({
           title: input.title,
+          titleLocked: Boolean(input.title),
           agentId: agent.id,
           agentName: agent.name,
           driver: agent.driver,
@@ -1881,12 +2008,15 @@ async function loadRegistry() {
       if (!sessions.has(info.id)) {
         const session = {
           ...info,
+          file: info.file || undefined,
           launch: record.launch ?? { binaryPath: info.binaryPath, extraArgs: info.extraArgs, customAgent: info.customAgent },
           attached: new Set(),
           proc: undefined,
           starting: undefined,
+          discoveringFile: undefined,
           internalPending: new Map(),
           pendingDialogs: new Map(),
+          pendingQueue: { steering: [], followUp: [] },
           deliverQueue: [],
           lastAnswer: "",
           pendingAnswer: "",
@@ -1907,6 +2037,7 @@ async function loadRegistry() {
           const prevFile = session.file;
           const { id: _ignored, ...rest } = record.info;
           Object.assign(session, rest);
+          if (!session.file) session.file = undefined;
           if (prevFile && prevFile !== session.file && sessionsByFile.get(prevFile) === session.id) {
             sessionsByFile.delete(prevFile);
           }

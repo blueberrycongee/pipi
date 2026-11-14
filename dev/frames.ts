@@ -10,8 +10,21 @@ export interface Grid {
   data: Uint8Array;
 }
 
-/** PNG decode keeping only every `step`-th pixel's luminance (8-bit RGBA/RGB/gray, all filters). */
-export function decodeLumGrid(bytes: Uint8Array, step: number): Grid {
+interface PngDecodeState {
+  width: number;
+  height: number;
+  bpp: number;
+  stride: number;
+  step: number;
+  gw: number;
+  gh: number;
+  raw: Uint8Array;
+  data: Uint8Array;
+  prev: Uint8Array;
+  cur: Uint8Array;
+}
+
+function inflatePng(bytes: Uint8Array, step: number): PngDecodeState {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const width = dv.getUint32(16);
   const height = dv.getUint32(20);
@@ -35,40 +48,90 @@ export function decodeLumGrid(bytes: Uint8Array, step: number): Grid {
   const stride = width * bpp;
   const gw = Math.ceil(width / step);
   const gh = Math.ceil(height / step);
-  const data = new Uint8Array(gw * gh);
-  const prev = new Uint8Array(stride);
-  const cur = new Uint8Array(stride);
-  for (let y = 0; y < height; y++) {
-    const filter = raw[y * (stride + 1)];
-    const row = raw.subarray(y * (stride + 1) + 1, y * (stride + 1) + 1 + stride);
-    for (let x = 0; x < stride; x++) {
-      const a = x >= bpp ? cur[x - bpp] : 0;
-      const b = prev[x];
-      const c = x >= bpp ? prev[x - bpp] : 0;
-      let v = row[x];
-      if (filter === 1) v += a;
-      else if (filter === 2) v += b;
-      else if (filter === 3) v += (a + b) >> 1;
-      else if (filter === 4) {
-        const p = a + b - c;
-        const pa = Math.abs(p - a);
-        const pb = Math.abs(p - b);
-        const pc = Math.abs(p - c);
-        v += pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+  return {
+    width,
+    height,
+    bpp,
+    stride,
+    step,
+    gw,
+    gh,
+    raw,
+    data: new Uint8Array(gw * gh),
+    prev: new Uint8Array(stride),
+    cur: new Uint8Array(stride),
+  };
+}
+
+function decodeRows(state: PngDecodeState, yStart: number, yEnd: number): void {
+  const { width, bpp, stride, step, gw, raw, data } = state;
+  let { prev, cur } = state;
+  const rowSpan = stride + 1;
+  for (let y = yStart; y < yEnd; y++) {
+    const base = y * rowSpan;
+    const filter = raw[base];
+    const row = raw.subarray(base + 1, base + rowSpan);
+    if (filter === 0) {
+      cur.set(row);
+    } else if (filter === 1) {
+      for (let x = 0; x < bpp; x++) cur[x] = row[x];
+      for (let x = bpp; x < stride; x++) cur[x] = (row[x] + cur[x - bpp]) & 0xff;
+    } else if (filter === 2) {
+      for (let x = 0; x < stride; x++) cur[x] = (row[x] + prev[x]) & 0xff;
+    } else if (filter === 3) {
+      for (let x = 0; x < bpp; x++) cur[x] = (row[x] + (prev[x] >> 1)) & 0xff;
+      for (let x = bpp; x < stride; x++) cur[x] = (row[x] + ((cur[x - bpp] + prev[x]) >> 1)) & 0xff;
+    } else if (filter === 4) {
+      for (let x = 0; x < bpp; x++) cur[x] = (row[x] + prev[x]) & 0xff;
+      for (let x = bpp; x < stride; x++) {
+        const a = cur[x - bpp];
+        const b = prev[x];
+        const c = prev[x - bpp];
+        const pa = b >= c ? b - c : c - b;
+        const pb = a >= c ? a - c : c - a;
+        const d = a + b - (c << 1);
+        const pc = d >= 0 ? d : -d;
+        cur[x] = (row[x] + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c)) & 0xff;
       }
-      cur[x] = v & 0xff;
+    } else {
+      cur.set(row);
     }
-    if (y % step !== 0) {
-      prev.set(cur);
-      continue;
+    if (y % step === 0) {
+      let out = ((y / step) | 0) * gw;
+      if (bpp === 1) {
+        for (let x = 0; x < width; x += step, out++) data[out] = cur[x];
+      } else {
+        for (let x = 0; x < width; x += step, out++) {
+          const i = x * bpp;
+          data[out] = (cur[i] * 30 + cur[i + 1] * 59 + cur[i + 2] * 11) / 100;
+        }
+      }
     }
-    for (let x = 0; x < width; x += step) {
-      const i = x * bpp;
-      data[(y / step) * gw + x / step] = bpp === 1 ? cur[i] : (cur[i] * 30 + cur[i + 1] * 59 + cur[i + 2] * 11) / 100;
-    }
-    prev.set(cur);
+    const swap = prev;
+    prev = cur;
+    cur = swap;
   }
-  return { width: gw, height: gh, step, data };
+  state.prev = prev;
+  state.cur = cur;
+}
+
+/** PNG decode keeping only every `step`-th pixel's luminance (8-bit RGBA/RGB/gray, all filters). */
+export function decodeLumGrid(bytes: Uint8Array, step: number): Grid {
+  const state = inflatePng(bytes, step);
+  decodeRows(state, 0, state.height);
+  return { width: state.gw, height: state.gh, step, data: state.data };
+}
+
+/** Chunked async variant of `decodeLumGrid` that yields every `chunkRows` scanlines so large Retina screenshots never trip QuickJS's 2000ms single-turn budget. */
+export async function decodeLumGridAsync(bytes: Uint8Array, step: number, chunkRows = 256): Promise<Grid> {
+  const state = inflatePng(bytes, step);
+  for (let y = 0; y < state.height; y += chunkRows) {
+    decodeRows(state, y, Math.min(state.height, y + chunkRows));
+    if (y + chunkRows < state.height) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }
+  return { width: state.gw, height: state.gh, step, data: state.data };
 }
 
 export const lum = (g: Grid, x: number, y: number) => g.data[y * g.width + x];

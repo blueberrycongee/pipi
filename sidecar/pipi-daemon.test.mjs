@@ -13,6 +13,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_SCRIPT = path.join(__dirname, "pipi-cli.mjs");
 const MCP_STDIO_SCRIPT = path.join(__dirname, "pipi-mcp-stdio.mjs");
 const PI_EXT_SCRIPT = path.join(__dirname, "pipi-orchestrator-extension.mjs");
+const BRIDGE_SCRIPT = path.join(__dirname, "external-agent.mjs");
+const FAKE_ACP_SCRIPT = path.join(__dirname, "..", "dev", "fake-acp.mjs");
 
 /** Creates an isolated fake agent script speaking Pi's JSONL RPC protocol. */
 function writeMockAgent(dir) {
@@ -46,8 +48,12 @@ let isStreaming = false;
 let runtimeMode = process.env.PIPI_RUNTIME_MODE || "full-access";
 let currentAbort = null;
 const pendingUi = new Map();
+const queued = { steering: [], followUp: [] };
 
 function saveMessages() {
+  if (!sessionFile) {
+    sessionFile = path.join(SESSION_DIR, \`sess-\${process.pid}-\${Date.now()}-\${++seq}.jsonl\`);
+  }
   fs.writeFileSync(
     sessionFile,
     messages.map((m) => JSON.stringify({ type: "message", message: m })).join("\\n") + (messages.length ? "\\n" : ""),
@@ -87,8 +93,7 @@ async function callMcp(name, args) {
   return res.json();
 }
 
-async function runTurn(promptText) {
-  isStreaming = true;
+async function runSingleTurn(promptText) {
   let aborted = false;
   let cancelWait = null;
   currentAbort = () => {
@@ -121,11 +126,8 @@ async function runTurn(promptText) {
     emit({ type: "message_start", message: asst });
     emit({ type: "message_end", message: asst });
     emit({ type: "turn_end" });
-    isStreaming = false;
-    currentAbort = null;
     emit({ type: "agent_end", willRetry: false });
-    emit({ type: "agent_settled", aborted: false });
-    return;
+    return false;
   }
 
   if (cmdText.startsWith("fail:")) {
@@ -142,11 +144,8 @@ async function runTurn(promptText) {
     emit({ type: "message_start", message: asst });
     emit({ type: "message_end", message: asst });
     emit({ type: "turn_end" });
-    isStreaming = false;
-    currentAbort = null;
     emit({ type: "agent_end", willRetry: false });
-    emit({ type: "agent_settled", aborted: false });
-    return;
+    return false;
   }
 
   if (cmdText.startsWith("block:")) {
@@ -174,11 +173,8 @@ async function runTurn(promptText) {
     emit({ type: "message_start", message: asst });
     emit({ type: "message_end", message: asst });
     emit({ type: "turn_end" });
-    isStreaming = false;
-    currentAbort = null;
     emit({ type: "agent_end", willRetry: false });
-    emit({ type: "agent_settled", aborted });
-    return;
+    return aborted;
   }
 
   if (cmdText.startsWith("slow:")) {
@@ -192,12 +188,9 @@ async function runTurn(promptText) {
       };
     });
     if (aborted) {
-      isStreaming = false;
-      currentAbort = null;
       emit({ type: "turn_end" });
       emit({ type: "agent_end", willRetry: false });
-      emit({ type: "agent_settled", aborted: true });
-      return;
+      return true;
     }
     const reply = rest.join(":") || "done-slow";
     const asst = { role: "assistant", content: [{ type: "text", text: reply }], stopReason: "stop", timestamp: Date.now() };
@@ -206,11 +199,8 @@ async function runTurn(promptText) {
     emit({ type: "message_start", message: asst });
     emit({ type: "message_end", message: asst });
     emit({ type: "turn_end" });
-    isStreaming = false;
-    currentAbort = null;
     emit({ type: "agent_end", willRetry: false });
-    emit({ type: "agent_settled", aborted: false });
-    return;
+    return false;
   }
 
   let reply = \`echo:\${promptText}\`;
@@ -248,10 +238,32 @@ async function runTurn(promptText) {
   emit({ type: "message_start", message: asst });
   emit({ type: "message_end", message: asst });
   emit({ type: "turn_end" });
+  emit({ type: "agent_end", willRetry: false });
+  return false;
+}
+
+async function runTurn(initialPrompt) {
+  isStreaming = true;
+  let lastAborted = false;
+  let next = initialPrompt;
+  while (next !== undefined) {
+    lastAborted = await runSingleTurn(next);
+    if (lastAborted) {
+      if (queued.steering.length || queued.followUp.length) {
+        queued.steering.length = 0;
+        queued.followUp.length = 0;
+        emit({ type: "queue_update", steering: [], followUp: [] });
+      }
+      break;
+    }
+    next = queued.steering.shift() ?? queued.followUp.shift();
+    if (next !== undefined) {
+      emit({ type: "queue_update", steering: [...queued.steering], followUp: [...queued.followUp] });
+    }
+  }
   isStreaming = false;
   currentAbort = null;
-  emit({ type: "agent_end", willRetry: false });
-  emit({ type: "agent_settled", aborted: false });
+  emit({ type: "agent_settled", aborted: Boolean(lastAborted) });
 }
 
 let buf = "";
@@ -285,12 +297,12 @@ process.stdin.on("data", (chunk) => {
         command: "get_state",
         success: true,
         data: {
-          sessionId: path.basename(sessionFile, ".jsonl"),
+          sessionId: sessionFile ? path.basename(sessionFile, ".jsonl") : "unsaved",
           sessionFile,
           isStreaming,
           isCompacting: false,
           messageCount: messages.length,
-          pendingMessageCount: 0,
+          pendingMessageCount: queued.steering.length + queued.followUp.length,
           thinkingLevel: "medium",
           steeringMode: "one-at-a-time",
           followUpMode: "one-at-a-time",
@@ -304,9 +316,27 @@ process.stdin.on("data", (chunk) => {
       emit({ id: cmd.id, type: "response", command: "get_messages", success: true, data: { messages } });
       continue;
     }
+    if (cmd.type === "new_session") {
+      messages = [];
+      queued.steering.length = 0;
+      queued.followUp.length = 0;
+      sessionFile = undefined;
+      emit({ id: cmd.id, type: "response", command: "new_session", success: true, data: { cancelled: false } });
+      continue;
+    }
     if (cmd.type === "switch_session") {
+      queued.steering.length = 0;
+      queued.followUp.length = 0;
       loadMessages(cmd.sessionPath);
       emit({ id: cmd.id, type: "response", command: "switch_session", success: true, data: { cancelled: false } });
+      continue;
+    }
+    if (cmd.type === "clear_queue") {
+      const cleared = { steering: [...queued.steering], followUp: [...queued.followUp] };
+      queued.steering.length = 0;
+      queued.followUp.length = 0;
+      emit({ type: "queue_update", steering: [], followUp: [] });
+      emit({ id: cmd.id, type: "response", command: "clear_queue", success: true, data: cleared });
       continue;
     }
     if (cmd.type === "set_runtime_mode") {
@@ -315,14 +345,26 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
     if (cmd.type === "abort") {
+      if (queued.steering.length || queued.followUp.length) {
+        queued.steering.length = 0;
+        queued.followUp.length = 0;
+        emit({ type: "queue_update", steering: [], followUp: [] });
+      }
       if (currentAbort) currentAbort();
       emit({ id: cmd.id, type: "response", command: "abort", success: true, data: {} });
       continue;
     }
     if (cmd.type === "prompt" || cmd.type === "steer" || cmd.type === "follow_up") {
       const msg = String(cmd.message ?? "");
-      emit({ id: cmd.id, type: "response", command: cmd.type, success: true, data: { disposition: isStreaming ? "queued" : "started" } });
-      void runTurn(msg);
+      if (isStreaming) {
+        const isSteer = cmd.type === "steer" || cmd.streamingBehavior === "steer";
+        (isSteer ? queued.steering : queued.followUp).push(msg);
+        emit({ type: "queue_update", steering: [...queued.steering], followUp: [...queued.followUp] });
+        emit({ id: cmd.id, type: "response", command: cmd.type, success: true, data: { disposition: "queued" } });
+      } else {
+        emit({ id: cmd.id, type: "response", command: cmd.type, success: true, data: { disposition: "started" } });
+        void runTurn(msg);
+      }
       continue;
     }
     emit({ id: cmd.id, type: "response", command: cmd.type, success: true, data: {} });
@@ -887,3 +929,279 @@ test("6 & 8: persistence (0600, compaction, interrupted replay on SIGTERM) and C
     return r.lastAnswer?.includes('status="failed"') && r.lastAnswer?.includes("daemon restarted");
   }, 10_000);
 });
+
+test("external-agent bridge saves sessionFile up front and drains queued steering/follow-up turns before a single agent_settled", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-bridge-queue-"));
+  const agentDir = path.join(tmp, "agent");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  const config = {
+    cwd: workDir,
+    agentId: "fake-acp",
+    driver: "acp",
+    runtimeMode: "approval-required",
+    customAgent: { id: "fake-acp", name: "Fake ACP", command: process.execPath, args: [FAKE_ACP_SCRIPT] },
+  };
+  const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir };
+  delete env.PI_CODING_AGENT_SESSION_DIR;
+  delete env.FAKE_ACP_USAGE;
+
+  const child = spawn(process.execPath, [BRIDGE_SCRIPT, JSON.stringify(config)], {
+    cwd: workDir,
+    env,
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  t.after(() => child.kill());
+
+  const records = [];
+  const waits = new Map();
+  let autoApprove = false;
+  let buf = "";
+  let seq = 0;
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    buf += chunk;
+    for (let at = buf.indexOf("\n"); at >= 0; at = buf.indexOf("\n")) {
+      const line = buf.slice(0, at);
+      buf = buf.slice(at + 1);
+      if (!line) continue;
+      const rec = JSON.parse(line);
+      records.push(rec);
+      if (rec.type === "response" && waits.has(rec.id)) {
+        waits.get(rec.id)(rec);
+        waits.delete(rec.id);
+      } else if (rec.type === "extension_ui_request" && autoApprove) {
+        child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: rec.id, confirmed: true })}\n`);
+      }
+    }
+  });
+
+  const rpc = (command) =>
+    new Promise((resolve) => {
+      const id = `b_${++seq}`;
+      waits.set(id, resolve);
+      child.stdin.write(`${JSON.stringify({ id, ...command })}\n`);
+    });
+
+  const waitRecord = async (pred, timeoutMs = 8000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const found = records.find(pred);
+      if (found) return found;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error("Timed out waiting for bridge record");
+  };
+
+  // Start Turn 1: pauses at tool permission dialog.
+  const started = await rpc({ type: "prompt", message: "first turn" });
+  assert.equal(started.data.disposition, "started");
+  const firstDialog = await waitRecord((r) => r.type === "extension_ui_request");
+
+  // `sessionFile` must already be assigned and persisted on disk BEFORE Turn 1 completes.
+  const midState = (await rpc({ type: "get_state" })).data;
+  assert.equal(midState.isStreaming, true);
+  assert.ok(midState.sessionFile && fs.existsSync(midState.sessionFile), "sessionFile must exist on disk mid-turn");
+
+  // Queue two follow-up turns and a steer turn while Turn 1 is paused on permission.
+  // First approve Turn 1 only after queueing follow-ups (without steer-interrupting Turn 1) to test normal multi-turn drain:
+  const qFollow1 = await rpc({ type: "prompt", message: "follow one", streamingBehavior: "followUp" });
+  const qFollow2 = await rpc({ type: "prompt", message: "follow two", streamingBehavior: "followUp" });
+  assert.equal(qFollow1.data.disposition, "queued");
+  assert.equal(qFollow2.data.disposition, "queued");
+
+  const stateWhileQueued = (await rpc({ type: "get_state" })).data;
+  assert.equal(stateWhileQueued.pendingMessageCount, 2);
+
+  // Auto-approve subsequent tool calls and approve Turn 1's dialog so all 3 turns drain back-to-back.
+  autoApprove = true;
+  child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: firstDialog.id, confirmed: true })}\n`);
+
+  const settled = await waitRecord((r) => r.type === "agent_settled");
+  assert.equal(settled.aborted, false);
+
+  // Must have emitted `agent_end` once per turn (3 total), and `agent_settled` strictly once at the end!
+  const agentEnds = records.filter((r) => r.type === "agent_end");
+  const agentSettleds = records.filter((r) => r.type === "agent_settled");
+  assert.equal(agentEnds.length, 3, "each drained turn must emit agent_end");
+  assert.equal(agentSettleds.length, 1, "agent_settled must fire only once after queue drains");
+
+  const history = (await rpc({ type: "get_messages" })).data.messages;
+  const userTexts = history
+    .filter((m) => m.role === "user")
+    .map((m) => (Array.isArray(m.content) ? m.content.find((b) => b.type === "text")?.text : m.content));
+  assert.deepEqual(userTexts, ["first turn", "follow one", "follow two"]);
+  assert.equal(history.filter((m) => m.role === "assistant").length, 3);
+});
+
+test("daemon replays queue_update across detach/reattach, drains queued turns before idle, and clears stale file on new_session", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-queue-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+
+  const ctrl1 = await openControl(homeDir, { HOME: tmp });
+  t.after(async () => {
+    ctrl1.client.close();
+    try {
+      const inst = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+      process.kill(inst.pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl1, mockBin);
+
+  const attached = await ctrl1.call("attach", {
+    session: { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" },
+  });
+  const sid = attached.session.id;
+
+  // Start a slow turn, then queue both a steer and a followUp message while it streams.
+  ctrl1.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "q1", type: "prompt", message: "slow:500:turn-one" }) });
+  await ctrl1.waitUntil(() => ctrl1.sessions.get(sid)?.status === "working");
+  ctrl1.client.send({
+    type: "in",
+    sessionId: sid,
+    line: JSON.stringify({ id: "q2", type: "prompt", message: "follow-msg", streamingBehavior: "followUp" }),
+  });
+  ctrl1.client.send({
+    type: "in",
+    sessionId: sid,
+    line: JSON.stringify({ id: "q3", type: "prompt", message: "steer-msg", streamingBehavior: "steer" }),
+  });
+  await ctrl1.waitUntil(() =>
+    ctrl1.events.some(
+      (e) =>
+        e.type === "out" &&
+        e.sessionId === sid &&
+        e.line.includes('"queue_update"') &&
+        e.line.includes("steer-msg") &&
+        e.line.includes("follow-msg"),
+    ),
+  );
+
+  // Detach while Turn 1 is still running and messages are queued.
+  await ctrl1.call("detach", { sessionId: sid });
+
+  // Reattach on a second client: daemon immediately replays `queue_update` with both queued messages.
+  const ctrl2 = await openControl(homeDir, { HOME: tmp });
+  t.after(() => ctrl2.client.close());
+  await ctrl2.call("attach", { session: { id: sid, cwd: workDir, agentId: "pi", driver: "pi" } });
+  const replayedQueue = await ctrl2.waitUntil(() =>
+    ctrl2.events.find((e) => e.type === "out" && e.sessionId === sid && e.line.includes('"queue_update"')),
+  );
+  assert.deepEqual(JSON.parse(replayedQueue.line.trim()), {
+    type: "queue_update",
+    steering: ["steer-msg"],
+    followUp: ["follow-msg"],
+  });
+
+  // Detach again and let all 3 turns finish in the background: steer runs before followUp, then session settles idle.
+  await ctrl2.call("detach", { sessionId: sid });
+  await ctrl1.waitUntil(() => ctrl1.sessions.get(sid)?.status === "idle");
+  assert.equal(ctrl1.sessions.get(sid)?.unread, true);
+  const finished = await ctrl1.readMessages(sid);
+  assert.deepEqual(
+    finished.messages.map((m) => `${m.role}:${m.text}`),
+    [
+      "user:slow:500:turn-one",
+      "assistant:turn-one",
+      "user:steer-msg",
+      "assistant:echo:steer-msg",
+      "user:follow-msg",
+      "assistant:echo:follow-msg",
+    ],
+  );
+
+  const firstFile = ctrl1.sessions.get(sid)?.file;
+  assert.ok(firstFile, "first conversation must have discovered its session file");
+
+  // Reattach and send `new_session`: daemon clears stale `file` and resets title, then discovers the new file on `agent_start`.
+  await ctrl1.call("attach", { session: { id: sid, cwd: workDir, agentId: "pi", driver: "pi" } });
+  ctrl1.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "ns1", type: "new_session" }) });
+  await ctrl1.waitUntil(() => !ctrl1.sessions.get(sid)?.file && ctrl1.sessions.get(sid)?.title === "New session");
+
+  ctrl1.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "ns2", type: "prompt", message: "fresh-start" }) });
+  await ctrl1.waitUntil(() => Boolean(ctrl1.sessions.get(sid)?.file) && ctrl1.sessions.get(sid)?.status === "idle");
+  const secondFile = ctrl1.sessions.get(sid)?.file;
+  assert.notEqual(secondFile, firstFile, "new_session turn must discover its own fresh sessionFile");
+
+  // Reattaching by `file: secondFile` (without `id`) must find `sid` rather than spawning a second process!
+  await ctrl1.call("detach", { sessionId: sid });
+  const byFile = await ctrl1.call("attach", { session: { file: secondFile, cwd: workDir, agentId: "pi", driver: "pi" } });
+  assert.equal(byFile.session.id, sid, "attach by discovered sessionFile must reuse the existing daemon session");
+});
+
+test("daemon retitles a session from the file it lands on, but keeps a given name", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-title-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+
+  const ctrl = await openControl(homeDir, { HOME: tmp });
+  t.after(async () => {
+    ctrl.client.close();
+    try {
+      const inst = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+      process.kill(inst.pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+
+  const writePiFile = (name, lines) => {
+    const file = path.join(workDir, name);
+    fs.writeFileSync(
+      file,
+      [
+        JSON.stringify({ type: "session", version: 3, id: name, timestamp: new Date().toISOString(), cwd: workDir }),
+        ...lines,
+        "",
+      ].join("\n"),
+    );
+    return file;
+  };
+  const userLine = (text) => JSON.stringify({ type: "message", message: { role: "user", content: text, timestamp: Date.now() } });
+
+  // A session that learned its title from its first prompt.
+  const attached = await ctrl.call("attach", {
+    session: { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" },
+  });
+  const sid = attached.session.id;
+  ctrl.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "t1", type: "prompt", message: "first conversation" }) });
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.title === "first conversation" && ctrl.sessions.get(sid)?.status === "idle");
+
+  // Re-keying onto another file retitles to that file's first message — no stale name.
+  const otherFile = writePiFile("other.jsonl", [userLine("the other conversation")]);
+  ctrl.client.send({ type: "file", sessionId: sid, file: otherFile });
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.title === "the other conversation");
+
+  // A `session_info` name on the file wins over the first message.
+  const namedFile = writePiFile("named.jsonl", [
+    userLine("some chat"),
+    JSON.stringify({ type: "session_info", name: "Named on disk" }),
+  ]);
+  ctrl.client.send({ type: "file", sessionId: sid, file: namedFile });
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.title === "Named on disk");
+
+  // A file that does not exist yet (a minted file that was never written) is no title.
+  ctrl.client.send({ type: "file", sessionId: sid, file: path.join(workDir, "ghost.jsonl") });
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.title === "New session");
+
+  // A title handed in via `start_session` is the task's name and survives file moves.
+  const started = await ctrl.call("start_session", { input: { title: "Named job", agentId: "pi", cwd: workDir } });
+  const namedId = started.session.id;
+  ctrl.client.send({ type: "file", sessionId: namedId, file: namedFile });
+  await ctrl.waitUntil(() => ctrl.sessions.get(namedId)?.file === namedFile);
+  assert.equal(ctrl.sessions.get(namedId)?.title, "Named job");
+
+  // `new_session` hands the name back: the next conversation tracks its file again.
+  ctrl.client.send({ type: "in", sessionId: namedId, line: JSON.stringify({ id: "ns", type: "new_session" }) });
+  await ctrl.waitUntil(() => ctrl.sessions.get(namedId)?.title === "New session");
+  ctrl.client.send({ type: "file", sessionId: namedId, file: namedFile });
+  await ctrl.waitUntil(() => ctrl.sessions.get(namedId)?.title === "Named on disk");
+});
+

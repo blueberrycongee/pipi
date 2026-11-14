@@ -61,12 +61,16 @@ export function delayedFade(delay: number = PATIENCE_MS, duration: number = DURA
 }
 
 /** Plays a named motion preset once when the host view mounts.
- * Call in a component body and spread/pass `.style`. */
+ * Call in a component body and spread/pass `.style`. Use only for top-level
+ * cold stages — never inside a `FloatingLayer` (which already animates as one
+ * surface) or on panes that swap inside an already-open surface (`ViewDeck`). */
 export function enter(preset: MotionName = "fadeInUp", delay = 0) {
   return untracked(() => createMotion({ enter: preset, delay }).style);
 }
 
-/** Staggered entrance for sections/cards on a screen (`opacity 0->1`, `translateY 10->0`). */
+/** Staggered entrance for top-level cold stages (`opacity 0->1`, `translateY 10->0`).
+ * Never nest inside an animating `FloatingLayer` or replay on pane switches
+ * inside an already-open surface — use `ViewDeck` instead. */
 export function enterStagger(index: number, stepMs = 45) {
   return untracked(() =>
     createMotion({
@@ -190,6 +194,22 @@ const STREAM_FADE_SPEC: LeanSpec<"opacity" | "translateY"> = {
   easing: [0.22, 1, 0.36, 1],
 };
 
+/** Sent user bubbles start perceptibly present so they never visually trail the reply indicator below them. */
+const USER_ENTRANCE_SPEC: LeanSpec<"opacity" | "translateY"> = {
+  tracks: {
+    opacity: [
+      { offset: 0, value: 0.35 },
+      { offset: 1, value: 1 },
+    ],
+    translateY: [
+      { offset: 0, value: 0 },
+      { offset: 1, value: 0 },
+    ],
+  },
+  duration: 120,
+  easing: [0.22, 1, 0.36, 1],
+};
+
 /** Tracks which transcript row IDs have already animated in during the current
  * session so recycled `List` cells and history loads stay still while newly
  * streamed/appended rows glide into place once. */
@@ -214,7 +234,7 @@ export function enableLiveRowEntrance() {
  * never a positional offset: streamed text settles through its own veil
  * (`skip()` true for `text` rows: no entrance at all). Recycled cells and
  * loaded history stay steady. */
-export function useRowEntrance(id: () => string, streaming?: () => boolean, skip?: () => boolean) {
+export function useRowEntrance(id: () => string, streaming?: () => boolean, skip?: () => boolean, crisp?: () => boolean) {
   const item = leanMotion(["opacity", "translateY"] as const);
   let lastId = "";
   effect(() => {
@@ -233,6 +253,11 @@ export function useRowEntrance(id: () => string, streaming?: () => boolean, skip
         return;
       }
       seenRowIds.add(currentId);
+      if (crisp?.()) {
+        item.values.opacity.set(0.35);
+        item.play(USER_ENTRANCE_SPEC);
+        return;
+      }
       const isStream = streaming?.() ?? false;
       item.values.opacity.set(0);
       item.play(isStream ? STREAM_FADE_SPEC : SLIDE_UP_SPEC);
@@ -277,9 +302,10 @@ export function useBreathingOpacity(active: () => boolean, minOpacity = 0.28, du
   return opacity;
 }
 
-/** Animates layout rearrangements natively when `step()` changes (such as
- * expanding the sidebar, toggling composer queues/attachments, or
- * switching views); `when` vetoes a change it should not animate. */
+/** Animates layout rearrangements window-wide when `step()` changes (such as
+ * toggling composer queues/attachments); `when` vetoes a change it should not
+ * animate. Because `LayoutAnimation.configureNext` touches the whole window,
+ * avoid it when virtualized `List`s may be laying out (`!isRunning()`). */
 export function animateLayoutOn<T>(step: () => T, duration: number = DURATION.base, when?: (previous: T, next: T) => boolean): void {
   let initialized = false;
   let last: T;
@@ -299,7 +325,10 @@ export function animateLayoutOn<T>(step: () => T, duration: number = DURATION.ba
   });
 }
 
-/** Triggers a one-shot native layout animation right before a state update. */
+/** Triggers a one-shot window-wide native layout animation right before a
+ * synchronous state update. Never call from generic controls (`Segmented` uses
+ * `Tabs`), never before an `await`, and guard with `!isRunning()` if a chat
+ * list may be active (`Reveal` / `Presence` are scoped alternatives). */
 export function animateNextLayout(duration: number = DURATION.base): void {
   if (reduceMotion()) return;
   LayoutAnimation.configureNext({
@@ -377,4 +406,4 @@ export const DIALOG_RISE: MotionSpec = {
   easing: EASING.smoothOut,
 };
 
-export { keepLast, Presence, Reveal } from "./Reveal";
+export { type DeckPane, FloatingLayer, keepLast, LayerActive, Presence, Reveal, ViewDeck } from "./Reveal";

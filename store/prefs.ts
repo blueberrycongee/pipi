@@ -5,11 +5,21 @@ import { isCoat, type CoatId } from "../mascot/geometry";
 import {
   buildWallpaperTintedTheme,
   clampAdjustment,
-  isWallpaperEffect,
+  DYNAMIC_WALLPAPER_ENABLED,
+  isAvailableWallpaperEffect,
+  isDynamicWallpaperConfig,
+  isVideoWallpaperPath,
+  isWallpaperPauseMode,
+  isWallpaperPreset,
+  isWallpaperVideoClickAction,
   rememberWallpaperHistory,
   type WallpaperAdjustment,
   type WallpaperConfig,
   type WallpaperEffect,
+  type WallpaperKind,
+  type WallpaperPauseMode,
+  type WallpaperPreset,
+  type WallpaperVideoClickAction,
 } from "../lib/wallpaper";
 
 /** What pipi remembers between launches, kept in the app's own storage. */
@@ -94,6 +104,18 @@ interface Prefs {
   wallpaperHistory: string[];
   /** Whether app theme surface and accent tokens are tinted from the wallpaper's dominant color. */
   wallpaperThemeColors: boolean;
+  /** Whether mouse parallax and cursor-reactive ripples/shaders are active on the wallpaper. */
+  wallpaperInteractive: boolean;
+  /** Whether dynamic wallpapers modulate speed & energy with the coding agent's live activity state. */
+  wallpaperAgentReactive: boolean;
+  /** How interactive video wallpapers respond when clicked (`"burst"`, `"seek"`, `"pause"`). */
+  wallpaperVideoClickAction: WallpaperVideoClickAction;
+  /** Power-saving auto-pause policy (`"inactive"`, `"background"`, `"never"`). */
+  wallpaperPauseMode: WallpaperPauseMode;
+  /** Whether dynamic wallpaper playback is manually paused. */
+  wallpaperPaused: boolean;
+  /** Whether video wallpaper audio is muted (`true` by default). */
+  wallpaperMuted: boolean;
 }
 
 const KEY = "pipi.prefs.v1";
@@ -131,6 +153,12 @@ const DEFAULTS: Prefs = {
   wallpaperEffect: "none",
   wallpaperHistory: [],
   wallpaperThemeColors: false,
+  wallpaperInteractive: DYNAMIC_WALLPAPER_ENABLED,
+  wallpaperAgentReactive: DYNAMIC_WALLPAPER_ENABLED,
+  wallpaperVideoClickAction: "burst",
+  wallpaperPauseMode: "inactive",
+  wallpaperPaused: false,
+  wallpaperMuted: true,
 };
 const MAX_WORKSPACES = 20;
 
@@ -168,14 +196,31 @@ function normalizeWallpaperConfig(raw: unknown): WallpaperConfig | null {
   const width = typeof w.width === "number" && w.width > 0 ? w.width : 1920;
   const height = typeof w.height === "number" && w.height > 0 ? w.height : 1080;
   const name = typeof w.name === "string" && w.name ? w.name : w.path.split("/").pop() ?? "wallpaper";
-  return {
+  const preset = isWallpaperPreset(w.preset)
+    ? w.preset
+    : w.path.startsWith("preset:") && isWallpaperPreset(w.path.slice(7))
+      ? (w.path.slice(7) as WallpaperPreset)
+      : undefined;
+  const kind: WallpaperKind =
+    w.kind === "video" || w.kind === "shader" || w.kind === "image"
+      ? w.kind
+      : preset
+        ? "shader"
+        : isVideoWallpaperPath(w.path)
+          ? "video"
+          : "image";
+  const config: WallpaperConfig = {
     path: w.path,
     name,
     width,
     height,
     adjustment: clampAdjustment(w.adjustment),
     ...(typeof w.dominantColor === "string" && w.dominantColor ? { dominantColor: w.dominantColor } : {}),
+    kind,
+    ...(preset ? { preset } : {}),
   };
+  if (!DYNAMIC_WALLPAPER_ENABLED && isDynamicWallpaperConfig(config)) return null;
+  return config;
 }
 
 function normalizeSessionChoices(raw: unknown): Record<string, AgentSessionChoice> {
@@ -207,6 +252,7 @@ export async function loadPrefs() {
       const parsed = JSON.parse(stored) as Partial<Prefs> & { archivedSessions?: unknown };
       const rawGroups = Array.isArray(parsed.collapsedGroups) ? parsed.collapsedGroups : DEFAULTS.collapsedGroups;
       const collapsedGroups = parsed.archivedSessions === undefined && !rawGroups.includes("archived") ? [...rawGroups, "archived"] : rawGroups;
+      const normalizedWallpaper = normalizeWallpaperConfig(parsed.wallpaper);
       prefs.set({
         ...DEFAULTS,
         ...parsed,
@@ -220,14 +266,31 @@ export async function loadPrefs() {
           ? (parsed.autoArchiveDays as AutoArchiveDays)
           : 0,
         sidebarWidth: typeof parsed.sidebarWidth === "number" ? clampSidebarWidth(parsed.sidebarWidth) : SIDEBAR_DEFAULT_WIDTH,
-        wallpaper: normalizeWallpaperConfig(parsed.wallpaper),
-        wallpaperEffect: isWallpaperEffect(parsed.wallpaperEffect) ? parsed.wallpaperEffect : "none",
+        wallpaper: normalizedWallpaper,
+        wallpaperEffect: isAvailableWallpaperEffect(parsed.wallpaperEffect) ? parsed.wallpaperEffect : "none",
         wallpaperFolder: typeof parsed.wallpaperFolder === "string" && parsed.wallpaperFolder ? parsed.wallpaperFolder : undefined,
-        wallpaperSource: typeof parsed.wallpaperSource === "string" && parsed.wallpaperSource ? parsed.wallpaperSource : undefined,
+        wallpaperSource:
+          normalizedWallpaper && typeof parsed.wallpaperSource === "string" && parsed.wallpaperSource
+            ? parsed.wallpaperSource
+            : undefined,
         wallpaperHistory: Array.isArray(parsed.wallpaperHistory)
           ? parsed.wallpaperHistory.filter((p): p is string => typeof p === "string" && p.length > 0)
           : [],
         wallpaperThemeColors: Boolean(parsed.wallpaperThemeColors),
+        wallpaperInteractive: DYNAMIC_WALLPAPER_ENABLED
+          ? (parsed.wallpaperInteractive !== undefined ? Boolean(parsed.wallpaperInteractive) : true)
+          : false,
+        wallpaperAgentReactive: DYNAMIC_WALLPAPER_ENABLED
+          ? (parsed.wallpaperAgentReactive !== undefined ? Boolean(parsed.wallpaperAgentReactive) : true)
+          : false,
+        wallpaperVideoClickAction: isWallpaperVideoClickAction(parsed.wallpaperVideoClickAction)
+          ? parsed.wallpaperVideoClickAction
+          : "burst",
+        wallpaperPauseMode: isWallpaperPauseMode(parsed.wallpaperPauseMode)
+          ? parsed.wallpaperPauseMode
+          : "inactive",
+        wallpaperPaused: DYNAMIC_WALLPAPER_ENABLED ? Boolean(parsed.wallpaperPaused) : false,
+        wallpaperMuted: parsed.wallpaperMuted !== undefined ? Boolean(parsed.wallpaperMuted) : true,
       });
     }
   } catch {
@@ -290,6 +353,12 @@ export const wallpaperFolder = () => prefs().wallpaperFolder;
 export const wallpaperSource = () => prefs().wallpaperSource;
 export const wallpaperHistory = () => prefs().wallpaperHistory;
 export const wallpaperThemeColors = () => prefs().wallpaperThemeColors;
+export const wallpaperInteractive = () => DYNAMIC_WALLPAPER_ENABLED && prefs().wallpaperInteractive;
+export const wallpaperAgentReactive = () => DYNAMIC_WALLPAPER_ENABLED && prefs().wallpaperAgentReactive;
+export const wallpaperVideoClickAction = () => prefs().wallpaperVideoClickAction;
+export const wallpaperPauseMode = () => prefs().wallpaperPauseMode;
+export const wallpaperPaused = () => DYNAMIC_WALLPAPER_ENABLED && prefs().wallpaperPaused;
+export const wallpaperMuted = () => prefs().wallpaperMuted;
 
 export function setAppearance(next: Appearance) {
   change({ appearance: next });
@@ -492,12 +561,14 @@ export function setWallpaperPref(
   next: WallpaperConfig | null,
   sourcePath?: string,
 ) {
+  const normalized = next ? normalizeWallpaperConfig(next) : null;
+  if (next && !normalized) return;
   const history = sourcePath
     ? rememberWallpaperHistory(prefs().wallpaperHistory, sourcePath)
     : prefs().wallpaperHistory;
   change({
-    wallpaper: next ? normalizeWallpaperConfig(next) : null,
-    wallpaperSource: next ? sourcePath : undefined,
+    wallpaper: normalized,
+    wallpaperSource: normalized ? sourcePath : undefined,
     wallpaperHistory: history,
   });
   applyWallpaperTheme();
@@ -515,7 +586,7 @@ export function setWallpaperAdjustmentPref(adjustment: WallpaperAdjustment) {
 }
 
 export function setWallpaperEffectPref(effect: WallpaperEffect) {
-  if (!isWallpaperEffect(effect)) return;
+  if (!isAvailableWallpaperEffect(effect)) return;
   change({ wallpaperEffect: effect });
 }
 
@@ -527,4 +598,48 @@ export function setWallpaperFolderPref(folder: string | undefined) {
 export function setWallpaperThemeColorsPref(enabled: boolean) {
   change({ wallpaperThemeColors: enabled });
   applyWallpaperTheme();
+}
+
+export function setWallpaperDimensionsPref(width: number, height: number) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  const current = prefs().wallpaper;
+  if (!current || width <= 0 || height <= 0) return;
+  if (current.width === width && current.height === height) return;
+  change({
+    wallpaper: {
+      ...current,
+      width: Math.round(width),
+      height: Math.round(height),
+    },
+  });
+}
+
+export function setWallpaperInteractivePref(enabled: boolean) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  change({ wallpaperInteractive: Boolean(enabled) });
+}
+
+export function setWallpaperAgentReactivePref(enabled: boolean) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  change({ wallpaperAgentReactive: Boolean(enabled) });
+}
+
+export function setWallpaperVideoClickActionPref(action: WallpaperVideoClickAction) {
+  if (!DYNAMIC_WALLPAPER_ENABLED || !isWallpaperVideoClickAction(action)) return;
+  change({ wallpaperVideoClickAction: action });
+}
+
+export function setWallpaperPauseModePref(mode: WallpaperPauseMode) {
+  if (!DYNAMIC_WALLPAPER_ENABLED || !isWallpaperPauseMode(mode)) return;
+  change({ wallpaperPauseMode: mode });
+}
+
+export function setWallpaperPausedPref(paused: boolean) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  change({ wallpaperPaused: Boolean(paused) });
+}
+
+export function setWallpaperMutedPref(muted: boolean) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  change({ wallpaperMuted: Boolean(muted) });
 }

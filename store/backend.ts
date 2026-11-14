@@ -11,6 +11,7 @@ import type {
   WorktreeInfo,
 } from "../agents/types";
 import type { Transport } from "../pi/client";
+import { DYNAMIC_WALLPAPER_ENABLED, SUPPORTED_WALLPAPER_EXTENSIONS } from "../lib/wallpaper";
 import { type CredentialKind, removeCredential, saveApiKey, storedCredentials } from "../pi/credentials";
 import { DaemonClient, type DaemonCallbacks } from "../pi/daemon";
 import { deleteSession, listSessions, listWorkspaceSessions, type SessionSummary } from "../pi/sessions";
@@ -176,17 +177,26 @@ const system: Backend = {
   async pickImage(prompt) {
     try {
       if (process.platform === "macos") {
-        const script = `POSIX path of (choose file of type {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "public.image"} with prompt ${JSON.stringify(prompt)})`;
+        const types = [
+          ...SUPPORTED_WALLPAPER_EXTENSIONS,
+          ...(DYNAMIC_WALLPAPER_ENABLED ? ["json", "public.image", "public.movie"] : ["public.image"]),
+        ]
+          .map((t) => JSON.stringify(t))
+          .join(", ");
+        const script = `POSIX path of (choose file of type {${types}} with prompt ${JSON.stringify(prompt)})`;
         const { code, stdout } = await process.run("osascript", ["-e", script], { timeoutMs: 600_000 });
         const path = stdout.trim();
         return code === 0 && path ? path : undefined;
       }
       if (process.platform === "windows") {
+        const patterns = SUPPORTED_WALLPAPER_EXTENSIONS.map((ext) => `*.${ext}`);
+        if (DYNAMIC_WALLPAPER_ENABLED) patterns.push("project.json");
+        const label = DYNAMIC_WALLPAPER_ENABLED ? "Wallpapers" : "Images";
         const script = [
           "Add-Type -AssemblyName System.Windows.Forms",
           `$d = New-Object System.Windows.Forms.OpenFileDialog`,
           `$d.Title = ${JSON.stringify(prompt)}`,
-          `$d.Filter = 'Images|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.tif;*.tiff|All files|*.*'`,
+          `$d.Filter = '${label}|${patterns.join(";")}|All files|*.*'`,
           `if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }`,
         ].join("; ");
         const { code, stdout } = await process.run("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-Command", script], { timeoutMs: 600_000 });
@@ -194,9 +204,11 @@ const system: Backend = {
         return code === 0 && path ? path : undefined;
       }
       if (process.platform === "linux") {
+        const patterns = [...SUPPORTED_WALLPAPER_EXTENSIONS.map((ext) => `*.${ext}`), ...(DYNAMIC_WALLPAPER_ENABLED ? ["project.json"] : [])].join(" ");
+        const label = DYNAMIC_WALLPAPER_ENABLED ? "Wallpapers" : "Images";
         const out = await runDesktopPicker([
-          ["zenity", ["--file-selection", `--title=${prompt}`, "--file-filter=Images | *.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff", "--file-filter=All files | *"]],
-          ["kdialog", ["--getopenfilename", ".", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff|Images", "--title", prompt]],
+          ["zenity", ["--file-selection", `--title=${prompt}`, `--file-filter=${label} | ${patterns}`, "--file-filter=All files | *"]],
+          ["kdialog", ["--getopenfilename", ".", `${patterns}|${label}`, "--title", prompt]],
         ]);
         return out || undefined;
       }

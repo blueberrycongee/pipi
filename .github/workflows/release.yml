@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install nsh
         env:
-          NSH_VERSION: v0.5.0
+          NSH_VERSION: v0.5.1
         run: |
           curl -fsSL https://nsh.dev/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -69,7 +69,7 @@ jobs:
       - name: Install nsh
         shell: pwsh
         env:
-          NSH_VERSION: v0.5.0
+          NSH_VERSION: v0.5.1
         run: |
           irm https://nsh.dev/install.ps1 | iex
           "$env:LOCALAPPDATA\nsh\bin" >> $env:GITHUB_PATH
@@ -103,7 +103,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install nsh
         env:
-          NSH_VERSION: v0.5.0
+          NSH_VERSION: v0.5.1
         run: |
           curl -fsSL https://nsh.dev/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -150,7 +150,7 @@ jobs:
           merge-multiple: true
       - name: Install nsh
         env:
-          NSH_VERSION: v0.5.0
+          NSH_VERSION: v0.5.1
         run: |
           curl -fsSL https://nsh.dev/install.sh | sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH

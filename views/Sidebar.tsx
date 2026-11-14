@@ -635,11 +635,23 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
 }
 
 /** A session row anywhere in the sidebar: the engine's mark, the title, and the running cue or archive action. */
-const sessionRowClass = (indent: boolean, reserveTrailing: boolean, reserveHoverAction: boolean, depth = 0) =>
+const sessionRowClass = (
+  indent: boolean,
+  reserveTrailing: boolean,
+  reserveHoverAction: boolean,
+  depth = 0,
+  keepTrailingOnHover = false,
+) =>
   `h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md ${
     depth >= 3 ? "pl-16" : depth === 2 ? "pl-14" : depth === 1 ? "pl-12" : indent ? "pl-8" : "pl-2.5"
   } ${
-    reserveTrailing ? "pr-8" : reserveHoverAction ? "pr-2.5 group-hover:pr-8" : "pr-2.5"
+    reserveTrailing && reserveHoverAction && keepTrailingOnHover
+      ? "pr-8 group-hover:pr-14"
+      : reserveTrailing
+        ? "pr-8"
+        : reserveHoverAction
+          ? "pr-2.5 group-hover:pr-8"
+          : "pr-2.5"
   } ${PRESS} active:scale-[0.99] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-sidebar-accent group-hover:bg-sidebar-accent active:bg-sidebar-accent selected:bg-sidebar-accent`;
 
 const sessionTitleClass = (selected: boolean) =>
@@ -679,7 +691,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
   const resolvedCwd = () => props.cwd || activeProjectPath();
   const active = () => Boolean(resolvedCwd()) && resolvedCwd() === activeProjectPath() && isDraftSession();
   const primary = () => active() && ownsDraftSession(props.group, resolvedCwd());
-  const running = () => active() && isRunning();
+  const running = () => active() && (isRunning() || openDaemon()?.status === "working" || openDaemon()?.status === "blocked");
   const selected = () => primary() && currentView().name === "chat";
   const shownTitle = signal(untracked(() => (isDraftSession() ? currentTitle() : tr("New session", "新会话"))));
   const shownAgentId = signal(untracked(activeAgentId));
@@ -722,11 +734,12 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
 
 function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupId; indent?: boolean }) {
   const home = backend().home();
-  const active = () => !isDraftSession() && props.cwd === activeProjectPath() && props.session.path === openFile();
-  const owns = () => ownsActiveSession(props.group, props.session.path, props.cwd);
-  const primary = () => active() && owns();
   /** The daemon session behind this file — its status is the row's truth (a parent's children keep its mark too). */
   const daemon = () => daemonSessionByFile(props.session.path);
+  const active = () =>
+    !isDraftSession() && projectCwdOf(props.cwd, daemon()) === activeProjectPath() && props.session.path === openFile();
+  const owns = () => ownsActiveSession(props.group, props.session.path, props.cwd);
+  const primary = () => active() && owns();
   const waitingHere = () => childSessionsOf(props.session.path).some((c) => c.status === "working" || c.status === "blocked");
   const daemonRunning = () => isSessionRunning(props.session.path) || waitingHere();
   /** A run kept going off screen marks every row the session has — whichever group the reader is looking at. */
@@ -742,6 +755,7 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
   const archived = () => isSessionArchived(props.session.path);
   const engine = () => engineOf(props.session.agentId);
   const selected = () => primary() && currentView().name === "chat";
+  const keepCue = () => running() || blocked();
   return (
     <View class={hoverGroup()} onContextMenu={(e) => Menu.popup(sessionMenuItems(props.session, props.cwd), e.pagePosition)}>
       <BaseButton
@@ -752,21 +766,21 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           void openSession(props.session.path, props.cwd);
         }}
         tooltip={tip(`${engine().name} · ${tildePath(props.cwd, home)}`, undefined, "right")}
-        class={calm(sessionRowClass(Boolean(props.indent), running() || unread() || blocked(), true))}
+        class={calm(sessionRowClass(Boolean(props.indent), running() || unread() || blocked() || failed(), true, 0, keepCue()))}
       >
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{titleOf(props.session)}</Text>
       </BaseButton>
-      <View class={`${TRAILING_SLOT} transition-opacity group-hover:opacity-0`}>
+      <View class={keepCue() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`}>
         <Presence
-          show={running()}
+          show={running() && !blocked()}
           testID="sidebar-session-running"
           accessibilityLabel={backgroundRunning() ? tr("Running in the background", "后台运行中") : undefined}
         >
           <Pip size={16} mood="work" />
         </Presence>
         <Presence
-          show={!running() && blocked()}
+          show={blocked()}
           testID="sidebar-session-blocked"
           accessibilityLabel={tr("Waiting for confirmation", "等待确认")}
           class="absolute inset-0 items-center justify-center"
@@ -800,7 +814,7 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           if (archived()) unarchiveSession(props.session.path);
           else void archiveSession(props.session.path, props.cwd);
         }}
-        class="absolute right-1 top-0.5 opacity-0 transition-opacity group-hover:opacity-100"
+        class={`absolute ${keepCue() ? "right-7" : "right-1"} top-0.5 opacity-0 transition-opacity group-hover:opacity-100`}
       />
     </View>
   );
@@ -839,7 +853,14 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId }) {
           undefined,
           "right",
         )}
-        class={calm(sessionRowClass(true, working() || unread() || failed(), false, rowDepth()))}
+        class={calm(
+          sessionRowClass(
+            props.group === "workspaces" || Boolean(session().parentId),
+            working() || unread() || failed(),
+            false,
+            rowDepth(),
+          ),
+        )}
       >
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{session().title}</Text>

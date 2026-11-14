@@ -4,6 +4,9 @@
 // `scripts/render-promo.py` frames the photographs.
 //
 //   nsh dev Promo.tsx
+//
+// `promo.scene` (storage) set to "welcome" opens the same day on the empty
+// chat instead: what `PromoWallpaper.test.tsx` photographs over each wallpaper.
 import { mount, Storage } from "nsh";
 import { fakeBackend } from "./dev/fake-pi";
 import { tr } from "./lib/i18n";
@@ -177,8 +180,8 @@ const INSTALLED: Record<string, string> = {
   grok: "1.0.9",
 };
 
-Storage.getItem("promo.ready").then(() => {
-  const fake = fakeBackend({ history, sessions: workspaceSessions[PROMO_WORKSPACES[0]], workspaceSessions });
+Storage.getItem("promo.scene").then((scene) => {
+  const fake = fakeBackend({ history: scene === "welcome" ? [] : history, sessions: workspaceSessions[PROMO_WORKSPACES[0]], workspaceSessions });
   useBackend({
     ...fake,
     async probeAgents(options) {

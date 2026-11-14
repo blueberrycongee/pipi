@@ -1,4 +1,4 @@
-import { Canvas, cleanup, createAnimatedValue, createMotion, effect, reduceMotion, token, View } from "nsh";
+import { Canvas, cleanup, createAnimatedValue, createMotion, effect, reduceMotion, signal, token, View } from "nsh";
 import type { CanvasRenderingContext2D } from "nsh";
 import { pipCoat } from "../store/prefs";
 import { BOUNDS, GRID, LINE_PAINT, pip, silhouette, tailPivot, type CoatId, type Mood, type Paint, type Path, type Shape } from "./geometry";
@@ -22,6 +22,14 @@ export function Pip(props: { size: number; mood?: Mood; coat?: CoatId; still?: b
   const body = createMotion();
   const mood = () => props.mood ?? "idle";
   let blinkTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // A canvas that lands inside a busy batch can lose its whole-picture
+  // paint; the platform then repaints only the animated band (the blink,
+  // the wag) and Pip shows as one cropped strip. Re-sending the drawing
+  // shortly after mount marks the full layer again.
+  const repaint = signal(0);
+  const repaintTimers = [300, 900].map((ms, i) => setTimeout(() => repaint.set(i + 1), ms));
+  cleanup(() => repaintTimers.forEach(clearTimeout));
 
   const blink = () => {
     lids.keyframes([1, 0.08, 1], { duration: 170, easing: "easeInOut" });
@@ -133,6 +141,7 @@ export function Pip(props: { size: number; mood?: Mood; coat?: CoatId; still?: b
       <Canvas
         style={{ width: props.size, height, transformOrigin: "bottom", transform: body.transform }}
         draw={(cx, { width }) => {
+          repaint();
           const scale = width / GRID;
           cx.scale(scale, scale);
           cx.translate(0, -BOUNDS.y);

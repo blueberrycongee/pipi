@@ -1,7 +1,8 @@
-import { cleanup, createAnimatedValue, effect, reduceMotion, signal, untracked, View } from "nsh";
+import { batch, cleanup, computed, context, createAnimatedValue, effect, Overlay, reduceMotion, signal, untracked, View } from "nsh";
 import type { JSX } from "nsh";
-import { Collapsible } from "nsh/base";
+import { Button as BaseButton, Collapsible } from "nsh/base";
 import { DURATION, EASING } from "./motion";
+import { GLASS_REGULAR, POPUP, SCRIM } from "./styles";
 
 /**
  * Standard vertical flow presence (`DESIGN.md` → Motion):
@@ -154,6 +155,190 @@ export function Presence(props: {
         style={{ opacity, transform: [{ scale }] }}
       >
         {props.children}
+      </View>
+    </If>
+  );
+}
+
+/**
+ * Accessor context reporting whether the enclosing `FloatingLayer` / `ViewDeck`
+ * pane is currently active on screen (`true` outside any layer/deck). Controls
+ * such as `TextField` subscribe so inputs inside a pane hidden via
+ * `display: "none"` or a closing sheet immediately release keyboard focus.
+ */
+export const LayerActive = context<() => boolean>(() => true);
+
+/** One pane inside a `ViewDeck`. */
+export interface DeckPane<K extends string> {
+  id: K;
+  render: () => JSX.Element;
+}
+
+/**
+ * Multi-pane switcher inside an already-open surface (such as Settings sections
+ * and subpages). Lazily mounts each pane on its first visit and keeps visited
+ * panes alive (`display: "none"` when inactive) at steady `opacity: 1`:
+ *
+ * - Synchronous `visited` tracking ensures outgoing and incoming panes switch in
+ *   the same commit with zero blank or translucent gap frames.
+ * - Revisiting a pane (such as `General` with 14 `<Pip>` canvases or `Agents` with
+ *   18 `<AgentLogo>` canvases, or returning from `Providers` to `Agents`) swaps
+ *   `display` in place without cold-remounting canvases or losing filter/scroll state.
+ * - Active panes omit `display` (`undefined`) so `View` keeps nsh's default
+ *   vertical column flex layout (`LayoutStyle.display` defaults `"flex"` to row).
+ */
+export function ViewDeck<K extends string>(props: {
+  active: K;
+  panes: readonly DeckPane<K>[];
+  class?: string;
+}) {
+  const parentActive = LayerActive();
+  const seen = new Set<K>();
+  const visited = computed(() => {
+    seen.add(props.active);
+    return new Set(seen);
+  });
+
+  return (
+    <View class={props.class ?? "min-h-0 min-w-0 flex-1"}>
+      <Each of={props.panes} key={(pane) => pane.id}>
+        {(pane) => {
+          const id = () => pane().id;
+          const isVisited = () => visited().has(id());
+          const isActive = () => props.active === id();
+          const paneActive = () => parentActive() && isActive();
+          return (
+            <If when={isVisited()}>
+              <View
+                class="min-h-0 min-w-0 flex-1"
+                style={isActive() ? undefined : { display: "none" }}
+              >
+                <LayerActive.Provider value={paneActive}>{pane().render()}</LayerActive.Provider>
+              </View>
+            </If>
+          );
+        }}
+      </Each>
+    </View>
+  );
+}
+
+/**
+ * Standard in-window glass layer over `SCRIM` (`z-40`, below `Toasts`):
+ *
+ * - Batches starting pose (`opacity: 0`, `scale: 0.97`, `translateY: 8`) with
+ *   `mounted.set(true)` so the first mounted frame never paints a stale pose.
+ * - Reverses smoothly from live UI-thread values if re-opened mid-close
+ *   (`mounted()` still `true`), never snapping a visible panel back to `0`.
+ * - Uses bounded `DURATION.fast` (`180ms`) `timing` curves (`<= 220ms` per
+ *   `DESIGN.md`) rather than unbounded springs that keep `nsh` non-idle.
+ * - Registers a childless `<Overlay onCancel>` while open so `Escape` closes
+ *   the layer even when a `TextField` inside it holds focus, while yielding to
+ *   any `<Popover>` or `<Dialog>` opened on top of it.
+ */
+export function FloatingLayer(props: {
+  open: boolean;
+  onClose: () => void;
+  closeLabel: string;
+  panelClass?: string;
+  testID?: string;
+  children: JSX.Element;
+}) {
+  const parentActive = LayerActive();
+  const layerActive = () => parentActive() && props.open;
+  const initiallyOpen = untracked(() => props.open);
+  const mounted = signal(initiallyOpen);
+  const scrimOpacity = createAnimatedValue(initiallyOpen ? 1 : 0);
+  const panelOpacity = createAnimatedValue(initiallyOpen ? 1 : 0);
+  const panelScale = createAnimatedValue(initiallyOpen ? 1 : 0.97);
+  const panelY = createAnimatedValue(initiallyOpen ? 0 : 8);
+  let wasOpen = initiallyOpen;
+  let seq = 0;
+  let exitTimer: ReturnType<typeof setTimeout> | undefined;
+
+  effect(() => {
+    const isOpen = props.open;
+    if (isOpen === wasOpen) return;
+    wasOpen = isOpen;
+    const mySeq = ++seq;
+    const reduced = untracked(reduceMotion);
+    untracked(() => {
+      clearTimeout(exitTimer);
+      void scrimOpacity.stop();
+      void panelOpacity.stop();
+      void panelScale.stop();
+      void panelY.stop();
+      if (isOpen) {
+        const alreadyMounted = mounted();
+        if (reduced) {
+          batch(() => {
+            scrimOpacity.set(1);
+            panelOpacity.set(1);
+            panelScale.set(1);
+            panelY.set(0);
+            if (!alreadyMounted) mounted.set(true);
+          });
+          return;
+        }
+        if (!alreadyMounted) {
+          batch(() => {
+            scrimOpacity.set(0);
+            panelOpacity.set(0);
+            panelScale.set(0.97);
+            panelY.set(8);
+            mounted.set(true);
+          });
+        }
+        void scrimOpacity.timing(1, { duration: DURATION.fast, easing: EASING.out });
+        void panelOpacity.timing(1, { duration: DURATION.fast, easing: EASING.smoothOut });
+        void panelScale.timing(1, { duration: DURATION.fast, easing: EASING.smoothOut });
+        void panelY.timing(0, { duration: DURATION.fast, easing: EASING.smoothOut });
+      } else if (mounted()) {
+        if (reduced) {
+          batch(() => {
+            scrimOpacity.set(0);
+            panelOpacity.set(0);
+            mounted.set(false);
+          });
+          return;
+        }
+        const ms = 140;
+        void scrimOpacity.timing(0, { duration: ms, easing: EASING.out });
+        void panelOpacity.timing(0, { duration: ms, easing: EASING.out });
+        void panelScale.timing(0.98, { duration: ms, easing: EASING.out });
+        void panelY.timing(6, { duration: ms, easing: EASING.out });
+        exitTimer = setTimeout(() => {
+          if (seq === mySeq) mounted.set(false);
+        }, ms + 10);
+      }
+    });
+  });
+
+  cleanup(() => {
+    clearTimeout(exitTimer);
+    void scrimOpacity.stop();
+    void panelOpacity.stop();
+    void panelScale.stop();
+    void panelY.stop();
+  });
+
+  return (
+    <If when={mounted()}>
+      <View
+        testID={props.testID}
+        class={`absolute inset-0 z-40 items-center justify-center p-6${props.open ? "" : " pointer-events-none"}`}
+      >
+        <View class={`pointer-events-none absolute inset-0 ${SCRIM}`} style={{ opacity: scrimOpacity }} />
+        <If when={props.open}>
+          <Overlay onCancel={props.onClose} class="pointer-events-none" />
+          <BaseButton onPress={props.onClose} accessibilityLabel={props.closeLabel} class="absolute inset-0" />
+        </If>
+        <View
+          class={`overflow-hidden ${POPUP} ${props.panelClass ?? ""}${props.open ? "" : " pointer-events-none"}`}
+          style={{ ...GLASS_REGULAR, opacity: panelOpacity, transform: [{ translateY: panelY }, { scale: panelScale }] }}
+        >
+          <LayerActive.Provider value={layerActive}>{props.children}</LayerActive.Provider>
+        </View>
       </View>
     </If>
   );

@@ -435,15 +435,19 @@ test("lines up what is sent during a run over the composer, and takes it back as
   await app.type("label:Message", "keep the changelog in step");
   await app.submit("label:Message");
   await app.waitFor("text:keep the changelog in step");
-  // What steers goes first; the composer is free again, and the reply stays on screen over the tray.
+  // The bubbles show in the order sent; the tray still lines up what steers first.
   const texts = app.texts();
-  expect(texts.indexOf("keep the changelog in step")).toBeLessThan(texts.indexOf("also update the readme"));
+  expect(texts.indexOf("also update the readme")).toBeLessThan(texts.indexOf("keep the changelog in step"));
+  expect(texts.lastIndexOf("keep the changelog in step")).toBeLessThan(texts.lastIndexOf("also update the readme"));
   expect(app.value("label:Message")).toBe("");
   expect(texts.some((text) => /^Part \d+ of the plan$/.test(text))).toBe(true);
 
   await app.press("label:Edit queued messages");
   await app.waitUntil(() => app.value("label:Message") === "keep the changelog in step\n\nalso update the readme");
   expect(app.count("label:Queued messages")).toBe(0);
+  // Recalled before delivery: their bubbles leave the conversation with the tray.
+  expect(app.count("label:Conversation >> text:keep the changelog in step")).toBe(0);
+  expect(app.count("label:Conversation >> text:also update the readme")).toBe(0);
   expect(app.texts().some((text) => /^Part \d+ of the plan$/.test(text))).toBe(true);
 });
 
@@ -504,3 +508,131 @@ test("switches projects while a run works, and comes back to it", async () => {
   expect(app.texts()).toContain("make a plan");
   expect(app.shows("label:Running in the background")).toBe(false);
 }, 60000);
+
+test("preserves queued steering and follow-up messages across session switches and delivers them in the background", async () => {
+  const app = await launch("slow");
+  await app.waitFor("text:What are we building?");
+  await app.type("label:Message", "make a plan");
+  await app.submit("label:Message");
+  await app.waitFor("text:make a plan");
+
+  // Queue both a follow-up and a steering message while the first turn is still running.
+  await app.type("label:Message", "also update the readme");
+  await app.keyboard.press("mod+enter");
+  await app.type("label:Message", "keep the changelog in step");
+  await app.submit("label:Message");
+  await app.waitFor("text:keep the changelog in step");
+  expect(app.count("label:Queued messages")).toBeGreaterThan(0);
+
+  // Switch to another session while Turn 1 is still streaming and 2 messages are queued.
+  await app.press("id:sidebar-workspaces >> text:Refactor the transcript reducer");
+  await app.waitFor("text:Here is the plan.");
+  expect(app.count("label:Queued messages")).toBe(0);
+
+  // Switch back mid-run: the daemon replays `queue_update` so the queue tray is restored intact.
+  await app.press("id:sidebar-workspaces >> text:make a plan");
+  await app.waitFor("label:Queued messages", { timeout: 10000 });
+  const midTexts = app.texts();
+  expect(midTexts).toContain("keep the changelog in step");
+  expect(midTexts).toContain("also update the readme");
+  // Bubbles in the order sent, the restored tray in delivery order.
+  expect(midTexts.indexOf("also update the readme")).toBeLessThan(midTexts.indexOf("keep the changelog in step"));
+  expect(midTexts.lastIndexOf("keep the changelog in step")).toBeLessThan(midTexts.lastIndexOf("also update the readme"));
+
+  // Switch away again and let the session drain all queued messages in the background.
+  await app.press("id:sidebar-workspaces >> text:Refactor the transcript reducer");
+  await app.waitFor("text:Here is the plan.");
+  await app.waitFor("text:make a plan finished in the background.", { timeout: 60000 });
+
+  // Reopen the session: Turn 1 and both queued messages were delivered and answered in order!
+  await app.press("id:sidebar-workspaces >> text:make a plan");
+  await app.waitFor("text:also update the readme", { timeout: 10000 });
+  await app.waitFor("label:Send", { timeout: 10000 });
+  expect(app.count("label:Queued messages")).toBe(0);
+  const finalTexts = app.texts();
+  expect(finalTexts).toContain("make a plan");
+  expect(finalTexts).toContain("keep the changelog in step");
+  expect(finalTexts).toContain("also update the readme");
+  expect(finalTexts.indexOf("keep the changelog in step")).toBeLessThan(finalTexts.indexOf("also update the readme"));
+}, 90000);
+
+test("displays the sent user bubble before any thinking or writing indicator on every frame", async () => {
+  const findPhrase = (texts: string[], phrase: string): number => {
+    const direct = texts.lastIndexOf(phrase);
+    if (direct >= 0) return direct;
+    const glyphs = [...phrase];
+    for (let i = texts.length - glyphs.length; i >= 0; i--) {
+      if (glyphs.every((ch, offset) => texts[i + offset]?.replace(/\u00a0/g, "") === ch)) return i;
+    }
+    return -1;
+  };
+
+  // `slow` spaces RPC records 400ms apart (`message_start(user)` arrives at ~800ms, after `submit`'s ~400ms),
+  // exercising both the pre-echo staged window and the live streaming window.
+  const app = await launch("slow", { locale: "zh-Hans-CN", clock: {} });
+  await app.waitFor("text:今天要构建什么？");
+
+  const assertChronologicalSend = async (promptText: string) => {
+    await app.type("label:消息", promptText);
+    await app.submit("label:消息");
+
+    const statusLabels = ["正在思考", "正在回复", "正在处理"];
+    let sawThinking = false;
+    let sawWriting = false;
+    for (let elapsed = 0; elapsed < 25_000; elapsed += 50) {
+      expect(app.count(`label:对话 >> text:${promptText}`)).toBeGreaterThan(0);
+      const allTexts = app.texts();
+      // Slice before the composer's model chip so the TitleBar overlay's session title
+      // (mounted after `<Chat>`) is excluded and `lastIndexOf` finds the bubble inside `<List>`.
+      const composerAt = allTexts.indexOf("Claude Sonnet 4.5");
+      const chatTexts = composerAt >= 0 ? allTexts.slice(0, composerAt) : allTexts;
+      const userAt = chatTexts.lastIndexOf(promptText);
+      expect(userAt).toBeGreaterThanOrEqual(0);
+      for (const label of statusLabels) {
+        const statusAt = findPhrase(chatTexts, label);
+        if (statusAt >= 0) {
+          if (label === "正在思考") sawThinking = true;
+          if (label === "正在回复") sawWriting = true;
+          expect(userAt).toBeLessThan(statusAt);
+        }
+      }
+      if (elapsed > 200 && app.shows("label:发送")) break;
+      await app.wait(50);
+    }
+    expect(sawThinking).toBe(true);
+    expect(sawWriting).toBe(true);
+    await app.waitFor("label:发送");
+  };
+
+  // First message from the welcome stage, then an immediate follow-up while Pip is still celebrating.
+  await assertChronologicalSend("第一条消息：先显示气泡再显示正在回复");
+  await assertChronologicalSend("第二条消息：紧接着发送也要保持时间顺序");
+});
+
+test("shows a message sent mid-run as a bubble in the conversation at once, and only once delivered", async () => {
+  const app = await launch("stream");
+  await app.waitFor("text:What are we building?");
+  await app.type("label:Message", "make a long plan");
+  await app.submit("label:Message");
+  await app.waitFor("text:Part 3 of the plan", { timeout: 30000 });
+
+  // Sent while the reply still streams: the bubble joins the conversation under
+  // the turn's rows at once — the tray is no longer the only place it shows.
+  await app.type("label:Message", "also check the tests");
+  await app.submit("label:Message");
+  await app.waitFor("label:Conversation >> text:also check the tests", { timeout: 5000 });
+  expect(app.count("label:Queued messages")).toBeGreaterThan(0);
+
+  // It lands after everything already said, where its echo will commit it.
+  const queuedTexts = app.texts();
+  const partAt = queuedTexts.map((text, at) => (/^Part \d+ of the plan$/.test(text) ? at : -1)).filter((at) => at >= 0);
+  expect(queuedTexts.indexOf("also check the tests")).toBeGreaterThan(Math.max(...partAt));
+
+  // Delivered in turn: the same bubble is answered — never a second copy of it.
+  await app.waitFor("label:Send", { timeout: 60000 });
+  expect(app.count("label:Conversation >> text:also check the tests")).toBe(1);
+  expect(app.count("label:Queued messages")).toBe(0);
+}, 90000);
+
+
+

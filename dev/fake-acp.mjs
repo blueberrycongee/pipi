@@ -123,6 +123,29 @@ function idle(sessionId, u) {
 }
 
 function backgroundTurn(sessionId, text) {
+  if (/multistep/i.test(text)) {
+    const job1 = `bg_${seq++}`;
+    const step2 = `bg_${seq++}`;
+    const step3 = `bg_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: job1, title: "job 1", kind: "execute", status: "in_progress", rawInput: { command: "job 1" } });
+    setTimeout(() => {
+      idle(sessionId, { sessionUpdate: "tool_call_update", toolCallId: job1, status: "completed", content: [{ type: "content", content: { type: "text", text: "job 1 done" } }] });
+      idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Step 1 back." } });
+      idle(sessionId, { sessionUpdate: "tool_call", toolCallId: step2, title: "edit", kind: "edit", status: "in_progress", rawInput: { path: "app.ts" } });
+    }, WAKE_MS);
+    setTimeout(() => {
+      idle(sessionId, { sessionUpdate: "tool_call_update", toolCallId: step2, status: "completed", content: [{ type: "content", content: { type: "text", text: "edited app.ts" } }] });
+      idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Step 2 back." } });
+      idle(sessionId, { sessionUpdate: "tool_call", toolCallId: step3, title: "bash", kind: "execute", status: "in_progress", rawInput: { command: "git status" } });
+    }, WAKE_MS * 2);
+    setTimeout(() => {
+      idle(sessionId, { sessionUpdate: "tool_call_update", toolCallId: step3, status: "completed", content: [{ type: "content", content: { type: "text", text: "clean" } }] });
+      idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Multi-step wake complete." } });
+    }, WAKE_MS * 3);
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Waiting for " } });
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "the job." } });
+    return "end_turn";
+  }
   const jobs = /twice/i.test(text) ? 2 : 1;
   for (let job = 1; job <= jobs; job++) {
     const toolCallId = `bg_${seq++}`;

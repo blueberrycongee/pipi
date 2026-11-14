@@ -1,9 +1,8 @@
-import { Text, View } from "nsh";
-import type { JSX } from "nsh";
-import { Button as BaseButton, Input, Switch as BaseSwitch } from "nsh/base";
-import type { InputRef } from "nsh";
-import { animateNextLayout } from "./motion";
-import { FIELD_SURFACE, FOCUS_RING, PRESS } from "./styles";
+import { effect, signal, Text, untracked, View } from "nsh";
+import type { InputRef, JSX } from "nsh";
+import { Input, Switch as BaseSwitch, Tab, Tabs } from "nsh/base";
+import { LayerActive } from "./Reveal";
+import { FIELD_SURFACE, FOCUS_RING } from "./styles";
 
 /** An on/off control. */
 export function Switch(props: { checked: boolean; onChange: (checked: boolean) => void; label: string; disabled?: boolean }) {
@@ -21,7 +20,7 @@ export function Switch(props: { checked: boolean; onChange: (checked: boolean) =
   );
 }
 
-/** A choice among a few options, all visible. */
+/** A choice among a few options, all visible. Uses `Tabs`'s native sliding indicator so switching options never arms a window-wide `LayoutAnimation`. */
 export function Segmented<T extends string>(props: {
   value: T;
   options: readonly { value: T; label: string }[];
@@ -31,24 +30,27 @@ export function Segmented<T extends string>(props: {
 }) {
   return (
     <View
-      class={`${props.fullWidth ? "w-full" : "shrink-0"} flex-row rounded-lg bg-muted p-0.5`}
-      role="radiogroup"
+      class={`${props.fullWidth ? "w-full" : "shrink-0"} rounded-lg bg-muted p-0.5`}
       accessibilityLabel={props.label}
     >
-      <Each of={props.options}>
-        {(option) => (
-          <BaseButton
-            selected={props.value === option().value}
-            onPress={() => {
-              if (props.value !== option().value) animateNextLayout(180);
-              props.onChange(option().value);
-            }}
-            class={`h-6 ${props.fullWidth ? "min-w-0 flex-1" : "shrink-0"} items-center justify-center rounded-md px-2.5 text-sm text-muted-foreground ${PRESS} ${FOCUS_RING} hover:text-foreground selected:bg-card selected:text-foreground selected:shadow-sm`}
-          >
-            <Text class={props.fullWidth ? "truncate" : ""}>{option().label}</Text>
-          </BaseButton>
-        )}
-      </Each>
+      <Tabs
+        class={`${props.fullWidth ? "w-full" : ""} flex-row`}
+        indicatorClass="inset-y-0 rounded-md bg-card shadow-sm"
+      >
+        <Each of={props.options}>
+          {(option) => (
+            <Tab
+              selected={props.value === option().value}
+              onPress={() => {
+                if (props.value !== option().value) props.onChange(option().value);
+              }}
+              class={`h-6 ${props.fullWidth ? "min-w-0 flex-1" : "shrink-0"} items-center justify-center rounded-md px-2.5 text-sm text-muted-foreground transition-colors duration-150 ${FOCUS_RING} hover:text-foreground selected:text-foreground`}
+            >
+              <Text class={props.fullWidth ? "truncate" : ""}>{option().label}</Text>
+            </Tab>
+          )}
+        </Each>
+      </Tabs>
     </View>
   );
 }
@@ -75,13 +77,26 @@ export function TextField(props: {
   /** Left inset of the hint overlay when `inputClass` shifts the text start (`left-8` under a leading icon). */
   hintClass?: string;
 }) {
+  const layerActive = LayerActive();
+  const focused = signal(false);
+  let inputRef: InputRef | undefined;
+  effect(() => {
+    if (!layerActive() && untracked(focused)) {
+      inputRef?.blur();
+    }
+  });
   return (
     <View class={`relative ${props.class ?? ""}`}>
       <Input
-        ref={props.ref}
+        ref={(el) => {
+          inputRef = el ?? undefined;
+          if (el) props.ref?.(el);
+        }}
         value={props.value}
         onChange={({ value }) => props.onChange(value)}
         onSubmit={props.onSubmit}
+        onFocus={() => focused.set(true)}
+        onBlur={() => focused.set(false)}
         masked={props.masked}
         scrollbar={false}
         autoFocus={props.autoFocus}

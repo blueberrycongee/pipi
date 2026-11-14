@@ -59,7 +59,7 @@ import {
   turnDefault,
   turnSay,
 } from "./Rows";
-import { HeaderBand, PaneVeil } from "./Wallpaper";
+import { HEADER_BAND, HeaderBand, PaneVeil } from "./Wallpaper";
 import { buildDisplayRows, displayRowIds, stableDisplayRows } from "../pi/turns";
 
 /** Whether the displayed conversation is actively running. */
@@ -96,24 +96,31 @@ function activityLabel() {
  * Reserves a constant 36pt (`h-9`) slot so starting, finishing or celebrating a run never
  * shifts the scroll content height or causes a layout jump at the end of a stream.
  * It is the last thing in the list, so where it stands is where the conversation ends (`anchor`). */
-function ActivityLine(props: { anchor?: (node: ViewRef) => void }) {
-  const shown = signal(false);
-  const opacity = createAnimatedValue(0);
-  const translateY = createAnimatedValue(4);
+function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void }) {
+  const alreadyWorking = untracked(() => (isChatActive() || pipMood() === "happy") && transcriptRows().some((row) => row.kind !== "user"));
+  const shown = signal(alreadyWorking);
+  const opacity = createAnimatedValue(alreadyWorking ? 1 : 0);
+  const translateY = createAnimatedValue(alreadyWorking ? 0 : 4);
   let exitTimer: ReturnType<typeof setTimeout> | undefined;
 
   effect(() => {
+    if (isLeavingSession()) return;
     const active = isChatActive() || pipMood() === "happy";
     const reduced = reduceMotion();
     untracked(() => {
       clearTimeout(exitTimer);
       if (active) {
+        const entering = !shown();
         shown.set(true);
         if (reduced) {
           opacity.set(1);
           translateY.set(0);
+        } else if (entering) {
+          opacity.set(0);
+          void opacity.keyframes([0, 1], { duration: 160, delay: 45, easing: EASING.out });
+          void translateY.spring(0, SPRING.snappy);
         } else {
-          void opacity.timing(1, { duration: 180, easing: "easeOut" });
+          void opacity.timing(1, { duration: 160, easing: "easeOut" });
           void translateY.spring(0, SPRING.snappy);
         }
       } else if (shown()) {
@@ -467,9 +474,48 @@ const EDGE_BEAT_MS = 250;
  * - `fade`: rows fade out as they pass under that edge.
  */
 const FIGURE_REST = 124;
+const HEAD_FADE = 24;
+const MASK_STEPS = 6;
+const smoothMask = (t: number) => t * t * (3 - 2 * t);
+
+function maskRamp(from: number, to: number, start: number, end: number): string[] {
+  const stops: string[] = [];
+  for (let i = 0; i <= MASK_STEPS; i++) {
+    const t = i / MASK_STEPS;
+    const at = Math.round((start + (end - start) * t) * 10) / 10;
+    const a = Math.round(Math.max(0, Math.min(1, from + (to - from) * smoothMask(t))) * 255)
+      .toString(16)
+      .padStart(2, "0");
+    stops.push(`#000000${a} ${at}px`);
+  }
+  return stops;
+}
+
 function footOf(figure: number) {
   const edge = (figure || FIGURE_REST) - 12;
-  return { end: edge + 16, fade: `linear-gradient(to top, transparent ${edge - 56}px, black ${edge + 6}px)` };
+  return { edge, end: edge + 16 };
+}
+
+/**
+ * One top-to-bottom mask (`maskImage` takes a single gradient) fading rows out
+ * at both ends of what can be read:
+ * - Above: without a wallpaper the title bar's own glass blurs rows behind it,
+ *   so the fade runs inside the bar (`top - HEAD_FADE` → `top`) right up to its
+ *   hairline; over a wallpaper the title bar has no band of its own, so the
+ *   bar's whole height stays transparent (`0` → `top`) and rows fade in below
+ *   it (`top` → `top + HEAD_FADE`), never crossing the title text.
+ * - Below: rows fade out as they pass under the composer's top `edge`.
+ */
+function transcriptMask(height: number, top: number, edge: number, overWallpaper: boolean): string {
+  const headStart = overWallpaper ? Math.max(0, top - 4) : Math.max(0, top - HEAD_FADE);
+  const headEnd = overWallpaper ? top + HEAD_FADE : top;
+  const stops = maskRamp(0, 1, headStart, headEnd);
+  if (height > headEnd + edge + 24) {
+    const footStart = height - (edge + 20);
+    const footEnd = height - Math.max(16, edge);
+    stops.push(...maskRamp(1, 0, footStart, Math.max(footStart + 1, footEnd)));
+  }
+  return `linear-gradient(to bottom, ${stops.join(", ")})`;
 }
 
 /**
@@ -619,7 +665,10 @@ export function Chat() {
   });
   const stable = stableDisplayRows();
   let shown: ChatRow[] = [];
+  let shownKey = -1;
   const displayRows = computed<ChatRow[]>(() => {
+    if (isLeavingSession() && shown.length > 0) return shown;
+    const key = conversationKey();
     trackFoldState();
     const processOf = new Map<string, string>();
     const projected = buildDisplayRows(
@@ -644,7 +693,8 @@ export function Chat() {
     }
     setProcessTurns(folded);
     // The same rows are the same list: an event that changed nothing on screen reaches the list as nothing.
-    if (following() && rows.length === shown.length && rows.every((row, at) => row === shown[at])) return shown;
+    if (key === shownKey && following() && rows.length === shown.length && rows.every((row, at) => row === shown[at])) return shown;
+    shownKey = key;
     shown = rows;
     return rows;
   });
@@ -673,6 +723,7 @@ export function Chat() {
   /** The stage around the composer: the screen's while it stands in the middle, and that one still while it fades. */
   const stage = signal<Screen | undefined>(untracked(hero) ? untracked(screen) : undefined);
   let paneHeight = 0;
+  const viewHeight = signal(0);
   /** The composer's figure as laid out: the composer and what stands on it. The conversation's foot is placed from it (`footOf`). */
   const figure = signal(0);
   /** How far the pane goes on under the composer in the middle, as laid out: the way down to the dock. */
@@ -906,9 +957,25 @@ export function Chat() {
   // A reply still growing moves the end under an animated scroll: go there at once.
   const jumpToLatest = () => follow(!reduceMotion() && !isChatActive());
 
+  let listKey = -1;
+  let listReady = false;
+  let scrollArmed = false;
   effect(() => {
     scrollToEndTick();
-    untracked(() => follow(false));
+    if (!scrollArmed) {
+      scrollArmed = true;
+      return;
+    }
+    untracked(() => {
+      inputAt = 0;
+      following.set(true);
+      // A conversation mounting a fresh `<List>` in this turn opens at its end natively via
+      // `initialScrollAtEnd` (before its first frame, following while rows measure); calling
+      // `scrollTo` during that synchronous swap would hit the outgoing list or cancel the pass.
+      if (list && listKey === conversationKey() && listReady) {
+        list.scrollTo({ y: 1e7, animated: false });
+      }
+    });
   });
   // That reaches a list on screen only. A conversation can land while none is —
   // the empty chat held, dimmed, until its successor is whole — and the list
@@ -968,9 +1035,24 @@ export function Chat() {
     if (was && !active) pokeRepaint();
   });
   // The whole conversation landing (a parked session adopted, a file loaded).
+  let landedArmed = false;
   effect(() => {
     sessionLandedTick();
-    untracked(pokeRepaint);
+    if (!landedArmed) {
+      landedArmed = true;
+      return;
+    }
+    untracked(() => {
+      pokeRepaint();
+      const expectedKey = conversationKey();
+      if (following() && list && listKey === expectedKey && listReady) {
+        queueMicrotask(() => {
+          if (untracked(following) && list && listKey === expectedKey && listReady) {
+            list.scrollTo({ y: 1e7, animated: false });
+          }
+        });
+      }
+    });
   });
 
   /**
@@ -1052,26 +1134,60 @@ export function Chat() {
             selectable
             onSelectionChange={onSelection}
             class="flex-1"
-            style={{ maskImage: `linear-gradient(to bottom, transparent 0px, black 40px), ${foot().fade}` }}
+            style={{ maskImage: transcriptMask(viewHeight(), titleBar().height || 44, foot().edge, Boolean(wallpaper()) && !HEADER_BAND) }}
           >
-            <List
-              ref={list}
-              each={displayRows()}
-              initialScrollAtEnd
-              estimatedItemSize={44}
-              keyExtractor={(row) => row.id}
-              onScroll={onScroll}
-              scrollEventThrottle={16}
-              onScrollDragStart={onInput}
-              onMomentumStart={onInput}
-              maintainVisibleContentPosition={following() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
-              class="flex-1"
-              contentStyle={{ paddingHorizontal: 24, paddingTop: (titleBar().height || 44) + 12, paddingBottom: foot().end }}
-              accessibilityLabel={tr("Conversation", "对话")}
-              footer={<ActivityLine anchor={(node) => (ending = node)} />}
-            >
-              {(row) => <TranscriptRow row={row()} />}
-            </List>
+            <Each of={[conversationKey()]} key={(k) => k}>
+              {(key) => {
+                const currentKey = untracked(key);
+                let mountedList: ListRef | undefined;
+                let mountedEnding: ViewRef | undefined;
+                listKey = currentKey;
+                listReady = false;
+                queueMicrotask(() => {
+                  if (listKey === currentKey) listReady = true;
+                });
+                cleanup(() => {
+                  if (listKey === currentKey) {
+                    listKey = -1;
+                    listReady = false;
+                  }
+                });
+                return (
+                  <List
+                    ref={(node) => {
+                      if (node) list = mountedList = node;
+                      else if (list === mountedList) list = undefined;
+                    }}
+                    each={displayRows()}
+                    initialScrollAtEnd
+                    estimatedItemSize={44}
+                    keyExtractor={(row) => row.id}
+                    onScroll={onScroll}
+                    scrollEventThrottle={16}
+                    onScrollDragStart={onInput}
+                    onMomentumStart={onInput}
+                    maintainVisibleContentPosition={following() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
+                    class="flex-1"
+                    contentStyle={{
+                      paddingHorizontal: 24,
+                      paddingTop: (titleBar().height || 44) + (wallpaper() && !HEADER_BAND ? HEAD_FADE : 12),
+                      paddingBottom: foot().end,
+                    }}
+                    accessibilityLabel={tr("Conversation", "对话")}
+                    footer={
+                      <ActivityLine
+                        anchor={(node) => {
+                          if (node) ending = mountedEnding = node;
+                          else if (ending === mountedEnding) ending = undefined;
+                        }}
+                      />
+                    }
+                  >
+                    {(row) => <TranscriptRow row={row()} />}
+                  </List>
+                );
+              }}
+            </Each>
           </View>
           <ScrollToBottomPill visible={!following() && distanceFromEnd() > FOLLOW_THRESHOLD} bottom={foot().end} onPress={jumpToLatest} />
         </If>
@@ -1085,7 +1201,13 @@ export function Chat() {
       <Waiting show={isLeavingSession() && !hero()} />
       <HeaderBand show={screen() === "transcript"} height={titleBar().height || 44} />
       {/* The composer's column: the spacers over and under it are where it stands (`hero`). */}
-      <View class="pointer-events-none absolute inset-0 z-10" onLayout={(e) => (paneHeight = e.bounds.size.height)}>
+      <View
+        class="pointer-events-none absolute inset-0 z-10"
+        onLayout={(e) => {
+          paneHeight = e.bounds.size.height;
+          viewHeight.set(Math.round(e.bounds.size.height));
+        }}
+      >
         <View style={{ flexGrow: hero() ? HERO.rise : 1, flexShrink: 1, flexBasis: hero() ? HERO.head : 0 }} />
         <View class="relative" style={{ transform: [{ translateY: slide }] }} onLayout={(e) => figure.set(Math.round(e.bounds.size.height))}>
           <View class="absolute inset-0" style={{ transform: [{ translateY: Animated.subtract(stand, slide) }] }}>

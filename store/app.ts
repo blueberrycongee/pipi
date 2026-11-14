@@ -16,10 +16,20 @@ import { answersTo, type ComposerCommand, parseSlashLine } from "../lib/slash";
 import {
   chooseRandomWallpaperCandidate,
   DEFAULT_WALLPAPER_ADJUSTMENT,
+  DYNAMIC_WALLPAPER_ENABLED,
   inspectImageBytes,
+  inspectWallpaperBytes,
+  isAvailableWallpaperEffect,
   isSupportedWallpaperPath,
+  isVideoWallpaperPath,
+  isWallpaperPreset,
+  parseWallpaperEngineProject,
+  WALLPAPER_PRESET_META,
   type WallpaperAdjustment,
   type WallpaperEffect,
+  type WallpaperPauseMode,
+  type WallpaperPreset,
+  type WallpaperVideoClickAction,
 } from "../lib/wallpaper";
 import type { Mood } from "../mascot/geometry";
 import { type Exit, PiClient, PiError } from "../pi/client";
@@ -44,7 +54,7 @@ import type {
 import { type SessionSummary, sessionTitle } from "../pi/sessions";
 import { EMPTY_USAGE, type UsageStats } from "../pi/usage";
 import { killAllSidecars, SidecarError } from "../pi/sidecar";
-import { type Row, Transcript, withoutImageNotes } from "../pi/transcript";
+import { type Row, Transcript, withoutHandoff, withoutImageNotes } from "../pi/transcript";
 import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
@@ -84,20 +94,33 @@ import {
   sessionTreeMax,
   setSessionArchived,
   setWallpaperAdjustmentPref,
+  setWallpaperAgentReactivePref,
+  setWallpaperDimensionsPref,
   setWallpaperEffectPref,
   setWallpaperFolderPref,
+  setWallpaperInteractivePref,
+  setWallpaperMutedPref,
+  setWallpaperPausedPref,
+  setWallpaperPauseModePref,
   setWallpaperPref,
   setWallpaperThemeColorsPref,
+  setWallpaperVideoClickActionPref,
   setWorkspaceCollapsed,
   storedAgentOverrides,
   storedCustomAgents,
   storedSessionChoice,
   wallpaper,
+  wallpaperAgentReactive,
   wallpaperEffect,
   wallpaperFolder,
   wallpaperHistory,
+  wallpaperInteractive,
+  wallpaperMuted,
+  wallpaperPaused,
+  wallpaperPauseMode,
   wallpaperSource,
   wallpaperThemeColors,
+  wallpaperVideoClickAction,
   worktreeIsolationDefault,
 } from "./prefs";
 
@@ -152,6 +175,7 @@ const models = signal<Model[]>([]);
 const levels = signal<ThinkingLevel[]>(["off"]);
 const stats = signal<SessionStats | undefined>(undefined);
 const usage = signal<UsageStats>(EMPTY_USAGE);
+const usageLoaded = signal(false);
 const commands = signal<SlashCommand[]>([]);
 const sessions = signal<SessionSummary[]>([]);
 const sessionsByWorkspace = signal<Record<string, SessionSummary[]>>({});
@@ -221,6 +245,7 @@ export const thinkingLevels = () => levels();
 export const sessionStats = () => stats();
 /** Token use and cost across every saved session on this machine (`sidecar/usage-stats.mjs`). */
 export const usageStats = () => usage();
+export const usageReady = () => usageLoaded();
 export interface ArchivedSessionItem {
   id: string;
   session: SessionSummary;
@@ -343,11 +368,15 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
     const warm = phase().name === "ready" || isDraftAhead();
     const welcome = !goal.file && !goal.daemonId && warm && agentHasModel(goal.agentId ?? currentAgentId());
     stashTranscript();
-    const seen = goal.file ? visited.get(goal.file) : undefined;
-    if (seen && goal.file) {
-      visited.delete(goal.file);
+    const seenFile = goal.file ?? (goal.daemonId ? daemonSessionOfId(goal.daemonId)?.file : undefined);
+    const seenDaemonId = goal.daemonId ?? (goal.file ? daemonSessionByFile(goal.file)?.id : undefined);
+    const seenDaemon = seenDaemonId ? daemonSessionOfId(seenDaemonId) : undefined;
+    const seen = (seenFile ? visited.get(seenFile) : undefined) ?? (seenDaemonId ? visitedByDaemon.get(seenDaemonId) : undefined);
+    if (seen) {
+      if (seenFile) visited.delete(seenFile);
+      if (seenDaemonId) visitedByDaemon.delete(seenDaemonId);
       transcript = seen;
-      ahead = { transcript: seen, file: goal.file };
+      ahead = { transcript: seen, file: seenFile, daemonId: seenDaemonId };
       shown = true;
     } else if (welcome) {
       if (transcript.rows().length) transcript.load([]);
@@ -359,6 +388,7 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
       shownVersion = -1;
       markTranscriptSeen();
     }
+    const seenWorking = Boolean(seen && seenDaemon && (seenDaemon.status === "working" || seenDaemon.status === "blocked"));
     // Only dim out the old content when there is actual content to leave behind.
     // A welcome/empty screen has nothing to fade — the new session's loading state
     // shows immediately instead, preventing a confusing blank white flash that
@@ -368,6 +398,14 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
       heading.set(target);
       leaving.set(!shown && hadContent && (leaving() || warm));
       if (shown) {
+        if (seenWorking && !running()) runStartedAt.set(Date.now());
+        running.set(seenWorking);
+        bashRunning.set(false);
+        activity.set(seenWorking ? (activity().kind === "idle" ? { kind: "thinking" } : activity()) : { kind: "idle" });
+        queue.set({ steering: [], followUp: [] });
+        dialogs.set([]);
+        statuses.set({});
+        widgets.set({});
         flush();
         landed.update((n) => n + 1);
         scrollToEnd.set(0);
@@ -400,9 +438,10 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
 
 /** Whether a session is working, on screen or in the background (the daemon says so, not the screen). */
 export function isSessionRunning(path: string) {
-  if (path === state()?.sessionFile) return running() || bashRunning();
   const known = daemonSessionByFile(path);
-  return known?.status === "working" || known?.status === "blocked";
+  const daemonBusy = known?.status === "working" || known?.status === "blocked";
+  if (path === state()?.sessionFile) return hasActiveOrQueuedWork() || daemonBusy;
+  return daemonBusy;
 }
 
 /** Whether a background run finished with something the user has not seen yet. */
@@ -560,9 +599,11 @@ export const currentParentSession = computed((): { id: string; file?: string; cw
  * Sessions working under the open one: the open session itself is at rest, so
  * this is the "waiting on N sessions" the activity line and the Stop affordance use.
  */
-export const waitingCount = computed(
-  () => descendantSessionsOf(openDaemonId()).filter((session) => session.status === "working" || session.status === "blocked").length,
-);
+export const waitingCount = computed(() => {
+  const target = !leaving() ? heading() : undefined;
+  const id = target ? (target.daemonId ?? daemonSessionByFile(target.file)?.id) : openDaemonId();
+  return descendantSessionsOf(id).filter((session) => session.status === "working" || session.status === "blocked").length;
+});
 
 /** Count of all daemon sessions currently running or waiting on confirmation across the machine. */
 export const activeDaemonSessionCount = computed(
@@ -756,9 +797,10 @@ function succeed(before: Transcript, next: Transcript) {
  * shows it with the click instead of after the agent has loaded it.
  */
 const visited = new Map<string, Transcript>();
+const visitedByDaemon = new Map<string, Transcript>();
 const VISITED_LIMIT = 8;
 /** The conversation shown from `visited`, until the agent's own history confirms or replaces it. */
-let ahead: { transcript: Transcript; file: string } | undefined;
+let ahead: { transcript: Transcript; file?: string; daemonId?: string } | undefined;
 /** The change under way showed its destination before the agent got there: a change that fails puts the agent's session back. */
 let early = false;
 /** Settles when the session change under way is over, however it ends. */
@@ -786,11 +828,26 @@ let daemonStarting: Promise<DaemonClient | undefined> | undefined;
 const clientDaemonId = new Map<PiClient, string>();
 let flushFrame: number | undefined;
 let shownVersion = -1;
+let dropSweepTimer: ReturnType<typeof setTimeout> | undefined;
+let dropSweepAt: number | undefined;
 let toastId = 0;
 const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
 /** The reader asked the open run to stop. However it then ends is their doing: Pi settles a retry cancelled mid-wait as not aborted. */
 let stopAsked = false;
 let bashRequestId: string | undefined;
+let pendingSendCount = 0;
+let deferredSendTail: Promise<void> = Promise.resolve();
+/** Holds a detached client's pipe open briefly when an in-flight `send()` is finishing attachment reads before writing its prompt. */
+const clientSendHolds = new Map<PiClient, Set<Promise<void>>>();
+
+function hasQueuedMessages(): boolean {
+  const q = queue();
+  return q.steering.length > 0 || q.followUp.length > 0 || (state()?.pendingMessageCount ?? 0) > 0;
+}
+
+function hasActiveOrQueuedWork(): boolean {
+  return running() || bashRunning() || Boolean(state()?.isCompacting) || hasQueuedMessages() || pendingSendCount > 0;
+}
 
 /** Publishes the transcript to the screen: synchronized to display VSync, at most once a frame. */
 function flushSoon() {
@@ -798,9 +855,28 @@ function flushSoon() {
   flushFrame = requestAnimationFrame(flush);
 }
 
+/**
+ * Wakes a flush for the soonest staged bubble the queue reconcile marked for
+ * withdrawal: its echo either lands inside the grace or it never does.
+ */
+function armDropSweep() {
+  const at = transcript.dropDeadline();
+  if (at === dropSweepAt) return;
+  if (dropSweepTimer !== undefined) clearTimeout(dropSweepTimer);
+  dropSweepTimer = undefined;
+  dropSweepAt = at;
+  if (at === undefined) return;
+  dropSweepTimer = setTimeout(() => {
+    dropSweepTimer = undefined;
+    dropSweepAt = undefined;
+    if (transcript.sweepDrops()) flushSoon();
+  }, Math.max(0, at - Date.now()) + 25);
+}
+
 function flush() {
   if (flushFrame !== undefined) cancelAnimationFrame(flushFrame);
   flushFrame = undefined;
+  armDropSweep();
   if (transcript.version === shownVersion) return;
   shownVersion = transcript.version;
   batch(() => {
@@ -820,26 +896,46 @@ function flush() {
 function stashTranscript() {
   const shownAhead = ahead?.transcript === transcript ? ahead : undefined;
   ahead = undefined;
-  const file = shownAhead ? shownAhead.file : phase().name === "ready" ? state()?.sessionFile : undefined;
+  const file = shownAhead
+    ? shownAhead.file
+    : phase().name === "ready"
+      ? (state()?.sessionFile ?? currentDaemonSession()?.file)
+      : undefined;
+  const did = shownAhead ? shownAhead.daemonId : phase().name === "ready" ? openDaemonId() : undefined;
   // Always give the next session a fresh transcript; keep the previous one for
   // immediate restore. bashRunning is not stashed — a shell task has no rows
   // of its own to preserve. An empty transcript is not worth caching.
   const previous = transcript;
   transcript = new Transcript(() => activeLanguage());
   shownVersion = -1;
-  if (!file || bashRunning() || !previous.rows().length) return;
-  visited.delete(file);
-  visited.set(file, previous);
-  for (const oldest of visited.keys()) {
-    if (visited.size <= VISITED_LIMIT) break;
-    visited.delete(oldest);
+  if (bashRunning() || !previous.rows().length) return;
+  if (file) {
+    visited.delete(file);
+    visited.set(file, previous);
+    for (const oldest of visited.keys()) {
+      if (visited.size <= VISITED_LIMIT) break;
+      visited.delete(oldest);
+    }
+    if (did) visitedByDaemon.delete(did);
+  } else if (did) {
+    visitedByDaemon.delete(did);
+    visitedByDaemon.set(did, previous);
+    for (const oldest of visitedByDaemon.keys()) {
+      if (visitedByDaemon.size <= VISITED_LIMIT) break;
+      visitedByDaemon.delete(oldest);
+    }
   }
 }
 
-/** Whether two transcripts show the same conversation (row ids are minted per transcript and never match). */
+/** Whether two transcripts show the same conversation (row ids and live-vs-disk timing skew do not change content). */
 function sameRows(a: Row[], b: Row[]) {
   if (a.length !== b.length) return false;
-  const shape = (rows: Row[]) => JSON.stringify(rows, (key, value) => (key === "id" ? undefined : value));
+  const shape = (rows: Row[]) =>
+    JSON.stringify(rows, (key, value) => {
+      if (key === "id" || key === "t0" || key === "durationMs" || key === "queued") return undefined;
+      if (key === "turnMs") return value === undefined ? undefined : true;
+      return value;
+    });
   return shape(a) === shape(b);
 }
 
@@ -859,23 +955,39 @@ function sameRows(a: Row[], b: Row[]) {
  */
 function landHistory(messages: AgentMessage[]) {
   const known = state();
-  const file = known?.sessionFile;
+  const file = known?.sessionFile ?? currentDaemonSession()?.file;
+  const did = openDaemonId();
   const shown = ahead?.transcript === transcript;
   ahead = undefined;
   early = false;
   const fresh = new Transcript(() => activeLanguage());
   // A session the daemon kept working is still on its last turn: nothing in it has stopped.
   fresh.load(messages, Boolean(known?.isStreaming));
-  // The conversation as it last stood on screen, when it is still held: shown ahead, or set aside under its file.
-  const before = shown ? transcript : file ? visited.get(file) : undefined;
-  if (before && !shown && file) visited.delete(file);
+  // The conversation as it last stood on screen, when it is still held: shown ahead, or set aside under its file / daemon id.
+  const before = shown
+    ? transcript
+    : (file ? visited.get(file) : undefined) ?? (did ? visitedByDaemon.get(did) : undefined);
+  if (before && !shown) {
+    if (file) visited.delete(file);
+    if (did) visitedByDaemon.delete(did);
+  }
   if (messages.length === 0 && transcript.rows().length === 0 && !before) {
     return;
   }
-  if (before && (sameRows(fresh.rows(), before.rows()) || fresh.rows().length < before.rows().length)) {
-    // The same rows, or the agent's history lags the stashed view: an in-progress
+  const countUsers = (list: readonly Row[]) => list.reduce((n, r) => (r.kind === "user" ? n + 1 : n), 0);
+  if (
+    before &&
+    (sameRows(fresh.rows(), before.rows()) ||
+      (Boolean(known?.isStreaming) &&
+        fresh.rows().length < before.rows().length &&
+        sameRows(fresh.rows(), before.rows().slice(0, fresh.rows().length))))
+  ) {
+    // The same rows, or the agent's history is an exact prefix of the stashed view: an in-progress
     // run has not yet written its streaming message to the session file. Keep
     // showing the stash so the thinking rows stay on screen while the stream catches up.
+    if (before.hasStagedUser() && countUsers(fresh.rows()) >= countUsers(before.rows())) {
+      before.commitStagedUsers();
+    }
     if (shown) return;
     transcript = before;
   } else {
@@ -884,9 +996,11 @@ function landHistory(messages: AgentMessage[]) {
   }
   shownVersion = -1;
   markTranscriptSeen();
-  flush();
-  landed.update((n) => n + 1);
-  scrollToEnd.set(0);
+  batch(() => {
+    flush();
+    landed.update((n) => n + 1);
+    if (!shown) scrollToEnd.set(0);
+  });
 }
 
 /** Marks every row the transcript can put on screen as already seen: a landing never replays row entrances. */
@@ -954,6 +1068,17 @@ function upsertDaemonSession(session: DaemonSession) {
     next[at] = session;
     return next;
   });
+  if (session.file && visitedByDaemon.has(session.id)) {
+    const stashed = visitedByDaemon.get(session.id)!;
+    visitedByDaemon.delete(session.id);
+    if (!visited.has(session.file)) {
+      visited.set(session.file, stashed);
+      for (const oldest of visited.keys()) {
+        if (visited.size <= VISITED_LIMIT) break;
+        visited.delete(oldest);
+      }
+    }
+  }
   // The open session's rows refresh through its own stream (a settle re-lists, as before); every
   // other session reports only here — a status, title or file change re-reads its workspace list.
   const open = client !== undefined && session.id === clientDaemonId.get(client);
@@ -1068,6 +1193,9 @@ function teardownStore() {
   client = undefined;
   for (const started of clientDaemonId.keys()) started.close(0);
   clientDaemonId.clear();
+  clientSendHolds.clear();
+  visited.clear();
+  visitedByDaemon.clear();
   active?.close(0);
   daemonClient?.close();
   daemonClient = undefined;
@@ -1092,6 +1220,7 @@ export async function boot() {
     currentAgentId.set(preferredAgentId());
     currentRuntimeMode.set(preferredRuntimeMode());
     agents.set(defaultAgentStatuses(storedCustomAgents(), storedAgentOverrides()));
+    usageLoaded.set(false);
   });
   const list = recentWorkspaces();
   const last = lastActiveWorkspace();
@@ -1100,6 +1229,7 @@ export async function boot() {
   await start(first, undefined, preferredAgentId());
   if (phase().name !== "failed") {
     void refreshAllWorkspaceSessions();
+    void refreshUsageStats();
   }
   startAppUpdateChecks();
 }
@@ -1166,6 +1296,7 @@ async function launch(
   const spec = agents().find((a) => a.id === targetAgentId);
   const effectiveAgentId = spec ? spec.id : "pi";
 
+  const keepAheadRun = Boolean(ahead && running());
   batch(() => {
     phase.set({ name: "starting" });
     workspace.set(cwd);
@@ -1174,8 +1305,10 @@ async function launch(
     currentAgentId.set(effectiveAgentId);
     if (!reopen && !daemonId) currentRuntimeMode.set(preferredRuntimeMode());
     state.set(undefined);
-    running.set(false);
-    activity.set({ kind: "idle" });
+    if (!keepAheadRun) {
+      running.set(false);
+      activity.set({ kind: "idle" });
+    }
     queue.set({ steering: [], followUp: [] });
     dialogs.set([]);
     statuses.set({});
@@ -1214,8 +1347,17 @@ async function launch(
     if ((reopen || daemonId) && !preserveRows) {
       batch(() => {
         state.set(first);
+        if (first.isStreaming || currentDaemonSession()?.status === "working") {
+          if (!running()) runStartedAt.set(Date.now());
+          running.set(true);
+          if (activity().kind === "idle") activity.set({ kind: "thinking" });
+        } else if (running()) {
+          running.set(false);
+          activity.set({ kind: "idle" });
+        }
         phase.set({ name: "ready" });
       });
+      if (first.sessionFile) reportSessionFile();
       // The daemon already put the process on `reopen`'s session file before answering the attach.
       const [, history] = await Promise.all([
         refreshState(),
@@ -1399,6 +1541,11 @@ function revive(agentLabel: string, cutShort: boolean, lost: Extract<Phase, { na
       ]);
       if (mine !== generation) return;
       state.set(next);
+      if (next.isStreaming && !running()) {
+        runStartedAt.set(Date.now());
+        running.set(true);
+        if (activity().kind === "idle") activity.set({ kind: "thinking" });
+      }
       // At rest the conversation on screen is the session's own and stays as it is. A run cut short left rows
       // no file has, and a session that could not be opened again is not the one shown: then the file speaks.
       if (!ahead && (cutShort || (file !== undefined && next.sessionFile !== file))) {
@@ -1578,7 +1725,7 @@ export async function openWorkspace(path: string, sessionPath?: string, sessionA
   }
   pendingHandoff.set(undefined);
   view.set({ name: "chat" });
-  if (running() || bashRunning()) return switchInto(path, sessionPath, sessionAgentId ?? currentAgentId(), held?.id);
+  if (mustDetachOnSwitch()) return switchInto(path, sessionPath, sessionAgentId ?? currentAgentId(), held?.id);
   await start(path, sessionPath, sessionAgentId ?? currentAgentId(), undefined, held?.id);
 }
 
@@ -1592,7 +1739,7 @@ export async function newSessionInWorkspace(cwd: string) {
   }
   pendingHandoff.set(undefined);
   view.set({ name: "chat" });
-  if (running() || bashRunning()) return switchInto(cwd, undefined, currentAgentId());
+  if (mustDetachOnSwitch()) return switchInto(cwd, undefined, currentAgentId());
   await start(cwd, undefined, currentAgentId());
   focusComposer();
 }
@@ -1604,7 +1751,7 @@ export async function closeWorkspace(cwd: string) {
   if (cwd === workspace()) {
     pendingHandoff.set(undefined);
     const next = remaining[0] ?? backend().home();
-    if (running() || bashRunning()) await switchInto(next, undefined, currentAgentId());
+    if (mustDetachOnSwitch()) await switchInto(next, undefined, currentAgentId());
     else await start(next, undefined, currentAgentId());
   }
   // Closing a project stops whatever it left running off screen, and drops its list.
@@ -1785,6 +1932,7 @@ async function refreshState() {
   if (next.isStreaming && !running()) {
     runStartedAt.set(Date.now());
     running.set(true);
+    if (activity().kind === "idle") activity.set({ kind: "thinking" });
   }
   return next;
 }
@@ -1822,6 +1970,8 @@ export async function refreshUsageStats() {
     usage.set((await backend().usageStats?.()) ?? EMPTY_USAGE);
   } catch (error) {
     toast("warning", `${tr("Could not read usage statistics", "无法读取用量统计")}: ${message(error)}`);
+  } finally {
+    usageLoaded.set(true);
   }
 }
 
@@ -1979,26 +2129,103 @@ async function applyThinkingChoice(known: SessionState | undefined, commit = tru
 // ── Events from Active Agent ────────────────────────────────────────────────
 
 function onEvent(event: SessionEvent) {
+  if (event.type === "commands_changed") {
+    // The bridge learned the agent's own commands (ACP `available_commands_update`, Claude's `initialize`).
+    void refreshCommands();
+    return;
+  }
+  if (event.type === "models_changed") {
+    // The bridge adopted the agent's real catalog (ACP session negotiation).
+    void (async () => {
+      await Promise.all([refreshModels(), refreshLevels(), refreshState().catch(() => undefined)]);
+      if (!running() && !rows().length && !(state()?.messageCount)) {
+        await applySessionChoices();
+      }
+    })();
+    return;
+  }
+  if (event.type === "agent_settled") {
+    // An idle-wake catch-up (`acpWakeBeforePrompt`) settles its own turn right before
+    // the staged user prompt's `agent_start` arrives: settle the wake rows, keep the run live.
+    if (!event.aborted && !stopAsked && transcript.hasPendingUser()) {
+      transcript.apply(event);
+      flush();
+      return;
+    }
+    const wasRunning = running();
+    batch(() => {
+      transcript.commitStagedUsers();
+      transcript.apply(event);
+      flush();
+      running.set(false);
+      activity.set({ kind: "idle" });
+      queue.set({ steering: [], followUp: [] });
+      // A settle empties the queue too: whatever it still held never echoes.
+      transcript.reconcileQueue([], []);
+    });
+    if (wasRunning && !event.aborted && !stopAsked) celebrate();
+    stopAsked = false;
+    refreshState().catch(() => undefined);
+    refreshStats();
+    refreshSessions();
+    void refreshGitWorkspace();
+    const current = view();
+    if (current.name === "settings" && current.section === "usage") void refreshUsageStats();
+    return;
+  }
+
+  // Advance the transcript before updating `running` or `activity`, and flush synchronously
+  // whenever a user message lands or the activity phase changes so a reply state ("Writing" /
+  // "Thinking") never commits on a frame ahead of the user's bubble or the turn's row.
+  if (event.type === "bash_execution_update") {
+    if (!event.id || event.id === bashRequestId) transcript.bashOutput(event.delta);
+    flushSoon();
+    return;
+  }
+  transcript.apply(event);
+
+  const publishActivity = (next: Activity) => {
+    if (sameActivity(activity(), next)) return false;
+    batch(() => {
+      flush();
+      activity.set(next);
+    });
+    return true;
+  };
+
   switch (event.type) {
     case "agent_start":
       stopAsked = false;
       batch(() => {
+        flush();
         if (!running()) runStartedAt.set(Date.now());
         running.set(true);
         // A retry is a run starting over: the line goes on saying which attempt it is until that attempt
         // shows life (or the retries end), rather than flapping to "Thinking" and back between attempts.
         if (activity().kind !== "retrying") activity.set({ kind: "thinking" });
       });
+      return;
+    case "message_start":
+      if (event.message.role === "user") {
+        flush();
+        return;
+      }
       break;
     case "message_update": {
       const kind = event.assistantMessageEvent.type;
-      if (kind.startsWith("text")) activity.set({ kind: "writing" });
-      else if (kind.startsWith("thinking")) activity.set({ kind: "thinking" });
-      else if (kind === "toolcall_start") activity.set({ kind: "tool", name: event.assistantMessageEvent.toolName });
+      const next: Activity | undefined =
+        kind === "text_start" || kind === "text_delta"
+          ? { kind: "writing" }
+          : kind === "thinking_start" || kind === "thinking_delta"
+            ? { kind: "thinking" }
+            : kind === "toolcall_start"
+              ? { kind: "tool", name: event.assistantMessageEvent.toolName }
+              : undefined;
+      if (next && publishActivity(next)) return;
       break;
     }
     case "tool_execution_start":
-      activity.set({ kind: "tool", name: event.toolName });
+      if (publishActivity({ kind: "tool", name: event.toolName })) return;
       break;
     case "message_end":
       // A fresh session gets its file as its first run starts (the bridge writes it then): knowing it is
@@ -2007,10 +2234,11 @@ function onEvent(event: SessionEvent) {
       break;
     case "turn_start":
     case "turn_end":
-      if (running() && activity().kind !== "retrying") activity.set({ kind: "thinking" });
+      if (running() && activity().kind !== "retrying" && publishActivity({ kind: "thinking" })) return;
       break;
     case "queue_update":
       queue.set({ steering: event.steering ?? [], followUp: event.followUp ?? [] });
+      transcript.reconcileQueue(event.steering ?? [], event.followUp ?? []);
       break;
     case "session_info_changed":
       state.update((s) => s && { ...s, sessionName: event.name });
@@ -2020,57 +2248,27 @@ function onEvent(event: SessionEvent) {
       state.update((s) => s && { ...s, thinkingLevel: event.level });
       break;
     case "compaction_start":
-      activity.set({ kind: "compacting" });
-      state.update((s) => s && { ...s, isCompacting: true });
-      break;
+      batch(() => {
+        flush();
+        activity.set({ kind: "compacting" });
+        state.update((s) => s && { ...s, isCompacting: true });
+      });
+      return;
     case "compaction_end":
-      state.update((s) => s && { ...s, isCompacting: false });
-      activity.set(running() ? { kind: "thinking" } : { kind: "idle" });
+      batch(() => {
+        flush();
+        state.update((s) => s && { ...s, isCompacting: false });
+        activity.set(running() ? { kind: "thinking" } : { kind: "idle" });
+      });
       refreshStats();
-      break;
+      return;
     case "auto_retry_start":
-      activity.set({ kind: "retrying", attempt: event.attempt, maxAttempts: event.maxAttempts, reason: event.errorMessage });
+      if (publishActivity({ kind: "retrying", attempt: event.attempt, maxAttempts: event.maxAttempts, reason: event.errorMessage })) return;
       break;
     case "auto_retry_end":
-      if (running()) activity.set({ kind: "thinking" });
+      if (running() && publishActivity({ kind: "thinking" })) return;
       break;
-    case "bash_execution_update":
-      if (!event.id || event.id === bashRequestId) transcript.bashOutput(event.delta);
-      break;
-    case "commands_changed":
-      // The bridge learned the agent's own commands (ACP `available_commands_update`, Claude's `initialize`).
-      void refreshCommands();
-      return;
-    case "models_changed":
-      // The bridge adopted the agent's real catalog (ACP session negotiation).
-      void (async () => {
-        await Promise.all([refreshModels(), refreshLevels(), refreshState().catch(() => undefined)]);
-        if (!running() && !rows().length && !(state()?.messageCount)) {
-          await applySessionChoices();
-        }
-      })();
-      return;
-    case "agent_settled": {
-      const wasRunning = running();
-      batch(() => {
-        running.set(false);
-        activity.set({ kind: "idle" });
-        queue.set({ steering: [], followUp: [] });
-      });
-      transcript.apply(event);
-      flush();
-      if (wasRunning && !event.aborted && !stopAsked) celebrate();
-      stopAsked = false;
-      refreshState().catch(() => undefined);
-      refreshStats();
-      refreshSessions();
-      void refreshGitWorkspace();
-      const current = view();
-      if (current.name === "settings" && current.section === "usage") void refreshUsageStats();
-      return;
-    }
   }
-  transcript.apply(event);
   flushSoon();
 }
 
@@ -2345,29 +2543,168 @@ async function runAppCommand(text: string): Promise<boolean> {
  *   user's clean message in the visible chat bubble!
  */
 export async function send(mode: "steer" | "followUp" = "steer") {
-  if (attachmentReads.size) await Promise.allSettled([...attachmentReads]);
-  // A message written while a session change is under way is for where it lands.
-  for (let wait = arrival; heading() && wait; wait = arrival === wait ? undefined : arrival) await wait;
-  // One written while the agent is being started again goes to it once it is back.
-  while (revival) await revival;
-  const text = draft().trim();
-  const images = attachments().map(({ type, data, mimeType }) => ({ type, data, mimeType }));
-  if (!text && !images.length) return;
-  // pipi's own commands need no agent: they run whatever the session is doing.
-  if (await runAppCommand(text)) return;
-  if (phase().name !== "ready") return;
+  // pipi's own commands need no agent or attachments: run them before counting an outgoing prompt send,
+  // so `/new` or `/clear` on an idle session reuses the open process instead of detaching.
+  const immediateText = draft().trim();
+  const immediateLine = immediateText ? parseSlashLine(immediateText) : undefined;
+  if (immediateLine && appCommands().some((own) => answersTo(own, immediateLine.name))) {
+    if (heading() || revival) {
+      for (let wait = arrival; heading() && wait; wait = arrival === wait ? undefined : arrival) await wait;
+      while (revival) await revival;
+    }
+    await runAppCommand(immediateText);
+    return;
+  }
 
-  if (text.startsWith("!") && !running()) {
+  const preSwitch = Boolean(heading() || revival);
+  const pinnedClient = !preSwitch && phase().name === "ready" ? client : undefined;
+  const pinnedWasQueued = running() || Boolean(state()?.isStreaming);
+  const pinnedHandoff = pinnedClient ? pendingHandoff() : undefined;
+  const preAttachments = pinnedClient ? attachments() : [];
+  let releaseHold: (() => void) | undefined;
+  if (pinnedClient && attachmentReads.size > 0) {
+    const hold = new Promise<void>((resolve) => {
+      releaseHold = resolve;
+    });
+    let set = clientSendHolds.get(pinnedClient);
+    if (!set) {
+      set = new Set();
+      clientSendHolds.set(pinnedClient, set);
+    }
+    set.add(hold);
+    void hold.finally(() => {
+      set?.delete(hold);
+      if (set && set.size === 0) clientSendHolds.delete(pinnedClient);
+    });
+  }
+
+  pendingSendCount++;
+  let countedSend = true;
+  const finishSendCount = () => {
+    if (!countedSend) return;
+    countedSend = false;
+    pendingSendCount = Math.max(0, pendingSendCount - 1);
+  };
+  try {
+    if (attachmentReads.size) await Promise.allSettled([...attachmentReads]);
+
+    // If `send` was triggered on an open session and the user switched away while `attachmentReads` finished,
+    // deliver the message to the original session's held pipe rather than misrouting it to the new session.
+    if (pinnedClient && client !== pinnedClient) {
+      const text = draft().trim();
+      const merged = [...preAttachments];
+      for (const item of attachments()) {
+        if (!merged.some((k) => k.data === item.data && k.mimeType === item.mimeType)) merged.push(item);
+      }
+      const images = merged.map(({ type, data, mimeType }) => ({ type, data, mimeType }));
+      if (!text && !images.length) return;
+      const line = parseSlashLine(text);
+      if (line && appCommands().some((own) => answersTo(own, line.name))) {
+        releaseHold?.();
+        releaseHold = undefined;
+        finishSendCount();
+        await runAppCommand(text);
+        return;
+      }
+      const wirePrompt = pinnedHandoff ? prependHandoffToPrompt(pinnedHandoff.context, text) : text;
+      batch(() => {
+        draft.set("");
+        attachments.set([]);
+      });
+      if (!pinnedClient.closed) {
+        void pinnedClient
+          .request("prompt", {
+            message: wirePrompt,
+            ...(images.length ? { images } : {}),
+            ...(pinnedWasQueued ? { streamingBehavior: mode } : {}),
+          })
+          .catch(() => undefined);
+      }
+      return;
+    }
+    releaseHold?.();
+    releaseHold = undefined;
+
+    // A message written while a session change or revival is under way is for where it lands.
+    // Snapshot and clear the composer immediately so multiple queued messages submitted during
+    // a slow switch are preserved in FIFO order instead of overwriting `draft()`.
+    if (heading() || revival) {
+      const text = draft().trim();
+      const images = attachments().map(({ type, data, mimeType }) => ({ type, data, mimeType }));
+      if (!text && !images.length) return;
+      const line = parseSlashLine(text);
+      if (line && appCommands().some((own) => answersTo(own, line.name))) {
+        finishSendCount();
+        for (let wait = arrival; heading() && wait; wait = arrival === wait ? undefined : arrival) await wait;
+        while (revival) await revival;
+        await runAppCommand(text);
+        return;
+      }
+      batch(() => {
+        draft.set("");
+        attachments.set([]);
+      });
+      const runDeferred = deferredSendTail.then(async () => {
+        for (let wait = arrival; heading() && wait; wait = arrival === wait ? undefined : arrival) await wait;
+        while (revival) await revival;
+        await dispatchPrompt(text, images, mode, false);
+      });
+      deferredSendTail = runDeferred.catch(() => undefined);
+      await runDeferred;
+      return;
+    }
+
+    const text = draft().trim();
+    const images = attachments().map(({ type, data, mimeType }) => ({ type, data, mimeType }));
+    if (!text && !images.length) return;
+    // pipi's own commands need no agent: they run whatever the session is doing.
+    const line = parseSlashLine(text);
+    if (line && appCommands().some((own) => answersTo(own, line.name))) {
+      finishSendCount();
+      await runAppCommand(text);
+      return;
+    }
+    await dispatchPrompt(text, images, mode, true);
+  } finally {
+    releaseHold?.();
+    finishSendCount();
+  }
+}
+
+async function dispatchPrompt(
+  text: string,
+  images: ImageContent[],
+  mode: "steer" | "followUp",
+  clearComposer: boolean,
+) {
+  const restoreUnsent = () => {
+    if (clearComposer || !text) return;
+    draft.set(draft() ? `${draft()}\n\n${text}` : text);
+  };
+
+  if (phase().name !== "ready") {
+    restoreUnsent();
+    return;
+  }
+
+  if (text.startsWith("!") && !running() && !state()?.isStreaming) {
     const exclude = text.startsWith("!!");
     const command = text.slice(exclude ? 2 : 1).trim();
     if (!command) return;
-    draft.set("");
+    if (clearComposer) draft.set("");
     return runBash(command, exclude);
   }
 
   if (!hasModel()) {
+    restoreUnsent();
     toast("warning", tr("Connect a model provider before sending.", "请先连接模型服务商再发送。"));
     showAgentSettings();
+    return;
+  }
+
+  const activeClient = client;
+  if (!activeClient) {
+    restoreUnsent();
     return;
   }
 
@@ -2383,44 +2720,67 @@ export async function send(mode: "steer" | "followUp" = "steer") {
   const handoff = agentCommand ? undefined : pendingHandoff();
   const wirePrompt = handoff ? prependHandoffToPrompt(handoff.context, text) : text;
 
-  batch(() => {
-    draft.set("");
-    attachments.set([]);
-    if (handoff) pendingHandoff.set(undefined);
-  });
+  const runTranscript = transcript;
+  const queued = running() || Boolean(state()?.isStreaming);
   enableLiveRowEntrance();
-  scrollToEnd.set(0);
-  const queued = running();
-  const activeClient = client;
-  if (!queued) {
-    batch(() => {
+  let stagedId: string | undefined;
+  batch(() => {
+    if (clearComposer) {
+      draft.set("");
+      attachments.set([]);
+    }
+    if (handoff) pendingHandoff.set(undefined);
+    if (!queued) cheer.set(false);
+    // The bubble shows at once even when the agent queues the message behind its
+    // run: it lands after the turn's rows, where it belongs in the order sent.
+    stagedId = runTranscript.stageUser(text, images.length, queued);
+    if (runTranscript === transcript) flush();
+    if (!queued) {
       running.set(true);
       runStartedAt.set(Date.now());
       activity.set({ kind: "thinking" });
-    });
-  }
+    }
+  });
+  scrollToEnd.set(0);
   try {
-    const { disposition } = await request("prompt", {
+    const { disposition } = await activeClient.request("prompt", {
       message: wirePrompt,
       ...(images.length ? { images } : {}),
       ...(queued ? { streamingBehavior: mode } : {}),
     });
     // The user may have switched sessions while the agent was answering: that run is the daemon's now, not this screen's.
-    if (client !== activeClient) return;
-    if (!queued && disposition === "handled") {
+    if (client !== activeClient) {
+      if (disposition === "queued") runTranscript.markStagedQueued(stagedId);
+      else if (disposition === "handled") runTranscript.dropStagedUser(stagedId);
+      return;
+    }
+    if (disposition === "handled" || disposition === "queued") {
       batch(() => {
-        running.set(false);
-        activity.set({ kind: "idle" });
+        if (disposition === "queued") runTranscript.markStagedQueued(stagedId);
+        else runTranscript.dropStagedUser(stagedId);
+        if (runTranscript === transcript) flush();
+        if (!queued && disposition === "handled") {
+          running.set(false);
+          activity.set({ kind: "idle" });
+        }
       });
     }
   } catch (error) {
-    if (client !== activeClient) return;
+    // Detaching closes the virtual transport (`activeClient.closed`), rejecting local response waiters
+    // after the `in` frame already went out to the daemon.
+    if (client !== activeClient && activeClient.closed) return;
+    if (client !== activeClient) {
+      runTranscript.dropStagedUser(stagedId);
+      return;
+    }
     batch(() => {
+      runTranscript.dropStagedUser(stagedId);
+      if (runTranscript === transcript) flush();
       if (!queued) {
         running.set(false);
         activity.set({ kind: "idle" });
       }
-      if (!draft()) draft.set(text);
+      draft.set(draft() ? `${draft()}\n\n${text}` : text);
       if (handoff) pendingHandoff.set(handoff);
     });
     // Said once, as every app error is: a toast. The message is back in the composer, and the conversation
@@ -2460,8 +2820,10 @@ export async function stop() {
     if (activity().kind === "retrying") request("abort_retry").catch(() => undefined);
     try {
       const cleared = await request("clear_queue");
+      transcript.dropQueuedMatching([...cleared.steering, ...cleared.followUp]);
+      flushSoon();
       const waiting = [...cleared.steering, ...cleared.followUp].join("\n\n");
-      if (waiting && !draft()) draft.set(waiting);
+      if (waiting) draft.set(draft() ? `${draft()}\n\n${waiting}` : waiting);
     } catch {}
     await attempt(tr("Could not stop", "无法停止"), () => request("abort"));
   }
@@ -2503,6 +2865,8 @@ export function openDaemonSession(sessionId: string) {
 export async function recallQueue() {
   const cleared = await attempt(tr("Could not clear the queue", "无法清空队列"), () => request("clear_queue"));
   if (!cleared) return;
+  transcript.dropQueuedMatching([...cleared.steering, ...cleared.followUp]);
+  flushSoon();
   const waiting = [...cleared.steering, ...cleared.followUp].join("\n\n");
   if (waiting) draft.set(draft() ? `${draft()}\n\n${waiting}` : waiting);
   focusComposer();
@@ -2516,8 +2880,9 @@ export async function recallQueue() {
  * session rather than switching files inside its process.
  */
 function mustDetachOnSwitch(): boolean {
-  if (running() || bashRunning()) return true;
+  if (hasActiveOrQueuedWork()) return true;
   const held = currentDaemonSession();
+  if (held?.status === "working" || held?.status === "blocked") return true;
   if (held?.parentId || held?.initiator === "external") return true;
   if (held && descendantSessionsOf(held.id).length > 0) return true;
   return false;
@@ -2530,12 +2895,24 @@ function mustDetachOnSwitch(): boolean {
  */
 function closeActive() {
   const current = client;
+  const hadWork = hasActiveOrQueuedWork();
   const leavingCwd = projectCwdOf(workspace(), currentDaemonSession());
   client = undefined;
-  if (current) clientDaemonId.delete(current);
-  current?.close();
+  if (current) {
+    const holds = clientSendHolds.get(current);
+    if (holds && holds.size > 0) {
+      void Promise.allSettled([...holds]).then(() => {
+        clientSendHolds.delete(current);
+        clientDaemonId.delete(current);
+        current.close();
+      });
+    } else {
+      clientDaemonId.delete(current);
+      current.close();
+    }
+  }
   // A run let go of keeps working off screen: re-list so its sidebar rows exist for the mark.
-  if (running() || bashRunning()) void refreshSessions(leavingCwd);
+  if (hadWork) void refreshSessions(leavingCwd);
 }
 
 /**
@@ -2568,7 +2945,8 @@ async function stayPut() {
   early = false;
   // The destination shown ahead goes back where it was kept; the session that stays comes back from there too (`landHistory`).
   if (ahead?.transcript === transcript) {
-    visited.set(ahead.file, ahead.transcript);
+    if (ahead.file) visited.set(ahead.file, ahead.transcript);
+    else if (ahead.daemonId) visitedByDaemon.set(ahead.daemonId, ahead.transcript);
     transcript = new Transcript(() => activeLanguage());
     shownVersion = -1;
   }
@@ -2712,7 +3090,7 @@ export async function forkFrom(index: number) {
   const ok = await changeSession(tr("Could not fork", "无法创建分支"), async () => {
     const result = await request("fork", { entryId: target.entryId });
     // Pi hands the message back as the model got it: the draft is what the person wrote.
-    text = withoutImageNotes(result.text ?? "");
+    text = withoutHandoff(withoutImageNotes(result.text ?? ""));
     return result;
   });
   if (ok && text) draft.set(text);
@@ -2979,18 +3357,25 @@ export async function removeProviderKey(provider: string) {
 // ── Navigation ──────────────────────────────────────────────────────────────
 
 export function showChat() {
-  view.set({ name: "chat" });
+  if (view().name !== "chat") view.set({ name: "chat" });
   focusComposer();
 }
 
 export function showSettings(section: SettingsSection = "general") {
-  view.set({ name: "settings", section });
-  if (section === "usage") void refreshUsageStats();
+  const cur = view();
+  if (cur.name !== "settings" || cur.section !== section || cur.agent !== undefined) {
+    view.set({ name: "settings", section });
+  }
+  if (section === "usage" || !usageLoaded()) void refreshUsageStats();
 }
 
 /** Opens Settings on one agent's configuration (the active agent's by default): every agent is set up under Agents. */
 export function showAgentSettings(agentId: string = currentAgentId()) {
-  view.set({ name: "settings", section: "agents", agent: agentId });
+  const cur = view();
+  if (cur.name !== "settings" || cur.section !== "agents" || cur.agent !== agentId) {
+    view.set({ name: "settings", section: "agents", agent: agentId });
+  }
+  if (!usageLoaded()) void refreshUsageStats();
 }
 
 export function setPaletteOpen(open: boolean) {
@@ -3007,14 +3392,22 @@ export function openModelPicker() {
 
 export {
   wallpaper,
+  wallpaperAgentReactive,
   wallpaperEffect,
   wallpaperFolder,
   wallpaperHistory,
+  wallpaperInteractive,
+  wallpaperMuted,
+  wallpaperPaused,
+  wallpaperPauseMode,
   wallpaperSource,
   wallpaperThemeColors,
+  wallpaperVideoClickAction,
 };
 
-const MAX_WALLPAPER_BYTES = 25 * 1024 * 1024;
+const MAX_WALLPAPER_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_WALLPAPER_VIDEO_INSPECT_BYTES = 32 * 1024 * 1024;
+const MAX_WALLPAPER_VIDEO_COPY_BYTES = 8 * 1024 * 1024;
 
 function wallpapersDir(): string {
   return `${backend().dataDir().replace(/\/$/, "")}/new-thread-backgrounds`;
@@ -3026,9 +3419,140 @@ function isPathInsideFolder(filePath: string, folderPath?: string): boolean {
   return filePath === cleanFolder || filePath.startsWith(`${cleanFolder}/`);
 }
 
+async function resolveWallpaperSource(
+  sourcePath: string,
+): Promise<{ mediaPath: string; title?: string; dominantColor?: string }> {
+  if (!DYNAMIC_WALLPAPER_ENABLED) {
+    return { mediaPath: sourcePath };
+  }
+  let cleanPath = sourcePath.replace(/\/$/, "");
+  try {
+    const st = await fs.stat(cleanPath);
+    if (st.isDirectory()) {
+      cleanPath = `${cleanPath}/project.json`;
+    }
+  } catch {
+    // Proceed with sourcePath directly
+  }
+
+  if (cleanPath.toLowerCase().endsWith("/project.json") || cleanPath.toLowerCase() === "project.json") {
+    const jsonText = await fs.readFile(cleanPath, "utf8");
+    const project = parseWallpaperEngineProject(jsonText);
+    if (!project) {
+      throw new Error(
+        tr("Invalid Wallpaper Engine project.json file.", "无效的 Wallpaper Engine project.json 文件。"),
+      );
+    }
+    const slash = cleanPath.lastIndexOf("/");
+    const dir = slash >= 0 ? cleanPath.slice(0, slash) : ".";
+    const candidatePath = `${dir}/${project.file}`;
+    if (isSupportedWallpaperPath(candidatePath)) {
+      return {
+        mediaPath: candidatePath,
+        title: project.title,
+        dominantColor: project.dominantColor,
+      };
+    }
+    // If project.file is a scene/web entry, check if the folder contains a direct video/image asset
+    try {
+      const entries = await fs.readdir(dir);
+      const fallback =
+        entries.find((e) => !e.startsWith(".") && isVideoWallpaperPath(e)) ??
+        entries.find((e) => !e.startsWith(".") && isSupportedWallpaperPath(e));
+      if (fallback) {
+        return {
+          mediaPath: `${dir}/${fallback}`,
+          title: project.title,
+          dominantColor: project.dominantColor,
+        };
+      }
+    } catch {
+      // Ignore directory fallback error
+    }
+    throw new Error(
+      tr(
+        "This Wallpaper Engine project does not contain a supported video or image file.",
+        "该 Wallpaper Engine 壁纸不包含受支持的视频或图片文件。",
+      ),
+    );
+  }
+
+  return { mediaPath: sourcePath };
+}
+
 async function applyWallpaperFile(sourcePath: string, recordInHistory = true): Promise<boolean> {
-  const bytes = await fs.readFile(sourcePath);
-  if (bytes.byteLength > MAX_WALLPAPER_BYTES) {
+  const resolved = await resolveWallpaperSource(sourcePath);
+  const mediaPath = resolved.mediaPath;
+  const isVideo = isVideoWallpaperPath(mediaPath);
+  const dir = wallpapersDir();
+
+  if (!DYNAMIC_WALLPAPER_ENABLED && isVideo) {
+    throw new Error(tr("Unsupported or corrupted image file.", "不支持或已损坏的图片文件。"));
+  }
+
+  if (DYNAMIC_WALLPAPER_ENABLED && isVideo) {
+    let fileSize = 0;
+    try {
+      const st = await fs.stat(mediaPath);
+      fileSize = st.size;
+    } catch {
+      // Continue and let readFile report if unreadable
+    }
+
+    let width = 1920;
+    let height = 1080;
+    let format = mediaPath.split(".").pop()?.toLowerCase() || "mp4";
+    let dominantColor = resolved.dominantColor;
+    let targetPath = mediaPath;
+
+    if (fileSize <= MAX_WALLPAPER_VIDEO_INSPECT_BYTES) {
+      const bytes = await fs.readFile(mediaPath);
+      const info = inspectWallpaperBytes(bytes, mediaPath);
+      if (!info) {
+        throw new Error(tr("Unsupported or corrupted video file.", "不支持或已损坏的视频壁纸文件。"));
+      }
+      width = info.width;
+      height = info.height;
+      format = info.format;
+      if (!dominantColor && info.dominantColor) dominantColor = info.dominantColor;
+
+      if (bytes.byteLength <= MAX_WALLPAPER_VIDEO_COPY_BYTES) {
+        try {
+          await fs.mkdir(dir, { recursive: true });
+          targetPath = `${dir}/background-${Date.now()}.${format}`;
+          await fs.writeFile(targetPath, bytes);
+        } catch {
+          targetPath = mediaPath;
+        }
+      }
+    }
+
+    const prevPath = wallpaper()?.path;
+    if (prevPath && prevPath !== targetPath && prevPath.startsWith(`${dir}/`)) {
+      await fs.unlink(prevPath).catch(() => undefined);
+    }
+
+    const fileName = resolved.title || mediaPath.split("/").pop() || `wallpaper.${format}`;
+    const trackSource =
+      recordInHistory || isPathInsideFolder(sourcePath, wallpaperFolder()) ? sourcePath : undefined;
+
+    setWallpaperPref(
+      {
+        path: targetPath,
+        name: fileName,
+        width,
+        height,
+        adjustment: { ...DEFAULT_WALLPAPER_ADJUSTMENT },
+        ...(dominantColor ? { dominantColor } : {}),
+        kind: "video",
+      },
+      trackSource,
+    );
+    return true;
+  }
+
+  const bytes = await fs.readFile(mediaPath);
+  if (bytes.byteLength > MAX_WALLPAPER_IMAGE_BYTES) {
     throw new Error(tr("Image must be 25 MB or smaller.", "图片大小不能超过 25 MB。"));
   }
   const info = inspectImageBytes(bytes);
@@ -3036,19 +3560,18 @@ async function applyWallpaperFile(sourcePath: string, recordInHistory = true): P
     throw new Error(tr("Unsupported or corrupted image file.", "不支持或已损坏的图片文件。"));
   }
 
-  const fileName = sourcePath.split("/").pop() || `wallpaper.${info.format}`;
-  const dot = fileName.lastIndexOf(".");
-  const ext = dot >= 0 ? fileName.slice(dot + 1).toLowerCase() : info.format;
-  const dir = wallpapersDir();
-  let targetPath = sourcePath;
+  const fileName = resolved.title || mediaPath.split("/").pop() || `wallpaper.${info.format}`;
+  const dot = mediaPath.lastIndexOf(".");
+  const ext = dot >= 0 ? mediaPath.slice(dot + 1).toLowerCase() : info.format;
+  let targetPath = mediaPath;
 
   try {
     await fs.mkdir(dir, { recursive: true });
     targetPath = `${dir}/background-${Date.now()}.${ext}`;
     await fs.writeFile(targetPath, bytes);
   } catch {
-    // In headless tests or read-only sandboxes, fall back to referencing sourcePath directly.
-    targetPath = sourcePath;
+    // In headless tests or read-only sandboxes, fall back to referencing mediaPath directly.
+    targetPath = mediaPath;
   }
 
   const prevPath = wallpaper()?.path;
@@ -3058,6 +3581,7 @@ async function applyWallpaperFile(sourcePath: string, recordInHistory = true): P
 
   const trackSource =
     recordInHistory || isPathInsideFolder(sourcePath, wallpaperFolder()) ? sourcePath : undefined;
+  const dominantColor = resolved.dominantColor ?? info.dominantColor;
 
   setWallpaperPref(
     {
@@ -3066,7 +3590,8 @@ async function applyWallpaperFile(sourcePath: string, recordInHistory = true): P
       width: info.width,
       height: info.height,
       adjustment: { ...DEFAULT_WALLPAPER_ADJUSTMENT },
-      ...(info.dominantColor ? { dominantColor: info.dominantColor } : {}),
+      ...(dominantColor ? { dominantColor } : {}),
+      kind: "image",
     },
     trackSource,
   );
@@ -3076,19 +3601,54 @@ async function applyWallpaperFile(sourcePath: string, recordInHistory = true): P
 export async function chooseWallpaperImage(): Promise<boolean> {
   const picker = backend().pickImage;
   if (!picker) return false;
-  const picked = await pickOrToast(picker(tr("Choose wallpaper", "选择壁纸图片")));
+  const picked = await pickOrToast(
+    picker(
+      DYNAMIC_WALLPAPER_ENABLED
+        ? tr("Choose wallpaper", "选择壁纸（图片 / 视频 / project.json）")
+        : tr("Choose wallpaper", "选择壁纸图片"),
+    ),
+  );
   if (!picked) return false;
-  const ok = await attempt(tr("Could not set background image", "无法设置背景图片"), () =>
-    applyWallpaperFile(picked, isPathInsideFolder(picked, wallpaperFolder())),
+  const ok = await attempt(
+    DYNAMIC_WALLPAPER_ENABLED
+      ? tr("Could not set wallpaper", "无法设置壁纸")
+      : tr("Could not set background image", "无法设置背景图片"),
+    () => applyWallpaperFile(picked, isPathInsideFolder(picked, wallpaperFolder())),
   );
   return Boolean(ok);
 }
 
 export async function setWallpaperFromPath(sourcePath: string): Promise<boolean> {
-  const ok = await attempt(tr("Could not set background image", "无法设置背景图片"), () =>
-    applyWallpaperFile(sourcePath, true),
+  const ok = await attempt(
+    DYNAMIC_WALLPAPER_ENABLED
+      ? tr("Could not set wallpaper", "无法设置壁纸")
+      : tr("Could not set background image", "无法设置背景图片"),
+    () => applyWallpaperFile(sourcePath, true),
   );
   return Boolean(ok);
+}
+
+export async function setWallpaperPreset(preset: WallpaperPreset) {
+  if (!DYNAMIC_WALLPAPER_ENABLED || !isWallpaperPreset(preset)) return;
+  const current = wallpaper();
+  const dir = wallpapersDir();
+  if (current?.path.startsWith(`${dir}/`)) {
+    await fs.unlink(current.path).catch(() => undefined);
+  }
+  const meta = WALLPAPER_PRESET_META[preset];
+  setWallpaperPref(
+    {
+      path: `preset:${preset}`,
+      name: meta.name,
+      width: 1920,
+      height: 1080,
+      adjustment: { ...DEFAULT_WALLPAPER_ADJUSTMENT },
+      dominantColor: meta.dominantColor,
+      kind: "shader",
+      preset,
+    },
+    undefined,
+  );
 }
 
 export async function removeWallpaper() {
@@ -3105,12 +3665,58 @@ export function updateWallpaperAdjustment(adjustment: WallpaperAdjustment) {
   setWallpaperAdjustmentPref(adjustment);
 }
 
+export function updateWallpaperDimensions(width: number, height: number) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  setWallpaperDimensionsPref(width, height);
+}
+
 export function setWallpaperEffect(effect: WallpaperEffect) {
+  if (!isAvailableWallpaperEffect(effect)) return;
   setWallpaperEffectPref(effect);
 }
 
 export function setWallpaperThemeColors(enabled: boolean) {
   setWallpaperThemeColorsPref(enabled);
+}
+
+export function setWallpaperInteractive(enabled: boolean) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  setWallpaperInteractivePref(enabled);
+}
+
+export function setWallpaperAgentReactive(enabled: boolean) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  setWallpaperAgentReactivePref(enabled);
+}
+
+export function setWallpaperVideoClickAction(action: WallpaperVideoClickAction) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  setWallpaperVideoClickActionPref(action);
+}
+
+export function setWallpaperPauseMode(mode: WallpaperPauseMode) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  setWallpaperPauseModePref(mode);
+}
+
+export function setWallpaperPaused(paused: boolean) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  setWallpaperPausedPref(paused);
+}
+
+export function toggleWallpaperPaused() {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  setWallpaperPausedPref(!wallpaperPaused());
+}
+
+export function setWallpaperMuted(muted: boolean) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  setWallpaperMutedPref(muted);
+}
+
+export function toggleWallpaperMuted() {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  setWallpaperMutedPref(!wallpaperMuted());
 }
 
 export async function chooseWallpaperFolder() {
@@ -3138,14 +3744,41 @@ export async function randomWallpaper(folderOverride?: string): Promise<boolean>
   }
 
   const chosen = await attempt(tr("Could not switch wallpaper", "无法切换随机壁纸"), async () => {
-    const names = await fs.readdir(folder);
-    const candidates = names
-      .filter((name) => !name.startsWith(".") && isSupportedWallpaperPath(name))
-      .sort((a, b) => a.localeCompare(b))
-      .map((name) => `${folder.replace(/\/$/, "")}/${name}`);
+    const cleanFolder = folder.replace(/\/$/, "");
+    const names = await fs.readdir(cleanFolder);
+    const sorted = names.filter((name) => !name.startsWith(".")).sort((a, b) => a.localeCompare(b));
+    const candidates: string[] = [];
+
+    for (const name of sorted) {
+      const fullPath = `${cleanFolder}/${name}`;
+      if (isSupportedWallpaperPath(name)) {
+        candidates.push(fullPath);
+        continue;
+      }
+      // Check if subdirectory is a Wallpaper Engine item with `project.json`
+      if (DYNAMIC_WALLPAPER_ENABLED && !name.includes(".")) {
+        try {
+          const pj = `${fullPath}/project.json`;
+          const st = await fs.stat(pj);
+          if (st.isFile()) {
+            candidates.push(pj);
+          }
+        } catch {
+          // Not a Wallpaper Engine project directory
+        }
+      }
+    }
 
     if (candidates.length === 0) {
-      toast("warning", tr("No supported images found in wallpaper folder.", "壁纸文件夹中未找到受支持的图片。"));
+      toast(
+        "warning",
+        DYNAMIC_WALLPAPER_ENABLED
+          ? tr(
+              "No supported wallpapers found in wallpaper folder.",
+              "壁纸文件夹中未找到受支持的壁纸文件。",
+            )
+          : tr("No supported images found in wallpaper folder.", "壁纸文件夹中未找到受支持的图片。"),
+      );
       return false;
     }
 

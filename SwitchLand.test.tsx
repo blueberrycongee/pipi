@@ -117,3 +117,57 @@ test("a session switch lands its status lines whole", async () => {
   await app.submit("label:消息");
   await app.waitUntil(() => app.count("id:rolling-born") > 0, { timeout: 30000 });
 }, 120000);
+
+// Regression: switching from a shorter session back to a longer visited session
+// that had streamed a live run landed mid-conversation (`scrollToEnd` clamped to
+// the outgoing list's height before `each` swapped), then jumped hundreds of
+// pixels down once `get_messages` arrived (`sameRows` missed live `t0`/`turnMs`/
+// `durationMs` stamps). Keying `<List>` per `conversationKey` opens each
+// conversation at its settled end on the first frame (`initialScrollAtEnd`), and
+// `sameRows` ignores live-vs-disk clock skew so confirmation does not re-scroll.
+test("switching back to a longer session after a live run lands settled on the first frame without jumping", async () => {
+  const longCjkPrompt = `${"请按步骤梳理并重构当前转录流与会话切换的状态同步机制，确保所有多行中文用户气泡在首帧即处于正确的折叠预览高度而不会在文本测量后发生二次跳动。".repeat(4)} please do this in steps`;
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "zh-Hans-CN",
+    storage: {
+      "harness.scenario": "history",
+      "harness.distinct": "1",
+      "harness.long": "1",
+      "harness.cut": "1",
+      "harness.startDelay": "400",
+    },
+  });
+  await app.waitFor("text:Look around and tell me what this project is", { timeout: 20000 });
+
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitFor("text:Part 24 of the plan", { timeout: 20000 });
+  await app.paste("label:消息", { text: longCjkPrompt });
+  await app.submit("label:消息");
+  await app.waitUntil(() => app.texts().some((t) => t.includes("Everything else is as it was")), { timeout: 20000 });
+  await app.wait(400);
+
+  // Switch to a shorter saved session on another engine, then switch back.
+  await app.press("id:sidebar-recents >> text:Release notes for 0.1");
+  await app.wait(900);
+  expect(app.shows("text:Part 24 of the plan")).toBe(true);
+  expect(app.shows("label:回到底部")).toBe(false);
+
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  expect(app.texts().some((t) => t.includes("Everything else is as it was"))).toBe(true);
+  expect(app.shows("label:回到底部")).toBe(false);
+  const f0 = decodeLumGrid(await app.screenshot(`${OUT}-liveback-f0.png`), 8);
+  await app.wait(100);
+  const f1 = decodeLumGrid(await app.screenshot(`${OUT}-liveback-f1.png`), 8);
+  await app.wait(600);
+  const settled = decodeLumGrid(await app.screenshot(`${OUT}-liveback-settled.png`), 8);
+  expect(app.count("id:rolling-born")).toBe(0);
+
+  const x0 = Math.round(settled.width * 0.3);
+  const x1 = settled.width - 4;
+  const y1 = Math.round(settled.height * 0.8);
+  expect(pixelDiff(f0, settled, x0, x1, 2, y1)).toBeLessThan(0.02);
+  expect(pixelDiff(f1, settled, x0, x1, 2, y1)).toBeLessThan(0.02);
+}, 120000);

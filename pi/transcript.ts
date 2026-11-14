@@ -10,7 +10,8 @@ import type { AgentMessage, AssistantMessage, AssistantMessageEvent, ImageConten
  * with a new object under the same `id`, which is what the list diffs by.
  */
 export type Row =
-  | { kind: "user"; id: string; text: string; images: number }
+  /** `queued`: staged behind the agent's queue — on screen, but not sent into the run yet. */
+  | { kind: "user"; id: string; text: string; images: number; queued?: boolean }
   | ({ kind: "text"; id: string; text: string; streaming: boolean; /** The prose of a message that called no tools: the turn's answer. Known once the message ended. */ final?: boolean } & TurnStamp)
   | ({ kind: "thinking"; id: string; text: string; streaming: boolean; redacted: boolean; durationMs?: number } & TurnStamp)
   | ToolRow
@@ -133,6 +134,20 @@ export function withoutImageNotes(text: string): string {
   return kept.length ? `${head}\n\n${kept.join("\n")}` : head;
 }
 
+const HANDOFF_PREFIX = /^<conversation_handoff\b[^>]*>[\s\S]*?<\/conversation_handoff>\n\nUser message:\n/;
+
+/** Strips a prepended Portable Context Handoff block so the user bubble shows only what the person wrote. */
+export function withoutHandoff(text: string): string {
+  return text.startsWith("<conversation_handoff") ? text.replace(HANDOFF_PREFIX, "") : text;
+}
+
+/**
+ * How long a queued bubble stays on screen after its queue entry goes, waiting
+ * for the echo that delivery brings. A dequeue's echo lands well inside it; a
+ * recall's never does, and the store withdraws the bubble once it passes.
+ */
+const QUEUE_ECHO_GRACE_MS = 3000;
+
 /** The arguments a partial JSON object has so far: enough to title a tool call while it streams. */
 function partialArgs(json: string): Record<string, unknown> {
   const args: Record<string, unknown> = {};
@@ -224,6 +239,16 @@ let seq = 0;
 export class Transcript {
   #rows: Row[] = [];
   #index = new Map<string, number>();
+  /**
+   * User messages shown at once on send before the agent echoes `message_start`:
+   * kept after `#rows` until confirmed so an idle-wake catch-up arriving ahead of
+   * the prompt still lands before the bubble, and the echoed message keeps the
+   * exact same row object and id. A message the agent queued (`queued`) may yet
+   * be taken back before its echo: `reconcileQueue` marks it `dropAt`, it stays
+   * on screen for a grace while the echo may still land, and `sweepDrops`
+   * withdraws it when none does.
+   */
+  #staged: { row: Extract<Row, { kind: "user" }>; t0: number; queued?: boolean; dropAt?: number }[] = [];
   /** The assistant message being streamed: its key, and what its tool calls have of their arguments. */
   #live: { key: string; toolIds: Map<number, string>; toolJson: Map<number, string>; thinkingSince: Map<number, number>; argsAt: Map<number, number> } | undefined;
   /** Start timestamps for running tool executions so external engines without `durationMs` still measure elapsed time. */
@@ -270,7 +295,9 @@ export class Transcript {
 
   /** The rows, in order: a new array each time they changed. */
   rows(): Row[] {
-    return this.#rows.slice();
+    const now = Date.now();
+    const pending = this.#staged.filter((item) => item.dropAt === undefined || item.dropAt > now);
+    return pending.length ? [...this.#rows, ...pending.map((item) => item.row)] : this.#rows.slice();
   }
 
   /**
@@ -280,6 +307,7 @@ export class Transcript {
    */
   load(messages: AgentMessage[], working = false) {
     this.#rows = [];
+    this.#staged = [];
     this.#index.clear();
     this.#live = undefined;
     this.#toolSince.clear();
@@ -349,12 +377,32 @@ export class Transcript {
       }
       if (at === undefined) return row;
       from = at + 1;
-      const id = before[at].id;
-      if (id === row.id || taken.has(id)) return row;
-      taken.delete(row.id);
-      taken.add(id);
+      const old = before[at];
+      let id = row.id;
+      if (old.id !== row.id && !taken.has(old.id)) {
+        taken.delete(row.id);
+        taken.add(old.id);
+        id = old.id;
+      }
+      const keepTurnMs =
+        isTurnRow(row) && isTurnRow(old) && row.turnMs !== undefined && old.turnMs !== undefined && row.turnMs !== old.turnMs
+          ? old.turnMs
+          : undefined;
+      const keepDuration =
+        (row.kind === "thinking" || row.kind === "tool") &&
+        old.kind === row.kind &&
+        row.durationMs === undefined &&
+        old.durationMs !== undefined
+          ? old.durationMs
+          : undefined;
+      if (id === row.id && keepTurnMs === undefined && keepDuration === undefined) return row;
       changed = true;
-      return { ...row, id };
+      return {
+        ...row,
+        id,
+        ...(keepTurnMs !== undefined ? { turnMs: keepTurnMs } : {}),
+        ...(keepDuration !== undefined ? { durationMs: keepDuration } : {}),
+      } as Row;
     });
     if (!changed) return;
     this.#index.clear();
@@ -367,6 +415,7 @@ export class Transcript {
     switch (event.type) {
       case "message_start":
         if (event.message.role === "assistant") {
+          if (!event.message.turnStart && this.#staged.length) this.#commitStaged();
           this.#live = { key: `m${++seq}`, toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
           if (event.message.turnStart) {
             this.#closeTurn();
@@ -479,9 +528,162 @@ export class Transcript {
     this.version++;
   }
 
+  /** Stages an outgoing user message so its bubble appears on send, ahead of the agent's echo. */
+  stageUser(rawText: string, images = 0, queued = false): string | undefined {
+    const text = withoutHandoff(withoutImageNotes(rawText));
+    if ((!text && !images) || (!images && pippiDeliveries(text))) return undefined;
+    const id = this.#id("u");
+    this.#staged.push({ row: { kind: "user", id, text, images, ...(queued ? { queued } : {}) }, t0: Date.now(), queued });
+    this.version++;
+    return id;
+  }
+
+  /** Withdraws an unconfirmed staged user message (e.g. a refused or extension-handled prompt). */
+  dropStagedUser(id: string | undefined): boolean {
+    if (!id) return false;
+    const at = this.#staged.findIndex((item) => item.row.id === id);
+    if (at < 0) return false;
+    this.#staged.splice(at, 1);
+    this.version++;
+    return true;
+  }
+
+  /** Marks a staged message as one the agent queued: it may yet be recalled before its echo. */
+  markStagedQueued(id: string | undefined) {
+    const item = this.#staged.find((entry) => entry.row.id === id);
+    if (!item || item.queued) return;
+    item.queued = true;
+    item.row = { ...item.row, queued: true };
+    this.version++;
+  }
+
+  /**
+   * Reconciles staged queued bubbles with the agent's queue: an entry still
+   * queued keeps its bubble; one that left gets `dropAt` — it normally echoes
+   * back as delivered, and only a recall leaves it to `sweepDrops`.
+   */
+  reconcileQueue(steering: readonly string[], followUp: readonly string[]) {
+    const cover = this.#queueCover([...steering, ...followUp]);
+    const now = Date.now();
+    let changed = false;
+    for (const item of this.#staged) {
+      if (!item.queued) continue;
+      const left = cover.get(item.row.text) ?? 0;
+      if (left > 0) {
+        cover.set(item.row.text, left - 1);
+        if (item.dropAt !== undefined) {
+          item.dropAt = undefined;
+          changed = true;
+        }
+      } else if (item.dropAt === undefined) {
+        item.dropAt = now + QUEUE_ECHO_GRACE_MS;
+        changed = true;
+      }
+    }
+    if (changed) this.version++;
+  }
+
+  /**
+   * Drops the staged bubbles of messages a `clear_queue` took back, at once —
+   * the texts it returned name exactly what will never echo.
+   */
+  dropQueuedMatching(cleared: readonly string[]) {
+    const cover = this.#queueCover([...cleared]);
+    const kept = this.#staged.filter((item) => {
+      if (!item.queued) return true;
+      const left = cover.get(item.row.text) ?? 0;
+      if (left <= 0) return true;
+      cover.set(item.row.text, left - 1);
+      return false;
+    });
+    if (kept.length === this.#staged.length) return;
+    this.#staged = kept;
+    this.version++;
+  }
+
+  /** Whether a sent user message is still waiting for its `message_start` echo. */
+  hasStagedUser(): boolean {
+    return this.#staged.length > 0;
+  }
+
+  /**
+   * Whether a staged message still expects a run or an echo: one the queue took
+   * back (`dropAt`) no longer does — its bubble only waits out the grace.
+   */
+  hasPendingUser(): boolean {
+    return this.#staged.some((item) => item.dropAt === undefined);
+  }
+
+  /** The soonest a staged bubble may withdraw, for the store to wake a flush at. */
+  dropDeadline(): number | undefined {
+    let at: number | undefined;
+    for (const item of this.#staged) {
+      if (item.dropAt !== undefined && (at === undefined || item.dropAt < at)) at = item.dropAt;
+    }
+    return at;
+  }
+
+  /** Withdraws staged bubbles past their `dropAt`; true when rows changed. */
+  sweepDrops(): boolean {
+    const now = Date.now();
+    const kept = this.#staged.filter((item) => item.dropAt === undefined || item.dropAt > now);
+    if (kept.length === this.#staged.length) return false;
+    this.#staged = kept;
+    this.version++;
+    return true;
+  }
+
+  /** Promotes any still-staged user rows into `#rows` (e.g. when re-attaching after `message_start` already ran). */
+  commitStagedUsers() {
+    if (!this.#staged.length) return;
+    this.#commitStaged();
+    this.version++;
+  }
+
+  #commitStaged() {
+    // A queued bubble commits only on its own echo: promoting it here would leave
+    // the echo to mint a second row for the same message.
+    const ready = this.#staged.filter((item) => !item.queued);
+    if (!ready.length) return;
+    this.#staged = this.#staged.filter((item) => item.queued);
+    for (const { row, t0 } of ready) {
+      this.#closeTurn();
+      this.#reportFailure();
+      this.#flushResults();
+      this.#push(row);
+      this.#turnStart = t0;
+    }
+  }
+
+  /** How many staged bubbles each queued text still covers (the queue holds wire prompts; staged rows hold what was typed). */
+  #queueCover(texts: readonly string[]) {
+    const cover = new Map<string, number>();
+    for (const raw of texts) {
+      const text = withoutHandoff(withoutImageNotes(raw));
+      cover.set(text, (cover.get(text) ?? 0) + 1);
+    }
+    return cover;
+  }
+
+  /**
+   * The staged bubble an echoed user message confirms. Content first — queued
+   * messages echo in delivery order, not send order — then, for an echo the
+   * agent rewrote (a skill or template expanded), the message already dequeued
+   * for delivery or the oldest still waiting on its echo.
+   */
+  #takeStaged(text: string, images: number) {
+    const exact = this.#staged.findIndex((item) => item.row.text === text && item.row.images === images);
+    if (exact >= 0) return this.#staged.splice(exact, 1)[0];
+    const dequeued = this.#staged.findIndex((item) => item.dropAt !== undefined);
+    const pending = this.#staged.findIndex((item) => !item.queued);
+    const at = dequeued >= 0 ? dequeued : pending;
+    return at >= 0 ? this.#staged.splice(at, 1)[0] : undefined;
+  }
+
   /** Prepends historical rows (for example, keeping visible conversation rows across a harness switch). */
   seedRows(previous: readonly Row[]) {
     this.#rows = [];
+    this.#staged = [];
     this.#index.clear();
     for (const row of previous) this.#push(row);
     this.version++;
@@ -761,15 +963,23 @@ export class Transcript {
     }
     switch (message.role) {
       case "user": {
-        const text = withoutImageNotes(textOf(message.content));
+        const text = withoutHandoff(withoutImageNotes(textOf(message.content)));
         const images = imagesOf(message.content);
         const deliveries = images ? undefined : pippiDeliveries(text);
         if (deliveries) {
           for (const item of deliveries) this.#push({ kind: "delivery", id: this.#id("d"), ...item });
+          this.#turnStart = this.#now();
         } else if (text || images) {
-          this.#push({ kind: "user", id: this.#id("u"), text, images });
+          const staged = this.#clock === undefined ? this.#takeStaged(text, images) : undefined;
+          const row: Row =
+            staged && staged.row.text === text && staged.row.images === images && !staged.row.queued
+              ? staged.row
+              : { kind: "user", id: staged ? staged.row.id : this.#id("u"), text, images };
+          this.#push(row);
+          this.#turnStart = staged?.t0 ?? this.#now();
+        } else {
+          this.#turnStart = this.#now();
         }
-        this.#turnStart = this.#now();
         break;
       }
       case "assistant":

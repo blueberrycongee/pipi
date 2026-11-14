@@ -1,9 +1,23 @@
 import type { Theme } from "nsh";
 import themeJson from "../theme.json";
 
-export type WallpaperEffect = "none" | "dither" | "ascii" | "halftone" | "scanlines";
+/**
+ * Frontend feature gate for dynamic wallpapers (video files, Wallpaper Engine
+ * `project.json` bundles, live shader presets, interactive ripple/rain effects,
+ * pointer parallax, and agent reactivity). Kept off until the UX is ready.
+ */
+export const DYNAMIC_WALLPAPER_ENABLED = false;
 
-export const WALLPAPER_EFFECTS: readonly WallpaperEffect[] = [
+export type WallpaperEffect =
+  | "none"
+  | "dither"
+  | "ascii"
+  | "halftone"
+  | "scanlines"
+  | "ripple"
+  | "rain";
+
+export const STATIC_WALLPAPER_EFFECTS: readonly WallpaperEffect[] = [
   "none",
   "dither",
   "ascii",
@@ -11,8 +25,70 @@ export const WALLPAPER_EFFECTS: readonly WallpaperEffect[] = [
   "scanlines",
 ] as const;
 
+export const WALLPAPER_EFFECTS: readonly WallpaperEffect[] = [
+  ...STATIC_WALLPAPER_EFFECTS,
+  "ripple",
+  "rain",
+] as const;
+
+export const AVAILABLE_WALLPAPER_EFFECTS: readonly WallpaperEffect[] =
+  DYNAMIC_WALLPAPER_ENABLED ? WALLPAPER_EFFECTS : STATIC_WALLPAPER_EFFECTS;
+
 export function isWallpaperEffect(v: unknown): v is WallpaperEffect {
   return typeof v === "string" && (WALLPAPER_EFFECTS as readonly string[]).includes(v);
+}
+
+export function isAvailableWallpaperEffect(v: unknown): v is WallpaperEffect {
+  return typeof v === "string" && (AVAILABLE_WALLPAPER_EFFECTS as readonly string[]).includes(v);
+}
+
+export type WallpaperKind = "image" | "video" | "shader";
+
+export type WallpaperPreset = "aurora" | "fluid" | "cosmos" | "matrix";
+
+export const WALLPAPER_PRESETS: readonly WallpaperPreset[] = [
+  "aurora",
+  "fluid",
+  "cosmos",
+  "matrix",
+] as const;
+
+export function isWallpaperPreset(v: unknown): v is WallpaperPreset {
+  return typeof v === "string" && (WALLPAPER_PRESETS as readonly string[]).includes(v);
+}
+
+export const WALLPAPER_PRESET_META: Record<
+  WallpaperPreset,
+  { name: string; dominantColor: string }
+> = {
+  aurora: { name: "Aurora Borealis", dominantColor: "#2dd4bf" },
+  fluid: { name: "Interactive Silk", dominantColor: "#818cf8" },
+  cosmos: { name: "Deep Cosmos", dominantColor: "#60a5fa" },
+  matrix: { name: "Cyber Rain", dominantColor: "#34d399" },
+};
+
+export type WallpaperVideoClickAction = "burst" | "seek" | "pause";
+
+export const WALLPAPER_VIDEO_CLICK_ACTIONS: readonly WallpaperVideoClickAction[] = [
+  "burst",
+  "seek",
+  "pause",
+] as const;
+
+export function isWallpaperVideoClickAction(v: unknown): v is WallpaperVideoClickAction {
+  return typeof v === "string" && (WALLPAPER_VIDEO_CLICK_ACTIONS as readonly string[]).includes(v);
+}
+
+export type WallpaperPauseMode = "inactive" | "background" | "never";
+
+export const WALLPAPER_PAUSE_MODES: readonly WallpaperPauseMode[] = [
+  "inactive",
+  "background",
+  "never",
+] as const;
+
+export function isWallpaperPauseMode(v: unknown): v is WallpaperPauseMode {
+  return typeof v === "string" && (WALLPAPER_PAUSE_MODES as readonly string[]).includes(v);
 }
 
 export interface WallpaperAdjustment {
@@ -34,18 +110,22 @@ export const DEFAULT_WALLPAPER_ADJUSTMENT: WallpaperAdjustment = {
 };
 
 export interface WallpaperConfig {
-  /** Managed image path stored under `<dataDir>/new-thread-backgrounds/`. */
+  /** Managed path stored under `<dataDir>/new-thread-backgrounds/`, direct video path, or `preset:<id>`. */
   path: string;
-  /** Original filename for display in Settings. */
+  /** Original filename or preset title for display in Settings. */
   name: string;
-  /** Intrinsic image width in pixels. */
+  /** Intrinsic media width in pixels. */
   width: number;
-  /** Intrinsic image height in pixels. */
+  /** Intrinsic media height in pixels. */
   height: number;
   /** Crop / pan / zoom adjustment. */
   adjustment: WallpaperAdjustment;
   /** Optional extracted dominant hex color (`#rrggbb`) for theme tinting. */
   dominantColor?: string;
+  /** Wallpaper source kind (`"image"` by default). */
+  kind?: WallpaperKind;
+  /** Built-in procedural shader preset when `kind === "shader"`. */
+  preset?: WallpaperPreset;
 }
 
 export interface FittedWallpaperGeometry {
@@ -191,7 +271,7 @@ export function zoomAdjustmentAround(
 
 export const WALLPAPER_HISTORY_LIMIT = 8;
 
-export const SUPPORTED_WALLPAPER_EXTENSIONS = [
+export const SUPPORTED_IMAGE_WALLPAPER_EXTENSIONS = [
   "png",
   "jpg",
   "jpeg",
@@ -201,6 +281,35 @@ export const SUPPORTED_WALLPAPER_EXTENSIONS = [
   "tif",
   "tiff",
 ] as const;
+
+export const SUPPORTED_VIDEO_WALLPAPER_EXTENSIONS = [
+  "mp4",
+  "mov",
+  "m4v",
+  "webm",
+] as const;
+
+export const SUPPORTED_WALLPAPER_EXTENSIONS: readonly string[] = DYNAMIC_WALLPAPER_ENABLED
+  ? [...SUPPORTED_IMAGE_WALLPAPER_EXTENSIONS, ...SUPPORTED_VIDEO_WALLPAPER_EXTENSIONS]
+  : [...SUPPORTED_IMAGE_WALLPAPER_EXTENSIONS];
+
+export function isVideoWallpaperPath(filePath: string): boolean {
+  const dot = filePath.lastIndexOf(".");
+  if (dot < 0) return false;
+  const ext = filePath.slice(dot + 1).toLowerCase();
+  return (SUPPORTED_VIDEO_WALLPAPER_EXTENSIONS as readonly string[]).includes(ext);
+}
+
+/** Returns true when a wallpaper config represents a dynamic video or procedural shader wallpaper. */
+export function isDynamicWallpaperConfig(
+  config: Pick<WallpaperConfig, "kind" | "preset" | "path"> | null | undefined,
+): boolean {
+  if (!config) return false;
+  if (config.kind === "video" || config.kind === "shader") return true;
+  if (config.preset && isWallpaperPreset(config.preset)) return true;
+  if (config.path.startsWith("preset:") && isWallpaperPreset(config.path.slice(7))) return true;
+  return isVideoWallpaperPath(config.path);
+}
 
 export function isSupportedWallpaperPath(filePath: string): boolean {
   const dot = filePath.lastIndexOf(".");
@@ -644,6 +753,171 @@ function extractDominantColorFromFileBytes(bytes: Uint8Array, format: string): s
   return rgbToHex(nr, ng, nb);
 }
 
+export interface WallpaperMediaInspection extends ImageInspection {
+  kind: "image" | "video";
+}
+
+function findIsoBmffTkhdDimensions(bytes: Uint8Array): { width: number; height: number } | null {
+  const limit = Math.min(bytes.length, 4 * 1024 * 1024);
+  for (let i = 0; i + 88 <= limit; i++) {
+    if (
+      bytes[i + 4] === 0x74 && // 't'
+      bytes[i + 5] === 0x6b && // 'k'
+      bytes[i + 6] === 0x68 && // 'h'
+      bytes[i + 7] === 0x64 // 'd'
+    ) {
+      const boxSize = readU32BE(bytes, i);
+      if (boxSize < 84 || i + boxSize > bytes.length) continue;
+      const version = bytes[i + 8] ?? 0;
+      const widthOffset = version === 1 ? i + 88 : i + 76;
+      const heightOffset = widthOffset + 4;
+      if (heightOffset + 4 > bytes.length) continue;
+      // 16.16 fixed-point dimensions in tkhd
+      const width = readU32BE(bytes, widthOffset) >>> 16;
+      const height = readU32BE(bytes, heightOffset) >>> 16;
+      if (width >= 16 && width <= 16384 && height >= 16 && height <= 16384) {
+        return { width, height };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Inspect raw video file bytes (`.mp4`, `.mov`, `.m4v`, `.webm`) to verify container header
+ * and extract intrinsic dimensions when available (falling back to 1920×1080 until `<Video onLoad>`
+ * reports exact dimensions).
+ */
+export function inspectVideoBytes(
+  bytes: Uint8Array,
+  filePath = "",
+): WallpaperMediaInspection | null {
+  // WebM / Matroska EBML magic: 0x1A 0x45 0xDF 0xA3
+  if (
+    bytes.length >= 4 &&
+    bytes[0] === 0x1a &&
+    bytes[1] === 0x45 &&
+    bytes[2] === 0xdf &&
+    bytes[3] === 0xa3
+  ) {
+    return {
+      kind: "video",
+      format: "webm",
+      width: 1920,
+      height: 1080,
+      dominantColor: extractDominantColorFromFileBytes(bytes, "webm"),
+    };
+  }
+
+  // ISO Base Media File Format (MP4 / MOV / M4V): box type 'ftyp', 'moov', 'wide', or 'mdat' at offset 4
+  if (bytes.length >= 12) {
+    const boxType = String.fromCharCode(
+      bytes[4] ?? 0,
+      bytes[5] ?? 0,
+      bytes[6] ?? 0,
+      bytes[7] ?? 0,
+    );
+    if (boxType === "ftyp" || boxType === "moov" || boxType === "wide" || boxType === "mdat") {
+      const dims = findIsoBmffTkhdDimensions(bytes) ?? { width: 1920, height: 1080 };
+      const ext = filePath.split(".").pop()?.toLowerCase();
+      const format = ext === "mov" || ext === "m4v" ? ext : "mp4";
+      return {
+        kind: "video",
+        format,
+        width: dims.width,
+        height: dims.height,
+        dominantColor: extractDominantColorFromFileBytes(bytes, format),
+      };
+    }
+  }
+
+  // Fallback if extension is a known video extension and non-empty bytes are provided
+  if (filePath && isVideoWallpaperPath(filePath) && bytes.length > 0) {
+    const ext = filePath.split(".").pop()?.toLowerCase() ?? "mp4";
+    return {
+      kind: "video",
+      format: ext,
+      width: 1920,
+      height: 1080,
+      dominantColor: extractDominantColorFromFileBytes(bytes, ext),
+    };
+  }
+
+  return null;
+}
+
+export function inspectWallpaperBytes(
+  bytes: Uint8Array,
+  filePath = "",
+): WallpaperMediaInspection | null {
+  const image = inspectImageBytes(bytes);
+  if (image) {
+    return { ...image, kind: "image" };
+  }
+  return inspectVideoBytes(bytes, filePath);
+}
+
+export interface WallpaperEngineProjectInfo {
+  /** Relative media filename from `project.json` (`file`). */
+  file: string;
+  /** Display title from `project.json` (`title`). */
+  title?: string;
+  /** Wallpaper Engine project type (`"video"`, `"scene"`, `"web"`, etc.). */
+  type?: string;
+  /** Normalized dominant color hex (`#rrggbb`) parsed from `schemecolor`. */
+  dominantColor?: string;
+}
+
+/**
+ * Parse a Wallpaper Engine `project.json` manifest to extract its video/image file,
+ * title, and `schemecolor` accent.
+ */
+export function parseWallpaperEngineProject(jsonText: string): WallpaperEngineProjectInfo | null {
+  try {
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") return null;
+    const rawFile = typeof parsed.file === "string" ? parsed.file.trim() : "";
+    if (!rawFile) return null;
+    const title = typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim() : undefined;
+    const type = typeof parsed.type === "string" ? parsed.type.trim().toLowerCase() : undefined;
+
+    let dominantColor: string | undefined;
+    const general = parsed.general as Record<string, unknown> | undefined;
+    const properties = general?.properties as Record<string, unknown> | undefined;
+    const schemeObj = properties?.schemecolor as Record<string, unknown> | undefined;
+    const rawScheme =
+      typeof schemeObj?.value === "string"
+        ? schemeObj.value
+        : typeof parsed.schemecolor === "string"
+          ? parsed.schemecolor
+          : undefined;
+    if (rawScheme) {
+      const parts = rawScheme
+        .trim()
+        .split(/[\s,]+/)
+        .map((n) => Number.parseFloat(n));
+      if (parts.length >= 3 && parts.every((n) => Number.isFinite(n))) {
+        const scale = parts.some((n) => n > 1.0) ? 1 / 255 : 1;
+        const [nr, ng, nb] = normalizeAccentRgb(
+          clamp(parts[0]! * scale, 0, 1),
+          clamp(parts[1]! * scale, 0, 1),
+          clamp(parts[2]! * scale, 0, 1),
+        );
+        dominantColor = rgbToHex(nr, ng, nb);
+      }
+    }
+
+    return {
+      file: rawFile,
+      title,
+      type,
+      dominantColor,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function normalizeAccentRgb(r: number, g: number, b: number): [number, number, number] {
   const [h, s, v] = rgbToHsv(clamp(r, 0, 1), clamp(g, 0, 1), clamp(b, 0, 1));
   const ns = Math.max(s, 0.25);
@@ -961,11 +1235,108 @@ fn shade(uv: vec2f) -> vec4f {
   return vec4f(scanned, src.a);
 }
 `,
+
+  ripple: `
+struct Uniforms {
+  strength: f32,
+  dark: f32,
+  mouseX: f32,
+  mouseY: f32,
+  pulse: f32,
+  energy: f32,
+}
+
+${COMMON_WGSL}
+
+fn shade(uv: vec2f) -> vec4f {
+  let aspect = nsh.size.x / max(nsh.size.y, 1.0);
+  let speed = 1.0 + uniforms.energy * 0.85;
+  let t = nsh.time * speed;
+  let mouse = vec2f(uniforms.mouseX, uniforms.mouseY);
+  let delta = (uv - mouse) * vec2f(aspect, 1.0);
+  let dist = length(delta);
+
+  let ambientWave = vec2f(
+    sin(uv.y * 18.0 + t * 1.9) + cos(uv.x * 14.0 - t * 1.4),
+    cos(uv.x * 16.0 + t * 1.6) + sin(uv.y * 12.0 + t * 1.2)
+  ) * 0.0022;
+
+  let cursorFalloff = exp(-dist * 5.2);
+  let cursorRing = sin(dist * 38.0 - t * 6.5) * cursorFalloff * (0.0055 + uniforms.pulse * 0.012);
+  let dir = delta / max(dist, 0.001);
+  let disp = (ambientWave + dir * cursorRing) * clamp(uniforms.strength, 0.0, 1.0);
+
+  let sampleUv = clamp(uv + disp, vec2f(0.001), vec2f(0.999));
+  let src = sample_content(sampleUv);
+  let caustic = max(0.0, sin(dist * 38.0 - t * 6.5)) * cursorFalloff * (0.08 + uniforms.pulse * 0.14);
+  let highlight = select(vec3f(1.0, 0.99, 0.96), vec3f(0.55, 0.78, 1.0), uniforms.dark > 0.5);
+  let rgb = clamp(src.rgb + highlight * caustic, vec3f(0.0), vec3f(1.0));
+  return vec4f(rgb, src.a);
+}
+`,
+
+  rain: `
+struct Uniforms {
+  strength: f32,
+  dark: f32,
+  mouseX: f32,
+  mouseY: f32,
+  pulse: f32,
+  energy: f32,
+}
+
+${COMMON_WGSL}
+
+fn hash21(p: vec2f) -> f32 {
+  var p3 = fract(vec3f(p.x, p.y, p.x) * 0.1031);
+  p3 += dot(p3, p3.yzx + vec3f(33.33));
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+fn rainLayer(uv: vec2f, scale: f32, speed: f32, t: f32) -> vec3f {
+  let aspect = nsh.size.x / max(nsh.size.y, 1.0);
+  var st = uv * vec2f(aspect * scale, scale * 0.55);
+  let id = floor(st);
+  let n = hash21(id);
+  st.y += t * speed * (0.75 + n * 0.5);
+  let cellId = floor(st);
+  let f = fract(st) - vec2f(0.5, 0.5);
+  let h = hash21(cellId);
+  let dropX = (h - 0.5) * 0.55;
+  let dropY = sin(t * 2.2 + h * 6.2831) * 0.22;
+  let dVec = (f - vec2f(dropX, dropY)) * vec2f(1.0, 1.65);
+  let drop = smoothstep(0.22, 0.04, length(dVec));
+  let trail = smoothstep(0.14, 0.0, abs(f.x - dropX)) * smoothstep(-0.05, 0.45, f.y - dropY) * 0.45;
+  let mask = max(drop, trail);
+  return vec3f(dVec * mask, mask);
+}
+
+fn shade(uv: vec2f) -> vec4f {
+  let speed = 1.0 + uniforms.energy * 0.75;
+  let t = nsh.time * speed;
+  let l1 = rainLayer(uv, 14.0, 0.65, t);
+  let l2 = rainLayer(uv + vec2f(0.37, 0.19), 24.0, 0.95, t * 1.15);
+  let drops = l1 + l2 * 0.7;
+
+  let aspect = nsh.size.x / max(nsh.size.y, 1.0);
+  let mouse = vec2f(uniforms.mouseX, uniforms.mouseY);
+  let cursorDist = length((uv - mouse) * vec2f(aspect, 1.0));
+  let clearZone = smoothstep(0.03, 0.24, cursorDist);
+
+  let refractUv = clamp(uv + drops.xy * 0.035 * clearZone * uniforms.strength, vec2f(0.001), vec2f(0.999));
+  let src = sample_content(refractUv);
+  let sheen = drops.z * clearZone * (0.12 + uniforms.pulse * 0.1);
+  let tint = select(vec3f(0.92, 0.96, 1.0), vec3f(0.62, 0.78, 0.98), uniforms.dark > 0.5);
+  let rgb = mix(src.rgb, tint, clamp(sheen * uniforms.strength, 0.0, 0.45));
+  return vec4f(rgb, src.a);
+}
+`,
 };
 
 export function wallpaperShaderUniforms(
   effect: Exclude<WallpaperEffect, "none">,
   dark: boolean,
+  energy = 0,
 ): Record<string, number> {
   const d = dark ? 1.0 : 0.0;
   switch (effect) {
@@ -977,5 +1348,208 @@ export function wallpaperShaderUniforms(
       return { pitch: 4.0, strength: 0.6, dark: d };
     case "scanlines":
       return { pitch: 3.0, strength: 0.48, dark: d };
+    case "ripple":
+      return { strength: 0.85, dark: d, mouseX: 0.5, mouseY: 0.5, pulse: 0.0, energy };
+    case "rain":
+      return { strength: 0.85, dark: d, mouseX: 0.5, mouseY: 0.5, pulse: 0.0, energy };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in procedural live wallpaper shaders (<Shader>)
+// ---------------------------------------------------------------------------
+
+export const WALLPAPER_PRESET_SHADERS: Record<WallpaperPreset, string> = {
+  aurora: `
+struct Uniforms {
+  dark: f32,
+  mouseX: f32,
+  mouseY: f32,
+  pulse: f32,
+  energy: f32,
+}
+
+fn shade(uv: vec2f) -> vec4f {
+  let aspect = nsh.size.x / max(nsh.size.y, 1.0);
+  let speed = 0.55 + uniforms.energy * 0.65;
+  let t = nsh.time * speed;
+  let mouse = vec2f(uniforms.mouseX, uniforms.mouseY);
+  let p = (uv - vec2f(0.5, 0.5)) * vec2f(aspect, 1.0);
+  let m = (mouse - vec2f(0.5, 0.5)) * vec2f(aspect, 1.0);
+  let distM = length(p - m);
+
+  let wave1 = sin(p.x * 2.6 + t * 0.9 + sin(p.y * 3.2 - t * 0.6)) * 0.5 + 0.5;
+  let wave2 = sin(p.x * 4.1 - t * 0.7 + cos(p.y * 2.4 + t * 0.8) + distM * 3.0) * 0.5 + 0.5;
+  let curtain = smoothstep(0.15, 0.88, wave1 * 0.6 + wave2 * 0.4) * smoothstep(1.0, 0.1, uv.y);
+  let flare = exp(-distM * 3.2) * (0.25 + uniforms.pulse * 0.55);
+
+  let baseDark = vec3f(0.035, 0.055, 0.095);
+  let baseLight = vec3f(0.89, 0.94, 0.96);
+  let base = select(baseLight, baseDark, uniforms.dark > 0.5);
+
+  let colA = select(vec3f(0.18, 0.76, 0.68), vec3f(0.12, 0.84, 0.68), uniforms.dark > 0.5);
+  let colB = select(vec3f(0.38, 0.52, 0.92), vec3f(0.34, 0.45, 0.95), uniforms.dark > 0.5);
+  let colC = vec3f(0.68, 0.36, 0.88);
+
+  let ribbon = mix(colA, colB, wave2) + colC * flare;
+  let strength = select(0.38, 0.62, uniforms.dark > 0.5);
+  let rgb = clamp(mix(base, ribbon, clamp((curtain + flare * 0.6) * strength, 0.0, 0.92)), vec3f(0.0), vec3f(1.0));
+  return vec4f(rgb, 1.0);
+}
+`,
+
+  fluid: `
+struct Uniforms {
+  dark: f32,
+  mouseX: f32,
+  mouseY: f32,
+  pulse: f32,
+  energy: f32,
+}
+
+fn shade(uv: vec2f) -> vec4f {
+  let aspect = nsh.size.x / max(nsh.size.y, 1.0);
+  let speed = 0.45 + uniforms.energy * 0.6;
+  let t = nsh.time * speed;
+  let mouse = vec2f(uniforms.mouseX, uniforms.mouseY);
+  var p = (uv - vec2f(0.5, 0.5)) * vec2f(aspect, 1.0) * 2.2;
+  let m = (mouse - vec2f(0.5, 0.5)) * vec2f(aspect, 1.0) * 2.2;
+
+  let swirl = exp(-length(p - m) * 1.6) * (0.65 + uniforms.pulse * 0.9);
+  p += (p - m) * swirl * 0.35;
+
+  for (var i = 1; i < 5; i++) {
+    let fi = f32(i);
+    p.x += 0.42 / fi * sin(fi * 2.4 * p.y + t + 0.3 * fi);
+    p.y += 0.42 / fi * cos(fi * 2.4 * p.x + t + 0.5 * fi);
+  }
+
+  let pattern = sin(p.x + p.y) * 0.5 + 0.5;
+  let sheen = cos(p.x * 1.4 - p.y * 1.2) * 0.5 + 0.5;
+
+  let darkBase = vec3f(0.055, 0.058, 0.095);
+  let lightBase = vec3f(0.93, 0.92, 0.97);
+  let c1 = select(vec3f(0.58, 0.62, 0.94), vec3f(0.32, 0.36, 0.78), uniforms.dark > 0.5);
+  let c2 = select(vec3f(0.86, 0.68, 0.88), vec3f(0.62, 0.28, 0.68), uniforms.dark > 0.5);
+  let base = select(lightBase, darkBase, uniforms.dark > 0.5);
+  let silk = mix(c1, c2, sheen);
+  let rgb = clamp(mix(base, silk, pattern * select(0.45, 0.68, uniforms.dark > 0.5)), vec3f(0.0), vec3f(1.0));
+  return vec4f(rgb, 1.0);
+}
+`,
+
+  cosmos: `
+struct Uniforms {
+  dark: f32,
+  mouseX: f32,
+  mouseY: f32,
+  pulse: f32,
+  energy: f32,
+}
+
+fn hash21(p: vec2f) -> f32 {
+  var p3 = fract(vec3f(p.x, p.y, p.x) * 0.1031);
+  p3 += dot(p3, p3.yzx + vec3f(33.33));
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+fn starLayer(p: vec2f, scale: f32, t: f32) -> f32 {
+  let gv = fract(p * scale) - vec2f(0.5, 0.5);
+  let id = floor(p * scale);
+  let h = hash21(id);
+  let offset = vec2f(fract(h * 17.3) - 0.5, fract(h * 31.7) - 0.5) * 0.5;
+  let d = length(gv - offset);
+  let twinkle = sin(t * (1.5 + h * 3.0) + h * 6.2831) * 0.35 + 0.65;
+  let spark = smoothstep(0.09 * fract(h * 9.1), 0.0, d) * twinkle;
+  return select(0.0, spark, h > 0.62);
+}
+
+fn shade(uv: vec2f) -> vec4f {
+  let aspect = nsh.size.x / max(nsh.size.y, 1.0);
+  let speed = 0.35 + uniforms.energy * 0.55;
+  let t = nsh.time * speed;
+  let mouse = vec2f(uniforms.mouseX, uniforms.mouseY);
+  let parallax = (mouse - vec2f(0.5, 0.5)) * 0.06;
+  let p = (uv - vec2f(0.5, 0.5)) * vec2f(aspect, 1.0);
+
+  let nebulaWave = sin(p.x * 2.5 + t * 0.4) * cos(p.y * 2.3 - t * 0.3) * 0.5 + 0.5;
+  let s1 = starLayer(p + parallax * 0.5 + vec2f(t * 0.015, 0.0), 14.0, t);
+  let s2 = starLayer(p + parallax * 1.1 - vec2f(0.0, t * 0.022), 26.0, t * 1.3);
+
+  let cursorDist = length(p - (mouse - vec2f(0.5, 0.5)) * vec2f(aspect, 1.0));
+  let nova = exp(-cursorDist * 4.0) * (0.2 + uniforms.pulse * 0.6);
+
+  let bg = select(vec3f(0.90, 0.93, 0.98), vec3f(0.03, 0.04, 0.08), uniforms.dark > 0.5);
+  let nebColor = select(vec3f(0.58, 0.72, 0.96), vec3f(0.16, 0.28, 0.58), uniforms.dark > 0.5);
+  let starColor = select(vec3f(0.22, 0.36, 0.72), vec3f(0.85, 0.92, 1.0), uniforms.dark > 0.5);
+
+  let rgb = clamp(
+    mix(bg, nebColor, nebulaWave * 0.55) + starColor * (s1 + s2 * 0.7 + nova),
+    vec3f(0.0),
+    vec3f(1.0)
+  );
+  return vec4f(rgb, 1.0);
+}
+`,
+
+  matrix: `
+struct Uniforms {
+  dark: f32,
+  mouseX: f32,
+  mouseY: f32,
+  pulse: f32,
+  energy: f32,
+}
+
+fn hash21(p: vec2f) -> f32 {
+  var p3 = fract(vec3f(p.x, p.y, p.x) * 0.1031);
+  p3 += dot(p3, p3.yzx + vec3f(33.33));
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+fn shade(uv: vec2f) -> vec4f {
+  let aspect = nsh.size.x / max(nsh.size.y, 1.0);
+  let speed = 0.85 + uniforms.energy * 0.9;
+  let t = nsh.time * speed;
+  let cols = floor(48.0 * aspect);
+  let cellX = floor(uv.x * cols);
+  let colHash = hash21(vec2f(cellX, 1.0));
+  let colSpeed = 0.55 + colHash * 0.85;
+  let dropPos = fract(uv.y * 1.4 - t * colSpeed + colHash * 10.0);
+
+  let rowY = floor(uv.y * 42.0);
+  let glyphNoise = step(0.32, hash21(vec2f(cellX, rowY + floor(t * 6.0))));
+  let trail = smoothstep(0.0, 0.85, 1.0 - dropPos) * glyphNoise;
+  let head = smoothstep(0.08, 0.0, dropPos) * glyphNoise;
+
+  let mouse = vec2f(uniforms.mouseX, uniforms.mouseY);
+  let distM = length((uv - mouse) * vec2f(aspect, 1.0));
+  let cursorBoost = exp(-distM * 4.5) * (0.35 + uniforms.pulse * 0.65);
+
+  let bg = select(vec3f(0.92, 0.96, 0.94), vec3f(0.025, 0.05, 0.04), uniforms.dark > 0.5);
+  let trailCol = select(vec3f(0.14, 0.62, 0.45), vec3f(0.10, 0.72, 0.48), uniforms.dark > 0.5);
+  let headCol = select(vec3f(0.06, 0.42, 0.30), vec3f(0.68, 0.98, 0.84), uniforms.dark > 0.5);
+
+  let intensity = select(0.38, 0.65, uniforms.dark > 0.5);
+  let rgb = clamp(
+    bg + (trailCol * (trail * 0.55 + cursorBoost * 0.4) + headCol * head * 0.75) * intensity,
+    vec3f(0.0),
+    vec3f(1.0)
+  );
+  return vec4f(rgb, 1.0);
+}
+`,
+};
+
+export function wallpaperPresetUniforms(
+  dark: boolean,
+  energy = 0,
+): Record<string, number> {
+  return {
+    dark: dark ? 1.0 : 0.0,
+    mouseX: 0.5,
+    mouseY: 0.5,
+    pulse: 0.0,
+    energy,
+  };
 }

@@ -6,15 +6,19 @@ import {
   createMotion,
   effect,
   Image,
+  lifecycle,
   platform,
   reduceMotion,
+  Shader,
   ShaderEffect,
   signal,
   Text,
   token,
   untracked,
+  Video,
   View,
   type ImageStyle,
+  type VideoRef,
   type ViewStyle,
 } from "nsh";
 import { Button as BaseButton, Dialog } from "nsh/base";
@@ -22,52 +26,231 @@ import { tr } from "../lib/i18n";
 import {
   clampAdjustment,
   DEFAULT_WALLPAPER_ADJUSTMENT,
+  DYNAMIC_WALLPAPER_ENABLED,
+  isAvailableWallpaperEffect,
   isDefaultAdjustment,
+  isDynamicWallpaperConfig,
+  isVideoWallpaperPath,
   MAX_WALLPAPER_ZOOM,
   MIN_WALLPAPER_ZOOM,
   panAdjustment,
+  WALLPAPER_PRESET_SHADERS,
   WALLPAPER_SHADERS,
+  wallpaperPresetUniforms,
   wallpaperShaderUniforms,
   zoomAdjustmentAround,
   type WallpaperAdjustment,
   type WallpaperConfig,
   type WallpaperEffect,
+  type WallpaperPreset,
 } from "../lib/wallpaper";
 import {
+  pipMood,
+  toggleWallpaperPaused,
   updateWallpaperAdjustment,
+  updateWallpaperDimensions,
   wallpaper,
+  wallpaperAgentReactive,
   wallpaperEffect,
+  wallpaperInteractive,
+  wallpaperMuted,
+  wallpaperPaused,
+  wallpaperPauseMode,
+  wallpaperVideoClickAction,
 } from "../store/app";
 import { Button, IconButton } from "../ui/Button";
 import { DIALOG_RISE, EASING } from "../ui/motion";
 import { GLASS_REGULAR, HEADER_GLASS, PAGE_GLASS, POPUP, SCRIM, WALLPAPER_FROST } from "../ui/styles";
 
+// ---------------------------------------------------------------------------
+// Global interactive wallpaper state (cursor parallax, shader ripples, video surge)
+// ---------------------------------------------------------------------------
+
+const cursorX = createAnimatedValue(0.5);
+const cursorY = createAnimatedValue(0.5);
+const clickPulse = createAnimatedValue(0.0);
+const videoSpeedBoost = signal(1.0);
+const videoSeekTick = signal(0);
+
+let windowViewport = { width: 1200, height: 800 };
+let pulseTimer: ReturnType<typeof setTimeout> | undefined;
+let burstTimer: ReturnType<typeof setTimeout> | undefined;
+
+function clamp01(v: number): number {
+  if (!Number.isFinite(v)) return 0.5;
+  return Math.max(0, Math.min(1, v));
+}
+
+/**
+ * Passive global mouse move observer hooked onto the root window view (`views/Shell.tsx`).
+ * Updates UI-thread `AnimatedValue`s directly without starting timers or stealing responder status.
+ */
+export function notifyWallpaperPointerMove(pageX: number, pageY: number) {
+  if (!DYNAMIC_WALLPAPER_ENABLED || !wallpaper() || !wallpaperInteractive()) return;
+  const nx = clamp01(pageX / Math.max(windowViewport.width, 1));
+  const ny = clamp01(pageY / Math.max(windowViewport.height, 1));
+  cursorX.set(nx);
+  cursorY.set(ny);
+}
+
+export function notifyWallpaperPointerLeave() {
+  if (!DYNAMIC_WALLPAPER_ENABLED || !wallpaper()) return;
+  cursorX.set(0.5);
+  cursorY.set(0.5);
+}
+
+/**
+ * Trigger a wallpaper interaction pulse (from a window click or test/shortcut):
+ * pulses shader ripple/glow uniforms and triggers the configured interactive video response.
+ */
+export function triggerWallpaperInteraction(pageX?: number, pageY?: number) {
+  if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  const wp = wallpaper();
+  if (!wp || !wallpaperInteractive()) return;
+  if (typeof pageX === "number" && typeof pageY === "number") {
+    cursorX.set(clamp01(pageX / Math.max(windowViewport.width, 1)));
+    cursorY.set(clamp01(pageY / Math.max(windowViewport.height, 1)));
+  }
+
+  clearTimeout(pulseTimer);
+  clickPulse.set(1.0);
+  pulseTimer = setTimeout(() => {
+    clickPulse.set(0.0);
+  }, 220);
+
+  const kind = wp.kind ?? (isVideoWallpaperPath(wp.path) ? "video" : "image");
+  if (kind === "video") {
+    const action = wallpaperVideoClickAction();
+    if (action === "burst") {
+      clearTimeout(burstTimer);
+      videoSpeedBoost.set(1.85);
+      burstTimer = setTimeout(() => {
+        videoSpeedBoost.set(1.0);
+      }, 650);
+    } else if (action === "seek") {
+      videoSeekTick.set(videoSeekTick() + 1);
+    } else if (action === "pause") {
+      toggleWallpaperPaused();
+    }
+  }
+}
+
+export function notifyWallpaperClick(pageX: number, pageY: number) {
+  triggerWallpaperInteraction(pageX, pageY);
+}
+
+function agentActivityEnergy(): number {
+  if (!wallpaperAgentReactive()) return 0;
+  switch (pipMood()) {
+    case "work":
+    case "write":
+      return 0.85;
+    case "think":
+      return 0.55;
+    case "happy":
+      return 1.0;
+    default:
+      return 0;
+  }
+}
+
+function agentVideoRateMultiplier(): number {
+  if (!wallpaperAgentReactive()) return 1.0;
+  switch (pipMood()) {
+    case "work":
+    case "write":
+      return 1.35;
+    case "think":
+      return 1.18;
+    case "happy":
+      return 1.45;
+    default:
+      return 1.0;
+  }
+}
+
 // The image over-covers its frame by a few percent so a frame where the fit
 // runs a resize or two behind still reaches every edge.
 const WALLPAPER_OVERSCAN = 1.06;
+const WALLPAPER_INTERACTIVE_OVERSCAN = 1.09;
+const PARALLAX_MAX_PX = 14;
+
 function EffectSurface(props: {
   effect: WallpaperEffect;
   config: WallpaperConfig;
   adjustment: WallpaperAdjustment;
   alpha?: number;
+  paused?: boolean;
 }) {
   const isDark = () => colorScheme() === "dark";
-  // The image lives in a fixed, intrinsic-size box and covering the frame is
-  // `fittedGeometry`'s `translate`/`scale`, so a live window resize only ever
-  // moves a compositor matrix. Laying the image out at its new bounds each
-  // resize frame re-rasterizes it, and the frames that raster misses during a
-  // fast drag read as flicker.
   const viewport = signal<{ width: number; height: number } | null>(null);
+  const canRender = () => DYNAMIC_WALLPAPER_ENABLED || !isDynamicWallpaperConfig(props.config);
+  const effectiveEffect = (): WallpaperEffect =>
+    DYNAMIC_WALLPAPER_ENABLED
+      ? props.effect
+      : isAvailableWallpaperEffect(props.effect)
+        ? props.effect
+        : "none";
+  const kind = () =>
+    !DYNAMIC_WALLPAPER_ENABLED
+      ? "image"
+      : props.config.kind ??
+        (props.config.preset
+          ? "shader"
+          : isVideoWallpaperPath(props.config.path)
+            ? "video"
+            : "image");
+
+  const isPaused = () => {
+    if (!DYNAMIC_WALLPAPER_ENABLED) return false;
+    if (props.paused) return true;
+    if (wallpaperPaused() || reduceMotion()) return true;
+    const mode = wallpaperPauseMode();
+    const state = lifecycle();
+    if (mode === "inactive" && state !== "active") return true;
+    if (mode === "background" && state === "background") return true;
+    return false;
+  };
+
+  const interactiveActive = () => DYNAMIC_WALLPAPER_ENABLED && !props.paused && wallpaperInteractive() && !isPaused();
+
+  let videoRef: VideoRef | undefined;
+  let videoDuration = 0;
+  let seekSegment = 0;
+
+  effect(() => {
+    const tick = videoSeekTick();
+    if (!DYNAMIC_WALLPAPER_ENABLED || tick <= 0 || props.paused) return;
+    untracked(() => {
+      if (kind() === "video" && videoRef && videoDuration > 0.5) {
+        seekSegment = (seekSegment + 1) % 4;
+        videoRef.seek((videoDuration * seekSegment) / 4);
+      }
+    });
+  });
+
+  const videoRate = () => {
+    if (isPaused()) return 1.0;
+    const base = agentVideoRateMultiplier();
+    const boost = interactiveActive() ? videoSpeedBoost() : 1.0;
+    return Math.min(2.5, Math.round(base * boost * 100) / 100);
+  };
+
   const worldStyle = (): ViewStyle => {
     const vp = viewport();
     const { width, height } = props.config;
     if (!vp || width <= 0 || height <= 0) {
       return { position: "absolute", width: 0, height: 0 };
     }
+    const interactive = interactiveActive();
+    const overscan = interactive ? WALLPAPER_INTERACTIVE_OVERSCAN : WALLPAPER_OVERSCAN;
     const s =
       Math.max(vp.width / width, vp.height / height) *
       props.adjustment.zoom *
-      WALLPAPER_OVERSCAN;
+      overscan;
+    const baseX = -Math.max(width * s - vp.width, 0) * props.adjustment.focalX;
+    const baseY = -Math.max(height * s - vp.height, 0) * props.adjustment.focalY;
+    const range = interactive ? PARALLAX_MAX_PX : 0;
     return {
       position: "absolute",
       left: 0,
@@ -76,10 +259,12 @@ function EffectSurface(props: {
       height,
       opacity: props.alpha ?? 1,
       transformOrigin: "0% 0%",
-      translate: [
-        -Math.max(width * s - vp.width, 0) * props.adjustment.focalX,
-        -Math.max(height * s - vp.height, 0) * props.adjustment.focalY,
-      ],
+      translate: interactive
+        ? [
+            cursorX.interpolate({ inputRange: [0, 1], outputRange: [baseX + range, baseX - range] }),
+            cursorY.interpolate({ inputRange: [0, 1], outputRange: [baseY + range, baseY - range] }),
+          ]
+        : [baseX, baseY],
       scale: s,
     };
   };
@@ -91,32 +276,105 @@ function EffectSurface(props: {
     left: 0,
     objectFit: "fill",
   };
+
+  const activeEffectUniforms = (eff: Exclude<WallpaperEffect, "none">) => {
+    const base = wallpaperShaderUniforms(eff, isDark(), agentActivityEnergy());
+    if ((eff === "ripple" || eff === "rain") && interactiveActive()) {
+      return {
+        ...base,
+        mouseX: cursorX,
+        mouseY: cursorY,
+        pulse: clickPulse,
+      };
+    }
+    return base;
+  };
+
+  const activePresetUniforms = () => {
+    const base = wallpaperPresetUniforms(isDark(), agentActivityEnergy());
+    if (interactiveActive()) {
+      return {
+        ...base,
+        mouseX: cursorX,
+        mouseY: cursorY,
+        pulse: clickPulse,
+      };
+    }
+    return base;
+  };
+
+  const renderMediaContent = () => {
+    if (!DYNAMIC_WALLPAPER_ENABLED) {
+      return <Image src={props.config.path} style={contentStyle} />;
+    }
+    const k = kind();
+    if (k === "shader") {
+      const preset: WallpaperPreset = props.config.preset ?? "aurora";
+      return (
+        <Shader
+          source={WALLPAPER_PRESET_SHADERS[preset]}
+          uniforms={activePresetUniforms()}
+          paused={isPaused()}
+          class="absolute inset-0"
+        />
+      );
+    }
+    if (k === "video") {
+      return (
+        <Video
+          ref={(r) => {
+            videoRef = r;
+          }}
+          src={props.config.path}
+          repeat
+          muted={props.paused ? true : wallpaperMuted()}
+          paused={isPaused()}
+          rate={videoRate()}
+          audioSession="mixWithOthers"
+          style={contentStyle}
+          onLoad={(e) => {
+            videoDuration = e.duration || 0;
+            if (!props.paused && e.size.width > 0 && e.size.height > 0) {
+              updateWallpaperDimensions(e.size.width, e.size.height);
+            }
+          }}
+        />
+      );
+    }
+    return <Image src={props.config.path} style={contentStyle} />;
+  };
+
+  const shaderEffect = (): Exclude<WallpaperEffect, "none"> => {
+    const eff = effectiveEffect();
+    return eff === "none" ? "dither" : eff;
+  };
+
   return (
-    <View
-      class="pointer-events-none absolute inset-0 overflow-hidden"
-      onLayout={(e) => {
-        const { width, height } = e.bounds.size;
-        viewport.set({ width, height });
-      }}
-    >
-      <View style={worldStyle()}>
-        <If
-          when={props.effect !== "none"}
-          else={<Image src={props.config.path} style={contentStyle} />}
-        >
-          <ShaderEffect
-            source={WALLPAPER_SHADERS[props.effect === "none" ? "dither" : props.effect]}
-            uniforms={wallpaperShaderUniforms(
-              props.effect === "none" ? "dither" : props.effect,
-              isDark(),
-            )}
-            class="absolute inset-0 overflow-hidden"
+    <If when={canRender()}>
+      <View
+        class="pointer-events-none absolute inset-0 overflow-hidden"
+        onLayout={(e) => {
+          const { width, height } = e.bounds.size;
+          viewport.set({ width, height });
+        }}
+      >
+        <View style={worldStyle()}>
+          <If
+            when={effectiveEffect() !== "none"}
+            else={renderMediaContent()}
           >
-            <Image src={props.config.path} style={contentStyle} />
-          </ShaderEffect>
-        </If>
+            <ShaderEffect
+              source={WALLPAPER_SHADERS[shaderEffect()]}
+              uniforms={activeEffectUniforms(shaderEffect())}
+              paused={isPaused() && (effectiveEffect() === "ripple" || effectiveEffect() === "rain")}
+              class="absolute inset-0 overflow-hidden"
+            >
+              {renderMediaContent()}
+            </ShaderEffect>
+          </If>
+        </View>
       </View>
-    </View>
+    </If>
   );
 }
 
@@ -131,6 +389,7 @@ export function CroppedWallpaperSurface(props: {
   adjustment?: WallpaperAdjustment;
   effect?: WallpaperEffect;
   alpha?: number;
+  paused?: boolean;
 }) {
   const adjustment = computed(() =>
     clampAdjustment(props.adjustment ?? props.config.adjustment),
@@ -142,6 +401,7 @@ export function CroppedWallpaperSurface(props: {
       config={props.config}
       adjustment={adjustment()}
       alpha={props.alpha}
+      paused={props.paused}
     />
   );
 }
@@ -153,9 +413,19 @@ export function WallpaperUnderlay() {
   return (
     <If when={wallpaper()}>
       {(wp) => (
-        <View class="pointer-events-none absolute inset-0 overflow-hidden">
-          <CroppedWallpaperSurface config={wp()} effect={wallpaperEffect()} />
-        </View>
+        <If when={DYNAMIC_WALLPAPER_ENABLED || !isDynamicWallpaperConfig(wp())}>
+          <View
+            class="pointer-events-none absolute inset-0 overflow-hidden"
+            onLayout={(e) => {
+              const { width, height } = e.bounds.size;
+              if (width > 0 && height > 0) {
+                windowViewport = { width, height };
+              }
+            }}
+          >
+            <CroppedWallpaperSurface config={wp()} effect={wallpaperEffect()} />
+          </View>
+        </If>
       )}
     </If>
   );
@@ -306,16 +576,17 @@ export function PaneVeil(props: { docked: boolean; reading: boolean }) {
   );
 }
 
-/** Where no mask draws (Windows), a conversation's rows do not fade out under
- * the title bar: there it keeps its band over a wallpaper too, the usual glass. */
-const HEADER_BAND = platform.os === "windows";
+/** Where no mask draws (Windows, Linux), a conversation's rows do not fade out
+ * under the title bar: Windows keeps the usual glass band, and Linux — which
+ * draws no backdrop filter either — caps the solid page with a solid band. */
+export const HEADER_BAND = platform.os === "windows" || platform.os === "linux";
 
 export function HeaderBand(props: { show: boolean; height: number }) {
   return (
     <If when={HEADER_BAND && props.show && wallpaper()}>
       <View
-        class={`pointer-events-none absolute inset-x-0 top-0 ${HEADER_GLASS}`}
-        style={{ ...GLASS_REGULAR, height: props.height }}
+        class={`pointer-events-none absolute inset-x-0 top-0 ${WALLPAPER_FROST ? HEADER_GLASS : "border-b-[0.5px] border-border bg-background"}`}
+        style={{ ...(WALLPAPER_FROST ? GLASS_REGULAR : undefined), height: props.height }}
       />
     </If>
   );

@@ -108,6 +108,9 @@ multi-agent orchestration, and settings.
   shown with the click, and that nothing passes through while the agent loads;
   `nsh test SwitchFilm.test.tsx --target macos` films the changes into
   `.nsh/shots/switch-*.png` (compare frames: the fades do not show in `texts()`)
+- `nsh test Settings.test.tsx` — Settings switches sections and subpages
+  without remounting visited panes or flashing `Usage`'s empty state;
+  `--target macos` checks pixel stability right after section switches
 - `nsh test SelectScroll.test.tsx --target macos` — a selection dragged to an
   edge of the conversation scrolls it on (and releases or follows as a scroll
   of the reader's does); `nsh test lib/edge-scroll.test.ts` — how fast
@@ -298,7 +301,36 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   animates the whole next layout pass, the chat's list included. Never key it
   to run state: a run that starts or settles re-lays the transcript in that
   same pass, and the list's cells cross-fade, jump, and are left shifted and
-  clipped (`AcpClip.test.tsx --target macos` shows it).
+  clipped (`AcpClip.test.tsx --target macos` shows it). Never call it in
+  generic controls (`Segmented` and `SettingsNav` use `nsh/base` `Tabs` +
+  `Tab` `indicatorClass`, whose native `spring_move` animates selection with
+  zero layout pass), never arm it before an `await`, and always guard it with
+  `!isRunning()` if a chat list may be active (`Reveal` and `Presence` in
+  `ui/Reveal.tsx` are scoped alternatives).
+- In-window sheets and multi-pane switchers use the shared anti-flicker
+  primitives in `ui/Reveal.tsx` (re-exported from `ui/motion.ts`):
+  `FloatingLayer` owns a sheet's open/close over `SCRIM` — batching its initial
+  pose with `mounted.set(true)`, reversing mid-close re-opens smoothly from live
+  UI-thread values instead of snapping opacity back to `0`, and using bounded
+  `<= 180ms` timing rather than unbounded springs that keep `nsh` non-idle.
+  Never nest `enter` / `enterStagger` inside an already-animating
+  `FloatingLayer`, and never cold-unmount/remount section or subpage panes on
+  tab switches (`opacity: 0` during `45ms` stagger lets the dimmed backdrop bleed
+  through translucent `POPUP` glass and cold-allocates `<Canvas>` marks): use
+  `ViewDeck` to keep visited panes mounted (`display: "none"` when inactive;
+  active panes omit `display` so vertical column flex holds) and swap at
+  steady `opacity: 1`. `FloatingLayer` registers a childless `<Overlay
+  onCancel>` while open so `Escape` dismisses the sheet even when an input
+  inside has focus, and `LayerActive` blurs `TextField`s when a `ViewDeck` pane
+  goes `display: "none"` or a `FloatingLayer` closes so hidden panes never trap
+  keyboard focus.
+- Do not introduce state, input, or CSS transitions that blink on commit: gate
+  async empty states on a `Ready` signal warmed ahead of view switches (or
+  `delayedFade`) so fast background scans never flash a false `"No … yet"`
+  screen; keep `TextField` placeholders as app-rendered `Text` overlays rather
+  than host `Input` placeholders (which step at integer bounds under ancestor
+  transforms); and use `transition-colors` instead of `transition-all` /
+  `PRESS` whenever `font-weight` flips on selection.
 - A session change answers the click, not the agent (`headFor` in
   `store/app.ts`, the pane in `views/Chat.tsx`; `DESIGN.md` → Motion). The
   destination goes on screen at once when there is one to show: a conversation

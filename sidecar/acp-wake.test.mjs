@@ -200,6 +200,35 @@ test("what still arrives ahead of a prompt's echo is kept out of its answer", as
   assert.deepEqual(toolEnds(next)[0], ["job 1", "job 1 done", false], "the job keeps its name");
 });
 
+test("multi-step reactive wake streams as one continuous live run with isStreaming true", async (t) => {
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "900" });
+  await bridge.prompt("start a background multistep job");
+  await bridge.settles(1);
+
+  // Wait until the live wake run begins (`agent_start` #2) and verify `isStreaming` stays true mid-wake.
+  const deadline = Date.now() + 5000;
+  while (bridge.records.filter((r) => r.type === "agent_start").length < 2) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for live wake agent_start");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const { data: midState } = await bridge.send({ type: "get_state" });
+  assert.equal(midState.isStreaming, true, "bridge reports isStreaming=true while multi-step wake is working");
+
+  await bridge.settles(2, 12_000);
+  const allRuns = runs(bridge.records);
+  assert.equal(allRuns.length, 2, "all 3 wake steps stream inside a single continuous wake run");
+  const [, wake] = allRuns;
+  assert.equal(textOf(wake), "Multi-step wake complete.");
+  assert.equal(thoughtsOf(wake), "Step 1 back.Step 2 back.");
+  assert.deepEqual(toolEnds(wake), [
+    ["job 1", "job 1 done", false],
+    ["edit", "edited app.ts", false],
+    ["bash", "clean", false],
+  ]);
+  const turnStarts = wake.filter((r) => r.type === "message_start" && r.message.role === "assistant" && r.message.turnStart);
+  assert.equal(turnStarts.length, 1, "only the first assistant message of the wake begins a new visual turn");
+});
+
 test("switching back to a saved session strips stale background flags", async (t) => {
   const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "60000" });
   await bridge.prompt("start a background job");
