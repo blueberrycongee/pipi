@@ -24,6 +24,7 @@ export type Row =
 export interface TurnStamp {
   t0?: number;
   turnMs?: number;
+  turnStart?: boolean;
 }
 
 const isTurnRow = (row: Row): row is Extract<Row, { kind: "text" | "thinking" | "tool" }> =>
@@ -71,6 +72,7 @@ export interface ToolRow extends TurnStamp {
   images: number;
   details?: unknown;
   durationMs?: number;
+  background?: boolean;
 }
 
 const textOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
@@ -241,6 +243,8 @@ export class Transcript {
   #turnStart: number | undefined;
   /** The turn at the end of the rows was closed (`#closeTurn`): a row that joins it opens it again. */
   #closed = false;
+  /** The next turn row begins a new visual turn even without a user row before it. */
+  #newTurn = false;
   /** While loading history: the time of the message being read (`null` when it has none). */
   #clock: number | null | undefined;
   /**
@@ -283,18 +287,24 @@ export class Transcript {
     this.#bashId = undefined;
     this.#turnStart = undefined;
     this.#closed = false;
+    this.#newTurn = false;
     this.#failure = undefined;
     for (const message of messages) {
-      if (message.role === "user") this.#closeTurn();
+      const assistantStart = message.role === "assistant" && !!message.turnStart;
+      if (message.role === "user" || assistantStart) this.#closeTurn();
       const at = (message as { timestamp?: unknown }).timestamp;
       this.#clock = typeof at === "number" ? at : null;
+      if (assistantStart) {
+        this.#turnStart = this.#now();
+        this.#newTurn = true;
+      }
       this.#append(message);
     }
     if (working) {
       this.#flushResults();
     } else {
       // A call with no recorded result was interrupted; history never shows it as running.
-      this.#settle();
+      this.#settle(false);
       this.#turnStart = undefined;
     }
     this.#clock = undefined;
@@ -358,6 +368,11 @@ export class Transcript {
       case "message_start":
         if (event.message.role === "assistant") {
           this.#live = { key: `m${++seq}`, toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
+          if (event.message.turnStart) {
+            this.#closeTurn();
+            this.#turnStart = this.#now();
+            this.#newTurn = true;
+          }
         } else if (event.message.role === "user") {
           this.#closeTurn();
           this.#append(event.message);
@@ -384,12 +399,15 @@ export class Transcript {
         const measured = started !== undefined ? Math.max(0, Date.now() - started) : undefined;
         this.#tool(
           event.toolCallId,
-          (row) => ({
-            ...row,
-            ...this.#result(event.result, row),
-            status: event.isError ? "error" : "done",
-            durationMs: event.durationMs ?? row.durationMs ?? measured,
-          }),
+          (row) => {
+            const { background: _bg, ...rest } = row;
+            return {
+              ...rest,
+              ...this.#result(event.result, row),
+              status: event.isError ? "error" : "done",
+              durationMs: event.durationMs ?? row.durationMs ?? measured,
+            };
+          },
           event.toolName,
         );
         break;
@@ -421,7 +439,7 @@ export class Transcript {
         this.#push({ kind: "notice", id: this.#id("notice"), tone: "warning", title: this.#tr(`Extension error in ${event.event}`, `扩展在 ${event.event} 中出错`), text: `${event.error}\n${event.extensionPath}` });
         break;
       case "agent_settled":
-        this.#settle();
+        this.#settle(!!event.aborted);
         break;
       default:
         return;
@@ -483,18 +501,34 @@ export class Transcript {
   #push(row: Row) {
     if (isTurnRow(row)) {
       if (row.t0 === undefined) row = { ...row, t0: this.#turnStart ?? this.#now() };
-      // A closed turn that a row joins goes on: it is not over, and how long it took is not known yet.
-      if (this.#closed) this.#stampTurn(undefined);
+      if (this.#newTurn) {
+        row = { ...row, turnStart: true };
+        this.#newTurn = false;
+      } else if (this.#closed) {
+        // A closed turn that a row joins goes on: it is not over, and how long it took is not known yet.
+        this.#stampTurn(undefined);
+      }
     }
     this.#closed = false;
     this.#index.set(row.id, this.#rows.length);
     this.#rows.push(row);
   }
 
+  /** Index of the first row of the turn at the end of the rows (stopping at a `turnStart` boundary). */
+  #turnHead(): number {
+    let first = this.#rows.length;
+    while (first > 0) {
+      const prev = this.#rows[first - 1];
+      if (!isTurnRow(prev)) break;
+      first--;
+      if (prev.turnStart) break;
+    }
+    return first;
+  }
+
   /** Writes how long the turn at the end of the rows took on its first row; `undefined` takes it back. */
   #stampTurn(turnMs: number | undefined) {
-    let first = this.#rows.length;
-    while (first > 0 && isTurnRow(this.#rows[first - 1])) first--;
+    const first = this.#turnHead();
     const row = this.#rows[first];
     if (row && isTurnRow(row) && row.turnMs !== turnMs) this.#rows[first] = { ...row, turnMs };
   }
@@ -505,7 +539,12 @@ export class Transcript {
     // What a row learned about its turn outlives the changes that replace it.
     const before = this.#rows[at];
     if (isTurnRow(row) && isTurnRow(before)) {
-      row = { ...row, t0: row.t0 ?? before.t0, turnMs: row.turnMs ?? before.turnMs };
+      row = {
+        ...row,
+        t0: row.t0 ?? before.t0,
+        turnMs: row.turnMs ?? before.turnMs,
+        ...((row.turnStart ?? before.turnStart) ? { turnStart: true } : {}),
+      };
       if (row.kind === "text" && before.kind === "text" && row.final === undefined && before.final) row = { ...row, final: true };
     }
     this.#rows[at] = row;
@@ -513,8 +552,7 @@ export class Transcript {
 
   /** The turn at the end of the rows is over: its first row keeps how long it took. */
   #closeTurn() {
-    let first = this.#rows.length;
-    while (first > 0 && isTurnRow(this.#rows[first - 1])) first--;
+    const first = this.#turnHead();
     const row = this.#rows[first];
     const now = this.#now();
     if (row && isTurnRow(row) && row.turnMs === undefined && row.t0 !== undefined && now !== undefined) {
@@ -522,6 +560,7 @@ export class Transcript {
     }
     this.#closed = row !== undefined && isTurnRow(row);
     this.#turnStart = undefined;
+    this.#newTurn = false;
   }
 
   #get(id: string | undefined) {
@@ -640,11 +679,19 @@ export class Transcript {
       } else if (block.type === "toolCall") {
         const before = this.#get(block.id);
         const base: ToolRow = before?.kind === "tool" ? before : { kind: "tool", id: block.id, name: block.name, args: {}, status: "queued", output: "", images: 0 };
+        const bg = !!block.background && !failed && message.stopReason !== "aborted";
         // A call the failed message never got to run will not run: it does not go on spinning through the retries.
         if (failed && (base.status === "call" || base.status === "queued")) {
-          this.#set({ ...base, name: block.name, args: block.arguments ?? {}, status: "error", output: base.output || this.#tr("Stopped before it finished.", "完成前已停止。") });
+          const { background: _bg, ...rest } = base;
+          this.#set({ ...rest, name: block.name, args: block.arguments ?? {}, status: "error", output: base.output || this.#tr("Stopped before it finished.", "完成前已停止。") });
         } else {
-          this.#set({ ...base, name: block.name, args: block.arguments ?? {}, status: keepRuns && base.status !== "call" ? base.status : "queued" });
+          const settled = base.status === "done" || base.status === "error";
+          if (bg && !settled) {
+            this.#set({ ...base, name: block.name, args: block.arguments ?? {}, status: "running", background: true });
+          } else {
+            const { background: _bg, ...rest } = base;
+            this.#set({ ...rest, name: block.name, args: block.arguments ?? {}, status: keepRuns && base.status !== "call" ? base.status : "queued" });
+          }
         }
         // A result read ahead of its call lands on the row now that the call is known.
         const pending = this.#pendingResults.get(block.id);
@@ -686,8 +733,9 @@ export class Transcript {
 
   /** A tool's result applied to its call's row: its output, images and outcome. */
   #applyToolResult(row: ToolRow, message: ToolResultMessage): ToolRow {
+    const { background: _bg, ...rest } = row;
     return {
-      ...row,
+      ...rest,
       output: textOf(message.content) || row.output,
       images: imagesOf(message.content),
       details: message.details ?? row.details,
@@ -762,10 +810,11 @@ export class Transcript {
   }
 
   /** A run is over: nothing is streaming or running any more, whatever the last event said. */
-  #settle() {
+  #settle(aborted = false) {
     this.#live = undefined;
     this.#toolSince.clear();
     this.#flushResults();
+    this.#newTurn = false;
     // Prose a stopped run left at the end is as much of an answer as there will
     // be — prose a message already classified keeps the place it was given.
     let tail = this.#rows.length;
@@ -773,8 +822,11 @@ export class Transcript {
     this.#rows = this.#rows.map((row, at) => {
       if (row.kind === "text" && at >= tail && row.final === undefined) return { ...row, streaming: false, final: true };
       if ((row.kind === "text" || row.kind === "thinking") && row.streaming) return { ...row, streaming: false };
-      if (row.kind === "tool" && (row.status === "call" || row.status === "queued" || row.status === "running"))
-        return { ...row, status: "error" as const, output: row.output || this.#tr("Stopped before it finished.", "完成前已停止。") };
+      if (row.kind === "tool" && (row.status === "call" || row.status === "queued" || row.status === "running")) {
+        if (row.background && !aborted && row.status === "running") return row;
+        const { background: _bg, ...rest } = row;
+        return { ...rest, status: "error" as const, output: row.output || this.#tr("Stopped before it finished.", "完成前已停止。") };
+      }
       return row;
     });
     this.#closeTurn();

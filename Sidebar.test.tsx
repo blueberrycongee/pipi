@@ -348,6 +348,41 @@ test("switching between two running sessions across collapsed workspaces keeps b
   expect(toNsh.every((f) => f.nshWeight > 400 && f.pipiWeight <= 400)).toBe(true);
 });
 
+test("sessions a draft started nest under its row in Recent too", async () => {
+  const app = await launch("welcome");
+  await app.waitFor("text:What are we building?");
+
+  // The compare sheet starts sibling sessions under the open one — the draft here.
+  await app.keyboard.press("mod+shift+o");
+  await app.waitFor("text:Compare Agents");
+  await app.type("label:Comparison task", "Audit security and add rate limiting");
+  await app.press("text:Launch Comparison");
+  await app.waitUntil(() => app.count("id:sidebar-workspaces >> text:Pi · Audit security and add rate limiting") === 1);
+
+  // The same tree nests under Recent's draft row — one row in each group.
+  expect(app.count("id:sidebar-recents >> text:Pi · Audit security and add rate limiting")).toBe(1);
+  expect(app.count("id:sidebar-recents >> text:Claude Code · Audit security and add rate limiting")).toBe(1);
+  expect(app.count("id:sidebar-recents >> text:Codex · Audit security and add rate limiting")).toBe(1);
+});
+
+test("children of a saved session nest under its row in Recent too", async () => {
+  const app = await launch("welcome");
+  await app.waitFor("text:What are we building?");
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+
+  await app.keyboard.press("mod+shift+o");
+  await app.waitFor("text:Compare Agents");
+  await app.type("label:Comparison task", "Audit security and add rate limiting");
+  await app.press("text:Launch Comparison");
+  await app.waitUntil(() => app.count("id:sidebar-recents >> text:Pi · Audit security and add rate limiting") === 1);
+
+  // The children hang under the parent's row in both groups, marks and all.
+  expect(app.count("id:sidebar-workspaces >> text:Pi · Audit security and add rate limiting")).toBe(1);
+  await app.waitUntil(() => app.count("id:sidebar-recents >> id:sidebar-child-unread") >= 3);
+  expect(app.count("id:sidebar-workspaces >> id:sidebar-child-unread")).toBeGreaterThanOrEqual(3);
+});
+
 test("a session in Recent keeps its place when it takes a message; only a new one goes on top", async () => {
   const app = await launch("welcome");
   await app.waitFor("text:What are we building?");

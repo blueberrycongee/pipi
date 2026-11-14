@@ -16,6 +16,7 @@ import {
   extensionWidgets,
   hasModel,
   isBashRunning,
+  isDraftAhead,
   isRunning,
   messageQueue,
   recallQueue,
@@ -474,6 +475,7 @@ export function Composer() {
   const height = signal(MIN_HEIGHT);
   const slash = useSlashMenu();
   const ready = () => sidecarPhase().name === "ready";
+  const canSend = () => ready() || isDraftAhead();
   const working = () => isRunning() || isBashRunning() || waitingCount() > 0;
   const hasText = () => composerDraft().trim().length > 0 || composerAttachments().length > 0;
   const statusLine = () => Object.values(extensionStatuses()).join("  ·  ");
@@ -685,7 +687,7 @@ export function Composer() {
                   else={
                     <BaseButton
                       onPress={() => submit()}
-                      disabled={!ready() || !hasText()}
+                      disabled={!canSend() || !hasText()}
                       accessibilityLabel={isRunning() ? tr("Steer", "引导") : tr("Send", "发送")}
                       tooltip={tip(
                         isRunning() ? tr("Steer — ⌘↵ queues a follow-up", "引导 — ⌘↵ 排队追问") : tr("Send — ⌘↵ queues a follow-up", "发送 — ⌘↵ 排队追问"),
@@ -694,7 +696,7 @@ export function Composer() {
                       )}
                       class={`size-7 shrink-0 items-center justify-center rounded-full bg-primary shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:bg-muted disabled:shadow-none`}
                     >
-                      <Icon name="arrowUp" tone={ready() && hasText() ? "brand-foreground" : "subtle"} />
+                      <Icon name="arrowUp" tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
                     </BaseButton>
                   }
                 >

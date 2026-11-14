@@ -62,6 +62,11 @@ function configOptions(s) {
   ];
 }
 
+const LEGACY_MODELS = {
+  currentModelId: "legacy-agy-model",
+  availableModels: [{ modelId: "legacy-agy-model", name: "Legacy Agy Model" }],
+};
+
 const LOG_FILE = process.env.FAKE_ACP_LOG || "/tmp/fake-acp-log.jsonl";
 try {
   fs.writeFileSync(LOG_FILE, "");
@@ -75,7 +80,67 @@ const log = (msg) => {
 };
 const reply = (id, result) => send({ jsonrpc: "2.0", id, result });
 const replyErr = (id, code, message) => send({ jsonrpc: "2.0", id, error: { code, message } });
-const update = (sessionId, u) => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: u } });
+const sendUpdate = (sessionId, u) => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: u } });
+const update = (sessionId, u) => {
+  record(sessionId, u);
+  sendUpdate(sessionId, u);
+};
+
+// ── Antigravity's idle wake (`FAKE_ACP_AGY=1`) ──────────────────────────────
+// As agy 1.5.9 does over ACP: a prompt is echoed as `user_message_chunk`; a
+// prompt containing "background" leaves a call running and answers "Waiting
+// for the job." — when the job ends (`FAKE_ACP_WAKE_MS` later) the agent runs
+// on by itself, but what it says is only kept (and `updatedAt` moves): it goes
+// out ahead of the next prompt's echo, or in a `session/load` replay of the
+// whole conversation (which drops what was held). "background twice" leaves
+// two jobs, the second ending later.
+const AGY = !!process.env.FAKE_ACP_AGY;
+const WAKE_MS = Number(process.env.FAKE_ACP_WAKE_MS || 400);
+const CONTENT = new Set(["user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"]);
+
+/** Keeps a content update in the session's history the way agy replays it: a call as one `tool_call`, as it stands. */
+function record(sessionId, u) {
+  const s = sessions.get(sessionId);
+  if (!AGY || !s || !CONTENT.has(u.sessionUpdate)) return;
+  s.updatedAt = new Date().toISOString();
+  if (u.sessionUpdate === "tool_call_update") {
+    const call = s.history.find((h) => h.sessionUpdate === "tool_call" && h.toolCallId === u.toolCallId);
+    if (call) Object.assign(call, { ...u, sessionUpdate: "tool_call" });
+    return;
+  }
+  s.history.push({ ...u });
+}
+
+/** What the agent does on its own while idle: kept, and held back from the wire. */
+function idle(sessionId, u) {
+  const s = sessions.get(sessionId);
+  if (!s) return;
+  const before = s.updatedAt;
+  record(sessionId, u);
+  // `FAKE_ACP_QUIET_LIST=1`: the list does not show it — only the next prompt can.
+  if (process.env.FAKE_ACP_QUIET_LIST) s.updatedAt = before;
+  s.backlog.push(u);
+}
+
+function backgroundTurn(sessionId, text) {
+  const jobs = /twice/i.test(text) ? 2 : 1;
+  for (let job = 1; job <= jobs; job++) {
+    const toolCallId = `bg_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId, title: `job ${job}`, kind: "execute", status: "in_progress", rawInput: { command: `job ${job}` } });
+    setTimeout(() => {
+      idle(sessionId, { sessionUpdate: "tool_call_update", toolCallId, status: "completed", content: [{ type: "content", content: { type: "text", text: `job ${job} done` } }] });
+      idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `Job ${job} is back.` } });
+      idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Job ${job} finished: ` } });
+      idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "all good." } });
+      if (/trail/i.test(text) && job === 1) {
+        idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Trailing idle thought." } });
+      }
+    }, WAKE_MS * job);
+  }
+  update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Waiting for " } });
+  update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "the job." } });
+  return "end_turn";
+}
 
 function requestPermission(sessionId, toolCallId) {
   const id = clientReqId++;
@@ -100,6 +165,7 @@ function requestPermission(sessionId, toolCallId) {
 async function runTurn(sessionId, text) {
   update(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `Thinking about: ${text.slice(0, 40)}` } });
   if (/cancel/i.test(text)) return "wait-for-cancel";
+  if (AGY && /background/i.test(text)) return backgroundTurn(sessionId, text);
   const toolCallId = `tc_${seq++}`;
   const editTool = /edit/i.test(text);
   const toolName = editTool ? "edit" : "bash";
@@ -148,15 +214,15 @@ async function handle(msg) {
     case "initialize":
       reply(msg.id, {
         protocolVersion: 1,
-        agentCapabilities: { loadSession: false, sessionCapabilities: { resume: {}, list: {}, close: {} } },
-        agentInfo: { name: "fake-dsh", title: "Fake DSH", version: "0.0.0" },
+        agentCapabilities: { loadSession: AGY, sessionCapabilities: { resume: {}, list: {}, close: {}, ...(AGY ? { load: {} } : {}) } },
+        agentInfo: AGY ? { name: "Antigravity ACP Server", title: "Fake agy", version: "0.0.0" } : { name: "fake-dsh", title: "Fake DSH", version: "0.0.0" },
       });
       return;
     case "session/new": {
       const sessionId = `fake-sess-${++seq}`;
-      const s = { cwd: p.cwd, model: JSON.stringify(["deepseek-official", "deepseek-v4-flash"]), effort: "medium" };
+      const s = { cwd: p.cwd, model: JSON.stringify(["deepseek-official", "deepseek-v4-flash"]), effort: "medium", history: [], backlog: [], updatedAt: new Date().toISOString() };
       sessions.set(sessionId, s);
-      reply(msg.id, { sessionId, configOptions: configOptions(s) });
+      reply(msg.id, { sessionId, configOptions: configOptions(s), ...(AGY ? { models: LEGACY_MODELS } : {}) });
       update(sessionId, {
         sessionUpdate: "available_commands_update",
         availableCommands: [
@@ -170,11 +236,23 @@ async function handle(msg) {
       const s = sessions.get(p.sessionId);
       if (!s || (p.cwd && s.cwd && p.cwd !== s.cwd)) return replyErr(msg.id, -32602, "unknown or mismatched session");
       s.closed = false; // like DSH: close detaches the live session, the record stays resumable
-      reply(msg.id, { sessionId: p.sessionId, configOptions: configOptions(s) });
+      reply(msg.id, { sessionId: p.sessionId, configOptions: configOptions(s), ...(AGY ? { models: LEGACY_MODELS } : {}) });
       return;
     }
     case "session/list": {
-      reply(msg.id, { sessions: [...sessions.keys()].map((sessionId) => ({ sessionId, cwd: sessions.get(sessionId).cwd, title: "fake", updatedAt: Date.now() })), nextCursor: null });
+      reply(msg.id, {
+        sessions: [...sessions.keys()].map((sessionId) => ({ sessionId, cwd: sessions.get(sessionId).cwd, title: "fake", updatedAt: AGY ? sessions.get(sessionId).updatedAt : Date.now() })),
+        nextCursor: null,
+      });
+      return;
+    }
+    case "session/load": {
+      const s = sessions.get(p.sessionId);
+      if (!AGY || !s) return replyErr(msg.id, -32602, "unknown session");
+      // agy replays the whole conversation, and what it held for the next prompt is spent.
+      for (const u of s.history) sendUpdate(p.sessionId, u);
+      s.backlog = [];
+      reply(msg.id, { sessionId: p.sessionId, configOptions: configOptions(s), models: LEGACY_MODELS });
       return;
     }
     case "session/close":
@@ -201,6 +279,11 @@ async function handle(msg) {
       if (!s) return replyErr(msg.id, -32602, "unknown session");
       if (inflightPrompt) return replyErr(msg.id, -32602, "prompt already in flight");
       const text = (p.prompt || []).map((c) => c?.text || "").join("\n");
+      if (AGY) {
+        // What the agent did while idle goes out first, then the prompt's echo.
+        for (const u of s.backlog.splice(0)) sendUpdate(p.sessionId, u);
+        update(p.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text } });
+      }
       const result = runTurn(p.sessionId, text);
       inflightPrompt = { id: msg.id, sessionId: p.sessionId };
       const outcome = await result;

@@ -751,6 +751,7 @@ export function buildDisplayRows(
     for (; i < rows.length; i++) {
       const cur = rows[i];
       if (!isTurnRow(cur)) break;
+      if (cur !== first && cur.turnStart) break;
       if (cur.kind === "tool" || cur.kind === "thinking") {
         steps.push(cur);
         activeStep = cur;

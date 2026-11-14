@@ -24,9 +24,12 @@ import {
   currentDaemonSession,
   currentTitle,
   currentView,
+  daemonRootEarnsRow,
   daemonSessionByFile,
   daemonSessionOfId,
   daemonSessions,
+  daemonTreePlace,
+  isDraftAhead,
   isRunning,
   isSessionRunning,
   isSessionUnread,
@@ -71,8 +74,8 @@ type FolderItem = { id: string; session?: SessionSummary; child?: DaemonSession 
 
 type GroupId = "workspaces" | "recents" | "archived";
 
-/** A session in 最近: the summary plus the project folder that owns it. */
-type RecentItem = { id: string; session: SessionSummary; cwd: string };
+/** A row in 最近: a saved session, or a daemon session of a tree with no saved row to hang under. */
+type RecentItem = { id: string; session?: SessionSummary; child?: DaemonSession; cwd?: string };
 
 /** How many sessions 最近 lists before its footer offers to show the rest. */
 const RECENT_LIMIT = 100;
@@ -194,32 +197,93 @@ const standingOf = (session: SessionSummary) => {
   recentStanding.set(session.path, session.modified);
   return session.modified;
 };
+/** A daemon session's standing, keyed by id: first sight of its row, like `standingOf` for files. */
+const daemonStandingOf = (session: DaemonSession) => {
+  const key = `daemon:${session.id}`;
+  const known = recentStanding.get(key);
+  if (known !== undefined) return known;
+  recentStanding.set(key, session.lastActive);
+  return session.lastActive;
+};
+const standOf = (item: RecentItem) => (item.session ? standingOf(item.session) : daemonStandingOf(item.child!));
+const createdOf = (item: RecentItem) => item.session?.created ?? item.child?.createdAt ?? 0;
 
-/** Recent sessions across every open folder, deduped by file, each in the place it first took (`recentStanding`). */
+/**
+ * Recent sessions across every open folder: the forest's roots in the place each
+ * first took (`recentStanding`), every root's daemon descendants nested under it
+ * in tree order — the tree a session started shows here as it does in 工作区.
+ * Roots are saved sessions and the daemon trees no saved row claims (external or
+ * detached runs, starts still without a file); a child whose own tree hides keeps
+ * a flat row rather than going missing.
+ */
 const allRecents = computed<RecentItem[]>(() => {
   const active = activeProjectPath();
+  const open = new Set(projects());
   const seen = new Set<string>();
-  const out: RecentItem[] = [];
+  const summaries: { session: SessionSummary; cwd: string }[] = [];
   for (const cwd of projects()) {
     const list = cwd === active ? savedSessions() : (workspaceSessions()[cwd] ?? []);
     for (const session of list) {
       if (seen.has(session.path)) continue;
-      // A daemon child belongs under its parent row, not in the flat recent list.
-      if (daemonSessionByFile(session.path)?.parentId) continue;
       seen.add(session.path);
-      out.push({ id: `recent:${session.path}`, session, cwd });
+      summaries.push({ session, cwd });
     }
   }
-  out.sort(
-    (a, b) =>
-      standingOf(b.session) - standingOf(a.session) || b.session.created - a.session.created || a.session.path.localeCompare(b.session.path),
-  );
+  const listed = new Set(summaries.map((entry) => entry.session.path));
+
+  // Daemon trees no saved row claims: each is led by its unclaimed top, and earns
+  // the row when it or anything under it has something to say — or holds a file
+  // the list would otherwise drop. The open draft leads no row: the draft's does.
+  const tops = new Map<string, DaemonSession>();
+  for (const ds of daemonSessions()) {
+    if (ds.file && listed.has(ds.file)) continue;
+    const { claimed, top } = daemonTreePlace(ds, listed);
+    if (claimed || top.id !== ds.id) continue;
+    if (ds.id === currentDaemonId() && isDraftSession()) continue;
+    if (!open.has(projectCwdOf(ds.cwd, ds))) continue;
+    const earns =
+      daemonRootEarnsRow(ds) ||
+      childSessionsOfDaemon(ds.id).some((d) => daemonRootEarnsRow(d) || (d.file !== undefined && listed.has(d.file)));
+    if (earns) tops.set(ds.id, ds);
+  }
+
+  const roots: RecentItem[] = [];
+  const draftChildren = hasRecentDraft() ? new Set(childSessionsOfOpen().map((c) => c.id)) : new Set<string>();
+  for (const { session, cwd } of summaries) {
+    const ds = daemonSessionByFile(session.path);
+    if (ds?.parentId) {
+      const { claimed, top } = daemonTreePlace(ds, listed);
+      // A daemon child belongs under its tree's row, not in the flat list — unless nothing above it takes a row here.
+      if (claimed || tops.has(top.id) || draftChildren.has(ds.id)) continue;
+    }
+    roots.push({ id: `recent:${session.path}`, session, cwd });
+  }
+  for (const ds of tops.values()) roots.push({ id: `recent-daemon:${ds.id}`, child: ds });
+  roots.sort((a, b) => standOf(b) - standOf(a) || createdOf(b) - createdOf(a) || a.id.localeCompare(b.id));
+
+  const out: RecentItem[] = [];
+  for (const root of roots) {
+    out.push(root);
+    const children = root.session ? childSessionsOf(root.session.path) : childSessionsOfDaemon(root.child!.id);
+    for (const child of children) out.push({ id: `recent-child:${child.id}`, child });
+  }
   return out;
 });
 
 /** What 最近 shows: its newest slice until the footer expands it, then everything. */
 const recentsExpanded = signal(false);
 const recents = computed<RecentItem[]>(() => (recentsExpanded() ? allRecents() : allRecents().slice(0, RECENT_LIMIT)));
+
+/** Daemon sessions with a row in 最近 right now: nested under its roots, or under the draft's row. */
+const recentDaemonRows = computed(() => {
+  const ids = new Set<string>();
+  for (const item of recents()) if (item.child) ids.add(item.child.id);
+  if (hasRecentDraft()) for (const child of childSessionsOfOpen()) ids.add(child.id);
+  return ids;
+});
+
+/** Whether a daemon session's mark is already on show in 最近 (a folded folder needn't repeat it). */
+const daemonShownInRecents = (ds: DaemonSession) => !isGroupCollapsed("recents") && recentDaemonRows().has(ds.id);
 
 /**
  * Which group highlights the open session when both 工作区 and 最近 list it:
@@ -231,9 +295,37 @@ const recents = computed<RecentItem[]>(() => (recentsExpanded() ? allRecents() :
 function ownsActiveSession(group: GroupId, sessionPath: string, cwd: string): boolean {
   if (isSessionArchived(sessionPath)) return group === "archived";
   const inWorkspaces = !isGroupCollapsed("workspaces") && !isWorkspaceCollapsed(cwd);
-  const inRecents = !isGroupCollapsed("recents") && recents().some((item) => item.session.path === sessionPath);
+  const inRecents = !isGroupCollapsed("recents") && recents().some((item) => item.session?.path === sessionPath);
   const owner: GroupId =
     chosenGroups()[sessionPath] === "recents" && inRecents ? "recents" : inWorkspaces ? "workspaces" : inRecents ? "recents" : "workspaces";
+  return group === owner;
+}
+
+/** Whether a daemon session's row is nested somewhere under 工作区 right now. */
+function daemonRowInWorkspaces(ds: DaemonSession): boolean {
+  if (isGroupCollapsed("workspaces")) return false;
+  const active = activeProjectPath();
+  const files = new Set<string>();
+  for (const cwd of projects()) {
+    if (isWorkspaceCollapsed(cwd)) continue;
+    for (const s of cwd === active ? savedSessions() : (workspaceSessions()[cwd] ?? [])) files.add(s.path);
+  }
+  const { claimed, top } = daemonTreePlace(ds, files);
+  if (claimed) return true;
+  if (top.id === currentDaemonId() && isDraftSession()) return true;
+  return (
+    daemonRootEarnsRow(top) &&
+    !top.file &&
+    projects().some((cwd) => !isWorkspaceCollapsed(cwd) && projectCwdOf(top.cwd, top) === cwd)
+  );
+}
+
+/** Which group highlights the open daemon session's row — the one it was clicked in, else whichever shows it. */
+function ownsDaemonRow(group: GroupId, ds: DaemonSession): boolean {
+  const inWorkspaces = daemonRowInWorkspaces(ds);
+  const inRecents = daemonShownInRecents(ds);
+  const owner: GroupId =
+    chosenGroups()[`daemon:${ds.id}`] === "recents" && inRecents ? "recents" : inWorkspaces ? "workspaces" : inRecents ? "recents" : "workspaces";
   return group === owner;
 }
 
@@ -422,7 +514,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
   const label = () => projectLabel(props.cwd, props.allProjects);
   const sessions = () => (active() ? savedSessions() : (workspaceSessions()[props.cwd] ?? []));
   const shownInRecents = (path: string | undefined) =>
-    !isGroupCollapsed("recents") && Boolean(path && recents().some((item) => item.session.path === path));
+    !isGroupCollapsed("recents") && Boolean(path && recents().some((item) => item.session?.path === path || item.child?.file === path));
   const activeShownInRecents = () =>
     !isGroupCollapsed("recents") && (isDraftSession() ? hasRecentDraft() : shownInRecents(openFile()));
   /** A folded folder still says so when a run inside it keeps working off screen — active or parked, any project. */
@@ -432,7 +524,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
       (ds) =>
         projectCwdOf(ds.cwd, ds) === props.cwd &&
         (ds.status === "working" || ds.status === "blocked") &&
-        (!ds.file || !shownInRecents(ds.file)),
+        !daemonShownInRecents(ds),
     );
   const collapsedRunning = () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents()));
   /** A folded folder surfaces an answer that finished out of sight the same way. */
@@ -440,10 +532,8 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
     collapsed() &&
     !collapsedRunning() &&
     (sessions().some((s) => isSessionUnread(s.path) && !shownInRecents(s.path)) ||
-      daemonSessions().some(
-        (ds) => projectCwdOf(ds.cwd, ds) === props.cwd && ds.unread && (!ds.file || !shownInRecents(ds.file)),
-      ));
-  const startingHere = () => active() && sidecarPhase().name === "starting";
+      daemonSessions().some((ds) => projectCwdOf(ds.cwd, ds) === props.cwd && ds.unread && !daemonShownInRecents(ds)));
+  const startingHere = () => active() && sidecarPhase().name === "starting" && !isDraftAhead();
   const canRemove = () => props.allProjects.length > 1;
 
   return (
@@ -729,13 +819,19 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId }) {
   const blocked = () => !active() && session().status === "blocked";
   const failed = () => !active() && (session().status === "failed" || session().status === "interrupted");
   const unread = () => session().unread && !active() && !failed() && !working();
-  const selected = () => active() && currentView().name === "chat";
+  /** A row the open session has in both groups takes the highlight in one only (`ownsDaemonRow`). */
+  const primary = () => active() && ownsDaemonRow(props.group, session());
+  const selected = () => primary() && currentView().name === "chat";
   const rowDepth = () => (session().parentId ? Math.max(1, session().depth) : 0);
   return (
     <View class={hoverGroup()} onContextMenu={(e) => Menu.popup(childMenuItems(session()), e.pagePosition)}>
       <BaseButton
         selected={selected()}
-        onPress={() => openDaemonSession(session().id)}
+        onPress={() => {
+          const key = `daemon:${session().id}`;
+          if (chosenGroups()[key] !== props.group) chosenGroups.update((all) => ({ ...all, [key]: props.group }));
+          openDaemonSession(session().id);
+        }}
         tooltip={tip(
           `${engine().name} · ${tildePath(session().cwd, home)}${session().worktree?.branch ? ` · ${session().worktree!.branch}` : ""}${
             file() ? "" : ` · ${statusLabel(session().status)}`
@@ -827,7 +923,7 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[] })
     for (const ds of daemonSessions()) {
       if (ds.parentId || ds.file) continue;
       if (projectCwdOf(ds.cwd, ds) !== props.cwd) continue;
-      if (ds.initiator !== "external" && ds.status === "idle" && !ds.unread) continue;
+      if (!daemonRootEarnsRow(ds)) continue;
       if (ds.id === currentDaemonId() && isDraftSession()) continue;
       rows.push({ id: `child:${ds.id}`, child: ds });
       for (const child of childSessionsOfDaemon(ds.id)) rows.push({ id: `child:${child.id}`, child });
@@ -884,7 +980,7 @@ function toggleProject(cwd: string) {
 
 /** The scrollable tree: 工作区's project folders, 最近's sessions across them, and 已归档's tucked-away sessions. */
 function SidebarTree() {
-  const recentCount = () => allRecents().length + (hasRecentDraft() ? 1 : 0);
+  const recentCount = () => allRecents().length + (hasRecentDraft() ? 1 + childSessionsOfOpen().length : 0);
   const showRecents = () => recentCount() > 0;
 
   // The rows under the pointer are about to move: a draft row opens or closes above them.
@@ -933,10 +1029,21 @@ function SidebarTree() {
           >
             <View testID="sidebar-recents">
               <Reveal open={hasRecentDraft()} instant={draftGraduated()}>
-                <DraftSessionRow cwd={activeProjectPath()} group="recents" />
+                <View>
+                  <DraftSessionRow cwd={activeProjectPath()} group="recents" />
+                  <Each of={childSessionsOfOpen()} key={(c) => `child:${c.id}`}>
+                    {(child) => <DaemonSessionRow session={child()} group="recents" />}
+                  </Each>
+                </View>
               </Reveal>
               <Each of={recents()} key={(item) => item.id}>
-                {(item) => <SessionRow session={item().session} cwd={item().cwd} group="recents" />}
+                {(item) =>
+                  item().child ? (
+                    <DaemonSessionRow session={item().child!} group="recents" />
+                  ) : (
+                    <SessionRow session={item().session!} cwd={item().cwd!} group="recents" />
+                  )
+                }
               </Each>
               <If when={allRecents().length > RECENT_LIMIT}>
                 <BaseButton

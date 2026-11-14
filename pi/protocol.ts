@@ -36,6 +36,8 @@ export interface ToolCall {
   id: string;
   name: string;
   arguments: Record<string, unknown>;
+  /** Kept running across `agent_settled` as a background task / subagent. */
+  background?: boolean;
 }
 
 export interface Usage {
@@ -67,6 +69,8 @@ export interface AssistantMessage {
   usage: Usage;
   stopReason: StopReason;
   errorMessage?: string;
+  /** Opens a new visual turn without a preceding user message (e.g., an autonomous wake turn). */
+  turnStart?: boolean;
   timestamp: number;
 }
 

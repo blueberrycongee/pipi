@@ -840,4 +840,118 @@ test("wallpaper crop geometry, pan/zoom adjustment, rotation cooldown, and color
   expect(dom).toMatch(/^#[0-9a-f]{6}$/);
 });
 
+test("Transcript and buildDisplayRows keep background tools running across idle settle and split turnStart wakes", () => {
+  const t = new Transcript();
+  const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
+  const userMsg = { role: "user" as const, content: [{ type: "text" as const, text: "run bg" }], timestamp: 100 };
+  const bgCall = { type: "toolCall" as const, id: "bg1", name: "bash", arguments: { command: "sleep 1" } };
+  const turn1EndMsg = {
+    role: "assistant" as const,
+    content: [{ ...bgCall, background: true }, { type: "text" as const, text: "Waiting for background task." }],
+    provider: "antigravity",
+    model: "m",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop" as const,
+    timestamp: 500,
+  };
+
+  t.apply({ type: "agent_start" });
+  t.apply({ type: "message_start", message: userMsg });
+  t.apply({ type: "message_end", message: userMsg });
+  t.apply({ type: "message_start", message: { ...turn1EndMsg, content: [], stopReason: "pending" } as never });
+  update({ type: "toolcall_start", contentIndex: 0, id: "bg1", toolName: "bash" });
+  update({ type: "toolcall_end", contentIndex: 0, toolCall: bgCall });
+  t.apply({ type: "tool_execution_start", toolCallId: "bg1", toolName: "bash", args: bgCall.arguments });
+  update({ type: "text_start", contentIndex: 1 });
+  update({ type: "text_delta", contentIndex: 1, delta: "Waiting for background task." });
+  update({ type: "text_end", contentIndex: 1, content: "Waiting for background task." });
+  t.apply({ type: "message_end", message: turn1EndMsg });
+  t.apply({ type: "agent_end", willRetry: false });
+  t.apply({ type: "agent_settled", aborted: false });
+
+  const liveMidRows = t.rows();
+  expect(liveMidRows.find((r) => r.kind === "tool")).toMatchObject({ id: "bg1", status: "running", background: true });
+  expect(liveMidRows.find((r) => r.kind === "text")).toMatchObject({ text: "Waiting for background task.", final: true });
+  const midDisplay = buildDisplayRows(liveMidRows, false);
+  expect(midDisplay.filter((r) => r.kind === "turn")).toHaveLength(1);
+  expect(midDisplay.find((r) => r.kind === "turn")).toMatchObject({ hasDetails: true, running: false, open: false });
+  const midExpanded = buildDisplayRows(liveMidRows, false, { chosen: () => true });
+  expect((midExpanded.find((r) => r.kind === "activity") as ActivityRow).running).toBe(true);
+
+  // Reloading while still running in background preserves running state and row IDs on adopt.
+  const reloadedMid = new Transcript();
+  reloadedMid.load([userMsg, turn1EndMsg], false);
+  reloadedMid.adopt(liveMidRows);
+  expect(reloadedMid.rows().find((r) => r.kind === "tool")).toMatchObject({ id: "bg1", status: "running", background: true });
+  expect(displayRowIds(reloadedMid.rows())).toEqual(displayRowIds(liveMidRows));
+  expect(buildDisplayRows(reloadedMid.rows(), false).map((r) => r.id)).toEqual(midDisplay.map((r) => r.id));
+
+  // Explicit abort marks background tools as stopped with an error instead of leaving them running.
+  const aborted = new Transcript();
+  aborted.load([userMsg, turn1EndMsg], true);
+  aborted.apply({ type: "agent_settled", aborted: true });
+  const abortedBg = aborted.rows().find((r) => r.kind === "tool");
+  expect(abortedBg).toMatchObject({ id: "bg1", status: "error" });
+  expect(abortedBg && "background" in abortedBg ? abortedBg.background : undefined).toBeUndefined();
+
+  // Promptless autonomous wake turn starts a new visual turn without merging into Turn 1.
+  const wakeMsg = {
+    role: "assistant" as const,
+    turnStart: true,
+    content: [{ type: "thinking" as const, thinking: "bg1 returned" }, { type: "text" as const, text: "All finished." }],
+    provider: "antigravity",
+    model: "m",
+    usage: turn1EndMsg.usage,
+    stopReason: "stop" as const,
+    timestamp: 5500,
+  };
+  const bgResultMsg = {
+    role: "toolResult" as const,
+    toolCallId: "bg1",
+    toolName: "bash",
+    content: [{ type: "text" as const, text: "ok" }],
+    isError: false,
+    timestamp: 5100,
+  };
+
+  t.apply({ type: "agent_start" });
+  t.apply({ type: "turn_start" });
+  t.apply({ type: "message_start", message: { ...wakeMsg, content: [], stopReason: "pending" } as never });
+  t.apply({ type: "tool_execution_end", toolCallId: "bg1", toolName: "bash", result: { content: [{ type: "text", text: "ok" }] }, isError: false });
+  t.apply({ type: "message_end", message: bgResultMsg });
+  update({ type: "thinking_start", contentIndex: 0 });
+  update({ type: "thinking_delta", contentIndex: 0, delta: "bg1 returned" });
+  update({ type: "thinking_end", contentIndex: 0, content: "bg1 returned" });
+  update({ type: "text_start", contentIndex: 1 });
+  update({ type: "text_delta", contentIndex: 1, delta: "All finished." });
+  update({ type: "text_end", contentIndex: 1, content: "All finished." });
+  t.apply({ type: "message_end", message: wakeMsg });
+  t.apply({ type: "turn_end" });
+  t.apply({ type: "agent_end", willRetry: false });
+  t.apply({ type: "agent_settled", aborted: false });
+
+  const afterLiveRows = t.rows();
+  expect(afterLiveRows.map((r) => r.kind)).toEqual(["user", "tool", "text", "thinking", "text"]);
+  expect(afterLiveRows[1]).toMatchObject({ id: "bg1", status: "done", output: "ok" });
+  expect(afterLiveRows[1] && "background" in afterLiveRows[1] ? afterLiveRows[1].background : undefined).toBeUndefined();
+  expect(afterLiveRows[3]).toMatchObject({ kind: "thinking", turnStart: true });
+
+  const liveAfterDisplay = buildDisplayRows(afterLiveRows, false);
+  const turns = liveAfterDisplay.filter((r): r is TurnHeaderRow => r.kind === "turn");
+  expect(turns).toHaveLength(2);
+  expect(liveAfterDisplay.map((r) => r.kind)).toEqual(["user", "turn", "text", "turn", "text"]);
+  const liveAfterExpanded = buildDisplayRows(afterLiveRows, false, { chosen: () => true });
+  expect(liveAfterExpanded.map((r) => r.kind)).toEqual(["user", "turn", "activity", "text", "turn", "activity", "text"]);
+
+  const reloadedAfter = new Transcript();
+  reloadedAfter.load([userMsg, turn1EndMsg, bgResultMsg, wakeMsg], false);
+  reloadedAfter.adopt(afterLiveRows);
+  const reloadedAfterDisplay = buildDisplayRows(reloadedAfter.rows(), false);
+  expect(displayRowIds(reloadedAfter.rows())).toEqual(displayRowIds(afterLiveRows));
+  expect(reloadedAfterDisplay.map((r) => r.id)).toEqual(liveAfterDisplay.map((r) => r.id));
+  const reloadedBg = reloadedAfter.rows().find((r) => r.kind === "tool");
+  expect(reloadedBg).toMatchObject({ id: "bg1", status: "done" });
+  expect(reloadedBg && "background" in reloadedBg ? reloadedBg.background : undefined).toBeUndefined();
+});
+
 

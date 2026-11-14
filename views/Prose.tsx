@@ -470,6 +470,11 @@ function StreamingCodeCard(props: { code: string; chunks: VeilChunk[] }) {
   );
 }
 
+/** A list marker column: `w-4` at least, wider for numbers past one digit (text-md, tabular). */
+const MARKER_MIN_WIDTH = 16;
+const MARKER_DIGIT_WIDTH = 9.5;
+const MARKER_DOT_WIDTH = 5;
+
 function VeiledListView(props: {
   block: Extract<TextViewBlock, { type: "list" }>;
   prefix: string;
@@ -479,6 +484,15 @@ function VeiledListView(props: {
 }) {
   const bullets = ["•", "◦", "▪"];
   const textSize = "text-md leading-relaxed";
+  // The marker column is one width for the whole list, sized for its widest
+  // number: a fixed column breaks "10." over two lines ("1" / "0."). It is a
+  // minimum, so a marker wider than the estimate widens its row, never wraps.
+  const markerWidth = () => {
+    if (!props.block.ordered) return MARKER_MIN_WIDTH;
+    const last = (props.block.start ?? 1) + Math.max(0, props.block.items.length - 1);
+    const digits = String(last).length;
+    return Math.max(MARKER_MIN_WIDTH, Math.ceil(digits * MARKER_DIGIT_WIDTH + MARKER_DOT_WIDTH));
+  };
 
   // Loose items sit a little farther apart — still thin: a selection dropped
   // between items targets only line boxes, and a wide gap dead-ends the drag.
@@ -495,7 +509,7 @@ function VeiledListView(props: {
               <If
                 when={isTask()}
                 else={
-                  <View class="w-4 shrink-0 items-end pt-[1px]">
+                  <View class="shrink-0 items-end pt-[1px]" style={{ minWidth: markerWidth() }}>
                     <Text class={`${textSize} tabular-nums text-subtle`}>{markerText()}</Text>
                   </View>
                 }

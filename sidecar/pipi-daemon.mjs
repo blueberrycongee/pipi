@@ -710,7 +710,7 @@ function onSettled(session, record) {
   session.lastAnswer = answer;
   session.pendingAnswer = "";
   if (!session.file) void discoverFile(session);
-  const initiator = session.initiator;
+  const initiator = session.initiator ?? session.upstreamInitiator;
   session.initiator = undefined;
   if (aborted) {
     setStatus(session, "idle");

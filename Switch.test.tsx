@@ -94,3 +94,38 @@ test("a message written during the change is sent where it lands", async () => {
   await app.waitUntil(() => app.texts().includes("and then what"), { timeout: DELAY * 4 });
   expect(shows(app, REFACTOR)).toBe(true);
 });
+
+test("starting a new session in another project keeps the chosen model without flashing defaults or waking", async () => {
+  const app = await launch("multi");
+  await app.waitFor("text:What are we building?");
+
+  // Pick a non-default model so the new CLI process boots on a different default first.
+  await app.press("text:Claude Sonnet 4.5");
+  await app.press("text:GPT-5.1");
+  await app.waitUntil(() => app.texts().includes("GPT-5.1") && !app.texts().includes("Claude Sonnet 4.5"));
+
+  await app.press("id:sidebar-recents >> text:Fix QuickJS GC mark phase");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+
+  await app.press("label:New session in pipi");
+  const seen = await frames(app, () => app.texts());
+  expect(seen.every((frame) => frame.includes("What are we building?"))).toBe(true);
+  expect(seen.some((frame) => frame.includes("Waking Pi"))).toBe(false);
+  expect(seen.some((frame) => frame.includes("No model"))).toBe(false);
+  expect(seen.some((frame) => frame.includes("Claude Sonnet 4.5"))).toBe(false);
+  expect(seen[seen.length - 1]).toContain("GPT-5.1");
+});
+
+test("starting a new session again while a new-session switch is still in flight stays on welcome", async () => {
+  const app = await launch("multi");
+  await app.waitFor("text:What are we building?");
+  await app.press("id:sidebar-recents >> text:Fix QuickJS GC mark phase");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+
+  await app.press("label:New session in pipi");
+  await app.press("id:sidebar-new-session");
+  const seen = await frames(app, () => app.texts());
+  expect(seen.every((frame) => frame.includes("What are we building?"))).toBe(true);
+  expect(seen.some((frame) => frame.includes("Waking Pi"))).toBe(false);
+  expect(seen.some((frame) => frame.includes("No model"))).toBe(false);
+});

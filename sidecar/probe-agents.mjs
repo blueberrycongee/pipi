@@ -292,10 +292,9 @@ const SPECS = [
     name: "Antigravity",
     driver: "acp",
     protocol: "acp",
-    binary: "agy_acp_server",
-    fallbackBinaries: ["agy"],
-    skipVersion: true,
-    description: "Google Antigravity agent harness (`agy_acp_server` / `agy acp`).",
+    binary: "agy",
+    fallbackBinaries: ["agy_acp_server"],
+    description: "Google Antigravity agent harness (`agy acp` / `agy_acp_server`).",
     models: defaultModelEntry("antigravity", "Antigravity"),
     supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
     supportsResume: true,
@@ -399,7 +398,8 @@ async function probeBuiltin(spec) {
     };
   }
 
-  const version = spec.skipVersion ? undefined : await readVersion(resolved);
+  const binBase = path.basename(resolved).replace(/\.(exe|cmd|bat|ps1)$/i, "");
+  const version = spec.skipVersion || binBase === "agy_acp_server" ? undefined : await readVersion(resolved);
   const authNote = spec.authFn ? spec.authFn() : "CLI ready";
   return {
     id: spec.id,

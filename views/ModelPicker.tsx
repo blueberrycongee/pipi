@@ -3,7 +3,7 @@ import { Button as BaseButton, Command, type CommandItem, Popover } from "nsh/ba
 import { thinkingText, tr } from "../lib/i18n";
 import type { ThinkingLevel } from "../pi/protocol";
 import { providerName } from "../pi/providers";
-import { activeAgent, availableModels, chooseModel, chooseThinkingLevel, focusComposer, modelPickerTick, sessionState, showAgentSettings, sidecarPhase, thinkingLevels } from "../store/app";
+import { activeAgent, availableModels, chooseModel, chooseThinkingLevel, draftModel, draftThinkingLevel, focusComposer, modelPickerTick, sessionState, showAgentSettings, sidecarPhase, thinkingLevels } from "../store/app";
 import { Chip } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import { popupHiddenStyle, popupLeavingStyle, popupStyle, Presence } from "../ui/motion";
@@ -14,7 +14,7 @@ const modelKey = (model: { provider: string; id: string }) => `${model.provider}
 /** The searchable list of the models Pi can call, grouped by provider. */
 export function ModelList(props: { onChosen: () => void; class?: string }) {
   const current = () => {
-    const model = sessionState()?.model;
+    const model = draftModel() ?? sessionState()?.model;
     return model ? modelKey(model) : "";
   };
   const items = computed<CommandItem[]>(() =>
@@ -72,7 +72,7 @@ export function ModelPicker() {
   const open = signal(false);
   let held = "";
   const label = () => {
-    const model = sessionState()?.model;
+    const model = draftModel() ?? sessionState()?.model;
     // While the agent starts (a session switch), the chip keeps its words rather than passing through "No model".
     if (!model && held && sidecarPhase().name === "starting") return held;
     return (held = model && model.provider !== "unknown" ? model.name || model.id : tr("No model", "无模型"));
@@ -112,7 +112,7 @@ export function ThinkingPicker() {
   const open = signal(false);
   let held: ThinkingLevel | undefined;
   const level = () => {
-    const now = sessionState()?.thinkingLevel;
+    const now = draftThinkingLevel() ?? sessionState()?.thinkingLevel;
     // As the model chip does: an agent that is starting has not said otherwise.
     if (!now && held && sidecarPhase().name === "starting") return held;
     return (held = now ?? "off");

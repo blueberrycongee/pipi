@@ -313,10 +313,20 @@ type Heading = {
   cwd: string;
   file?: string;
   daemonId?: string;
+  agentId?: string;
   keepTitle?: boolean;
   /** A fresh session's empty chat is shown ahead of the agent. */
   welcome?: boolean;
 };
+
+/** Cached models per agent id so switching to a fresh session knows ahead whether the agent has models. */
+const modelsByAgent = new Map<string, Model[]>();
+
+function agentHasModel(agentId: string): boolean {
+  if (agentId === currentAgentId() && hasModel()) return true;
+  const cached = modelsByAgent.get(agentId);
+  return Boolean(cached && cached.length > 0);
+}
 
 /**
  * Marks a session change as heading for `target` until `work` ends.
@@ -330,8 +340,8 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
   let target = goal;
   let shown = false;
   if (!goal.keepTitle) {
-    const warm = phase().name === "ready";
-    const welcome = !goal.file && !goal.daemonId && warm && hasModel();
+    const warm = phase().name === "ready" || isDraftAhead();
+    const welcome = !goal.file && !goal.daemonId && warm && agentHasModel(goal.agentId ?? currentAgentId());
     stashTranscript();
     const seen = goal.file ? visited.get(goal.file) : undefined;
     if (seen && goal.file) {
@@ -444,6 +454,31 @@ function descendantSessionsOf(rootId: string | undefined, all = daemonSessionLis
 /** Sessions started under `sessionId` (every nested generation in tree order). */
 export function childSessionsOfDaemon(sessionId: string | undefined): DaemonSession[] {
   return descendantSessionsOf(sessionId);
+}
+
+/**
+ * Where a daemon session's subtree hangs in a list of saved files: `claimed`
+ * is the nearest ancestor whose file is in `files` (the row its tree nests
+ * under); when no ancestor claims it, `top` is the unclaimed top of the chain —
+ * the session itself when it stands alone.
+ */
+export function daemonTreePlace(session: DaemonSession, files: ReadonlySet<string>): { claimed?: DaemonSession; top: DaemonSession } {
+  const all = daemonSessionList();
+  const seen = new Set<string>([session.id]);
+  let cur = session;
+  while (cur.parentId && !seen.has(cur.parentId)) {
+    seen.add(cur.parentId);
+    const up = all.find((s) => s.id === cur.parentId);
+    if (!up) break;
+    if (up.file && files.has(up.file)) return { claimed: up, top: up };
+    cur = up;
+  }
+  return { top: cur };
+}
+
+/** Whether a tree root earns a sidebar row of its own: work, a wait, an unread answer, or an outside caller. */
+export function daemonRootEarnsRow(session: DaemonSession): boolean {
+  return session.initiator === "external" || session.status !== "idle" || session.unread;
 }
 
 /** Sessions started under the session whose file is `path`, nested in the sidebar under it. */
@@ -640,6 +675,21 @@ export const hasModel = computed(() => {
   return !!model && model.provider !== "unknown" && models().length > 0;
 });
 
+/** Optimistic model for a fresh draft session shown ahead of the agent (`isDraftAhead`). */
+export const draftModel = computed<Model | undefined>(() => {
+  if (!isDraftAhead()) return undefined;
+  const wanted = storedSessionChoice(currentAgentId())?.model;
+  if (!wanted) return undefined;
+  const list = models().length ? models() : (modelsByAgent.get(currentAgentId()) ?? []);
+  return list.find((m) => m.id === wanted.id && m.provider === wanted.provider) ?? list.find((m) => m.id === wanted.id);
+});
+
+/** Optimistic thinking depth for a fresh draft session shown ahead of the agent (`isDraftAhead`). */
+export const draftThinkingLevel = computed<ThinkingLevel | undefined>(() => {
+  if (!isDraftAhead()) return undefined;
+  return storedSessionChoice(currentAgentId())?.thinkingLevel;
+});
+
 /** The session's title: its name, else the start of its first message. */
 export const currentTitle = computed(() => {
   const target = heading();
@@ -819,6 +869,9 @@ function landHistory(messages: AgentMessage[]) {
   // The conversation as it last stood on screen, when it is still held: shown ahead, or set aside under its file.
   const before = shown ? transcript : file ? visited.get(file) : undefined;
   if (before && !shown && file) visited.delete(file);
+  if (messages.length === 0 && transcript.rows().length === 0 && !before) {
+    return;
+  }
   if (before && (sameRows(fresh.rows(), before.rows()) || fresh.rows().length < before.rows().length)) {
     // The same rows, or the agent's history lags the stashed view: an in-progress
     // run has not yet written its streaming message to the session file. Keep
@@ -1019,6 +1072,7 @@ function teardownStore() {
   daemonClient?.close();
   daemonClient = undefined;
   daemonStarting = undefined;
+  modelsByAgent.clear();
   stopAppUpdateChecks();
 }
 
@@ -1092,7 +1146,7 @@ function start(
   preserveRows?: { previousRows: Row[]; handoffTitle: string; handoffDetail: string },
   daemonId?: string,
 ) {
-  return headFor({ cwd, file: reopen, daemonId, keepTitle: Boolean(preserveRows) }, () =>
+  return headFor({ cwd, file: reopen, daemonId, agentId: targetAgentId, keepTitle: Boolean(preserveRows) }, () =>
     launch(cwd, reopen, targetAgentId, preserveRows, daemonId),
   );
 }
@@ -1141,7 +1195,7 @@ async function launch(
     transcript.summary(preserveRows.handoffTitle, preserveRows.handoffDetail);
     flush();
     markTranscriptSeen();
-  } else if (!ahead && !leaving()) {
+  } else if (!ahead && !leaving() && !isDraftAhead()) {
     // Nothing of the destination to show and nothing on its way out (a cold start, a restart).
     transcript.load([]);
     flush();
@@ -1155,13 +1209,13 @@ async function launch(
     const first = await withStartupTimeout(started.request("get_state"), agentLabel);
     if (mine !== generation) return;
     rememberWorkspace(projectCwdOf(cwd, currentDaemonSession()));
-    batch(() => {
-      state.set(first);
-      phase.set({ name: "ready" });
-    });
     const retry = autoRetryChoice();
     if (retry !== undefined) request("set_auto_retry", { enabled: retry }).catch(() => undefined);
     if ((reopen || daemonId) && !preserveRows) {
+      batch(() => {
+        state.set(first);
+        phase.set({ name: "ready" });
+      });
       // The daemon already put the process on `reopen`'s session file before answering the attach.
       const [, history] = await Promise.all([
         refreshState(),
@@ -1173,35 +1227,56 @@ async function launch(
       void finishLaunch().catch(failLaunch);
       return;
     }
-    await finishLaunch();
+    await finishFreshLaunch(first, agentLabel);
   } catch (error) {
     failLaunch(error);
   }
 
-  /** What the open session supports: models, commands, levels, the lists around it. */
-  async function finishLaunch() {
+  /** Resolves models and user session choices before publishing `"ready"` so fresh sessions never flash default models or levels. */
+  async function finishFreshLaunch(first: SessionState, agentLabel: string) {
     const listCwd = projectCwdOf(cwd, currentDaemonSession());
     await Promise.all([
-      refreshModels(),
+      refreshModels(effectiveAgentId),
       refreshCommands(),
       refreshSessions(listCwd),
       refreshCredentials(),
       refreshGitWorkspace(cwd),
     ]);
     if (mine !== generation) return;
-    if (!reopen && !daemonId) {
-      await applySessionChoices();
-    }
-    if (!preserveRows) {
-      if (reopen || daemonId) {
-        await Promise.all([refreshState(), refreshLevels(), refreshStats()]);
-      } else {
-        await syncSession();
-      }
-    } else {
-      await Promise.all([refreshState(), refreshLevels(), refreshStats()]);
+    const chosen = await applySessionChoices(first, false);
+    if (mine !== generation) return;
+    const [, history] = await Promise.all([
+      refreshLevels(),
+      preserveRows ? Promise.resolve(undefined) : withStartupTimeout(request("get_messages"), agentLabel),
+    ]);
+    if (mine !== generation) return;
+    const resolved = await applyThinkingChoice(chosen, false);
+    if (mine !== generation) return;
+    batch(() => {
+      state.set(resolved);
+      phase.set({ name: "ready" });
+    });
+    reportSessionFile();
+    if (preserveRows) {
       scrollToEnd.set(0);
+    } else if (history) {
+      landHistory(history.messages);
     }
+    void refreshStats();
+  }
+
+  /** What the open session supports: models, commands, levels, the lists around it. */
+  async function finishLaunch() {
+    const listCwd = projectCwdOf(cwd, currentDaemonSession());
+    await Promise.all([
+      refreshModels(effectiveAgentId),
+      refreshCommands(),
+      refreshSessions(listCwd),
+      refreshCredentials(),
+      refreshGitWorkspace(cwd),
+    ]);
+    if (mine !== generation) return;
+    await Promise.all([refreshState(), refreshLevels(), refreshStats()]);
   }
 
   function failLaunch(error: unknown) {
@@ -1693,6 +1768,7 @@ export async function removeAgentApiKey(agentId: string) {
     return true;
   });
   if (!removed) return;
+  modelsByAgent.delete(agentId);
   await Promise.all([refreshCredentials(), refreshAgents()]);
   if (currentAgentId() === agentId && phase().name === "ready") {
     await restartPi();
@@ -1713,9 +1789,12 @@ async function refreshState() {
   return next;
 }
 
-async function refreshModels() {
+async function refreshModels(agentId = currentAgentId()) {
   try {
-    models.set((await request("get_available_models")).models);
+    const list = (await request("get_available_models")).models;
+    models.set(list);
+    if (list.length) modelsByAgent.set(agentId, list);
+    else modelsByAgent.delete(agentId);
   } catch {
     models.set([]);
   }
@@ -1865,33 +1944,36 @@ async function syncSession() {
  * pick is put back the way `autoRetry` is — never on a reopened session, which
  * keeps the model its own history recorded.
  */
-async function applySessionChoices() {
+async function applySessionChoices(initialState?: SessionState, commit = true): Promise<SessionState | undefined> {
   const choice = storedSessionChoice(currentAgentId());
-  if (!choice) return;
-  // Compare against the fresh session's own state, not the screen's stale copy.
-  let known = await refreshState().catch(() => undefined);
-  const wantedModel = choice.model;
+  // Compare against the fresh session's own state without flashing intermediate defaults on screen.
+  let known = initialState ?? (await request("get_state").catch(() => undefined));
+  const wantedModel = choice?.model;
   if (wantedModel) {
     const found =
       models().find((m) => m.id === wantedModel.id && m.provider === wantedModel.provider) ?? models().find((m) => m.id === wantedModel.id);
     if (found && (known?.model?.id !== found.id || known?.model?.provider !== found.provider)) {
       const chosen = await request("set_model", { provider: found.provider, modelId: found.id }).catch(() => undefined);
       if (chosen) {
-        state.update((s) => s && { ...s, model: chosen });
-        known = await refreshState().catch(() => known);
+        known = await request("get_state").catch(() => (known ? { ...known, model: chosen } : undefined));
       }
     }
   }
-  const wantedLevel = choice.thinkingLevel;
-  if (!wantedLevel) return;
-  // The levels wait on the engine's own session: put the depth back once they are known, not before the session lands.
-  const sessionId = known?.sessionId;
-  void refreshLevels().then(async () => {
-    if (!client || state()?.sessionId !== sessionId) return;
-    if (!levels().includes(wantedLevel) || wantedLevel === state()?.thinkingLevel) return;
-    await request("set_thinking_level", { level: wantedLevel });
-    if (state()?.sessionId === sessionId) state.update((s) => s && { ...s, thinkingLevel: wantedLevel });
-  }).catch(() => undefined);
+  if (!commit) return known;
+  await refreshLevels();
+  const resolved = await applyThinkingChoice(known, false);
+  if (resolved) state.set(resolved);
+  return resolved;
+}
+
+async function applyThinkingChoice(known: SessionState | undefined, commit = true): Promise<SessionState | undefined> {
+  const wantedLevel = storedSessionChoice(currentAgentId())?.thinkingLevel;
+  if (!wantedLevel || !known) return known;
+  if (!levels().includes(wantedLevel) || wantedLevel === known.thinkingLevel) return known;
+  await request("set_thinking_level", { level: wantedLevel }).catch(() => undefined);
+  const next = { ...known, thinkingLevel: wantedLevel };
+  if (commit && state()?.sessionId === known.sessionId) state.update((s) => s && { ...s, thinkingLevel: wantedLevel });
+  return next;
 }
 
 // ── Events from Active Agent ────────────────────────────────────────────────
@@ -2551,6 +2633,10 @@ async function requestNewSession() {
 export function newSession() {
   pendingHandoff.set(undefined);
   const rootCwd = activeProjectPath() || workspace();
+  if (isDraftAhead() && heading()?.cwd === rootCwd && (!heading()?.agentId || heading()?.agentId === currentAgentId())) {
+    view.set({ name: "chat" });
+    return focusComposer();
+  }
   if (phase().name !== "ready") {
     busy.set(false);
     view.set({ name: "chat" });
@@ -2883,7 +2969,10 @@ export async function removeProviderKey(provider: string) {
     return true;
   });
   if (!removed) return;
-  if (activeAgent().driver === "pi") await restartPi();
+  if (activeAgent().driver === "pi") {
+    modelsByAgent.delete("pi");
+    await restartPi();
+  }
   else await refreshCredentials();
 }
 

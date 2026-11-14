@@ -170,7 +170,8 @@ function ActivityLine(props: { anchor?: (node: ViewRef) => void }) {
  * on the composer's top edge and what follows hangs from its lower one. Both are placed from the
  * composer's own box, so the three are one figure whatever the composer grows to.
  */
-function Stage(props: { title: string; detail?: string; size?: number; around?: boolean; children?: JSX.Element }) {
+function Stage(props: { title: string | (() => string); detail?: string; size?: number; around?: boolean; children?: JSX.Element }) {
+  const titleText = () => (typeof props.title === "function" ? props.title() : props.title);
   const pip = (
     <View style={enterStagger(0)}>
       <Pip size={props.size ?? 96} mood={pipMood()} />
@@ -179,7 +180,7 @@ function Stage(props: { title: string; detail?: string; size?: number; around?: 
   const words = (
     <View class="max-w-110 items-center gap-1.5" style={enterStagger(1)}>
       <Text class="text-center text-2xl font-semibold tracking-tight text-foreground" role="header">
-        {props.title}
+        {titleText()}
       </Text>
       <If when={props.detail}>
         <Text class="text-center text-sm text-subtle">{props.detail}</Text>
@@ -290,12 +291,51 @@ function WelcomeProject() {
   );
 }
 
-/** The empty chat: Pip and the question over the composer, and under it which project the session will run in. */
-function Welcome() {
+/**
+ * The centered hero stage shared across `"starting"` and `"welcome"` so Pip and
+ * the stage wrapper stay mounted when the CLI finishes waking up instead of
+ * unmounting and replaying `enterStagger` (which flickers the whole center).
+ */
+function HeroStage(props: { mode: () => "welcome" | "starting" }) {
+  const agentName = () => activeAgent().name;
+  const slow = signal(false);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  effect(() => {
+    const starting = props.mode() === "starting";
+    clearTimeout(timer);
+    if (!starting) {
+      slow.set(false);
+      return;
+    }
+    timer = setTimeout(() => slow.set(true), SLOW_WAKE_MS);
+  });
+  cleanup(() => clearTimeout(timer));
+  const title = () =>
+    props.mode() === "starting"
+      ? tr(`Waking ${agentName()}…`, `正在唤醒 ${agentName()}…`)
+      : tr("What are we building?", "今天要构建什么？");
   return (
-    <Stage around title={tr("What are we building?", "今天要构建什么？")}>
-      <If when={workspacePath()}>
-        <WelcomeProject />
+    <Stage around title={title}>
+      <If
+        when={props.mode() === "welcome"}
+        else={
+          <If when={slow()}>
+            <Text class="max-w-110 text-center text-xs text-subtle">
+              {tr(
+                "Taking longer than usual — you can restart the agent or start a fresh session.",
+                "响应时间较长，你可以重启智能体或开启新会话。",
+              )}
+            </Text>
+            <View class="flex-row flex-wrap justify-center gap-2">
+              <Button label={tr(`Restart ${agentName()}`, `重启 ${agentName()}`)} variant="primary" size="lg" icon="refresh" onPress={() => void restartPi()} />
+              <Button label={tr("New session", "新会话")} size="lg" icon="plus" onPress={() => void newSession()} />
+            </View>
+          </If>
+        }
+      >
+        <If when={workspacePath()}>
+          <WelcomeProject />
+        </If>
       </If>
     </Stage>
   );
@@ -1052,11 +1092,8 @@ export function Chat() {
             <If when={stage() !== undefined}>
               {/* The stage is the pane's content: it dims and lands with it, and fades on its own once the composer has left it. */}
               <View class="absolute inset-0" style={{ opacity: hero() ? pane : stageFade }}>
-                <If when={stage() === "welcome"}>
-                  <Welcome />
-                </If>
-                <If when={stage() === "starting"}>
-                  <Waking around />
+                <If when={stage() === "welcome" || stage() === "starting"}>
+                  <HeroStage mode={() => (stage() === "starting" ? "starting" : "welcome")} />
                 </If>
               </View>
             </If>

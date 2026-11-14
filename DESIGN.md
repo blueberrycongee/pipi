@@ -1,9 +1,9 @@
 # pipi design
 
-pipi is a quiet, precise desktop tool with one loud thing in it: Pip. The
+pipi is a quiet, precise desktop tool with one expressive thing in it: Pip. The
 interface is near-monochrome so that the conversation carries the screen; the
-brand color appears only where Pip is, where the caret is, and on the one
-primary action of a surface.
+brand color appears only where the caret is, on links, on the primary action of
+a surface, and on active indicators.
 
 Sources of truth: `theme.json` (color, radius), `nsh.json` → `tailwind` (type
 scale, shadows, easing), `ui/styles.ts` (shared class recipes),
@@ -15,8 +15,8 @@ the files win and this document is wrong.
 1. **Content first.** Replies are unboxed prose on the background. Only what
    the user said (a bubble) and what a machine printed (a sunken block) get a
    container.
-2. **One accent, spent rarely.** Pitaya marks Pip, the caret, links, and the
-   primary button. Never a decoration, never a status.
+2. **One accent, spent rarely.** Cobalt blue (`brand`) marks the caret, links,
+   the primary button, and active focus or status indicators. Never a decoration.
 3. **A turn is a unit.** Steps of one turn sit 4pt apart; turns sit 28pt apart.
    Spacing says what belongs together before any line or box does.
 4. **State is visible, motion is short.** Every pressable has hover, pressed,
@@ -32,57 +32,68 @@ the files win and this document is wrong.
 
 ## Pip, the mascot
 
-Pip is the letter π that stood up: one slab (π's bar: head and body at once),
-two legs, a toe that kicks right (π's hook, and the direction Pip walks), and
-two ink eyes. Not a person, not an animal, not a robot.
+Pip is a little ghost: a sheet with ears, a hem of two lobes, a tail drawn as
+one line on its right, and a face with no mouth (dogs carry a nose and, for
+some breeds, a smile or tongue). It is line art — a coat under one round
+outline (`3.2` grid units wide).
+
+Pip comes as a cat or a dog across **14 coats** (`COATS` in
+`mascot/geometry.ts`, selectable in Settings → General, defaulting to `ghost`):
+
+- **Cats** (slit eyes and whiskers; in `work` mode pupils widen on a hunt):
+  `ghost`, `cow`, `calico`, `ginger`, `black`, `blue`, `siamese`.
+- **Dogs** (round eyes and a nose; drop-ear breeds draw hanging flaps):
+  `shiba`, `husky`, `border`, `shepherd`, `golden`, `rottweiler`, `dalmatian`.
 
 ### Construction
 
-Drawn on a 64-unit grid; every key edge sits on a multiple of 4, so the
-silhouette lands on whole pixels at 16px (4 units = 1px). The art fills the
-grid's width and the band y 12–52: aspect 8:5.
+Drawn on a `64 × 64` grid (`GRID = 64`), cropped to `BOUNDS` (`x: 0, y: 7,
+w: 64, h: 50`, aspect `64:50`). The body is symmetric about axis `x = 30` so
+the right side leaves room for the tail.
 
-| Part | Shape | x, y, w, h | Radius |
-|---|---|---|---|
-| Slab | rounded rect | 0, 12, 64, 24 | 10 |
-| Left leg | rect, round bottom | 12, 30, 12, 22 | 0 0 5 5 |
-| Right leg | rect, round bottom | 40, 30, 12, 22 | 0 0 5 5 |
-| Toe | rounded rect | 44, 44, 16, 8 | 4 |
-| Eyes (idle) | pills, centers (21, 24) and (43, 24) | 7 × 11 | full |
+Each coat defines:
 
-Legs overlap the slab by 6 units so joins never show a seam.
+- `build`: ear profile (`cat`, `tall`, `round`, `prick`, `big`, `tipped`, or
+  `drop` for hanging ear flaps) and half-widths at the ear base (`h`), flanks
+  (`m`), and hem (`w`).
+- `tail`: one stroked path (`handle`, `stout`, `hook`, `kink`, `curl`,
+  `sickle`, `plume`, `low`, `stub`, `whip`) swinging about `tailPivot`.
+- `base` and `markings`: coat fill and markings clipped to the body silhouette,
+  plus optional `ear` flaps, `eyes`, and `whiskers` or `muzzle`.
 
 ### Color
 
-| Token | Value | Use |
+| Token / Paint | Value | Use |
 |---|---|---|
-| `brand` | `#F2348A` (pitaya) | The body. Same in light and dark. |
-| `ink` | `#1B0F17` | The eyes. Same in light and dark. |
+| `pip-line` (`LINE_PAINT`) | `#16161D` (light) / `#F1F2F6` (dark) | The outline and tail stroke. Follows the appearance so Pip's edge always reads against the background. |
+| Coat & features | Breed palette (`#FFFFFF`, `#26262E`, `#F0A04B`, `#F8F0DE`, …) + `#16161D` ink | Fixed across appearances; Pip is never recolored by theme or given a gradient. |
 
-Pip is never recolored, outlined, given a gradient, or drawn in monochrome.
-On the app icon Pip stands on an aubergine tile (`#2E2233` → `#130E16`).
+On the app icon (`icon.png`), the default `ghost` Pip stands in `idle` mood
+(light outline) on a flat pure white (`#FFFFFF`) macOS squircle tile (`824 px`
+superellipse in a `1024 px` canvas).
 
 ### Moods
 
-Only the eyes and the motion change; the silhouette never does.
+Only the eyes (and a dog's smile/tongue) and the motion change; the silhouette
+never does.
 
 | Mood | Eyes | Motion | When |
 |---|---|---|---|
-| `idle` | tall pills | breathes (3.6s), blinks every 3–6s | Ready |
-| `think` | round, up and toward the toe | floats and tilts (2.2s) | Model is reasoning |
-| `work` | tall pills | legs alternate, body bobs (0.62s) | A tool runs |
-| `write` | looking down | quick small steps (0.3s) | Reply streams |
-| `happy` | upward arcs | one squash-and-jump (0.62s) | A run ended well |
-| `error` | crosses | one head shake | A run failed |
-| `sleep` | flat lines | slow breath (4.2s) | Starting; empty lists |
+| `idle` | coat eyes (slit or round) | breathes (`scaleY`, 3.6s), tail wags (`0.12` rad, 3.6s), blinks every ~2.6–5.8s | Ready |
+| `think` | round, up and toward the tail | floats and tilts (`-2.5°`, 2.2s), blinks every 2s | Model is reasoning |
+| `work` | coat eyes (cats widen pupils) | bobs (`translateY`) and wags tail (`0.35` rad, 0.62s) | A tool runs |
+| `write` | round, looking down | quick small bob and brisk tail wag (`0.18` rad, 0.3s) | Reply streams |
+| `happy` | upward arcs | one squash-and-jump (0.62s) with two quick tail wags | A run ended well |
+| `error` | crosses | one `headShake` (dogs hide smile/tongue) | A run failed |
+| `sleep` | flat lines | slow breath (`scaleY`, 4.2s; dogs tuck tongue in) | Starting; empty lists |
 
 `store/app.ts` → `pipMood` is the only place app state becomes a mood.
 
 ### Rules
 
 - Minimum size 16px wide. Below 24px use `still` (no loops) unless Pip *is*
-  the status indicator (activity line, running session row).
-- Clear space: one leg-width (12 units) on every side.
+  the status indicator (activity line, running session row, update card).
+- Clear space: leave breathing room around the 64-unit frame.
 - One animated Pip per surface; the sidebar carries one per working session.
   Pip never overlaps text and never talks.
 - With reduced motion Pip holds the mood's pose and does not move.
@@ -91,26 +102,30 @@ Only the eyes and the motion change; the silhouette never does.
 
 | Place | Size | Mood |
 |---|---|---|
-| App icon (`icon.png`) | 560 of 1024 | idle |
-| Welcome / connect / failure stage | 80–96 | from `pipMood` |
-| Activity line under the transcript | 22 | from `pipMood` |
-| Running session in the sidebar — every row the run has, and a folded project row hiding one | 16 | work |
-| Sub-agents bar | 16 | work |
-| Empty session list, empty model list | 40–48, still | sleep |
-| About | 88 | idle |
+| App icon (`icon.png`) | 620 of 1024 | idle (`ghost`) |
+| Welcome / waking / failure stage (`views/Chat.tsx`) | 96 (welcome) / 80 (waking, failure) | from `pipMood` |
+| Activity line under the transcript (`views/Chat.tsx`) | 22 | from `pipMood` |
+| Running session, draft, child session, or collapsed running project in the sidebar (`views/Sidebar.tsx`) | 16 | work |
+| Empty single-folder sidebar (`views/Sidebar.tsx`) | 40, still | sleep |
+| Update card (`views/UpdateCard.tsx`) | 22 | `idle` / `work` / `happy` along the track |
+| Settings → General coat picker (`views/Settings.tsx`) | 40 | `idle` (`still`); chosen coat `happy` |
+| Settings → About (`views/Settings.tsx`) | 88 | idle |
 
 ### Files
 
-- `mascot/geometry.ts`: the shapes as data. No imports; the single source.
+- `mascot/geometry.ts`: the shapes and 14 coats as data. No imports; the single source.
 - `mascot/Pip.tsx`: the in-app canvas. Everything that moves is an animated
   value read on the UI thread; no app code runs per frame.
 - `scripts/render-brand.mjs`: `node scripts/render-brand.mjs` regenerates
-  `icon.png`, `assets/brand/*.svg` and size proofs in `assets/brand/proof/`.
+  `icon.png`, `assets/brand/*.svg`, `assets/brand/dmg-background*.png` and
+  proofs in `assets/brand/proof/`.
 
 ## Color
 
 Semantic tokens only; no hex or palette classes in components. Neutrals carry
-a faint aubergine tint (hue 315–330) so they sit with the pitaya.
+a faint cool slate-blue tint (hue `262`) so they sit cleanly with the cobalt
+blue `brand` (`#4C6FFF`; `brand-soft`, `brand-text` and `ring` sit at hue
+`268`).
 
 | Token | Role |
 |---|---|
@@ -122,8 +137,9 @@ a faint aubergine tint (hue 315–330) so they sit with the pitaya.
 | `secondary` | The user's bubble; quiet buttons |
 | `muted-foreground` → `subtle` | Secondary text → tertiary (captions, hints) |
 | `accent` | Hover and keyboard highlight of rows |
-| `border` / `input` | Hairlines / control outlines |
+| `border` / `input` / `hairline*` | Structural dividers / control outlines / glass and focus hairlines |
 | `brand`, `brand-text`, `brand-soft` | Accent fill / accent as text / tint |
+| `pip-line` | Pip's outline and tail stroke (`#16161D` light, `#F1F2F6` dark) |
 | `success`, `warning`, `destructive` | Only for their meanings |
 | `scrim` | Behind every floating layer: Settings, the palette, dialogs (`SCRIM`) |
 
@@ -165,7 +181,7 @@ offset.
 | Sidebar | 264 wide |
 | Reading column | max 760 |
 | Row, large button, text field | 32 |
-| Session row in the sidebar, two lines | 50 |
+| Session row in the sidebar | 28 |
 | Button, icon button, disclosure | 28 |
 | Chip, small button | 24 |
 | Icon | 16 (14 inside chips and tool rows) |
@@ -275,10 +291,11 @@ composer's glass, not underlined words: words do not stand on a picture.
 | Wallpaper veil: composer in the middle ↔ docked ↔ conversation | 200ms | opacity only, under the pane |
 | Composer: the middle of the pane ↔ its dock | ~550ms | a spring with no bounce (`DOCK_SPRING`), played as keyframes; the stage it leaves fades where it stood in 140ms |
 | Waiting on a session change | after 600ms, 480ms in | `PATIENCE_MS`; a change that lands sooner never shows it |
-| Streaming caret, "Thinking" label | pulse | `motion-safe:` only |
+| "Working", "Thinking" and activity labels | breathing opacity | `useBreathingOpacity` (honors reduced motion) |
 | Streamed text veil | 120–400ms | opacity only, zero offset |
 
-Motion explains a change; nothing loops except Pip, a spinner and the caret.
+Motion explains a change; nothing loops except Pip, a spinner, the active
+breathing label, and the input caret.
 Dynamic rows, sections, and status marks never pop in or vanish in one frame:
 vertical stack items use `Reveal` (`ui/Reveal.tsx`, scoped `Collapsible reveal`
 spring + opacity/glide so virtualized `List`s elsewhere never reflow; pass
@@ -336,17 +353,19 @@ need it.
   colored by a theme `tone`.
 - **AgentLogo**: another company's mark, drawn from their own art in a square
   (`ui/AgentLogo.tsx`). It is the one place brand colour is allowed: a mark
-  paints in its `agent-*` token (DeepSeek blue, Qwen purple, Claude clay, the
-  Gemini spark's wash, Kiro purple) and only while that CLI is present — an
-  unavailable agent drops to `tone`, so a greyed row stays quiet. Companies
-  whose marks have no colour of their own (OpenAI, Copilot, Cursor, Grok,
-  OpenCode, Pi) stay monochrome in `tone`; Pi keeps its fixed pixel colours.
-- **Session row**: two lines, because a transcript is worth knowing the origin
-  of before you open it. The title takes the first line with the running mark
-  (the working Pip — a run kept going off screen marks every row the session
-  has, in the workspaces tree and Recent alike); the second is the engine —
-  its `AgentLogo` at 14, its name in `2xs` `subtle` — with the relative time
-  trailing. A row whose engine is gone keeps the name and greys the mark.
+  paints in its `agent-*` token (DeepSeek blue, Qwen purple, Claude clay, Amp
+  red, Kiro purple, the Gemini spark and Antigravity arch washes) and only
+  while that CLI is present — an unavailable agent drops to `tone`, so a
+  greyed row stays quiet. Companies whose marks have no colour of their own
+  (OpenAI, Copilot, Cursor, Grok, OpenCode, Devin, Goose, Kimi, Hermes, Droid)
+  stay monochrome in `tone`; Pi keeps its fixed pixel colours (`pi-coral`,
+  `pi-blue`, `pi-yellow`).
+- **Session row**: single-line (`h-7`, 28pt), leading with the engine's
+  `AgentLogo` at 14, then the session title, and a trailing status slot
+  (working Pip at 16 — a run kept going off screen marks every row the session
+  has, in the workspaces tree and Recent alike — blocked `clock`, failed
+  `alert`, or unread `brand` dot). Hover tooltips carry the engine name and
+  workspace/branch; a row whose engine is gone greys the mark.
 - **tip()**: the tooltip.
 - **Reveal / Presence** (`ui/Reveal.tsx`, re-exported from `ui/motion.ts`): the
   standardized enter + exit primitives for flow rows/sections and inline marks.
@@ -379,15 +398,15 @@ need it.
 | Row | Look |
 |---|---|
 | User | Right-aligned bubble, `secondary`, max 70%; a message laid out past six lines folds to a preview that fades into a chevron at the bubble's foot — the press opens it, the chevron folds it back |
-| Reply | Unboxed Markdown, selectable, streams with a brand caret |
-| Thinking | One line: sparkle + "Thought for 4s"; collapsed by default, the reader opens it |
-| Tool call | One line: status mark, tool icon, **name**, mono summary; opens to sunken output or a diff |
-| Shell (`!cmd`) | `$ command`, output open by default |
+| Reply | Unboxed Markdown, selectable; newly arrived text dissolves in through an opacity veil (`RowVeil`) |
+| Thinking | One line ("Thought for 4s" / "Thinking…"), collapsed by default; opens to quiet prose on a hairline |
+| Tool call | One line: status mark, **verb**, target (mono for paths/commands), meta, diff badge; opens to sunken output or a diff |
+| Shell (`!cmd`) | `Running` / `Ran` + mono command, output open by default |
 | Notice | Card with icon; red tint only for errors |
-| Summary | A rule across the column with a label; opens to the summary |
+| Summary / Delivery | A rule across the column with an icon and label; opens to the summary or delivered `<pipi-message>` answer |
 
-Status mark: spinner (running), check (done, quiet), red cross (failed).
-Success is never green; only failure gets color.
+Status mark: `brand` spinner (running), quiet tool/step icon (done), red cross
+(failed). Diff badges use `success` / `destructive` for `+N` / `-N`.
 
 ## Voice
 
