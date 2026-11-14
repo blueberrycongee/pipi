@@ -20,7 +20,8 @@ async function shot(app: App, name: string) {
 
 const UPDATE = {
   version: "0.3.0",
-  notes: "A shinier coat, a steadier step, and everything a little quicker.",
+  // Like the real release notes (`release.yml`): Markdown with bolds and code spans.
+  notes: "**macOS**: signed and notarized by Apple; the disk image and `pipi.app` inside it carry stapled tickets.\n\n**Windows**: unpack `pipi-*-windows-x64.zip` and run `pipi.exe`.\n\n**Linux**: unpack `pipi-*-linux-x64.tar.gz` and run `pipi`.",
   bytes: 48_000_000,
   rate: 7_000,
 };

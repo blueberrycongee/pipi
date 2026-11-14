@@ -8,6 +8,8 @@ import { activeLanguage, agentDescription, formatAgentMeta, queueModeLabel, runt
 import {
   AVAILABLE_WALLPAPER_EFFECTS,
   DYNAMIC_WALLPAPER_ENABLED,
+  isDynamicWallpaperConfig,
+  isPausableWallpaper,
   WALLPAPER_PAUSE_MODES,
   WALLPAPER_PRESETS,
   WALLPAPER_VIDEO_CLICK_ACTIONS,
@@ -157,7 +159,7 @@ function Page(props: { title: string; lead?: string; action?: JSX.Element; back?
           <View class="min-w-0 flex-1 gap-1">
             <If when={props.back}>
               {(back) => (
-                <BaseButton testID="settings-back" onPress={() => back().onPress()} class={`-ml-1.5 mb-1 h-6 flex-row items-center gap-1 self-start rounded-md px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
+                <BaseButton testID="settings-back" onPress={() => back().onPress()} class={`-ml-1.5 mb-1 h-6 flex-row items-center gap-1 self-start rounded-md corner-squircle px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
                   <Icon name="arrowLeft" size={12} tone="muted-foreground" />
                   <Text class="text-sm text-muted-foreground">{back().label}</Text>
                 </BaseButton>
@@ -275,7 +277,7 @@ function ProviderRow(props: { provider: ProviderInfo; agentName: string; live: b
             </Text>
             <If when={props.provider.keysUrl}>
               {(url) => (
-                <BaseButton onPress={() => void openUrl(url())} role="link" class={`h-6 shrink-0 flex-row items-center gap-1 rounded-md px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
+                <BaseButton onPress={() => void openUrl(url())} role="link" class={`h-6 shrink-0 flex-row items-center gap-1 rounded-md corner-squircle px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
                   <Text class="text-xs text-brand-text">{tr("Get a key", "获取密钥")}</Text>
                   <Icon name="external" size={12} tone="brand-text" />
                 </BaseButton>
@@ -437,18 +439,18 @@ function AgentHarnessRow(props: { agent: AgentHarnessStatus; editing: boolean; o
         <View class="min-w-0 flex-1 gap-0.5">
           <View class="min-w-0 flex-row items-center gap-1.5">
             <Text class="shrink truncate text-base font-medium text-foreground">{props.agent.name}</Text>
-            <Text class="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 font-mono text-2xs text-subtle">{protocolLabel()}</Text>
+            <Text class="shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 font-mono text-2xs text-subtle">{protocolLabel()}</Text>
             <If when={meta().versionBadge}>
               {(v) => <Text class="shrink-0 font-mono text-xs text-subtle">{v()}</Text>}
             </If>
             <If when={active()}>
-              <Text class="shrink-0 rounded-sm bg-secondary px-1.5 py-0.5 text-2xs font-medium text-secondary-foreground">{tr("Active", "当前")}</Text>
+              <Text class="shrink-0 rounded-sm corner-squircle bg-secondary px-1.5 py-0.5 text-2xs font-medium text-secondary-foreground">{tr("Active", "当前")}</Text>
             </If>
             <If when={props.agent.hasApiKey || storedKeySaved()}>
-              <Text class="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs text-subtle">{tr("Key", "已配密钥")}</Text>
+              <Text class="shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 text-2xs text-subtle">{tr("Key", "已配密钥")}</Text>
             </If>
             <If when={hasOverride()}>
-              <Text class="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs text-subtle">{tr("Custom", "已定制")}</Text>
+              <Text class="shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 text-2xs text-subtle">{tr("Custom", "已定制")}</Text>
             </If>
           </View>
           <Text class="truncate text-xs text-muted-foreground">{desc()}</Text>
@@ -507,7 +509,7 @@ function AgentHarnessRow(props: { agent: AgentHarnessStatus; editing: boolean; o
         <View class="gap-2.5 pb-1 pl-6 pt-3">
           <If when={!props.agent.available ? props.agent.installCommand : undefined}>
             {(cmd) => (
-              <View class="flex-row items-center gap-2 rounded-lg border border-border bg-sunken px-3 py-2">
+              <View class="flex-row items-center gap-2 rounded-lg corner-squircle border border-border bg-sunken px-3 py-2">
                 <Icon name="terminal" size={14} tone="subtle" />
                 <Text class="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{cmd()}</Text>
                 <Button label={tr("Copy Install", "复制安装命令")} size="sm" icon="copy" onPress={() => void copyText(cmd())} />
@@ -567,7 +569,7 @@ function AgentHarnessRow(props: { agent: AgentHarnessStatus; editing: boolean; o
             />
             <If when={props.agent.docsUrl}>
               {(url) => (
-                <BaseButton onPress={() => void openUrl(url())} role="link" class={`h-8 shrink-0 flex-row items-center gap-1 rounded-md px-2 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
+                <BaseButton onPress={() => void openUrl(url())} role="link" class={`h-8 shrink-0 flex-row items-center gap-1 rounded-md corner-squircle px-2 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
                   <Text class="text-xs text-brand-text">{tr("Docs", "文档")}</Text>
                   <Icon name="external" size={12} tone="brand-text" />
                 </BaseButton>
@@ -982,9 +984,7 @@ function wallpaperEffectLabel(effect: WallpaperEffect) {
 function wallpaperEffectDescription(effect: WallpaperEffect) {
   switch (effect) {
     case "none":
-      return DYNAMIC_WALLPAPER_ENABLED
-        ? tr("Render the original media without a shader pass.", "直接显示原画面，不叠加着色器滤镜。")
-        : tr("Render the original image without a shader pass.", "直接显示原图，不叠加着色器滤镜。");
+      return tr("Render the original image without a shader pass.", "直接显示原图，不叠加着色器滤镜。");
     case "dither":
       return tr("Ordered Bayer matrix dithering with crisp ink contrast.", "使用有序 Bayer 矩阵抖动，呈现复古墨点质感。");
     case "ascii":
@@ -1002,14 +1002,14 @@ function wallpaperEffectDescription(effect: WallpaperEffect) {
 
 function wallpaperPresetLabel(preset: WallpaperPreset) {
   switch (preset) {
+    case "flock":
+      return tr("Flock", "群鸟");
+    case "orbit":
+      return tr("Orbit", "星环");
     case "aurora":
       return tr("Aurora", "极光");
-    case "fluid":
-      return tr("Silk", "流光");
-    case "cosmos":
-      return tr("Cosmos", "星云");
-    case "matrix":
-      return tr("Matrix", "代码雨");
+    case "jelly":
+      return tr("Jelly", "水母");
   }
 }
 
@@ -1085,7 +1085,7 @@ function General() {
                   <BaseButton
                     onPress={() => adjustOpen.set(true)}
                     accessibilityLabel={tr("Preview and adjust wallpaper", "预览并调整壁纸")}
-                    class={`relative h-9 w-15 overflow-hidden rounded-md border border-border bg-sunken ${PRESS} ${FOCUS_RING}`}
+                    class={`relative h-9 w-15 overflow-hidden rounded-md corner-squircle border border-border bg-sunken ${PRESS} ${FOCUS_RING}`}
                   >
                     <CroppedWallpaperSurface
                       config={wp()}
@@ -1093,7 +1093,7 @@ function General() {
                       paused
                     />
                   </BaseButton>
-                  <If when={DYNAMIC_WALLPAPER_ENABLED && (wp().kind === "video" || wp().kind === "shader" || wallpaperEffect() === "ripple" || wallpaperEffect() === "rain")}>
+                  <If when={DYNAMIC_WALLPAPER_ENABLED && isPausableWallpaper(wp(), wallpaperEffect())}>
                     <Button
                       label={wallpaperPaused() ? tr("Resume", "继续") : tr("Pause", "暂停")}
                       size="sm"
@@ -1193,21 +1193,27 @@ function General() {
         </SettingRow>
         <Reveal open={Boolean(wallpaper())}>
           <View>
-            <Rule />
-            <SettingRow
-              title={tr("Wallpaper effect", "壁纸效果")}
-              description={wallpaperEffectDescription(wallpaperEffect())}
-            >
-              <Segmented
-                label={tr("Wallpaper effect", "壁纸效果")}
-                value={wallpaperEffect()}
-                options={AVAILABLE_WALLPAPER_EFFECTS.map((eff) => ({
-                  value: eff,
-                  label: wallpaperEffectLabel(eff),
-                }))}
-                onChange={setWallpaperEffect}
-              />
-            </SettingRow>
+            {/* An effect is a shader pass over a still image: a video or live
+                shader already animates by itself, so the picker is theirs. */}
+            <If when={Boolean(wallpaper()) && !isDynamicWallpaperConfig(wallpaper())}>
+              <View>
+                <Rule />
+                <SettingRow
+                  title={tr("Wallpaper effect", "壁纸效果")}
+                  description={wallpaperEffectDescription(wallpaperEffect())}
+                >
+                  <Segmented
+                    label={tr("Wallpaper effect", "壁纸效果")}
+                    value={wallpaperEffect()}
+                    options={AVAILABLE_WALLPAPER_EFFECTS.map((eff) => ({
+                      value: eff,
+                      label: wallpaperEffectLabel(eff),
+                    }))}
+                    onChange={setWallpaperEffect}
+                  />
+                </SettingRow>
+              </View>
+            </If>
             <If when={DYNAMIC_WALLPAPER_ENABLED}>
               <View>
                 <Rule />
@@ -1315,7 +1321,7 @@ function General() {
                       role="radio"
                       selected={chosen()}
                       accessibilityLabel={name()}
-                      class={`w-19 items-center gap-1.5 rounded-lg border py-2.5 ${PRESS} ${FOCUS_RING} ${chosen() ? "border-brand bg-brand-soft" : "border-transparent hover:bg-accent"}`}
+                      class={`w-19 items-center gap-1.5 rounded-lg corner-squircle border py-2.5 ${PRESS} ${FOCUS_RING} ${chosen() ? "border-brand bg-brand-soft" : "border-transparent hover:bg-accent"}`}
                     >
                       <Pip size={40} coat={id} mood={chosen() ? "happy" : "idle"} still={!chosen()} />
                       <Text class={`text-xs ${chosen() ? "font-medium text-foreground" : "text-muted-foreground"}`}>{name()}</Text>
@@ -1488,7 +1494,7 @@ function ArchivePage() {
                     updateAutoArchiveDays(days());
                     daysMenuOpen.set(false);
                   }}
-                  class={`h-8 flex-row items-center justify-between rounded-lg px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-accent selected:bg-accent`}
+                  class={`h-8 flex-row items-center justify-between rounded-lg corner-squircle px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-accent selected:bg-accent`}
                 >
                   <Text class="text-base text-foreground">{autoArchiveLabel(days())}</Text>
                   <If when={autoArchiveDays() === days()}>
@@ -1546,7 +1552,7 @@ function ArchivePage() {
                       workspaceFilter.set(opt().value);
                       wsMenuOpen.set(false);
                     }}
-                    class={`h-8 flex-row items-center justify-between gap-2 rounded-lg px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-accent selected:bg-accent`}
+                    class={`h-8 flex-row items-center justify-between gap-2 rounded-lg corner-squircle px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-accent selected:bg-accent`}
                   >
                     <Text class="min-w-0 flex-1 truncate text-base text-foreground">{opt().label}</Text>
                     <If when={workspaceFilter() === opt().value}>
@@ -1588,7 +1594,7 @@ function ArchivePage() {
                   </View>
                   <Text class="text-xs tabular-nums text-subtle">{String(group().items.length)}</Text>
                 </View>
-                <View class="overflow-hidden rounded-xl bg-muted/50 px-4">
+                <View class="overflow-hidden rounded-xl corner-squircle bg-muted/50 px-4">
                   <Each of={group().items} key={(item) => item.id}>
                     {(entry, index) => {
                       const title = () => sessionTitle(entry().session, tr("New session", "新会话"));
@@ -1601,7 +1607,7 @@ function ArchivePage() {
                             <BaseButton
                               onPress={() => void openSession(entry().session.path, entry().cwd)}
                               tooltip={tip(tr("Open conversation", "打开对话"))}
-                              class={`min-w-0 flex-1 flex-row items-center gap-2.5 rounded-lg px-1.5 py-1 -ml-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
+                              class={`min-w-0 flex-1 flex-row items-center gap-2.5 rounded-lg corner-squircle px-1.5 py-1 -ml-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
                             >
                               <AgentLogo id={entry().session.agentId ?? "pi"} size={15} tone="muted-foreground" />
                               <Text class="min-w-0 flex-1 truncate text-base text-foreground">{title()}</Text>
@@ -1742,7 +1748,7 @@ function Usage() {
                 <Each of={trailingDays()}>
                   {(day) => (
                     <View
-                      class={`min-w-0 flex-1 rounded-sm ${day().tokens ? "bg-primary" : "bg-input"}`}
+                      class={`min-w-0 flex-1 rounded-sm corner-squircle ${day().tokens ? "bg-primary" : "bg-input"}`}
                       style={{ height: day().tokens ? `${Math.max(4, Math.round((day().tokens / maxDay()) * 100))}%` : 3 }}
                       tooltip={tip(`${day().day} · ${compactNumber(day().tokens)} tokens${day().cost > 0 ? ` · ${money(day().cost)}` : ""}`)}
                     />
@@ -1853,7 +1859,7 @@ function About() {
         "为你机器上已有的编码智能体打造的原生桌面控制台。",
       )}
     >
-      <View class="items-center gap-5 rounded-xl border border-border bg-card px-6 py-10">
+      <View class="items-center gap-5 rounded-xl corner-squircle border border-border bg-card px-6 py-10">
         <Pip size={88} />
         <View class="items-center gap-1">
           <Text class="text-xl font-semibold tracking-tight text-foreground">pipi</Text>
@@ -1896,7 +1902,7 @@ function SettingsNav(props: { section: SettingsSection }) {
         <Text class="px-2.5 pb-2 pt-2 text-xs font-medium text-subtle" role="header">
           {tr("Settings", "设置")}
         </Text>
-        <Tabs class="gap-0.5" indicatorClass="inset-x-0 rounded-lg bg-accent">
+        <Tabs class="gap-0.5" indicatorClass="inset-x-0 rounded-lg corner-squircle bg-accent">
           <Each of={SECTIONS}>
             {(item) => {
               const active = () => props.section === item().id;
@@ -1905,7 +1911,7 @@ function SettingsNav(props: { section: SettingsSection }) {
                   testID={`settings-nav-${item().id}`}
                   selected={active()}
                   onPress={() => showSettings(item().id)}
-                  class={`h-8 flex-row items-center gap-2 rounded-lg px-2.5 transition-colors duration-150 ${FOCUS_RING} ${active() ? "" : "hover:bg-accent/60"}`}
+                  class={`h-8 flex-row items-center gap-2 rounded-lg corner-squircle px-2.5 transition-colors duration-150 ${FOCUS_RING} ${active() ? "" : "hover:bg-accent/60"}`}
                 >
                   <Icon name={item().icon} tone={active() ? "foreground" : "muted-foreground"} />
                   <Text class={`shrink truncate text-base transition-colors duration-150 ${active() ? "font-medium text-foreground" : "text-muted-foreground"}`}>

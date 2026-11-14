@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import { runHelper } from "./sidecar";
+export { parseSessionSnapshot, readSessionSnapshot, type SessionSnapshot } from "./session-file";
 
 /** A saved session of the working directory, as the sidebar lists it. */
 export interface SessionSummary {

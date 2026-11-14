@@ -25,7 +25,7 @@ mount(() => (
     </View>
     <View class="flex-row flex-wrap gap-3">
       <Each of={ICONS}>{(n) => (
-        <View class="size-8 items-center justify-center rounded-md bg-card"><Icon name={n()} tone="foreground" /></View>
+        <View class="size-8 items-center justify-center rounded-md corner-squircle bg-card"><Icon name={n()} tone="foreground" /></View>
       )}</Each>
     </View>
     <View class="flex-row flex-wrap gap-3">

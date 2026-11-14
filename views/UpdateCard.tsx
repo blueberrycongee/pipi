@@ -1,11 +1,14 @@
 import { cleanup, createAnimatedValue, createMotion, effect, openUrl, reduceMotion, signal, Text, untracked, View } from "nsh";
+import { TextView } from "nsh/base";
 import { tr } from "../lib/i18n";
+import { mendStreamingMarkdown } from "../lib/mend";
 import { Pip } from "../mascot/Pip";
 import { appUpdate, appUpdateVisible, beginAppUpdate, dismissAppUpdate, installAppUpdate } from "../store/update";
 import { Button, IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, Presence, SPRING } from "../ui/motion";
 import { POPUP } from "../ui/styles";
+import { PROSE } from "./Prose";
 
 /**
  * The update card, floating bottom-right: an update the checker found lands
@@ -36,10 +39,31 @@ const BONK_MS = 310;
 const fmtBytes = (n: number) =>
   n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1e3))} KB`;
 
+/** The notes' height in the card: ~140 chars of their Markdown, cut mid-source
+    and mended (`**` half-open, a code span, a link's URL) so what shows never
+    reads as raw syntax. */
+const NOTES_LIMIT = 140;
+
+/** The notes' typography: the card's scale — small, muted, headings only set off by weight. */
+const NOTES_CLASSES = {
+  ...PROSE,
+  root: "gap-1.5 text-xs leading-4 text-muted-foreground",
+  heading1: "text-xs",
+  heading2: "text-xs",
+  heading3: "text-xs",
+  heading4: "text-xs",
+  heading5: "text-xs",
+  heading6: "text-xs",
+  code: "rounded-sm corner-squircle bg-muted px-1 text-foreground",
+  tableCell: "px-3 py-1.5 text-xs",
+} as const;
+
 function shortNotes(notes: string | null | undefined): string {
   if (!notes) return "";
-  const first = notes.replace(/\s+/g, " ").trim();
-  return first.length > 140 ? `${first.slice(0, 140).trimEnd()}…` : first;
+  const src = notes.replace(/\r\n?/g, "\n").trim();
+  if (src.length <= NOTES_LIMIT) return src;
+  const cut = `${[...src].slice(0, NOTES_LIMIT).join("").trimEnd()}…`;
+  return mendStreamingMarkdown(cut).source;
 }
 
 /** One spark of the struck-block burst, popping then gone at its own delay. */
@@ -202,6 +226,8 @@ export function UpdateCard() {
     return tr("A new version is out", "新版本可用");
   };
 
+  const notes = () => shortNotes(update()?.notes);
+
   const mood = () => {
     switch (phase()) {
       case "downloading":
@@ -265,8 +291,15 @@ export function UpdateCard() {
             </If>
           </View>
 
-          <If when={shortNotes(update()?.notes)}>
-            <Text class="text-xs leading-4 text-muted-foreground">{shortNotes(update()?.notes)}</Text>
+          <If when={notes()}>
+            <TextView
+              markdown={notes()}
+              selectable
+              links="open"
+              codeBlockScrollbar={false}
+              tableScrollbar={false}
+              classes={NOTES_CLASSES}
+            />
           </If>
 
           {/* The stage: the track is the card's whole foot, flush with its bottom

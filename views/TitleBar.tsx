@@ -48,7 +48,7 @@ function SessionTitle() {
           onPress={startRenaming}
           disabled={sidecarPhase().name !== "ready"}
           tooltip={tip(tr("Rename session", "重命名会话"))}
-          class={`h-7 min-w-0 shrink flex-row items-center rounded-md px-2 ${PRESS} ${FOCUS_RING} hover:bg-accent active:bg-accent`}
+          class={`h-7 min-w-0 shrink flex-row items-center rounded-md corner-squircle px-2 ${PRESS} ${FOCUS_RING} hover:bg-accent active:bg-accent`}
         >
           <Text class="max-w-150 shrink truncate text-base font-medium text-foreground">{currentTitle()}</Text>
         </BaseButton>
@@ -66,7 +66,7 @@ function SessionTitle() {
         scrollbar={false}
         accessibilityLabel={tr("Session name", "会话名称")}
         placeholder={tr("Name this session", "为会话命名")}
-        class={`h-7 w-80 rounded-md px-2 text-base font-medium text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
+        class={`h-7 w-80 rounded-md corner-squircle px-2 text-base font-medium text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
       />
       <If when={anchor()}>
         {(field) => <Overlay anchor={field()} onPressOutside={commit} onCancel={cancelRenaming} />}
@@ -104,7 +104,7 @@ export function TitleBar() {
               <BaseButton
                 onPress={() => openDaemonSession(up().id)}
                 tooltip={tip(tr(`Back to ${up().title}`, `回到 ${up().title}`))}
-                class={`h-6 max-w-44 shrink-0 flex-row items-center gap-1 rounded-md bg-muted px-1.5 ${PRESS} hover:bg-accent`}
+                class={`h-6 max-w-44 shrink-0 flex-row items-center gap-1 rounded-md corner-squircle bg-muted px-1.5 ${PRESS} hover:bg-accent`}
               >
                 <Icon name="arrowLeft" size={12} tone="subtle" />
                 <Text class="shrink truncate text-2xs text-muted-foreground">{up().title}</Text>
@@ -129,7 +129,7 @@ export function TitleBar() {
               <BaseButton
                 onPress={() => void openWorkspace(wt().path)}
                 tooltip={tip(tr(`Open worktree ${wt().path}`, `打开工作树目录 ${wt().path}`))}
-                class={`h-6 max-w-36 shrink-0 flex-row items-center gap-1 rounded-md bg-muted px-1.5 ${PRESS} hover:bg-accent`}
+                class={`h-6 max-w-36 shrink-0 flex-row items-center gap-1 rounded-md corner-squircle bg-muted px-1.5 ${PRESS} hover:bg-accent`}
               >
                 <Icon name="fork" size={11} tone="subtle" />
                 <Text class="shrink truncate font-mono text-2xs text-muted-foreground">{wt().branch}</Text>

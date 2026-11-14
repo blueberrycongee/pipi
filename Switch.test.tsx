@@ -3,8 +3,10 @@ import type { App } from "nsh/test";
 
 // A session change answers the click, not the agent. On a manual clock with
 // agents as slow as real CLIs (`harness.startDelay`), each test reads the chat
-// from the press on: what can be shown is shown at once, and what cannot
-// leaves the screen as it was until the destination lands.
+// from the press on: a conversation seen before, a fresh session's empty chat,
+// and a saved session's own file are all shown at once — what the file holds is
+// the destination's last settled state — and the agent's own history confirms
+// or replaces it invisibly as it lands.
 //
 //   nsh test Switch.test.tsx
 //
@@ -52,7 +54,7 @@ test("a conversation seen before is on screen with the click", async () => {
   expect(seen.every(Boolean)).toBe(true);
 });
 
-test("a conversation not seen yet keeps the screen as it was until it lands", async () => {
+test("a conversation not seen yet lands from its file at once and never moves again", async () => {
   const app = await launch("welcome");
   await app.waitFor("text:What are we building?");
   await app.press(row(REFACTOR));
@@ -61,11 +63,16 @@ test("a conversation not seen yet keeps the screen as it was until it lands", as
   await app.press(row(NOTES));
   const seen = await frames(app, () => ({ old: shows(app, REFACTOR), next: shows(app, NOTES), texts: app.texts() }));
 
+  // The saved file answers the click, not the agent's load: the destination is
+  // there inside the first frames, the agent's own history confirms it later.
+  const firstNext = seen.findIndex((frame) => frame.next);
+  expect(firstNext).toBeGreaterThanOrEqual(0);
+  expect(firstNext * 16).toBeLessThan(DELAY);
   // Never both, and nothing in between but the frame the list takes to mount the rows it was handed.
   expect(seen.some((frame) => frame.old && frame.next)).toBe(false);
   expect(seen.filter((frame) => !frame.old && !frame.next).length).toBeLessThanOrEqual(1);
-  expect(seen[0].old).toBe(true);
-  expect(seen[seen.length - 1].next).toBe(true);
+  // What landed stays landed: the late agent history replaces nothing the reader can see.
+  expect(seen.slice(firstNext).every((frame) => frame.next && !frame.old)).toBe(true);
   expect(seen.some((frame) => frame.texts.includes("What are we building?"))).toBe(false);
 });
 
@@ -76,6 +83,7 @@ test("a new session's empty chat is on screen with the click, in another project
   await app.waitUntil(() => app.texts().includes("Here is the plan."));
 
   // Another project means another agent process: the chat does not wait for it.
+  await app.hover("label:New session in pipi");
   await app.press("label:New session in pipi");
   const seen = await frames(app, () => app.texts());
   expect(seen.every((frame) => frame.includes("What are we building?"))).toBe(true);
@@ -88,7 +96,6 @@ test("a message written during the change is sent where it lands", async () => {
   await app.waitFor("text:What are we building?");
 
   await app.press(row(REFACTOR));
-  expect(shows(app, REFACTOR)).toBe(false);
   await app.type("label:Message", "and then what");
   await app.submit("label:Message");
   await app.waitUntil(() => app.texts().includes("and then what"), { timeout: DELAY * 4 });
@@ -100,7 +107,6 @@ test("multiple messages submitted during a slow session change are delivered in 
   await app.waitFor("text:What are we building?");
 
   await app.press(row(REFACTOR));
-  expect(shows(app, REFACTOR)).toBe(false);
   await app.type("label:Message", "first in flight");
   await app.submit("label:Message");
   expect(app.value("label:Message") ?? "").toBe("");
@@ -129,6 +135,7 @@ test("starting a new session in another project keeps the chosen model without f
   await app.press("id:sidebar-recents >> text:Fix QuickJS GC mark phase");
   await app.waitUntil(() => app.texts().includes("Here is the plan."));
 
+  await app.hover("label:New session in pipi");
   await app.press("label:New session in pipi");
   const seen = await frames(app, () => app.texts());
   expect(seen.every((frame) => frame.includes("What are we building?"))).toBe(true);
@@ -144,6 +151,7 @@ test("starting a new session again while a new-session switch is still in flight
   await app.press("id:sidebar-recents >> text:Fix QuickJS GC mark phase");
   await app.waitUntil(() => app.texts().includes("Here is the plan."));
 
+  await app.hover("label:New session in pipi");
   await app.press("label:New session in pipi");
   await app.press("id:sidebar-new-session");
   const seen = await frames(app, () => app.texts());

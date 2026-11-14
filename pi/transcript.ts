@@ -254,14 +254,23 @@ export class Transcript {
   /** Start timestamps for running tool executions so external engines without `durationMs` still measure elapsed time. */
   #toolSince = new Map<string, number>();
   /**
-   * Results read ahead of the call that made them: the bridge lists a turn's
-   * tool results before the one assistant message holding every block (its
-   * calls included), so on a reload a result can land before its call's row
-   * exists. It waits here for the block instead — minting the row on sight
-   * would park every tool at the head of its turn and leave the message's
-   * prose out of order.
+   * Results read ahead of the call that made them, in the order read: the
+   * bridge lists a turn's tool results before the one assistant message
+   * holding every block (its calls included), so on a reload a result can
+   * land before its call's row exists. It waits here for the block instead —
+   * minting the row on sight would park every tool at the head of its turn
+   * and leave the message's prose out of order.
    */
-  #pendingResults = new Map<string, ToolResultMessage>();
+  #pendingResults = new Map<string, ToolResultMessage[]>();
+  /**
+   * Row ids minted per wire `toolCallId`: how many times each was seen, and
+   * the row its open call resolves to — engines reusing `item_0` / `"0"` across
+   * turns get a suffix instead of overwriting the earlier call's row in place
+   * (`#mintToolId`). A call the run abandoned stays mapped until `agent_settled`
+   * marks it `ended`; every event after that mints the next occurrence.
+   */
+  #callCounts = new Map<string, number>();
+  #callRows = new Map<string, { id: string; ended: boolean }>();
   /** Rows that are still open when a run stops, to close them. */
   #bashId: string | undefined;
   /** When the current turn started: the user's message, else its first row. */
@@ -312,16 +321,27 @@ export class Transcript {
     this.#live = undefined;
     this.#toolSince.clear();
     this.#pendingResults.clear();
+    this.#callCounts.clear();
+    this.#callRows.clear();
     this.#bashId = undefined;
     this.#turnStart = undefined;
     this.#closed = false;
     this.#newTurn = false;
     this.#failure = undefined;
+    let lastClock: number | null = null;
     for (const message of messages) {
       const assistantStart = message.role === "assistant" && !!message.turnStart;
       if (message.role === "user" || assistantStart) this.#closeTurn();
-      const at = (message as { timestamp?: unknown }).timestamp;
-      this.#clock = typeof at === "number" ? at : null;
+      const rawAt = (message as { timestamp?: unknown }).timestamp;
+      const parsedAt =
+        typeof rawAt === "number" && Number.isFinite(rawAt)
+          ? rawAt
+          : typeof rawAt === "string" && rawAt
+            ? Date.parse(rawAt)
+            : NaN;
+      // An unstamped message is of its time, not of none: the last stamped keeps the clock.
+      if (Number.isFinite(parsedAt)) lastClock = parsedAt;
+      this.#clock = lastClock;
       if (assistantStart) {
         this.#turnStart = this.#now();
         this.#newTurn = true;
@@ -360,6 +380,7 @@ export class Transcript {
       if ((row.kind === "text" || row.kind === "thinking") && row.streaming) streaming.push(at);
     });
     const taken = new Set(this.#rows.map((row) => row.id));
+    const renamed = new Map<string, string>();
     // A conversation's order does not change: a pair is looked for after the last one made.
     let from = 0;
     let changed = false;
@@ -383,9 +404,13 @@ export class Transcript {
         taken.delete(row.id);
         taken.add(old.id);
         id = old.id;
+        renamed.set(row.id, old.id);
       }
       const keepTurnMs =
-        isTurnRow(row) && isTurnRow(old) && row.turnMs !== undefined && old.turnMs !== undefined && row.turnMs !== old.turnMs
+        isTurnRow(row) &&
+        isTurnRow(old) &&
+        old.turnMs !== undefined &&
+        ((row.turnMs !== undefined && row.turnMs !== old.turnMs) || (row.turnMs === undefined && this.#closed))
           ? old.turnMs
           : undefined;
       const keepDuration =
@@ -407,6 +432,26 @@ export class Transcript {
     if (!changed) return;
     this.#index.clear();
     this.#rows.forEach((row, at) => this.#index.set(row.id, at));
+    // The maps that point at rows by id follow the rename, or an open call's
+    // next event would resolve to nothing and mint a phantom row.
+    if (renamed.size) {
+      for (const [wire, call] of this.#callRows) {
+        const to = renamed.get(call.id);
+        if (to) this.#callRows.set(wire, { ...call, id: to });
+      }
+      if (this.#toolSince.size) {
+        const moved = new Map<string, number>();
+        for (const [id, since] of this.#toolSince) moved.set(renamed.get(id) ?? id, since);
+        this.#toolSince = moved;
+      }
+      if (this.#bashId) this.#bashId = renamed.get(this.#bashId) ?? this.#bashId;
+      if (this.#live) {
+        for (const [contentIndex, id] of this.#live.toolIds) {
+          const to = renamed.get(id);
+          if (to) this.#live.toolIds.set(contentIndex, to);
+        }
+      }
+    }
     this.version++;
   }
 
@@ -434,20 +479,25 @@ export class Transcript {
         if (event.message.role === "assistant") this.#finish(event.message);
         else if (event.message.role !== "user") this.#append(event.message);
         break;
-      case "tool_execution_start":
-        if (!this.#toolSince.has(event.toolCallId)) this.#toolSince.set(event.toolCallId, Date.now());
-        this.#tool(event.toolCallId, (row) => ({ ...row, name: event.toolName, args: event.args ?? row.args, status: "running" }), event.toolName);
+      case "tool_execution_start": {
+        const rowId = this.#callRow(event.toolCallId);
+        if (!this.#toolSince.has(rowId)) this.#toolSince.set(rowId, Date.now());
+        this.#tool(rowId, (row) => ({ ...row, name: event.toolName, args: event.args ?? row.args, status: "running" }), event.toolName);
         break;
-      case "tool_execution_update":
-        if (!this.#toolSince.has(event.toolCallId)) this.#toolSince.set(event.toolCallId, Date.now());
-        this.#tool(event.toolCallId, (row) => ({ ...row, ...this.#result(event.partialResult, row), status: "running" }), event.toolName);
+      }
+      case "tool_execution_update": {
+        const rowId = this.#callRow(event.toolCallId);
+        if (!this.#toolSince.has(rowId)) this.#toolSince.set(rowId, Date.now());
+        this.#tool(rowId, (row) => ({ ...row, ...this.#result(event.partialResult, row), status: "running" }), event.toolName);
         break;
+      }
       case "tool_execution_end": {
-        const started = this.#toolSince.get(event.toolCallId);
-        this.#toolSince.delete(event.toolCallId);
+        const rowId = this.#callRow(event.toolCallId);
+        const started = this.#toolSince.get(rowId);
+        this.#toolSince.delete(rowId);
         const measured = started !== undefined ? Math.max(0, Date.now() - started) : undefined;
         this.#tool(
-          event.toolCallId,
+          rowId,
           (row) => {
             const { background: _bg, ...rest } = row;
             return {
@@ -685,6 +735,8 @@ export class Transcript {
     this.#rows = [];
     this.#staged = [];
     this.#index.clear();
+    this.#callCounts.clear();
+    this.#callRows.clear();
     for (const row of previous) this.#push(row);
     this.version++;
   }
@@ -693,6 +745,28 @@ export class Transcript {
 
   #id(prefix: string) {
     return `${prefix}${++seq}`;
+  }
+
+  /**
+   * The row id for one call of a wire `toolCallId`: the id itself the first
+   * time, a suffix for every later occurrence, so engines reusing `item_0` /
+   * `"0"` across turns never overwrite earlier rows. The minted id becomes the
+   * wire id's entry in `#callRows` — the row every event for that open call
+   * resolves to.
+   */
+  #mintToolId(toolCallId: string) {
+    let count = (this.#callCounts.get(toolCallId) ?? 0) + 1;
+    let id = count === 1 ? toolCallId : `${toolCallId}~${count}`;
+    while (this.#index.has(id)) id = `${toolCallId}~${++count}`;
+    this.#callCounts.set(toolCallId, count);
+    this.#callRows.set(toolCallId, { id, ended: false });
+    return id;
+  }
+
+  /** The row a wire `toolCallId`'s live events resolve to: its open call's, else a new occurrence's. */
+  #callRow(toolCallId: string) {
+    const open = this.#callRows.get(toolCallId);
+    return open && !open.ended ? open.id : this.#mintToolId(toolCallId);
   }
 
   /** The time as the transcript reads it: now, or while loading, the message's (`undefined` when it has none). */
@@ -819,11 +893,13 @@ export class Transcript {
         this.#set({ kind: "thinking", id, text: event.content, streaming: false, redacted: false, durationMs: since ? Date.now() - since : undefined });
         break;
       }
-      case "toolcall_start":
-        live.toolIds.set(event.contentIndex, event.id);
+      case "toolcall_start": {
+        const rowId = this.#mintToolId(event.id);
+        live.toolIds.set(event.contentIndex, rowId);
         live.toolJson.set(event.contentIndex, "");
-        this.#set({ kind: "tool", id: event.id, name: event.toolName, args: {}, status: "call", output: "", images: 0 });
+        this.#set({ kind: "tool", id: rowId, name: event.toolName, args: {}, status: "call", output: "", images: 0 });
         break;
+      }
       case "toolcall_delta": {
         const toolId = live.toolIds.get(event.contentIndex);
         const row = this.#get(toolId);
@@ -839,8 +915,9 @@ export class Transcript {
         break;
       }
       case "toolcall_end": {
-        const row = this.#get(event.toolCall.id);
-        const base: ToolRow = row?.kind === "tool" ? row : { kind: "tool", id: event.toolCall.id, name: event.toolCall.name, args: {}, status: "queued", output: "", images: 0 };
+        const rowId = live.toolIds.get(event.contentIndex) ?? this.#callRow(event.toolCall.id);
+        const row = this.#get(rowId);
+        const base: ToolRow = row?.kind === "tool" ? row : { kind: "tool", id: rowId, name: event.toolCall.name, args: {}, status: "queued", output: "", images: 0 };
         this.#set({ ...base, name: event.toolCall.name, args: event.toolCall.arguments ?? {}, status: base.status === "call" ? "queued" : base.status });
         break;
       }
@@ -851,13 +928,13 @@ export class Transcript {
   #finish(message: AssistantMessage) {
     const live = this.#live ?? { key: `m${++seq}`, toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
     this.#live = undefined;
-    this.#blocks(message, live.key, true);
+    this.#blocks(message, live.key, true, live.toolIds);
     // The answer is in: the turn took this long, whatever the provider still cleans up.
     // (A message that failed is no answer yet: a retry goes on in the same turn.)
     if (answeredTurn(message)) this.#closeTurn();
   }
 
-  #blocks(message: AssistantMessage, key: string, keepRuns: boolean) {
+  #blocks(message: AssistantMessage, key: string, keepRuns: boolean, toolIds?: Map<number, string>) {
     // A later assistant message is the attempt made again: it answers for the one that failed before it.
     this.#failure = undefined;
     const failed = message.stopReason === "error";
@@ -879,8 +956,13 @@ export class Transcript {
           this.#set({ kind: "thinking", id, text: block.thinking, streaming: false, redacted: !!block.redacted, durationMs: before?.kind === "thinking" ? before.durationMs : undefined });
         }
       } else if (block.type === "toolCall") {
-        const before = this.#get(block.id);
-        const base: ToolRow = before?.kind === "tool" ? before : { kind: "tool", id: block.id, name: block.name, args: {}, status: "queued", output: "", images: 0 };
+        // The block's own call is the one streamed at its content index, if
+        // there was one; anything else — history, a call never streamed — is
+        // the wire id seen once more: a new occurrence, not the row it named
+        // before.
+        const rowId = toolIds?.get(index) ?? this.#mintToolId(block.id);
+        const before = this.#get(rowId);
+        const base: ToolRow = before?.kind === "tool" ? before : { kind: "tool", id: rowId, name: block.name, args: {}, status: "queued", output: "", images: 0 };
         const bg = !!block.background && !failed && message.stopReason !== "aborted";
         // A call the failed message never got to run will not run: it does not go on spinning through the retries.
         if (failed && (base.status === "call" || base.status === "queued")) {
@@ -895,11 +977,16 @@ export class Transcript {
             this.#set({ ...rest, name: block.name, args: block.arguments ?? {}, status: keepRuns && base.status !== "call" ? base.status : "queued" });
           }
         }
-        // A result read ahead of its call lands on the row now that the call is known.
-        const pending = this.#pendingResults.get(block.id);
+        // A result read ahead of its call lands on the row now that the call is
+        // known — the first in line: an id the turn used twice has a result
+        // waiting for each of its calls, in the order they ran.
+        const pendings = this.#pendingResults.get(block.id);
+        const pending = pendings?.shift();
         if (pending) {
-          this.#pendingResults.delete(block.id);
-          this.#tool(block.id, (row) => this.#applyToolResult(row, pending), pending.toolName);
+          if (!pendings!.length) this.#pendingResults.delete(block.id);
+          this.#tool(rowId, (row) => this.#applyToolResult(row, pending), pending.toolName);
+          // Its result consumed, the call is over: the id's next use is a new occurrence's.
+          if (this.#callRows.get(block.id)?.id === rowId) this.#callRows.delete(block.id);
         }
       }
     });
@@ -948,8 +1035,12 @@ export class Transcript {
   /** Results still waiting on their call missed it once the transcript moves on: they land where the wait ended. */
   #flushResults() {
     if (!this.#pendingResults.size) return;
-    for (const message of this.#pendingResults.values()) {
-      this.#tool(message.toolCallId, (row) => this.#applyToolResult(row, message), message.toolName);
+    for (const pendings of this.#pendingResults.values()) {
+      for (const message of pendings) {
+        const rowId = this.#callRow(message.toolCallId);
+        this.#tool(rowId, (row) => this.#applyToolResult(row, message), message.toolName);
+        this.#callRows.delete(message.toolCallId);
+      }
     }
     this.#pendingResults.clear();
   }
@@ -985,11 +1076,21 @@ export class Transcript {
       case "assistant":
         this.#blocks(message, `m${++seq}`, false);
         break;
-      case "toolResult":
-        // A result whose call has a row joins it; one read ahead of it waits for the block.
-        if (this.#get(message.toolCallId)?.kind === "tool") this.#tool(message.toolCallId, (row) => this.#applyToolResult(row, message), message.toolName);
-        else this.#pendingResults.set(message.toolCallId, message);
+      case "toolResult": {
+        // A result whose call is open joins its row — and ends it, so the id's
+        // next use is a new occurrence's; one read ahead of its call waits for
+        // the block, in line behind any read before it.
+        const open = this.#callRows.get(message.toolCallId);
+        if (open && !open.ended && this.#get(open.id)?.kind === "tool") {
+          this.#tool(open.id, (row) => this.#applyToolResult(row, message), message.toolName);
+          this.#callRows.delete(message.toolCallId);
+        } else {
+          const waiting = this.#pendingResults.get(message.toolCallId) ?? [];
+          waiting.push(message);
+          this.#pendingResults.set(message.toolCallId, waiting);
+        }
         break;
+      }
       case "bashExecution":
         this.#push({
           kind: "bash",
@@ -1039,6 +1140,13 @@ export class Transcript {
       }
       return row;
     });
+    // The calls still open when the run stopped are over: an id minting again
+    // past this point is a new occurrence's, never theirs. A background call
+    // goes on running — its events still find it.
+    for (const open of this.#callRows.values()) {
+      const row = this.#get(open.id);
+      if (!row || row.kind !== "tool" || !(!aborted && row.background && row.status === "running")) open.ended = true;
+    }
     this.#closeTurn();
     this.#reportFailure();
   }

@@ -1406,6 +1406,10 @@ const acpPending = new Map(); // rpc id → {resolve, reject}
 let acpStream = undefined; // stream helper of the in-flight prompt
 let acpOutBuf = "";
 let acpErrBuf = "";
+// Last byte the peer wrote — the liveness signal the prompt watchdog reads:
+// a wedged worker (Antigravity's per-session process dying mid-dispatch) keeps
+// the process and its pipes alive while producing nothing.
+let acpLastOutAt = 0;
 // Negotiated capabilities & catalogs, filled from initialize/session responses:
 let acpSpecModels = false; // agent advertised `models.availableModels` (ACP spec)
 let acpModelConfigId = undefined; // configOptions select carrying the model list (Devin dialect)
@@ -1417,6 +1421,10 @@ let acpModelConfigCurrent = undefined; // last-known currentValue of the model s
 let acpEffortConfig = undefined; // advertised `reasoning_effort` select {id, values, hasProviderDefault, currentValue}
 let acpUsage = undefined; // last `usage_update` {used, size}
 const acpRecentTools = new Map(); // toolCallId → {title, kind, rawInput} for permission enrichment
+// Last `session/update` the peer sent — the turn's own progress signal. Unlike
+// `acpLastOutAt` (every byte, probes included), only the session's traffic
+// resets the stall clock.
+let acpLastEventAt = 0;
 
 // ── Turns an agent runs on its own between prompts (Antigravity) ────────────
 //
@@ -2039,7 +2047,13 @@ function acpRequest(method, params, timeoutMs = 60_000) {
     acpPending.set(id, waiter);
     if (timeoutMs > 0) {
       waiter.timer = setTimeout(() => {
-        if (acpPending.delete(id)) reject(new Error(`${method} timed out`));
+        if (acpPending.delete(id)) {
+          const err = new Error(`${method} timed out`);
+          // A timeout is the only rejection that says the peer is gone — a
+          // JSON-RPC error the peer sent proves it is still answering.
+          err.acpTimeout = true;
+          reject(err);
+        }
       }, timeoutMs);
       waiter.timer.unref?.();
     }
@@ -2280,6 +2294,7 @@ async function handleAcpPermission(msg) {
 }
 
 function handleAcpUpdate(u) {
+  acpLastEventAt = Date.now();
   const kind = u.sessionUpdate || u.type;
   const textOf = (c) => (typeof c === "string" ? c : c?.text || "");
   // A catch-up's replay is read as a whole once the load answers (`acpWokenSince`).
@@ -2346,6 +2361,7 @@ function spawnAcp(bin) {
     acpErrBuf = (acpErrBuf + c).slice(-6000);
   });
   child.stdout.on("data", (chunk) => {
+    acpLastOutAt = Date.now();
     acpOutBuf += chunk;
     let nl = acpOutBuf.indexOf("\n");
     while (nl !== -1) {
@@ -2396,6 +2412,10 @@ function spawnAcp(bin) {
   };
   child.on("error", drop);
   child.on("close", drop);
+  // `exit` is the dead-peer signal `close` withholds: under Antigravity's
+  // --process-per-session the front can exit while a session worker inherits the
+  // pipes — stdio never reaches EOF, but a dead front answers nothing.
+  child.on("exit", drop);
 }
 
 let acpCatalogCooldownUntil = 0;
@@ -2569,6 +2589,65 @@ async function negotiateAcpRound(bin, epoch) {
 
 const ACP_STOP_REASONS = { end_turn: "stop", max_tokens: "length", cancelled: "aborted", refusal: "stop", max_turn_requests: "stop" };
 
+// ── The prompt watchdog ──────────────────────────────────────────────────────
+// `session/prompt` is the one request with no deadline: its notification stream
+// is the turn's heartbeat, and a peer can keep the process and its pipes alive
+// while the turn dies silently — an Antigravity session worker wedged
+// mid-dispatch under `--process-per-session`, or a front whose stdin no longer
+// reaches the worker. `close` never fires either while grandchildren hold the
+// pipes. So silence past SILENCE_MS probes the peer on the same connection —
+// any answer, even a JSON-RPC error, is life; a probe that times out means the
+// request path is dead and the peer is dropped, ending the turn as an error
+// instead of hanging forever. A peer that still answers but reports no turn
+// progress for STALL_MS — no `session/update`, no move of the session's
+// `updatedAt` or Antigravity's transcript step — is judged stalled the same
+// way. A turn waiting on the user's own permission answer is never a wedge.
+const ACP_TURN_SILENCE_MS = Number(process.env.PIPI_ACP_TURN_SILENCE_MS) || 90_000;
+const ACP_TURN_PROBE_MS = Number(process.env.PIPI_ACP_TURN_PROBE_MS) || 20_000;
+const ACP_TURN_STALL_MS = Number(process.env.PIPI_ACP_TURN_STALL_MS) || 20 * 60_000;
+
+/** `session/list` as a liveness probe: any answer is life; only a timeout is a dead path. */
+async function acpProbeAlive() {
+  if (!acpChild) return false;
+  try {
+    await acpRequest("session/list", { cwd }, ACP_TURN_PROBE_MS);
+  } catch (err) {
+    return !err?.acpTimeout;
+  }
+  return true;
+}
+
+/** Awaits a `session/prompt`, dropping a peer that goes silent or stops making progress. */
+async function acpPromptWatched(acpId, params) {
+  const prompt = acpRequest("session/prompt", params, 0);
+  let markAt = undefined; // the session's `updatedAt` as session/list last reported it
+  let markStep = undefined; // Antigravity's transcript step at the last look
+  let markEvent = acpLastEventAt; // session traffic the turn has produced so far
+  let quietSince = Date.now();
+  for (;;) {
+    const outcome = await Promise.race([prompt.then(() => "done", () => "done"), acpWakeSleep(ACP_TURN_SILENCE_MS).then(() => "waited")]);
+    if (outcome === "done" || abortRequested) return prompt;
+    if (pendingUiRequests.size > 0 || Date.now() - acpLastOutAt < ACP_TURN_SILENCE_MS) continue;
+    if (!(await acpProbeAlive())) {
+      dropAcpPeer("ACP agent stopped responding mid-turn");
+      return prompt;
+    }
+    const at = await acpUpdatedAt(acpId, ACP_TURN_PROBE_MS);
+    const step = agyTranscriptState(acpId)?.stepIndex;
+    if (at !== markAt || step !== markStep || acpLastEventAt !== markEvent) {
+      markAt = at;
+      markStep = step;
+      markEvent = acpLastEventAt;
+      quietSince = Date.now();
+      continue;
+    }
+    if (Date.now() - quietSince >= ACP_TURN_STALL_MS) {
+      dropAcpPeer("ACP turn stalled — the agent answers but its session made no progress");
+      return prompt;
+    }
+  }
+}
+
 // ACP (Agent Client Protocol) JSON-RPC 2.0 over stdio — one prompt per call on
 // the persistent session; peer lifetime managed by ensureAcp/spawnAcp above.
 async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch) {
@@ -2580,7 +2659,7 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
   const stream = makeTurnStreamHelper(turnEpoch);
   acpStream = stream;
   try {
-    const res = await acpRequest("session/prompt", { sessionId: acpId, prompt: [{ type: "text", text: promptText }, ...images] }, 0);
+    const res = await acpPromptWatched(acpId, { sessionId: acpId, prompt: [{ type: "text", text: promptText }, ...images] });
     const stopReason = abortRequested ? "aborted" : ACP_STOP_REASONS[res?.stopReason] || "stop";
     const mayWake = acpLazyWake && !abortRequested && res?.stopReason === "end_turn";
     stream.usageSummary(acpPromptPart(res?.usage));

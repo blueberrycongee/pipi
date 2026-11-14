@@ -34,6 +34,7 @@ import {
   MAX_WALLPAPER_ZOOM,
   MIN_WALLPAPER_ZOOM,
   panAdjustment,
+  resolveWallpaperPreset,
   WALLPAPER_PRESET_SHADERS,
   WALLPAPER_SHADERS,
   wallpaperPresetUniforms,
@@ -185,12 +186,10 @@ function EffectSurface(props: {
   const isDark = () => colorScheme() === "dark";
   const viewport = signal<{ width: number; height: number } | null>(null);
   const canRender = () => DYNAMIC_WALLPAPER_ENABLED || !isDynamicWallpaperConfig(props.config);
+  // An effect only ever paints over a still image — over a video or a live
+  // shader it is a second animation fighting the first, not a filter.
   const effectiveEffect = (): WallpaperEffect =>
-    DYNAMIC_WALLPAPER_ENABLED
-      ? props.effect
-      : isAvailableWallpaperEffect(props.effect)
-        ? props.effect
-        : "none";
+    kind() === "image" && isAvailableWallpaperEffect(props.effect) ? props.effect : "none";
   const kind = () =>
     !DYNAMIC_WALLPAPER_ENABLED
       ? "image"
@@ -307,41 +306,59 @@ function EffectSurface(props: {
     if (!DYNAMIC_WALLPAPER_ENABLED) {
       return <Image src={props.config.path} style={contentStyle} />;
     }
-    const k = kind();
-    if (k === "shader") {
-      const preset: WallpaperPreset = props.config.preset ?? "aurora";
-      return (
-        <Shader
-          source={WALLPAPER_PRESET_SHADERS[preset]}
-          uniforms={activePresetUniforms()}
-          paused={isPaused()}
-          class="absolute inset-0"
-        />
-      );
-    }
-    if (k === "video") {
-      return (
-        <Video
-          ref={(r) => {
-            videoRef = r;
-          }}
-          src={props.config.path}
-          repeat
-          muted={props.paused ? true : wallpaperMuted()}
-          paused={isPaused()}
-          rate={videoRate()}
-          audioSession="mixWithOthers"
-          style={contentStyle}
-          onLoad={(e) => {
-            videoDuration = e.duration || 0;
-            if (!props.paused && e.size.width > 0 && e.size.height > 0) {
-              updateWallpaperDimensions(e.size.width, e.size.height);
+    // The element each kind needs mounts through a live `when`: a component's
+    // JSX builds once and only its prop bindings re-evaluate, so a plain
+    // if/else would leave the first kind's element mounted with the next
+    // wallpaper's `src` pushed into it — a video asked to play "preset:…".
+    return (
+      <>
+        <If when={kind() === "shader"}>
+          <Shader
+            source={
+              WALLPAPER_PRESET_SHADERS[
+                resolveWallpaperPreset(props.config.preset) ?? "jelly"
+              ]
             }
-          }}
-        />
-      );
-    }
-    return <Image src={props.config.path} style={contentStyle} />;
+            uniforms={activePresetUniforms()}
+            paused={isPaused()}
+            class="absolute inset-0"
+          />
+        </If>
+        <If when={kind() === "video"}>
+          {/* Keyed on the path: a late onLoad can only report for the file this
+              element was given — a stale video's load never writes the new
+              wallpaper's dimensions. */}
+          <Each of={[props.config.path]} key={(p) => p}>
+            {(videoPath) => (
+              <Video
+                ref={(r) => {
+                  videoRef = r;
+                }}
+                src={videoPath()}
+                repeat
+                muted={props.paused ? true : wallpaperMuted()}
+                paused={isPaused()}
+                rate={videoRate()}
+                audioSession="mixWithOthers"
+                style={contentStyle}
+                onLoadStart={() => {
+                  videoDuration = 0;
+                }}
+                onLoad={(e) => {
+                  videoDuration = e.duration || 0;
+                  if (!props.paused && e.size.width > 0 && e.size.height > 0) {
+                    updateWallpaperDimensions(videoPath(), e.size.width, e.size.height);
+                  }
+                }}
+              />
+            )}
+          </Each>
+        </If>
+        <If when={kind() === "image"}>
+          <Image src={props.config.path} style={contentStyle} />
+        </If>
+      </>
+    );
   };
 
   const shaderEffect = (): Exclude<WallpaperEffect, "none"> => {
@@ -363,14 +380,20 @@ function EffectSurface(props: {
             when={effectiveEffect() !== "none"}
             else={renderMediaContent()}
           >
-            <ShaderEffect
-              source={WALLPAPER_SHADERS[shaderEffect()]}
-              uniforms={activeEffectUniforms(shaderEffect())}
-              paused={isPaused() && (effectiveEffect() === "ripple" || effectiveEffect() === "rain")}
-              class="absolute inset-0 overflow-hidden"
-            >
-              {renderMediaContent()}
-            </ShaderEffect>
+            {/* Keyed on the effect: switching effects remounts the ShaderEffect
+                so its WGSL and its uniforms never mix across a frame. */}
+            <Each of={[shaderEffect()]} key={(eff) => eff}>
+              {() => (
+                <ShaderEffect
+                  source={WALLPAPER_SHADERS[shaderEffect()]}
+                  uniforms={activeEffectUniforms(shaderEffect())}
+                  paused={isPaused() && (effectiveEffect() === "ripple" || effectiveEffect() === "rain")}
+                  class="absolute inset-0 overflow-hidden"
+                >
+                  {renderMediaContent()}
+                </ShaderEffect>
+              )}
+            </Each>
           </If>
         </View>
       </View>
@@ -685,7 +708,7 @@ export function WallpaperAdjustDialog(props: {
         <If when={wallpaper()}>
           {(wp) => (
             <View
-              class="relative w-full overflow-hidden rounded-lg border border-border bg-sunken"
+              class="relative w-full overflow-hidden rounded-lg corner-squircle border border-border bg-sunken"
               style={{ height: PREVIEW_HEIGHT }}
               onLayout={(e) => {
                 const { width, height } = e.bounds.size;
@@ -742,7 +765,7 @@ export function WallpaperAdjustDialog(props: {
               </If>
 
               {/* Corner hint pill */}
-              <View class="pointer-events-none absolute bottom-2.5 left-2.5 flex-row items-center gap-1.5 rounded-md border border-border bg-popover/85 px-2.5 py-1">
+              <View class="pointer-events-none absolute bottom-2.5 left-2.5 flex-row items-center gap-1.5 rounded-md corner-squircle border border-border bg-popover/85 px-2.5 py-1">
                 <Text class="text-2xs font-medium text-foreground">
                   {tr("Drag to reposition", "拖动以调整位置")}
                 </Text>

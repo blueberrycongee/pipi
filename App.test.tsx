@@ -264,10 +264,12 @@ test("organizes multiple projects in the sidebar and opens sessions across works
   await app.waitFor("text:Refactor the transcript reducer");
 
   // Starting a new session directly inside another workspace switches to it cleanly
+  await app.hover("label:New session in pi-docs");
   await app.press("label:New session in pi-docs");
   await app.waitFor("text:Pi · ~/code/pi-docs");
 
   // Adding a new project folder adds it to the sidebar tree and opens it
+  await app.hover("label:Add project folder");
   await app.press("label:Add project folder");
   await app.waitFor("text:Pi · ~/code/new-app");
   expect(app.texts()).toContain("new-app");
@@ -622,16 +624,19 @@ test("shows a message sent mid-run as a bubble in the conversation at once, and 
   await app.submit("label:Message");
   await app.waitFor("label:Conversation >> text:also check the tests", { timeout: 5000 });
   expect(app.count("label:Queued messages")).toBeGreaterThan(0);
+  // Its bubble reads as waiting in line, not said into the run yet.
+  expect(app.count("label:Conversation >> text:Queued")).toBe(1);
 
   // It lands after everything already said, where its echo will commit it.
   const queuedTexts = app.texts();
   const partAt = queuedTexts.map((text, at) => (/^Part \d+ of the plan$/.test(text) ? at : -1)).filter((at) => at >= 0);
   expect(queuedTexts.indexOf("also check the tests")).toBeGreaterThan(Math.max(...partAt));
 
-  // Delivered in turn: the same bubble is answered — never a second copy of it.
+  // Delivered in turn: the same bubble is answered — never a second copy of it, no waiting mark left.
   await app.waitFor("label:Send", { timeout: 60000 });
   expect(app.count("label:Conversation >> text:also check the tests")).toBe(1);
   expect(app.count("label:Queued messages")).toBe(0);
+  expect(app.count("label:Conversation >> text:Queued")).toBe(0);
 }, 90000);
 
 

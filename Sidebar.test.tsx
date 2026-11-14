@@ -127,7 +127,9 @@ test("clicking New session in a collapsed folder leaves it collapsed and lists d
   await app.waitUntil(() => app.texts().includes("Here is the plan."));
   expect(app.count(RECENT_DRAFT)).toBe(0);
 
-  // Starting a new session from the collapsed folder's + button
+  // Starting a new session from the collapsed folder's + button — which only
+  // shows (and only answers a press) while its row sits under the pointer.
+  await app.hover("label:New session in pipi");
   await app.press("label:New session in pipi");
   await app.waitUntil(() => app.texts().includes("What are we building?"));
 
@@ -145,6 +147,7 @@ test("Recent's own New session action highlights Recent's draft and keeps it onc
   await app.press("id:sidebar-workspaces >> text:Refactor the transcript reducer");
   await app.waitUntil(() => app.texts().includes("Here is the plan."));
 
+  await app.hover("id:sidebar-recents-action");
   await app.press("id:sidebar-recents-action");
   await app.waitUntil(() => app.texts().includes("What are we building?"));
   expect(weight(app, RECENT_DRAFT)).toBeGreaterThan(400);
@@ -175,6 +178,7 @@ test("reopening a draft while its reveal is closing keeps the draft row alive", 
   // and advance past the original close timeout (400ms): the draft row must stay open.
   await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
   await app.wait(80);
+  await app.hover("id:sidebar-recents-action");
   await app.press("id:sidebar-recents-action");
   await app.wait(400);
   expect(app.count(RECENT_DRAFT)).toBe(1);
@@ -193,6 +197,7 @@ test("reopening a draft while its reveal is closing keeps the draft row alive", 
   expect(quiet.count(RECENT_DRAFT)).toBe(1);
   await quiet.press("id:sidebar-recents >> text:Refactor the transcript reducer");
   expect(quiet.count(RECENT_DRAFT)).toBe(0);
+  await quiet.hover("id:sidebar-recents-action");
   await quiet.press("id:sidebar-recents-action");
   expect(quiet.count(RECENT_DRAFT)).toBe(1);
 });
@@ -410,6 +415,7 @@ test("a session in Recent keeps its place when it takes a message; only a new on
   expect(orders.every((order) => order === saved.join(" | "))).toBe(true);
 
   // A session the list has not shown before lands on top, where its draft row was.
+  await app.hover("id:sidebar-recents-action");
   await app.press("id:sidebar-recents-action");
   await app.waitUntil(() => app.texts().includes("What are we building?"));
   await app.type("label:Message", "a task of today");

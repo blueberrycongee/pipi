@@ -127,7 +127,7 @@ function ConfirmBody(props: { detail?: ConfirmDetail }) {
     <If when={props.detail}>
       <If when={of("command")}>
         {(d) => (
-          <View selectable class="overflow-hidden rounded-lg border border-border bg-sunken">
+          <View selectable class="overflow-hidden rounded-lg corner-squircle border border-border bg-sunken">
             <Scroll class="max-h-36" contentClass="px-3 py-2">
               <If when={d().note}>
                 <Text class="pb-1 text-xs text-subtle">{d().note}</Text>
@@ -142,7 +142,7 @@ function ConfirmBody(props: { detail?: ConfirmDetail }) {
       </If>
       <If when={of("file")}>
         {(d) => (
-          <View selectable class="overflow-hidden rounded-lg border border-border bg-sunken">
+          <View selectable class="overflow-hidden rounded-lg corner-squircle border border-border bg-sunken">
             <View class={`flex-row items-center gap-1.5 px-3 py-1.5 ${d().preview ? "border-b border-border" : ""}`}>
               <Icon name="file" size={12} tone="subtle" />
               <Text class="flex-1 truncate font-mono text-xs text-foreground">{d().path}</Text>
@@ -159,7 +159,7 @@ function ConfirmBody(props: { detail?: ConfirmDetail }) {
       </If>
       <If when={of("code")}>
         {(d) => (
-          <View selectable class="overflow-hidden rounded-lg border border-border bg-sunken">
+          <View selectable class="overflow-hidden rounded-lg corner-squircle border border-border bg-sunken">
             <Scroll class="max-h-36" contentClass="px-3 py-2">
               <View>
                 <Text class="font-mono text-xs leading-relaxed text-muted-foreground">{d().text}</Text>
@@ -223,7 +223,7 @@ export function ExtensionPrompt() {
         <View
           role="region"
           accessibilityLabel={tr("Confirmation prompt", "确认提示")}
-          class={`mb-2.5 gap-2.5 rounded-2xl p-3.5 ${POPUP}`}
+          class={`mb-2.5 gap-2.5 rounded-2xl corner-squircle p-3.5 ${POPUP}`}
           style={GLASS_REGULAR}
         >
         <If when={of("confirm")}>
@@ -237,7 +237,7 @@ export function ExtensionPrompt() {
                     {info().heading}
                   </Text>
                   <If when={info().badge}>
-                    <Text class="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-2xs text-muted-foreground">{info().badge}</Text>
+                    <Text class="shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 text-2xs text-muted-foreground">{info().badge}</Text>
                   </If>
                   <If when={pendingDialogCount() > 1}>
                     <Text class="shrink-0 tabular-nums text-xs text-subtle">{`1 / ${pendingDialogCount()}`}</Text>
@@ -282,7 +282,7 @@ export function ExtensionPrompt() {
                     {(option) => (
                       <BaseButton
                         onPress={() => answerDialog(dialog().id, { value: option() })}
-                        class={`min-h-8 flex-row items-center rounded-md px-2.5 py-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent focus:bg-accent active:bg-accent`}
+                        class={`min-h-8 flex-row items-center rounded-md corner-squircle px-2.5 py-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent focus:bg-accent active:bg-accent`}
                       >
                         <Text class="text-base text-foreground">{option()}</Text>
                       </BaseButton>
@@ -394,7 +394,7 @@ export function ExtensionDialog() {
               <View class="-mx-2 gap-0.5">
                 <Each of={dialog().options} key="index">
                   {(option) => (
-                    <BaseButton onPress={() => answerDialog(dialog().id, { value: option() })} class={`min-h-8 flex-row items-center rounded-md px-2 py-1.5 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}>
+                    <BaseButton onPress={() => answerDialog(dialog().id, { value: option() })} class={`min-h-8 flex-row items-center rounded-md corner-squircle px-2 py-1.5 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}>
                       <Text class="text-base text-foreground">{option()}</Text>
                     </BaseButton>
                   )}
@@ -430,7 +430,7 @@ export function ExtensionDialog() {
                 value={text()}
                 onChange={({ value }) => text.set(value)}
                 accessibilityLabel={dialog().title}
-                class={`h-56 rounded-lg p-2.5 font-mono text-sm text-foreground caret-brand ${FIELD_SURFACE}`}
+                class={`h-56 rounded-lg corner-squircle p-2.5 font-mono text-sm text-foreground caret-brand ${FIELD_SURFACE}`}
               />
               <View class="flex-row justify-end gap-2">
                 <Button label={tr("Cancel", "取消")} size="lg" onPress={cancelPendingDialog} />

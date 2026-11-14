@@ -765,7 +765,9 @@ function observeWrite(session, line) {
   } catch {
     return;
   }
-  touch(session);
+  // `lastActive` is the agent's own activity — a client polling `get_state` or
+  // a daemon bookkeeping write must not pass for it. Only records coming out
+  // of the process (observeRecord) move it.
   if (record.type === "extension_ui_response" && typeof record.id === "string") {
     session.pendingDialogs.delete(record.id);
     if (session.pendingDialogs.size === 0 && session.status === "blocked") setStatus(session, "working");
@@ -1319,6 +1321,10 @@ async function stopTree(session) {
         await daemonCommand(target, "clear_queue", {});
       }
       await daemonCommand(target, "abort", {});
+      // Stop means stopped: a bridge that cannot settle its run within the
+      // abort's own window is dead weight — the exit flips the session instead
+      // of leaving it "working" behind a run that never answers.
+      if ((target.status === "working" || target.status === "blocked") && target.proc && !target.proc.killed) killProcess(target);
     }),
   );
 }

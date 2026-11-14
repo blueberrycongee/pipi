@@ -23,7 +23,7 @@ import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
-import { FOCUS_RING, PRESS } from "../ui/styles";
+import { FOCUS_RING, HOVER_REVEAL, PRESS } from "../ui/styles";
 import { clearProseState, PROSE, ProseBlock, type ProseRow } from "./Prose";
 
 /**
@@ -422,16 +422,19 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   const foldable = () => (userLineCounts()[props.row.id] ?? roughLines(props.row.text)) > USER_FOLD_LINES;
   const folded = () => foldable() && !open();
   const fold = () => toggle(props.row.id, false);
+  /** The queue still holds this message: its bubble stands where it was sent, but reads as waiting — not said into the run yet. */
+  const queued = () => props.row.queued === true;
   return (
     <View class="group items-end">
       <View
-        class="max-w-[70%] gap-1.5 rounded-2xl rounded-br-md bg-secondary px-3.5 py-2.5"
+        class={`max-w-[70%] gap-1.5 rounded-2xl rounded-br-md corner-squircle bg-secondary px-3.5 py-2.5 ${queued() ? "opacity-60" : ""}`}
         selectable
         onContextMenu={(e) =>
           Menu.popup(
             [
               { label: tr("Copy", "复制"), onSelect: () => void copyText(props.row.text) },
-              { label: tr("Fork From Here", "从此处创建分支"), onSelect: () => void forkFrom(ordinal()) },
+              // There is nothing in the session to fork at until the agent takes the message.
+              ...(queued() ? [] : [{ label: tr("Fork From Here", "从此处创建分支"), onSelect: () => void forkFrom(ordinal()) }]),
             ],
             e.pagePosition,
           )
@@ -473,7 +476,7 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
             onPress={fold}
             accessibilityState={{ expanded: open() }}
             accessibilityLabel={open() ? tr("Collapse message", "收起消息") : tr("Expand message", "展开消息")}
-            class={`-mx-1 -mb-1 h-5 select-none items-center justify-center rounded-md ${PRESS} ${FOCUS_RING}`}
+            class={`-mx-1 -mb-1 h-5 select-none items-center justify-center rounded-md corner-squircle ${PRESS} ${FOCUS_RING}`}
           >
             <View
               class={`transition-transform duration-200 ease-out-quint motion-reduce:transition-none ${open() ? "rotate-180" : ""}`}
@@ -484,13 +487,19 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
         </If>
       </View>
       {/* Shown while the pointer is on the message (or just after a copy), so the bubbles stay quiet. */}
-      <View class="h-6 select-none flex-row items-center pt-0.5">
+      <View class="h-6 select-none flex-row items-center gap-1.5 pt-0.5">
+        <If when={queued()}>
+          <View class="flex-row items-center gap-1 pr-1">
+            <Icon name="queue" size={12} tone="subtle" />
+            <Text class="text-xs text-subtle">{tr("Queued", "排队中")}</Text>
+          </View>
+        </If>
         <If when={props.row.text}>
           <CopyButton
             id={props.row.id}
             text={props.row.text}
             label={tr("Copy message", "复制消息")}
-            class="-mr-1 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus:opacity-100 motion-reduce:transition-none"
+            class={`-mr-1 transition-opacity duration-150 motion-reduce:transition-none ${HOVER_REVEAL}`}
           />
         </If>
       </View>
@@ -567,7 +576,7 @@ function Disclosure(props: {
       role="button"
       onPress={props.onPress}
       accessibilityState={{ expanded: props.open }}
-      class={`group -mx-2 ${props.compact ? "h-6.5" : "h-7"} select-none flex-row items-center gap-2 rounded-md px-2 ${PRESS} active:scale-[0.995] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-accent active:bg-accent`}
+      class={`group -mx-2 ${props.compact ? "h-6.5" : "h-7"} select-none flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} active:scale-[0.995] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-accent active:bg-accent`}
     >
       {props.children}
       <View
@@ -599,7 +608,7 @@ function ProcessLine(props: { open: boolean; onPress?: () => void; children?: JS
         role="button"
         onPress={props.onPress}
         accessibilityState={{ expanded: props.open }}
-        class={`group h-7 min-w-0 max-w-full select-none flex-row items-center gap-1.5 self-start rounded-md ${FOCUS_RING}`}
+        class={`group h-7 min-w-0 max-w-full select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle ${FOCUS_RING}`}
       >
         {props.children}
         <View
@@ -736,7 +745,7 @@ function ReasoningBody(props: { text: string }) {
 function Output(props: { text: string; command?: string; tone?: "error"; insetClass?: string }) {
   const shown = () => clip(props.text, 400);
   return (
-    <View selectable class={`mb-1 mt-0.5 overflow-hidden rounded-lg border border-border bg-sunken ${props.insetClass ?? "ml-6"}`}>
+    <View selectable class={`mb-1 mt-0.5 overflow-hidden rounded-lg corner-squircle border border-border bg-sunken ${props.insetClass ?? "ml-6"}`}>
       <Scroll class="max-h-72" contentClass="p-3">
         <View>
           <If when={props.command}>
@@ -1040,7 +1049,7 @@ function BashRow(props: { row: Extract<Row, { kind: "bash" }> }) {
 function NoticeRow(props: { row: Extract<Row, { kind: "notice" }> }) {
   const tone = () => (props.row.tone === "error" ? "destructive" : props.row.tone === "warning" ? "warning" : "muted-foreground");
   return (
-    <View selectable class={`flex-row gap-2.5 rounded-lg border px-3 py-2.5 ${props.row.tone === "error" ? "border-destructive/30 bg-destructive/5" : "border-border bg-card"}`}>
+    <View selectable class={`flex-row gap-2.5 rounded-lg corner-squircle border px-3 py-2.5 ${props.row.tone === "error" ? "border-destructive/30 bg-destructive/5" : "border-border bg-card"}`}>
       <View class="pt-px">
         <Icon name={props.row.tone === "info" ? "info" : "alert"} tone={tone()} />
       </View>
@@ -1062,12 +1071,12 @@ function SummaryRow(props: { row: Extract<Row, { kind: "summary" }> }) {
       open={open()}
       reveal
       content={
-        <View class="mt-2 rounded-lg border border-border bg-card px-3 py-2.5">
+        <View class="mt-2 rounded-lg corner-squircle border border-border bg-card px-3 py-2.5">
           <TextView markdown={props.row.text} selectable codeBlockScrollbar={false} tableScrollbar={false} classes={{ ...PROSE, root: "gap-2 text-sm text-muted-foreground" }} />
         </View>
       }
     >
-      <View role="button" onPress={() => toggle(props.row.id, false)} accessibilityState={{ expanded: open() }} class={`h-7 select-none flex-row items-center gap-3 rounded-md ${FOCUS_RING}`}>
+      <View role="button" onPress={() => toggle(props.row.id, false)} accessibilityState={{ expanded: open() }} class={`h-7 select-none flex-row items-center gap-3 rounded-md corner-squircle ${FOCUS_RING}`}>
         <View class="h-px flex-1 bg-border" />
         <Icon name="compact" size={14} tone="subtle" />
         <Text class="text-xs text-muted-foreground">{props.row.title}</Text>
@@ -1091,7 +1100,7 @@ function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
       open={open()}
       reveal
       content={
-        <View class="mt-2 rounded-lg border border-border bg-card px-3 py-2.5">
+        <View class="mt-2 rounded-lg corner-squircle border border-border bg-card px-3 py-2.5">
           <TextView markdown={props.row.text} selectable codeBlockScrollbar={false} tableScrollbar={false} classes={{ ...PROSE, root: "gap-2 text-sm text-muted-foreground" }} />
         </View>
       }
@@ -1101,7 +1110,7 @@ function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
         onPress={() => toggle(props.row.id, false)}
         accessibilityState={{ expanded: open() }}
         accessibilityLabel={label()}
-        class={`h-7 select-none flex-row items-center gap-3 rounded-md ${FOCUS_RING}`}
+        class={`h-7 select-none flex-row items-center gap-3 rounded-md corner-squircle ${FOCUS_RING}`}
       >
         <View class="h-px flex-1 bg-border" />
         <Icon name="agents" size={14} tone="brand-text" />

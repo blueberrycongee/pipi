@@ -32,7 +32,15 @@ const session = (title: string) => `id:sidebar-recents >> text:${title}`;
 /** Whether `text` is in the conversation (the sidebar and the composer say some of the same words). */
 const shows = (app: App, text: string) => app.count(`label:Conversation >> text:${text}`) > 0;
 /** The header of a turn that took a while: each reads its own length, so it names one turn. */
-const finished = (app: App) => app.texts().filter((text) => /^Finished in \d+ seconds?$/.test(text));
+const finished = (app: App) => app.texts().filter((text) => /^Finished in (under )?\d+ seconds?$/.test(text));
+/** Presses the header of the last finished turn — two turns can read the same length, so `nth` names it. */
+async function pressFinished(app: App) {
+  const texts = app.texts();
+  const header = finished(app).at(-1);
+  expect(header).toBeDefined();
+  const nth = texts.slice(0, texts.lastIndexOf(header!)).filter((text) => text === header).length;
+  await app.press(`label:Conversation >> text:${header} >> nth=${nth}`);
+}
 
 async function say(app: App, text: string) {
   await app.type("label:Message", text);
@@ -228,11 +236,12 @@ test("what the reader unfolded is there with the click when they come back", asy
   await app.waitUntil(() => shows(app, REFACTOR), { timeout: DELAY * 4 });
 
   // A turn run here, then unfolded: its rows were made as it streamed, and the session's file holds them anew.
+  const settledBefore = finished(app).length;
   await say(app, "make a plan");
   await app.waitUntil(() => shows(app, "Steps"), { timeout: 60000 });
   await app.waitFor("label:Send", { timeout: 20000 });
-  const [header] = finished(app);
-  await app.press(`label:Conversation >> text:${header}`);
+  await app.waitUntil(() => finished(app).length > settledBefore, { timeout: 20000 });
+  await pressFinished(app);
   await app.waitUntil(() => shows(app, "Read package.json"));
   await app.press("label:Conversation >> text:Read package.json");
   await app.waitUntil(() => shows(app, "View reasoning"));
@@ -331,8 +340,7 @@ test("leaving a turn held open for a reader folds it: back from an empty chat, i
   expect(shows(app, ANSWER)).toBe(true);
   expect(seen.some(Boolean)).toBe(false);
   // What they opened by their own press inside it is theirs still, under the fold.
-  const [header] = finished(app);
-  await app.press(`label:Conversation >> text:${header}`);
+  await pressFinished(app);
   await app.waitUntil(() => shows(app, FIRST));
   expect(shows(app, "The user wants this done in steps. I will look at the project first.")).toBe(true);
 });

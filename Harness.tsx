@@ -17,14 +17,16 @@
 // `harness.dies` (`"<ms>"` or `"<ms>x<count>"`) makes the first agent process (or the first `count`) go away on its
 // own that long after it starts, exit code 0 and nothing said: an agent lost at rest.
 // `harness.starts` (a count) lets only that many agent processes start: the next one cannot be spawned.
-// `harness.wallpaper` (JSON: `{}`, or `{ "path": "<absolute path>", "width": …, "height": … }`) lays a wallpaper:
+// `harness.wallpaper` (JSON: `{}`, or `{ "path": "<absolute path>", "width": …, "height": …,
+// "kind": "video"|"shader", "preset": "jelly" }`) lays a wallpaper:
 // the repository's own picture, or any image on disk — a wallpaper is a file, and a test cannot name one here.
+// `harness.pickedImage` / `harness.pickedFolder` answer the app's file pickers, for wallpaper flows.
 // `harness.update` (JSON of FakeOptions.update) has the update checker find a new version: the card, its
 // track and its sparkles.
 import { mount, Storage } from "nsh";
 import wallpaperPicture from "./assets/brand/dmg-background@2x.png";
 import { fakeBackend, sampleHistory } from "./dev/fake-pi";
-import { boot, newSession, openSession, showSettings, type SettingsSection } from "./store/app";
+import { boot, newSession, openSession, send, setDraft, showSettings, type SettingsSection } from "./store/app";
 import { useBackend } from "./store/backend";
 import { Shell } from "./views/Shell";
 
@@ -71,7 +73,14 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
   }
   const wallpaperChoice = await Storage.getItem("harness.wallpaper");
   if (wallpaperChoice) {
-    const picture = JSON.parse(wallpaperChoice) as { path?: string; width?: number; height?: number; dominantColor?: string };
+    const picture = JSON.parse(wallpaperChoice) as {
+      path?: string;
+      width?: number;
+      height?: number;
+      dominantColor?: string;
+      kind?: string;
+      preset?: string;
+    };
     const stored = JSON.parse((await Storage.getItem("pipi.prefs.v1")) ?? "{}") as Record<string, unknown>;
     const path = picture.path ?? wallpaperPicture.url;
     await Storage.setItem(
@@ -85,6 +94,8 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
           height: picture.height ?? 840,
           adjustment: { focalX: 0.5, focalY: 0.5, zoom: 1 },
           dominantColor: picture.dominantColor ?? "#7963d9",
+          ...(picture.kind ? { kind: picture.kind } : {}),
+          ...(picture.preset ? { preset: picture.preset } : {}),
         },
       }),
     );
@@ -96,7 +107,8 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       history: scenario === "history" ? sampleHistory() : [],
       sessions: scenario === "connect" || scenario === "failed" ? [] : sessions,
       workspaceSessions: scenario === "multi" || scenario === "multi-slow" ? workspaceSessions : undefined,
-      pickedFolder: "/Users/pip/code/new-app",
+      pickedFolder: (await Storage.getItem("harness.pickedFolder")) ?? "/Users/pip/code/new-app",
+      pickedImage: (await Storage.getItem("harness.pickedImage")) ?? undefined,
       pace: scenario === "slow" ? 400 : scenario === "stream" || scenario === "multi-slow" ? 150 : 0,
       startDelay,
       distinctHistories,
@@ -112,8 +124,17 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
   for (const step of ((await Storage.getItem("harness.then")) ?? "").split(";").filter(Boolean)) {
     const at = step.indexOf(":");
     const target = step.slice(at + 1);
-    const [file, cwd] = target.split("@");
-    setTimeout(() => void (target === "new" ? newSession() : openSession(file, cwd)), Number(step.slice(0, at)));
+    setTimeout(() => {
+      if (target === "new") void newSession();
+      else if (target.startsWith("draft:")) setDraft(target.slice(6).replace(/\\n/g, "\n"));
+      else if (target.startsWith("send:")) {
+        if (target.length > 5) setDraft(target.slice(5).replace(/\\n/g, "\n"));
+        void send();
+      } else {
+        const [file, cwd] = target.split("@");
+        void openSession(file, cwd);
+      }
+    }, Number(step.slice(0, at)));
   }
   // "harness.settings": open Settings on this section shortly after mount, so a
   // test can photograph the page entrance mid-animation.

@@ -189,7 +189,11 @@ offset.
 Radius is concentric: `rounded-sm` (inline code) → `rounded-md` 6 (rows,
 buttons) → `rounded-lg` 8 (fields, blocks) → `rounded-xl` 12 (cards, popups)
 → `rounded-2xl` 16 (user bubble) → 22 (composer: the send button's 14 plus
-its 8pt inset) → `rounded-full` (send, switches).
+its 8pt inset) → `rounded-full` (send, switches). Every rounded corner is
+continuous (`corner-squircle` — Figma's corner smoothing, the iOS curve whose
+curvature eases into the edges, on the same radius budget); only a true
+pill or circle (`rounded-full`) keeps circular corners, since it has none to
+smooth.
 
 The composer rests at 92pt: 16 above the text, a 32pt field that grows from
 the second line, 8 to the toolbar, the 28pt toolbar, 8 below. Its text and
@@ -249,10 +253,47 @@ see. No layer picks a backdrop of its own; a new one takes `SCRIM`.
 
 ## Wallpaper
 
-A wallpaper is one picture laid once under the whole window
+A wallpaper is one surface laid once under the whole window
 (`WallpaperUnderlay`, `views/Shell.tsx`). No region draws a copy of its own,
-so the picture runs on from the sidebar into the pane and up behind the title
-bar to the window's edge. Each region is a depth of the same glass over it:
+so the surface runs on from the sidebar into the pane and up behind the title
+bar to the window's edge.
+
+The surface is one of three kinds, and only ever one: a still image, a video,
+or a live procedural shader — they share the single `wallpaper` slot, so
+choosing one replaces whichever came before and nothing of it survives on the
+next (`kind` on the config; a video or shader is *dynamic*, an image is
+still). The dynamic kinds animate by themselves; a still image can take an
+*effect* instead — a static shader laid over it (`dither`, `ascii`,
+`halftone`, `scanlines`) or an animated one (`ripple`, `rain`). The effect is
+the image's own: over a video or a live shader it would be a second animation
+fighting the first, so the choice stays stored but never draws there, and the
+picker is shown only while an image holds the slot. Pausing
+belongs to whatever is playing: a video, a live shader, or an image under an
+animated effect — a still under a static effect has nothing to freeze, so no
+control offers it and no state claims it.
+
+What plays answers the room the way Wallpaper Engine's do. The pointer drags
+a small parallax and a ripple pulse on a click (`notifyWallpaperPointerMove`,
+`triggerWallpaperInteraction`); the agent's mood feeds an `energy` uniform —
+shaders run faster and videos push their playback rate while it works — and
+`reduceMotion`, `wallpaperPaused` or the auto-pause mode stills it all. Each
+of these is a live binding on the one mounted surface, which is why the
+surface is chosen through `<If>`s, not an if/else: the element must be the
+kind's own, remounted when the kind changes, or a video stays mounted playing
+whatever path the next wallpaper hands it.
+
+The four built-in shaders are subjects, not fields: `jelly` swims an
+ASCII-rendered jellyfish through the deep — its bell pulses to swim, the
+pointer is a current it flees, a click is a contraction dart — `flock`
+ribbons a murmuration whose birds ride one drifting attractor, parting for
+the cursor and scattering on a click, `orbit` shears a ring of dust around
+a dark seed that snaps loose on a click and spirals home, and `aurora`
+breathes two curtains of light over mountain ridges doubled in a still
+lake, leaning toward the cursor and carrying a meteor on each click. A
+stored `preset:` that outlives its name is upgraded to its successor,
+never left unlit.
+
+Each region is a depth of the same glass over it:
 
 | Region | Over the wallpaper |
 |---|---|

@@ -45,12 +45,12 @@ export const PROSE = {
   heading2: "mt-2 text-lg",
   heading3: "mt-1.5 text-md",
   heading4: "mt-1 text-md",
-  code: "rounded-sm bg-muted px-1 text-sm text-foreground",
-  codeBlock: "rounded-xl border border-border bg-sunken",
+  code: "rounded-sm corner-squircle bg-muted px-1 text-sm text-foreground",
+  codeBlock: "rounded-xl corner-squircle border border-border bg-sunken",
   codeBlockCode: "p-3.5 text-xs leading-relaxed",
   link: "text-brand-text",
   blockquote: "border-l-2 border-border pl-3.5 text-muted-foreground",
-  table: "rounded-lg border border-border",
+  table: "rounded-lg corner-squircle border border-border",
   tableHead: "bg-muted",
   tableCell: "px-3 py-1.5 text-sm",
   tableHeaderCell: "text-xs font-semibold text-muted-foreground",
@@ -163,7 +163,7 @@ function collectRuns(content: readonly TextViewInline[], marks: InlineMarks, out
         collectRuns(n.content, { ...marks, underline: true }, out);
         break;
       case "highlight":
-        collectRuns(n.content, { ...marks, cls: `${marks.cls} rounded-xs`, bg: "brand-soft" }, out);
+        collectRuns(n.content, { ...marks, cls: `${marks.cls} rounded-xs corner-squircle`, bg: "brand-soft" }, out);
         break;
       case "small":
       case "subscript":
@@ -175,7 +175,7 @@ function collectRuns(content: readonly TextViewInline[], marks: InlineMarks, out
           out.push({
             ...marks,
             text: n.code,
-            cls: `${marks.cls} font-mono text-[0.9em] rounded-sm px-1`,
+            cls: `${marks.cls} font-mono text-[0.9em] rounded-sm corner-squircle px-1`,
             tone: marks.tone === "brand" ? "brand" : "fg",
             bg: "muted",
           });
@@ -186,7 +186,7 @@ function collectRuns(content: readonly TextViewInline[], marks: InlineMarks, out
           out.push({
             ...marks,
             text: n.text,
-            cls: `${marks.cls} font-mono text-xs rounded-sm px-1`,
+            cls: `${marks.cls} font-mono text-xs rounded-sm corner-squircle px-1`,
             bg: "muted",
           });
         }
@@ -460,7 +460,7 @@ function StreamingCodeCard(props: { code: string; chunks: VeilChunk[] }) {
   // Identical box and metrics to the settled code block (`PROSE.codeBlock`), so the
   // card does not change size when highlighting takes over once its veil finishes.
   return (
-    <View selectable class="overflow-hidden rounded-xl border border-border bg-sunken">
+    <View selectable class="overflow-hidden rounded-xl corner-squircle border border-border bg-sunken">
       <Scroll horizontal class="w-full" contentClass="p-3.5">
         <View>
           <Text class="font-mono text-xs leading-relaxed">{codeSpans()}</Text>
@@ -515,7 +515,7 @@ function VeiledListView(props: {
                 }
               >
                 <View
-                  class={`mt-[4px] size-3.5 shrink-0 items-center justify-center rounded-xs border ${
+                  class={`mt-[4px] size-3.5 shrink-0 items-center justify-center rounded-xs corner-squircle border ${
                     item().checked ? "border-brand bg-brand" : "border-hairline-focus bg-card"
                   }`}
                 >
@@ -574,7 +574,7 @@ function VeiledTableView(props: {
   };
 
   return (
-    <View selectable class="overflow-hidden rounded-lg border border-border">
+    <View selectable class="overflow-hidden rounded-lg corner-squircle border border-border">
       <Scroll horizontal class="w-full">
         <View class="min-w-full">
           <View class="flex-row border-b border-border bg-muted">

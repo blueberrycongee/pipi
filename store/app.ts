@@ -51,7 +51,7 @@ import type {
   SlashCommand,
   ThinkingLevel,
 } from "../pi/protocol";
-import { type SessionSummary, sessionTitle } from "../pi/sessions";
+import { type SessionSnapshot, type SessionSummary, sessionTitle } from "../pi/sessions";
 import { EMPTY_USAGE, type UsageStats } from "../pi/usage";
 import { killAllSidecars, SidecarError } from "../pi/sidecar";
 import { type Row, Transcript, withoutHandoff, withoutImageNotes } from "../pi/transcript";
@@ -365,7 +365,10 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
   let target = goal;
   let shown = false;
   if (!goal.keepTitle) {
-    const warm = phase().name === "ready" || isDraftAhead();
+    // The app is usable already: ready, a welcome shown ahead, or content a
+    // switch in flight already put on screen. Only a cold boot is not warm —
+    // its "starting" stage stands until the first agent answers.
+    const warm = phase().name === "ready" || isDraftAhead() || ahead !== undefined || transcript.rows().length > 0;
     const welcome = !goal.file && !goal.daemonId && warm && agentHasModel(goal.agentId ?? currentAgentId());
     stashTranscript();
     const seenFile = goal.file ?? (goal.daemonId ? daemonSessionOfId(goal.daemonId)?.file : undefined);
@@ -412,6 +415,23 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
         arrived.update((n) => n + 1);
       }
     });
+    // Nothing cached or fresh to show — the saved file still can be: it reads
+    // in milliseconds while the agent attaches and confirms with its own.
+    if (!shown) {
+      const snapFile = goal.file ?? (goal.daemonId ? daemonSessionOfId(goal.daemonId)?.file : undefined);
+      if (snapFile) {
+        const epoch = ++snapshotEpoch;
+        void backend()
+          .readSessionSnapshot(snapFile)
+          .then((snap) => {
+            if (!snap?.messages.length) return;
+            // A newer change took over, the change reverted (`stayPut`), or a destination already landed — nothing to paint.
+            if (snapshotEpoch !== epoch || heading() !== target || ahead || (!leaving() && transcript.rows().length)) return;
+            landSnapshot(snapFile, goal.daemonId, snap);
+          })
+          .catch(() => undefined);
+      }
+    }
   } else {
     heading.set(target);
   }
@@ -803,6 +823,8 @@ const VISITED_LIMIT = 8;
 let ahead: { transcript: Transcript; file?: string; daemonId?: string } | undefined;
 /** The change under way showed its destination before the agent got there: a change that fails puts the agent's session back. */
 let early = false;
+/** The session-change generation a pending saved-file read belongs to: a change that reverts or is superseded voids it. */
+let snapshotEpoch = 0;
 /** Settles when the session change under way is over, however it ends. */
 let arrival: Promise<void> | undefined;
 /**
@@ -831,7 +853,9 @@ let shownVersion = -1;
 let dropSweepTimer: ReturnType<typeof setTimeout> | undefined;
 let dropSweepAt: number | undefined;
 let toastId = 0;
-const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
+const toastTimers = new Map<number, { timer: ReturnType<typeof setTimeout>; deadline: number }>();
+/** What a hovered toast still had ahead of it when the pointer came to rest on it. */
+const heldToasts = new Map<number, number>();
 /** The reader asked the open run to stop. However it then ends is their doing: Pi settles a retry cancelled mid-wait as not aborted. */
 let stopAsked = false;
 let bashRequestId: string | undefined;
@@ -1006,6 +1030,41 @@ function landHistory(messages: AgentMessage[]) {
 /** Marks every row the transcript can put on screen as already seen: a landing never replays row entrances. */
 function markTranscriptSeen() {
   markRowsSeen(displayRowIds(transcript.rows()));
+}
+
+/**
+ * A saved session's file is its conversation's last settled state, read
+ * straight from disk while the agent is still attaching — the switch answers
+ * the click with it, and the agent's own history confirms or replaces it as it
+ * lands (`landHistory`). The daemon's registry still says whether a run is
+ * going on there: the file may lag it, so its turn stays open.
+ */
+function landSnapshot(file: string | undefined, daemonId: string | undefined, snap: SessionSnapshot) {
+  const fresh = new Transcript(() => activeLanguage());
+  const held = (file ? daemonSessionByFile(file) : undefined) ?? (daemonId ? daemonSessionOfId(daemonId) : undefined);
+  const working = held?.status === "working" || held?.status === "blocked";
+  fresh.load(snap.messages, working);
+  transcript = fresh;
+  ahead = { transcript: fresh, file, daemonId };
+  early = true;
+  shownVersion = -1;
+  markTranscriptSeen();
+  batch(() => {
+    if (working && !running()) runStartedAt.set(Date.now());
+    running.set(working);
+    bashRunning.set(false);
+    activity.set(working ? (activity().kind === "idle" ? { kind: "thinking" } : activity()) : { kind: "idle" });
+    queue.set({ steering: [], followUp: [] });
+    dialogs.set([]);
+    statuses.set({});
+    widgets.set({});
+    flush();
+    landed.update((n) => n + 1);
+    scrollToEnd.set(0);
+    // The destination is on screen: the leaving dim was for the wait, and it is over.
+    if (leaving()) leaving.set(false);
+    arrived.update((n) => n + 1);
+  });
 }
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -2393,13 +2452,36 @@ function toastLifetime(tone: Toast["tone"], text: string, hasAction: boolean) {
   return Math.min(12_000, base + Math.max(0, length - 60) * 40);
 }
 
-/** (Re)starts the time a toast has left. */
+/** The beat a toast still gets once the pointer leaves it — long enough to come back to, short enough to move on. */
+const TOAST_LINGER_MS = 1600;
+
+/** (Re)starts the time a toast has left. A held one only learns its new clock. */
 function expireToast(id: number, ttl: number) {
-  clearTimeout(toastTimers.get(id));
-  toastTimers.set(
-    id,
-    setTimeout(() => dismissToast(id), ttl),
-  );
+  const entry = toastTimers.get(id);
+  if (entry) clearTimeout(entry.timer);
+  toastTimers.delete(id);
+  if (heldToasts.has(id)) {
+    heldToasts.set(id, ttl);
+    return;
+  }
+  toastTimers.set(id, { timer: setTimeout(() => dismissToast(id), ttl), deadline: Date.now() + ttl });
+}
+
+/** Holds a toast's clock while the pointer rests on it, so what it offers cannot vanish mid-reach. */
+export function pauseToast(id: number) {
+  const entry = toastTimers.get(id);
+  if (!entry || heldToasts.has(id)) return;
+  clearTimeout(entry.timer);
+  toastTimers.delete(id);
+  heldToasts.set(id, Math.max(0, entry.deadline - Date.now()));
+}
+
+/** Starts a held toast's clock again, with a beat left even if the pointer only just caught it. */
+export function resumeToast(id: number) {
+  const left = heldToasts.get(id);
+  if (left === undefined) return;
+  heldToasts.delete(id);
+  expireToast(id, Math.max(left, TOAST_LINGER_MS));
 }
 
 /**
@@ -2426,16 +2508,20 @@ export function toast(
   const id = ++toastId;
   // Three at most: the oldest makes room.
   for (const gone of toasts().slice(0, -2)) {
-    clearTimeout(toastTimers.get(gone.id));
+    const entry = toastTimers.get(gone.id);
+    if (entry) clearTimeout(entry.timer);
     toastTimers.delete(gone.id);
+    heldToasts.delete(gone.id);
   }
   toasts.update((list) => [...list.slice(-2), { id, tone, text, icon: options?.icon, action: options?.action }]);
   expireToast(id, ttl);
 }
 
 export function dismissToast(id: number) {
-  clearTimeout(toastTimers.get(id));
+  const entry = toastTimers.get(id);
+  if (entry) clearTimeout(entry.timer);
   toastTimers.delete(id);
+  heldToasts.delete(id);
   toasts.update((list) => list.filter((item) => item.id !== id));
 }
 
@@ -2941,6 +3027,8 @@ async function switchInto(cwd: string, sessionPath: string | undefined, agentId 
 
 /** A change that showed its destination ahead and then did not happen: the agent's own session goes back on screen. */
 async function stayPut() {
+  // Nothing the destination's saved file read still in flight may show lands after a reverted change.
+  snapshotEpoch++;
   if (!early) return;
   early = false;
   // The destination shown ahead goes back where it was kept; the session that stays comes back from there too (`landHistory`).
@@ -3486,6 +3574,51 @@ async function applyWallpaperFile(sourcePath: string, recordInHistory = true): P
   const isVideo = isVideoWallpaperPath(mediaPath);
   const dir = wallpapersDir();
 
+  const applyImageMedia = async (bytes: Uint8Array): Promise<boolean> => {
+    const info = inspectImageBytes(bytes);
+    if (!info) {
+      throw new Error(tr("Unsupported or corrupted image file.", "不支持或已损坏的图片文件。"));
+    }
+    const fileName = resolved.title || mediaPath.split("/").pop() || `wallpaper.${info.format}`;
+    const dot = mediaPath.lastIndexOf(".");
+    const ext = dot >= 0 ? mediaPath.slice(dot + 1).toLowerCase() : info.format;
+    let targetPath = mediaPath;
+
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      // The copy is named by what the bytes are, not what the pick was called —
+      // a renamed file must never produce a `background-*.mp4` that holds an image.
+      targetPath = `${dir}/background-${Date.now()}.${isVideoWallpaperPath(mediaPath) ? info.format : ext}`;
+      await fs.writeFile(targetPath, bytes);
+    } catch {
+      // In headless tests or read-only sandboxes, fall back to referencing mediaPath directly.
+      targetPath = mediaPath;
+    }
+
+    const prevPath = wallpaper()?.path;
+    if (prevPath && prevPath !== targetPath && prevPath.startsWith(`${dir}/`)) {
+      await fs.unlink(prevPath).catch(() => undefined);
+    }
+
+    const trackSource =
+      recordInHistory || isPathInsideFolder(sourcePath, wallpaperFolder()) ? sourcePath : undefined;
+    const dominantColor = resolved.dominantColor ?? info.dominantColor;
+
+    setWallpaperPref(
+      {
+        path: targetPath,
+        name: fileName,
+        width: info.width,
+        height: info.height,
+        adjustment: { ...DEFAULT_WALLPAPER_ADJUSTMENT },
+        ...(dominantColor ? { dominantColor } : {}),
+        kind: "image",
+      },
+      trackSource,
+    );
+    return true;
+  };
+
   if (!DYNAMIC_WALLPAPER_ENABLED && isVideo) {
     throw new Error(tr("Unsupported or corrupted image file.", "不支持或已损坏的图片文件。"));
   }
@@ -3510,6 +3643,11 @@ async function applyWallpaperFile(sourcePath: string, recordInHistory = true): P
       const info = inspectWallpaperBytes(bytes, mediaPath);
       if (!info) {
         throw new Error(tr("Unsupported or corrupted video file.", "不支持或已损坏的视频壁纸文件。"));
+      }
+      // Content wins over the extension: a renamed image goes down the image path
+      // instead of becoming a `kind:"video"` wallpaper nothing can play.
+      if (info.kind === "image") {
+        return applyImageMedia(bytes);
       }
       width = info.width;
       height = info.height;
@@ -3555,47 +3693,7 @@ async function applyWallpaperFile(sourcePath: string, recordInHistory = true): P
   if (bytes.byteLength > MAX_WALLPAPER_IMAGE_BYTES) {
     throw new Error(tr("Image must be 25 MB or smaller.", "图片大小不能超过 25 MB。"));
   }
-  const info = inspectImageBytes(bytes);
-  if (!info) {
-    throw new Error(tr("Unsupported or corrupted image file.", "不支持或已损坏的图片文件。"));
-  }
-
-  const fileName = resolved.title || mediaPath.split("/").pop() || `wallpaper.${info.format}`;
-  const dot = mediaPath.lastIndexOf(".");
-  const ext = dot >= 0 ? mediaPath.slice(dot + 1).toLowerCase() : info.format;
-  let targetPath = mediaPath;
-
-  try {
-    await fs.mkdir(dir, { recursive: true });
-    targetPath = `${dir}/background-${Date.now()}.${ext}`;
-    await fs.writeFile(targetPath, bytes);
-  } catch {
-    // In headless tests or read-only sandboxes, fall back to referencing mediaPath directly.
-    targetPath = mediaPath;
-  }
-
-  const prevPath = wallpaper()?.path;
-  if (prevPath && prevPath !== targetPath && prevPath.startsWith(`${dir}/`)) {
-    await fs.unlink(prevPath).catch(() => undefined);
-  }
-
-  const trackSource =
-    recordInHistory || isPathInsideFolder(sourcePath, wallpaperFolder()) ? sourcePath : undefined;
-  const dominantColor = resolved.dominantColor ?? info.dominantColor;
-
-  setWallpaperPref(
-    {
-      path: targetPath,
-      name: fileName,
-      width: info.width,
-      height: info.height,
-      adjustment: { ...DEFAULT_WALLPAPER_ADJUSTMENT },
-      ...(dominantColor ? { dominantColor } : {}),
-      kind: "image",
-    },
-    trackSource,
-  );
-  return true;
+  return applyImageMedia(bytes);
 }
 
 export async function chooseWallpaperImage(): Promise<boolean> {
@@ -3665,9 +3763,9 @@ export function updateWallpaperAdjustment(adjustment: WallpaperAdjustment) {
   setWallpaperAdjustmentPref(adjustment);
 }
 
-export function updateWallpaperDimensions(width: number, height: number) {
+export function updateWallpaperDimensions(path: string, width: number, height: number) {
   if (!DYNAMIC_WALLPAPER_ENABLED) return;
-  setWallpaperDimensionsPref(width, height);
+  setWallpaperDimensionsPref(path, width, height);
 }
 
 export function setWallpaperEffect(effect: WallpaperEffect) {
@@ -3723,7 +3821,9 @@ export async function chooseWallpaperFolder() {
   const picked = await pickOrToast(backend().pickFolder(tr("Choose wallpaper folder", "选择壁纸文件夹")));
   if (!picked) return;
   setWallpaperFolderPref(picked);
-  await randomWallpaper(picked);
+  // Picking a folder configures ⌘U rotation; it must not silently replace the
+  // wallpaper the user already chose — shuffle now only when there is none.
+  if (!wallpaper()) await randomWallpaper(picked);
 }
 
 export function clearWallpaperFolder() {

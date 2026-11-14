@@ -1,7 +1,7 @@
 import { cleanup, createAnimatedValue, createMotion, effect, reduceMotion, signal, Text, untracked, View } from "nsh";
 import { Button as BaseButton } from "nsh/base";
 import { tr } from "../lib/i18n";
-import { activeToasts, dismissToast, type Toast } from "../store/app";
+import { activeToasts, dismissToast, pauseToast, resumeToast, type Toast } from "../store/app";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName, type Tone } from "../ui/Icon";
 import { EASING, Reveal } from "../ui/motion";
@@ -49,6 +49,8 @@ function ToastCard(props: { toast: Toast; leaving: boolean }) {
           class={`${props.leaving ? "pointer-events-none" : "pointer-events-auto"} max-w-120 flex-row items-center gap-2.5 py-2 pl-3 pr-1.5 ${POPUP_TOAST}`}
           style={enter.style}
           role="alert"
+          onMouseEnter={() => pauseToast(props.toast.id)}
+          onMouseLeave={() => resumeToast(props.toast.id)}
         >
           <View class="shrink-0">
             <Icon name={icon()} tone={LOOK[props.toast.tone].tone} />
@@ -62,7 +64,7 @@ function ToastCard(props: { toast: Toast; leaving: boolean }) {
                   dismissToast(props.toast.id);
                   fn();
                 }}
-                class={`h-6 shrink-0 flex-row items-center rounded-md bg-secondary px-2 ${PRESS} ${FOCUS_RING} hover:bg-secondary/80 active:bg-secondary/70`}
+                class={`h-6 shrink-0 flex-row items-center rounded-md corner-squircle bg-secondary px-2 ${PRESS} ${FOCUS_RING} hover:bg-secondary/80 active:bg-secondary/70`}
               >
                 <Text class="text-xs font-medium text-secondary-foreground">{act().label}</Text>
               </BaseButton>

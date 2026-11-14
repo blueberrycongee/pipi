@@ -1275,6 +1275,14 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     async listWorkspaceSessions(cwds) {
       return Object.fromEntries(cwds.map((cwd) => [cwd, byWorkspace[cwd] ?? sessions]));
     },
+    // The session file's contents answer at once even while the agent is slow
+    // to attach — what `switch_session`'s own `get_messages` will confirm.
+    async readSessionSnapshot(path) {
+      const messages = sessionMessages.get(path) ?? historyOf(path);
+      if (!messages.length) return undefined;
+      const summary = [...sessions, ...Object.values(byWorkspace).flat()].find((s) => s.path === path);
+      return { kind: summary?.agentId && summary.agentId !== "pi" ? "external" : "pi", agentId: summary?.agentId, messages };
+    },
     async deleteSession(path) {
       sessions = sessions.filter((s) => s.path !== path);
       for (const cwd of Object.keys(byWorkspace)) {

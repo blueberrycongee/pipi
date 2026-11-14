@@ -30,12 +30,12 @@ export function Segmented<T extends string>(props: {
 }) {
   return (
     <View
-      class={`${props.fullWidth ? "w-full" : "shrink-0"} rounded-lg bg-muted p-0.5`}
+      class={`${props.fullWidth ? "w-full" : "shrink-0"} rounded-lg corner-squircle bg-muted p-0.5`}
       accessibilityLabel={props.label}
     >
       <Tabs
         class={`${props.fullWidth ? "w-full" : ""} flex-row`}
-        indicatorClass="inset-y-0 rounded-md bg-card shadow-sm"
+        indicatorClass="inset-y-0 rounded-md corner-squircle bg-card shadow-sm"
       >
         <Each of={props.options}>
           {(option) => (
@@ -44,7 +44,7 @@ export function Segmented<T extends string>(props: {
               onPress={() => {
                 if (props.value !== option().value) props.onChange(option().value);
               }}
-              class={`h-6 ${props.fullWidth ? "min-w-0 flex-1" : "shrink-0"} items-center justify-center rounded-md px-2.5 text-sm text-muted-foreground transition-colors duration-150 ${FOCUS_RING} hover:text-foreground selected:text-foreground`}
+              class={`h-6 ${props.fullWidth ? "min-w-0 flex-1" : "shrink-0"} items-center justify-center rounded-md corner-squircle px-2.5 text-sm text-muted-foreground transition-colors duration-150 ${FOCUS_RING} hover:text-foreground selected:text-foreground`}
             >
               <Text class={props.fullWidth ? "truncate" : ""}>{option().label}</Text>
             </Tab>
@@ -103,7 +103,7 @@ export function TextField(props: {
         autoCorrect={false}
         autoCapitalize="none"
         accessibilityLabel={props.label}
-        class={`h-8 w-full rounded-lg px-2.5 text-base text-foreground caret-brand ${FIELD_SURFACE} ${props.mono ? "font-mono text-sm" : ""} ${props.inputClass ?? ""}`}
+        class={`h-8 w-full rounded-lg corner-squircle px-2.5 text-base text-foreground caret-brand ${FIELD_SURFACE} ${props.mono ? "font-mono text-sm" : ""} ${props.inputClass ?? ""}`}
       />
       <If when={props.placeholder !== undefined && props.value.length === 0}>
         <View class={`pointer-events-none absolute inset-y-0 right-2.5 min-w-0 justify-center ${props.hintClass ?? "left-2.5"}`}>
@@ -136,7 +136,7 @@ export function SettingGroup(props: { title?: string; children?: JSX.Element }) 
           {props.title}
         </Text>
       ) : null}
-      <View class="overflow-hidden rounded-xl bg-muted/50 px-4">{props.children}</View>
+      <View class="overflow-hidden rounded-xl corner-squircle bg-muted/50 px-4">{props.children}</View>
     </View>
   );
 }

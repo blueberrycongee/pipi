@@ -3,7 +3,7 @@ import { Command, type CommandItem, Dialog } from "nsh/base";
 import { runtimeModeRank } from "../agents/catalog";
 import type { RuntimeMode } from "../agents/types";
 import { basename, tildePath } from "../lib/format";
-import { DYNAMIC_WALLPAPER_ENABLED, WALLPAPER_PRESET_META, WALLPAPER_PRESETS } from "../lib/wallpaper";
+import { DYNAMIC_WALLPAPER_ENABLED, isPausableWallpaper, WALLPAPER_PRESET_META, WALLPAPER_PRESETS } from "../lib/wallpaper";
 import { sessionTitle } from "../pi/sessions";
 import {
   activeAgent,
@@ -49,6 +49,7 @@ import {
   toggleWallpaperPaused,
   unarchiveCurrentSession,
   wallpaper,
+  wallpaperEffect,
   wallpaperPaused,
   workspacePath,
   workspaceSessions,
@@ -144,7 +145,7 @@ export function Palette() {
         : []),
       { id: "restart", label: tr(`Restart ${activeAgent().name}`, `重启 ${activeAgent().name}`), group: workspaceGroup, keywords: ["restart", "pi", "agent"], icon: "refresh", run: () => void restartPi() },
       { id: "wallpaper-random", label: tr("Random Wallpaper", "随机切换壁纸"), group: workspaceGroup, keywords: ["wallpaper", "random", "shuffle", "壁纸", "随机"], shortcut: "mod+u", icon: "shuffle", run: () => void randomWallpaper() },
-      ...(DYNAMIC_WALLPAPER_ENABLED && wallpaper()
+      ...(DYNAMIC_WALLPAPER_ENABLED && isPausableWallpaper(wallpaper(), wallpaperEffect())
         ? [
             {
               id: "wallpaper-toggle-pause",
@@ -296,7 +297,7 @@ export function Palette() {
           listClass="max-h-96 p-1.5"
           groupClass="px-2.5 pb-1 pt-2.5 text-xs font-medium text-subtle"
           separatorClass="mx-1 my-1 h-px bg-border"
-          itemClass={`group h-9 flex-row items-center rounded-lg px-2.5 ${PRESS} focus:bg-accent`}
+          itemClass={`group h-9 flex-row items-center rounded-lg corner-squircle px-2.5 ${PRESS} focus:bg-accent`}
           empty={<Text class="py-10 text-center text-sm text-muted-foreground">{tr("Nothing matches.", "无匹配结果。")}</Text>}
           renderItem={(entry) => (
             <View class="flex-1 flex-row items-center gap-2.5">

@@ -28,12 +28,12 @@ export const SCRIM = "bg-scrim";
 
 /** The anchored-surface family: popovers, menus, the palette, toasts —
  * translucent popover fill over native Liquid Glass. */
-export const POPUP = "rounded-xl border-[0.5px] border-hairline bg-popover/72 shadow-popover dark:bg-popover/68";
+export const POPUP = "rounded-xl corner-squircle border-[0.5px] border-hairline bg-popover/72 shadow-popover dark:bg-popover/68";
 
 /** Toasts stack over the scrolling transcript, unlike other popups: an opaque
  * surface — translucent glass would let rows ghost through — and a tight
  * shadow that does not fall onto the card below. */
-export const POPUP_TOAST = "rounded-xl border-[0.5px] border-hairline bg-popover shadow-toast dark:bg-popover";
+export const POPUP_TOAST = "rounded-xl corner-squircle border-[0.5px] border-hairline bg-popover shadow-toast dark:bg-popover";
 
 /** Floating header bar recipe over scrolling pages. */
 export const HEADER_GLASS = "border-b-[0.5px] border-border bg-background/62 dark:bg-background/58";
@@ -44,6 +44,10 @@ export const POPUP_HIDDEN = "opacity-0 scale-[0.96] translate-y-1";
 
 /** Keyboard focus, the same ring everywhere. */
 export const FOCUS_RING = "focus:ring-2 focus:ring-ring";
+
+/** A control that only shows under the group's pointer — or its own keyboard focus, so a
+ * control Tab reaches never stays invisible while it holds the ring. */
+export const HOVER_REVEAL = "opacity-0 group-hover:opacity-100 focus:opacity-100";
 
 /** The feedback of anything pressable: smooth color & micro-scale press. */
 export const PRESS = "transition duration-150 ease-out-quint motion-reduce:transition-none";
@@ -78,7 +82,7 @@ export const PAGE_GLASS: ViewStyle = {
 };
 
 /** A row in a list or menu: hover and keyboard highlight share one look. */
-export const ROW = `h-8 flex-row items-center gap-2 rounded-md px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`;
+export const ROW = `h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`;
 
 /** Text roles. */
 export const LABEL = "text-base text-foreground";

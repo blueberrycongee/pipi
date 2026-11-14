@@ -177,6 +177,13 @@ async function runSingleTurn(promptText) {
     return aborted;
   }
 
+  if (cmdText.startsWith("wedge:")) {
+    // The run starts and then dies silently: agent_start went out, and nothing
+    // ever follows — abort is still answered, but no agent_end/agent_settled
+    // comes behind it. What a wedged ACP worker reads as over the bridge.
+    await new Promise(() => {});
+  }
+
   if (cmdText.startsWith("slow:")) {
     const [, msStr, ...rest] = cmdText.split(":");
     const ms = Number(msStr) || 500;
@@ -1205,3 +1212,39 @@ test("daemon retitles a session from the file it lands on, but keeps a given nam
   await ctrl.waitUntil(() => ctrl.sessions.get(namedId)?.title === "Named on disk");
 });
 
+
+test("stop puts down a bridge that answers abort but never settles its run", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-wedge-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+
+  const ctrl = await openControl(homeDir, { HOME: tmp });
+  t.after(async () => {
+    ctrl.client.close();
+    try {
+      const inst = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+      process.kill(inst.pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+
+  const attached = await ctrl.call("attach", {
+    session: { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" },
+  });
+  const sid = attached.session.id;
+  ctrl.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "w1", type: "prompt", message: "wedge:now" }) });
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.status === "working");
+
+  // The abort is answered but the run never settles — stop must kill, not report.
+  await ctrl.call("stop", { sessionId: sid });
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.status === "failed", 6000);
+  assert.equal(ctrl.sessions.get(sid)?.loaded, false, "the wedged process is gone");
+
+  // The session still works afterwards: a message revives it on a fresh process.
+  await ctrl.call("send", { sessionId: sid, message: "back from the dead" });
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.status === "idle", 10000);
+  const read = await ctrl.readMessages(sid);
+  assert.equal(read.messages.at(-1).text, "echo:back from the dead");
+});

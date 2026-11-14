@@ -46,11 +46,11 @@ export function ModelList(props: { onChosen: () => void; class?: string }) {
       listClass="max-h-80 p-1"
       groupClass="px-2 pb-1 pt-2 text-xs font-medium text-subtle"
       separatorClass="mx-1 my-1 h-px bg-border"
-      itemClass={`group h-8 flex-row items-center rounded-md px-2 ${PRESS} focus:bg-accent`}
+      itemClass={`group h-8 flex-row items-center rounded-md corner-squircle px-2 ${PRESS} focus:bg-accent`}
       empty={
         <View class="items-center gap-3 px-6 py-8">
           <Text class="text-center text-sm text-muted-foreground">{tr("No models match. Connect a provider to see its models here.", "没有匹配的模型。连接服务商后即可在此查看其模型。")}</Text>
-          <BaseButton onPress={() => (props.onChosen(), showAgentSettings())} class={`h-7 justify-center rounded-md bg-secondary px-2.5 ${PRESS} hover:bg-secondary/80`}>
+          <BaseButton onPress={() => (props.onChosen(), showAgentSettings())} class={`h-7 justify-center rounded-md corner-squircle bg-secondary px-2.5 ${PRESS} hover:bg-secondary/80`}>
             <Text class="text-base font-medium text-secondary-foreground">{tr(`Configure ${activeAgent().name}`, `配置 ${activeAgent().name}`)}</Text>
           </BaseButton>
         </View>
@@ -144,7 +144,7 @@ export function ThinkingPicker() {
                 void chooseThinkingLevel(option());
                 focusComposer();
               }}
-              class={`h-8 flex-row items-center gap-2 rounded-md px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+              class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
             >
               <Text class="text-base text-foreground">{thinkingText(option()).label}</Text>
               <Text class="flex-1 truncate text-xs text-subtle">{thinkingText(option()).hint}</Text>

@@ -14,7 +14,7 @@ export function tip(label: string, shortcut?: string, placement: "top" | "bottom
       offset={6}
       delay={450}
       style={GLASS_REGULAR}
-      class="flex-row items-center gap-1.5 rounded-lg border-[0.5px] border-hairline bg-popover/74 px-2 py-1 shadow-popover transition-all duration-150 ease-out-quint dark:bg-popover/70 motion-reduce:transition-none"
+      class="flex-row items-center gap-1.5 rounded-lg corner-squircle border-[0.5px] border-hairline bg-popover/74 px-2 py-1 shadow-popover transition-all duration-150 ease-out-quint dark:bg-popover/70 motion-reduce:transition-none"
       startingClass="opacity-0 scale-95"
       endingClass="opacity-0 scale-95"
     >

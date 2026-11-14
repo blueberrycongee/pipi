@@ -72,7 +72,7 @@ export function AgentPicker() {
                   close();
                   void switchAgentHarness(agent().id);
                 }}
-                class={`min-h-9 flex-row items-center gap-2.5 rounded-md px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+                class={`min-h-9 flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
               >
                 <AgentLogo id={agent().id} size={18} tone={agent().available ? "foreground" : "muted-foreground"} status={agent().available ? "ready" : "off"} />
                 <View class="min-w-0 flex-1">
@@ -131,7 +131,7 @@ export function PermissionPicker() {
                 void changeRuntimeMode(option());
                 focusComposer();
               }}
-              class={`min-h-9 flex-row items-center gap-2 rounded-md px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent disabled:opacity-45`}
+              class={`min-h-9 flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent disabled:opacity-45`}
             >
               <Icon name={runtimeModeIcon(option())} size={15} tone={option() === mode() ? "foreground" : "muted-foreground"} />
               <View class="min-w-0 flex-1">
@@ -219,7 +219,7 @@ export function CompareDialog() {
               : tr("Describe the task, files, and goal…", "描述要交给智能体执行的任务、目标与约束…")
           }
           accessibilityLabel={tr("Comparison task", "对比任务描述")}
-          class={`min-h-22 rounded-xl p-3 text-base text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
+          class={`min-h-22 rounded-xl corner-squircle p-3 text-base text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
         />
 
         <View class="gap-2">
@@ -232,7 +232,7 @@ export function CompareDialog() {
                   <BaseButton
                     selected={on()}
                     onPress={() => toggleParallel(agent().id)}
-                    class={`h-8 shrink-0 flex-row items-center gap-2 rounded-lg border px-3 ${PRESS} ${on() ? "border-brand bg-accent" : "border-border bg-card hover:bg-accent/50"}`}
+                    class={`h-8 shrink-0 flex-row items-center gap-2 rounded-lg corner-squircle border px-3 ${PRESS} ${on() ? "border-brand bg-accent" : "border-border bg-card hover:bg-accent/50"}`}
                   >
                     <Icon name={on() ? "check" : "agents"} size={14} tone={on() ? "brand-text" : "muted-foreground"} />
                     <Text class="text-sm font-medium text-foreground">{agent().name}</Text>
@@ -244,7 +244,7 @@ export function CompareDialog() {
         </View>
 
         <If when={gitWorkspaceInfo().isGitRepo}>
-          <View class="flex-row items-center justify-between gap-3 rounded-xl border border-border bg-card px-3.5 py-2.5">
+          <View class="flex-row items-center justify-between gap-3 rounded-xl corner-squircle border border-border bg-card px-3.5 py-2.5">
             <View class="min-w-0 flex-1 gap-0.5">
               <Text class="text-sm font-medium text-foreground">{tr("Isolate in Git worktrees", "Git 工作树分支隔离")}</Text>
               <Text class="text-xs text-subtle">

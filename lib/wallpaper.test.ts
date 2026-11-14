@@ -5,11 +5,14 @@ import {
   DYNAMIC_WALLPAPER_ENABLED,
   inspectVideoBytes,
   inspectWallpaperBytes,
+  isAnimatedWallpaperEffect,
   isAvailableWallpaperEffect,
   isDynamicWallpaperConfig,
+  isPausableWallpaper,
   isSupportedWallpaperPath,
   isVideoWallpaperPath,
   parseWallpaperEngineProject,
+  resolveWallpaperPreset,
   WALLPAPER_EFFECTS,
   WALLPAPER_PRESET_SHADERS,
   WALLPAPER_PRESETS,
@@ -43,24 +46,24 @@ function makeMp4WithTkhd(width: number, height: number): Uint8Array {
   return buf;
 }
 
-test("dynamic wallpapers are disabled on the frontend while static images and static effects remain supported", () => {
-  expect(DYNAMIC_WALLPAPER_ENABLED).toBe(false);
+test("dynamic wallpapers are enabled: videos, presets, animated effects and static images share one kind-differentiated slot", () => {
+  expect(DYNAMIC_WALLPAPER_ENABLED).toBe(true);
 
   expect(isSupportedWallpaperPath("/wallpapers/scene.png")).toBe(true);
   expect(isSupportedWallpaperPath("/wallpapers/photo.jpg")).toBe(true);
-  expect(isSupportedWallpaperPath("/wallpapers/loop.mp4")).toBe(false);
-  expect(isSupportedWallpaperPath("/wallpapers/loop.MOV")).toBe(false);
-  expect(isSupportedWallpaperPath("/wallpapers/loop.webm")).toBe(false);
-  expect(isSupportedWallpaperPath("/wallpapers/loop.m4v")).toBe(false);
+  expect(isSupportedWallpaperPath("/wallpapers/loop.mp4")).toBe(true);
+  expect(isSupportedWallpaperPath("/wallpapers/loop.MOV")).toBe(true);
+  expect(isSupportedWallpaperPath("/wallpapers/loop.webm")).toBe(true);
+  expect(isSupportedWallpaperPath("/wallpapers/loop.m4v")).toBe(true);
   expect(isSupportedWallpaperPath("/wallpapers/project.json")).toBe(false);
   expect(isVideoWallpaperPath("/wallpapers/loop.mp4")).toBe(true);
   expect(isVideoWallpaperPath("/wallpapers/scene.png")).toBe(false);
 
-  expect(AVAILABLE_WALLPAPER_EFFECTS).toEqual(["none", "dither", "ascii", "halftone", "scanlines"]);
+  expect(AVAILABLE_WALLPAPER_EFFECTS).toEqual(["none", "dither", "ascii", "halftone", "scanlines", "ripple", "rain"]);
   expect(isAvailableWallpaperEffect("dither")).toBe(true);
   expect(isAvailableWallpaperEffect("ascii")).toBe(true);
-  expect(isAvailableWallpaperEffect("ripple")).toBe(false);
-  expect(isAvailableWallpaperEffect("rain")).toBe(false);
+  expect(isAvailableWallpaperEffect("ripple")).toBe(true);
+  expect(isAvailableWallpaperEffect("rain")).toBe(true);
 
   expect(
     isDynamicWallpaperConfig({
@@ -75,17 +78,41 @@ test("dynamic wallpapers are disabled on the frontend while static images and st
   ).toBe(true);
   expect(
     isDynamicWallpaperConfig({
-      path: "preset:aurora",
+      path: "preset:flock",
     }),
   ).toBe(true);
   expect(
     isDynamicWallpaperConfig({
-      path: "preset:cosmos",
+      path: "preset:jelly",
       kind: "shader",
-      preset: "cosmos",
+      preset: "jelly",
     }),
   ).toBe(true);
+  // A retired preset still resolves — its stored wallpaper upgrades, never loses its shader.
+  expect(
+    isDynamicWallpaperConfig({
+      path: "preset:stellar",
+    }),
+  ).toBe(true);
+  expect(resolveWallpaperPreset("dotwave")).toBe("orbit");
+  expect(resolveWallpaperPreset("stellar")).toBe("aurora");
   expect(DEFAULT_WALLPAPER_ADJUSTMENT.zoom).toBe(1);
+});
+
+test("isPausableWallpaper is true only where something animates", () => {
+  expect(isPausableWallpaper(null, "none")).toBe(false);
+  expect(isPausableWallpaper({ path: "/w/scene.png", kind: "image" }, "none")).toBe(false);
+  expect(isPausableWallpaper({ path: "/w/scene.png", kind: "image" }, "dither")).toBe(false);
+  expect(isPausableWallpaper({ path: "/w/scene.png", kind: "image" }, "rain")).toBe(true);
+  expect(isPausableWallpaper({ path: "/w/scene.png", kind: "image" }, "ripple")).toBe(true);
+  expect(isPausableWallpaper({ path: "/w/loop.mp4", kind: "video" }, "none")).toBe(true);
+  expect(isPausableWallpaper({ path: "preset:flock", kind: "shader", preset: "flock" }, "none")).toBe(true);
+
+  expect(isAnimatedWallpaperEffect("ripple")).toBe(true);
+  expect(isAnimatedWallpaperEffect("rain")).toBe(true);
+  expect(isAnimatedWallpaperEffect("none")).toBe(false);
+  expect(isAnimatedWallpaperEffect("dither")).toBe(false);
+  expect(isAnimatedWallpaperEffect("scanlines")).toBe(false);
 });
 
 test("inspectVideoBytes extracts dimensions and dominant color from MP4 and WebM headers", () => {
@@ -104,6 +131,27 @@ test("inspectVideoBytes extracts dimensions and dominant color from MP4 and WebM
   expect(webmInfo?.format).toBe("webm");
   expect(webmInfo?.width).toBe(1920);
   expect(webmInfo?.height).toBe(1080);
+});
+
+test("inspectWallpaperBytes trusts content over the extension: a PNG named .mp4 is an image", () => {
+  const png = new Uint8Array(33);
+  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  png.set([0, 0, 0, 13], 8);
+  png.set([0x49, 0x48, 0x44, 0x52], 12);
+  png.set([0, 0, 0, 64], 16);
+  png.set([0, 0, 0, 48], 20);
+  png.set([8, 6, 0, 0, 0], 24);
+
+  const renamed = inspectWallpaperBytes(png, "/wallpapers/fake-video.mp4");
+  expect(renamed?.kind).toBe("image");
+  expect(renamed?.format).toBe("png");
+  expect(renamed?.width).toBe(64);
+  expect(renamed?.height).toBe(48);
+
+  // And the reverse direction: video bytes under an image-looking name stay video.
+  const mp4 = makeMp4WithTkhd(1920, 1080);
+  const misnamed = inspectWallpaperBytes(mp4, "/wallpapers/clip.png");
+  expect(misnamed?.kind).toBe("video");
 });
 
 test("parseWallpaperEngineProject parses file, title, and normalized schemecolor", () => {

@@ -66,7 +66,7 @@ import {
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { animateNextLayout, delayedFade, Presence, Reveal } from "../ui/motion";
-import { FOCUS_RING, PRESS, WALLPAPER_FROST } from "../ui/styles";
+import { FOCUS_RING, HOVER_REVEAL, PRESS, WALLPAPER_FROST } from "../ui/styles";
 import { tip } from "../ui/Tip";
 
 /** A row inside an expanded workspace folder: a saved session. */
@@ -102,6 +102,8 @@ const pointerResting = signal(false);
 const hoverGroup = () => (pointerResting() ? "relative" : "group relative");
 /** A pressable's own hover background, dropped the same way. */
 const calm = (classes: string) => (pointerResting() ? classes.replace(" hover:bg-sidebar-accent", "") : classes);
+/** A row's hover action is inert under a resting pointer too: never shown, it cannot be pressed blind. */
+const inert = (classes: string) => (pointerResting() ? `${classes} pointer-events-none` : classes);
 /** The group each session was last clicked in (`ownsActiveSession`). */
 const chosenGroups = signal<Record<string, GroupId>>({});
 /** Which group (`workspaces` or `recents`) owns the open draft session's highlight. */
@@ -456,7 +458,7 @@ function GroupHeading(props: {
       <BaseButton
         onPress={() => toggleGroupCollapsed(props.id)}
         accessibilityLabel={collapsed() ? tr(`Expand ${props.label}`, `展开 ${props.label}`) : tr(`Collapse ${props.label}`, `收起 ${props.label}`)}
-        class={`h-6 w-full min-w-0 flex-row items-center gap-1 rounded-md pl-2.5 ${props.action ? "pr-8" : "pr-2.5"} ${calm(ROW_PRESS)}`}
+        class={`h-6 w-full min-w-0 flex-row items-center gap-1 rounded-md corner-squircle pl-2.5 ${props.action ? "pr-8" : "pr-2.5"} ${calm(ROW_PRESS)}`}
       >
         <Text class="shrink-0 truncate text-sm text-subtle">{props.label}</Text>
         <If when={collapsed() && props.count > 0}>
@@ -480,7 +482,7 @@ function GroupHeading(props: {
             shortcut={action().shortcut}
             tipPlacement="right"
             onPress={() => action().onPress()}
-            class="absolute right-1 top-0 opacity-0 transition-opacity group-hover:opacity-100"
+            class={`absolute right-1 top-0 transition-opacity ${inert(HOVER_REVEAL)}`}
           />
         )}
       </If>
@@ -568,7 +570,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
           onPress={() => toggleProject(props.cwd)}
           accessibilityLabel={collapsed() ? tr(`Expand ${label().name}`, `展开 ${label().name}`) : tr(`Collapse ${label().name}`, `收起 ${label().name}`)}
           tooltip={tip(tildePath(props.cwd, home), undefined, "right")}
-          class={`h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md pl-2.5 pr-8 ${calm(ROW_PRESS)}`}
+          class={`h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle pl-2.5 pr-8 ${calm(ROW_PRESS)}`}
         >
           <View class={ICON_SLOT}>
             <Icon name={collapsed() ? "folder" : "folderOpen"} size={14} tone={active() ? "foreground" : "muted-foreground"} />
@@ -627,7 +629,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
           label={tr(`New session in ${label().name}`, `在 ${label().name} 中新建会话`)}
           tipPlacement="right"
           onPress={() => startNewSessionIn(props.cwd)}
-          class="absolute right-1 top-0.5 opacity-0 transition-opacity group-hover:opacity-100"
+          class={`absolute right-1 top-0.5 transition-opacity ${inert(HOVER_REVEAL)}`}
         />
       </View>
     </View>
@@ -642,7 +644,7 @@ const sessionRowClass = (
   depth = 0,
   keepTrailingOnHover = false,
 ) =>
-  `h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md ${
+  `h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle ${
     depth >= 3 ? "pl-16" : depth === 2 ? "pl-14" : depth === 1 ? "pl-12" : indent ? "pl-8" : "pl-2.5"
   } ${
     reserveTrailing && reserveHoverAction && keepTrailingOnHover
@@ -814,14 +816,14 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           if (archived()) unarchiveSession(props.session.path);
           else void archiveSession(props.session.path, props.cwd);
         }}
-        class={`absolute ${keepCue() ? "right-7" : "right-1"} top-0.5 opacity-0 transition-opacity group-hover:opacity-100`}
+        class={`absolute ${keepCue() ? "right-7" : "right-1"} top-0.5 transition-opacity ${inert(HOVER_REVEAL)}`}
       />
     </View>
   );
 }
 
 /** A session the daemon started under another one (or externally without a file yet) — nested in the sidebar. */
-function DaemonSessionRow(props: { session: DaemonSession; group: GroupId }) {
+function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; nested?: boolean }) {
   const home = backend().home();
   const session = () => props.session;
   const file = () => session().file;
@@ -836,7 +838,13 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId }) {
   /** A row the open session has in both groups takes the highlight in one only (`ownsDaemonRow`). */
   const primary = () => active() && ownsDaemonRow(props.group, session());
   const selected = () => primary() && currentView().name === "chat";
-  const rowDepth = () => (session().parentId ? Math.max(1, session().depth) : 0);
+  /** Whether the row hangs under its parent's — a tree top whose own tree hides takes a flat row of its own. */
+  const nested = () => props.nested ?? Boolean(session().parentId);
+  /** A child steps one notch in from its parent's row: 最近's roots sit at the folder's level, 工作区's a rung deeper. */
+  const rowDepth = () => {
+    if (!nested()) return 0;
+    return props.group === "recents" ? Math.max(0, session().depth - 1) : Math.max(1, session().depth);
+  };
   return (
     <View class={hoverGroup()} onContextMenu={(e) => Menu.popup(childMenuItems(session()), e.pagePosition)}>
       <BaseButton
@@ -855,7 +863,7 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId }) {
         )}
         class={calm(
           sessionRowClass(
-            props.group === "workspaces" || Boolean(session().parentId),
+            props.group === "workspaces" || nested(),
             working() || unread() || failed(),
             false,
             rowDepth(),
@@ -1060,7 +1068,7 @@ function SidebarTree() {
               <Each of={recents()} key={(item) => item.id}>
                 {(item) =>
                   item().child ? (
-                    <DaemonSessionRow session={item().child!} group="recents" />
+                    <DaemonSessionRow session={item().child!} group="recents" nested={item().id.startsWith("recent-child:")} />
                   ) : (
                     <SessionRow session={item().session!} cwd={item().cwd!} group="recents" />
                   )
@@ -1074,7 +1082,7 @@ function SidebarTree() {
                     recentsExpanded.update((on) => !on);
                   }}
                   accessibilityLabel={recentsExpanded() ? tr("Show less", "收起") : tr("Show more", "展开更多")}
-                  class={`h-7 w-full min-w-0 flex-row items-center rounded-md pl-8 pr-2.5 ${ROW_PRESS}`}
+                  class={`h-7 w-full min-w-0 flex-row items-center rounded-md corner-squircle pl-8 pr-2.5 ${ROW_PRESS}`}
                 >
                   <Text class="truncate text-sm text-subtle">{recentsExpanded() ? tr("Show less", "收起") : tr("Show more", "展开更多")}</Text>
                 </BaseButton>
@@ -1168,7 +1176,7 @@ export function Sidebar() {
           onPress={startNewSession}
           accessibilityLabel={tr("New session", "新会话")}
           tooltip={tip(tr("New session", "新会话"), "mod+n", "right")}
-          class={`h-8 min-w-0 flex-1 flex-row items-center gap-1.5 rounded-md px-2.5 ${ROW_PRESS}`}
+          class={`h-8 min-w-0 flex-1 flex-row items-center gap-1.5 rounded-md corner-squircle px-2.5 ${ROW_PRESS}`}
         >
           <View class={ICON_SLOT}>
             <Icon name="pencil" size={14} tone="muted-foreground" />

@@ -67,6 +67,74 @@ test("rebuilds a streamed turn into rows and joins tool results to their calls",
   expect(rows).toHaveLength(3);
 });
 
+test("a wire toolCallId an engine reuses across turns lands each call in its own row", () => {
+  // Codex's `item_0`, ACP's `"0"` — some engines name every turn's first call
+  // the same. The second occurrence must not write over the first's row in
+  // place: each lands at the end, and its events keep finding it there.
+  const play = (t: Transcript, prompt: string, name: string, args: Record<string, unknown>, out: string, at: number) => {
+    const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
+    const call = { type: "toolCall", id: "item_0", name, arguments: args };
+    t.apply({ type: "message_start", message: { role: "user", content: prompt, timestamp: at } });
+    t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+    update({ type: "toolcall_start", contentIndex: 0, id: "item_0", toolName: name });
+    update({ type: "toolcall_end", contentIndex: 0, toolCall: call });
+    t.apply({ type: "tool_execution_start", toolCallId: "item_0", toolName: name, args });
+    t.apply({ type: "tool_execution_end", toolCallId: "item_0", toolName: name, result: { content: [{ type: "text", text: out }] }, isError: false });
+    t.apply({ type: "message_end", message: { role: "toolResult", toolCallId: "item_0", toolName: name, content: [{ type: "text", text: out }], isError: false, timestamp: at + 1 } as never });
+    t.apply({ type: "message_end", message: { role: "assistant", content: [call], stopReason: "toolUse", timestamp: at + 2 } as never });
+    t.apply({ type: "agent_settled" });
+  };
+  const live = new Transcript();
+  play(live, "one", "read", { path: "a.ts" }, "out a", 1);
+  play(live, "two", "bash", { command: "ls" }, "out b", 10);
+  const tools = live.rows().filter((row) => row.kind === "tool");
+  expect(tools).toMatchObject([
+    { id: "item_0", name: "read", args: { path: "a.ts" }, status: "done", output: "out a" },
+    { name: "bash", args: { command: "ls" }, status: "done", output: "out b" },
+  ]);
+  expect(tools[1].id).not.toBe("item_0");
+  expect(live.rows().map((row) => row.kind)).toEqual(["user", "tool", "user", "tool"]);
+
+  // Reloaded from the file the same events persisted: each call again its own row.
+  const call = (name: string, args: object, at: number) => ({ role: "assistant", content: [{ type: "toolCall", id: "item_0", name, arguments: args }], stopReason: "toolUse", timestamp: at }) as never;
+  const result = (name: string, out: string, at: number) => ({ role: "toolResult", toolCallId: "item_0", toolName: name, content: [{ type: "text", text: out }], isError: false, timestamp: at }) as never;
+  const fresh = new Transcript();
+  fresh.load([
+    { role: "user", content: "one", timestamp: 1 } as never,
+    result("read", "out a", 2),
+    call("read", { path: "a.ts" }, 3),
+    { role: "user", content: "two", timestamp: 10 } as never,
+    result("bash", "out b", 11),
+    call("bash", { command: "ls" }, 12),
+  ]);
+  expect(fresh.rows().filter((row) => row.kind === "tool")).toMatchObject([
+    { id: "item_0", name: "read", status: "done", output: "out a" },
+    { name: "bash", status: "done", output: "out b" },
+  ]);
+
+  // Two same-id calls in one turn, both results read ahead of the message that
+  // holds their blocks: they join their calls in the order the calls ran.
+  const twin = new Transcript();
+  twin.load([
+    { role: "user", content: "both", timestamp: 1 } as never,
+    result("read", "out a", 2),
+    result("bash", "out b", 3),
+    {
+      role: "assistant",
+      content: [
+        { type: "toolCall", id: "item_0", name: "read", arguments: { path: "a.ts" } },
+        { type: "toolCall", id: "item_0", name: "bash", arguments: { command: "ls" } },
+      ],
+      stopReason: "toolUse",
+      timestamp: 4,
+    } as never,
+  ]);
+  expect(twin.rows().filter((row) => row.kind === "tool")).toMatchObject([
+    { id: "item_0", name: "read", status: "done", output: "out a" },
+    { name: "bash", status: "done", output: "out b" },
+  ]);
+});
+
 test("a turn's process folds once, when its answer is known, and prose never changes place before", () => {
   const t = new Transcript();
   const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);

@@ -131,7 +131,7 @@ test("Settings section switches land settled on the first frame", async () => {
   await checkSwitch("usage-to-general", "id:settings-nav-general", "Appearance");
 }, 60000);
 
-test("dynamic wallpaper entry points are hidden in Settings and Command Palette, and stored dynamic prefs are cleared", async () => {
+test("dynamic wallpaper entry points show in Settings and Command Palette, and stored dynamic prefs survive a reload", async () => {
   const app = await open("./Harness.tsx", {
     width: 1180,
     height: 780,
@@ -144,7 +144,7 @@ test("dynamic wallpaper entry points are hidden in Settings and Command Palette,
         activeWorkspace: "/Users/pip/code/pipi",
         wallpaper: {
           path: "preset:aurora",
-          name: "Aurora Borealis",
+          name: "Aurora Ridge",
           width: 1920,
           height: 1080,
           adjustment: { focalX: 0.5, focalY: 0.5, zoom: 1 },
@@ -154,6 +154,7 @@ test("dynamic wallpaper entry points are hidden in Settings and Command Palette,
         wallpaperEffect: "ripple",
         wallpaperInteractive: true,
         wallpaperAgentReactive: true,
+        wallpaperPaused: true,
       }),
     },
   });
@@ -162,14 +163,17 @@ test("dynamic wallpaper entry points are hidden in Settings and Command Palette,
   await app.press("label:Settings");
   await app.waitFor("text:Appearance");
   const settingsTexts = app.texts();
-  expect(settingsTexts).toContain("Choose image");
-  expect(settingsTexts).not.toContain("Live wallpaper presets");
-  expect(settingsTexts).not.toContain("Aurora");
-  expect(settingsTexts).not.toContain("Interactive wallpaper");
-  expect(settingsTexts).not.toContain("React to agent activity");
-  expect(settingsTexts).not.toContain("Auto-pause");
-  expect(settingsTexts).not.toContain("Ripple");
-  expect(settingsTexts).not.toContain("Rain");
+  // A stored live shader wallpaper loads as itself — not normalized away.
+  expect(settingsTexts).toContain("Live wallpaper presets");
+  expect(settingsTexts).toContain("Aurora");
+  expect(settingsTexts).toContain("Interactive wallpaper");
+  expect(settingsTexts).toContain("React to agent activity");
+  expect(settingsTexts).toContain("Auto-pause");
+  // The stored overlay effect is masked on a live shader — the picker is a
+  // still image's own control and stays out of dynamic kinds.
+  expect(settingsTexts).not.toContain("Wallpaper effect");
+  // The stored pause survived too: a pausable wallpaper offers Resume.
+  expect(settingsTexts).toContain("Resume");
 
   await app.keyboard.press("escape");
   await app.waitUntil(() => app.count("id:settings-nav-agents") === 0);
@@ -177,13 +181,12 @@ test("dynamic wallpaper entry points are hidden in Settings and Command Palette,
   await app.keyboard.press("mod+k");
   await app.waitFor("text:Random Wallpaper");
   const paletteTexts = app.texts();
-  expect(paletteTexts.some((t) => t.includes("Live Wallpaper"))).toBe(false);
-  expect(paletteTexts).not.toContain("Pause Dynamic Wallpaper");
-  expect(paletteTexts).not.toContain("Resume Dynamic Wallpaper");
+  expect(paletteTexts.some((t) => t.includes("Live Wallpaper"))).toBe(true);
+  expect(paletteTexts).toContain("Resume Dynamic Wallpaper");
   await app.keyboard.press("escape");
 
-  // With a static image wallpaper, static shader effects and color matching still appear,
-  // while dynamic effects and controls stay hidden.
+  // With a still image and no animated effect, the dynamic controls exist but
+  // pause/mute stay away — nothing on it can pause.
   const staticApp = await open("./Harness.tsx", {
     width: 1180,
     height: 780,
@@ -195,9 +198,7 @@ test("dynamic wallpaper entry points are hidden in Settings and Command Palette,
       "pipi.prefs.v1": JSON.stringify({
         workspaces: ["/Users/pip/code/pipi"],
         activeWorkspace: "/Users/pip/code/pipi",
-        wallpaperEffect: "ripple",
-        wallpaperInteractive: true,
-        wallpaperAgentReactive: true,
+        wallpaperEffect: "none",
       }),
     },
   });
@@ -205,19 +206,20 @@ test("dynamic wallpaper entry points are hidden in Settings and Command Palette,
   await staticApp.press("label:Settings");
   await staticApp.waitFor("text:Wallpaper effect");
   const staticTexts = staticApp.texts();
-  expect(staticTexts).toContain("Replace image");
+  expect(staticTexts).toContain("Replace");
   expect(staticTexts).toContain("Dither");
   expect(staticTexts).toContain("ASCII");
   expect(staticTexts).toContain("Halftone");
   expect(staticTexts).toContain("Scanlines");
+  expect(staticTexts).toContain("Ripple");
+  expect(staticTexts).toContain("Rain");
+  expect(staticTexts).toContain("Live wallpaper presets");
+  expect(staticTexts).toContain("Interactive wallpaper");
+  expect(staticTexts).toContain("React to agent activity");
+  expect(staticTexts).toContain("Auto-pause");
   expect(staticTexts).toContain("Match wallpaper colors");
-  expect(staticTexts).not.toContain("Ripple");
-  expect(staticTexts).not.toContain("Rain");
-  expect(staticTexts).not.toContain("Live wallpaper presets");
-  expect(staticTexts).not.toContain("Interactive wallpaper");
-  expect(staticTexts).not.toContain("React to agent activity");
-  expect(staticTexts).not.toContain("Video click action");
-  expect(staticTexts).not.toContain("Auto-pause");
   expect(staticTexts).not.toContain("Pause");
+  expect(staticTexts).not.toContain("Resume");
   expect(staticTexts).not.toContain("Mute");
+  expect(staticTexts).not.toContain("Video click action");
 });

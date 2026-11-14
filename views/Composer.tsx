@@ -36,7 +36,7 @@ import {
 import { IconButton } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import { animateLayoutOn, EASING, enter, keepLast, Presence, Reveal, SPRING } from "../ui/motion";
-import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, POPUP, PRESS } from "../ui/styles";
+import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { AgentPicker, PermissionPicker } from "./AgentPicker";
 import { ExtensionPrompt } from "./ExtensionDialog";
@@ -276,7 +276,7 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
                 onMouseMove={() => {
                   if (props.menu.selected() !== index()) props.menu.selected.set(index());
                 }}
-                class={`h-8 flex-row items-center gap-2 rounded-md px-2 ${PRESS}`}
+                class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS}`}
                 classList={{ "bg-accent": index() === props.menu.selected() }}
               >
                 <Text class="shrink-0 font-mono text-sm text-foreground">{row().title}</Text>
@@ -315,7 +315,7 @@ function QueueTray() {
   return (
     <Reveal open={waiting().length > 0} offset={6}>
       <View
-        class="relative mx-4 -mb-2 flex-row items-center gap-1 rounded-t-2xl border-[0.5px] border-b-0 border-hairline bg-card/85 pb-3 pl-3 pr-1.5 pt-1 dark:bg-card/75"
+        class="relative mx-4 -mb-2 flex-row items-center gap-1 rounded-t-2xl corner-squircle border-[0.5px] border-b-0 border-hairline bg-card/85 pb-3 pl-3 pr-1.5 pt-1 dark:bg-card/75"
         accessibilityLabel={tr("Queued messages", "排队消息")}
       >
         <View class="min-w-0 flex-1">
@@ -355,13 +355,13 @@ function AttachmentTray() {
   return (
     <Reveal open={composerAttachments().length > 0} offset={6}>
       <View
-        class="relative mx-4 -mb-2 overflow-hidden rounded-t-2xl border-[0.5px] border-b-0 border-hairline bg-card/85 pb-2 dark:bg-card/75"
+        class="relative mx-4 -mb-2 overflow-hidden rounded-t-2xl corner-squircle border-[0.5px] border-b-0 border-hairline bg-card/85 pb-2 dark:bg-card/75"
         accessibilityLabel={tr("Attachments", "附件")}
       >
         <Scroll horizontal contentClass="flex-row gap-2 p-2">
           <Each of={shown() ?? []} key="index">
             {(image, index) => (
-              <View class="group relative size-14 shrink-0 overflow-hidden rounded-lg bg-muted" style={enter("zoomIn")}>
+              <View class="group relative size-14 shrink-0 overflow-hidden rounded-lg corner-squircle bg-muted" style={enter("zoomIn")}>
                 <Image
                   src={`data:${image().mimeType};base64,${image().data}`}
                   class="size-full"
@@ -369,12 +369,12 @@ function AttachmentTray() {
                   accessibilityLabel={image().name}
                 />
                 {/* The edge is drawn over the pixels, so a white screenshot still has one. */}
-                <View class="pointer-events-none absolute inset-0 rounded-lg border-[0.5px] border-hairline-hover" />
+                <View class="pointer-events-none absolute inset-0 rounded-lg corner-squircle border-[0.5px] border-hairline-hover" />
                 <BaseButton
                   onPress={() => removeAttachment(index())}
                   accessibilityLabel={tr("Remove image", "移除图片")}
                   tooltip={tip(tr("Remove image", "移除图片"))}
-                  class={`absolute right-1 top-1 size-5 items-center justify-center rounded-full border-[0.5px] border-hairline-hover bg-popover shadow-sm opacity-0 ${PRESS} ${FOCUS_RING} hover:bg-secondary group-hover:opacity-100 focus:opacity-100`}
+                  class={`absolute right-1 top-1 size-5 items-center justify-center rounded-full border-[0.5px] border-hairline-hover bg-popover shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-secondary ${HOVER_REVEAL}`}
                 >
                   <Icon name="x" size={12} tone="foreground" />
                 </BaseButton>
@@ -442,7 +442,7 @@ function ContextMeter() {
   };
   return (
     <Presence show={visible()} scaleFrom={0.85}>
-      <View class="h-6 flex-row items-center gap-1.5 rounded-md px-1.5" tooltip={tip(detail())} accessibilityLabel={detail()}>
+      <View class="h-6 flex-row items-center gap-1.5 rounded-md corner-squircle px-1.5" tooltip={tip(detail())} accessibilityLabel={detail()}>
         <Canvas
           style={{ width: 14, height: 14 }}
           draw={(cx, { width }) => {
@@ -635,7 +635,7 @@ export function Composer() {
         <SlashMenu menu={slash} onChoose={choose} />
         <QueueTray />
         <AttachmentTray />
-        <View class={`rounded-[22px] ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
+        <View class={`rounded-[22px] corner-squircle ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
           <ExtensionLines below={false} />
           <Input
             ref={input}

@@ -8,17 +8,18 @@ import {
   DYNAMIC_WALLPAPER_ENABLED,
   isAvailableWallpaperEffect,
   isDynamicWallpaperConfig,
+  isPausableWallpaper,
   isVideoWallpaperPath,
+  isWallpaperEffect,
   isWallpaperPauseMode,
-  isWallpaperPreset,
   isWallpaperVideoClickAction,
   rememberWallpaperHistory,
+  resolveWallpaperPreset,
   type WallpaperAdjustment,
   type WallpaperConfig,
   type WallpaperEffect,
   type WallpaperKind,
   type WallpaperPauseMode,
-  type WallpaperPreset,
   type WallpaperVideoClickAction,
 } from "../lib/wallpaper";
 
@@ -153,8 +154,8 @@ const DEFAULTS: Prefs = {
   wallpaperEffect: "none",
   wallpaperHistory: [],
   wallpaperThemeColors: false,
-  wallpaperInteractive: DYNAMIC_WALLPAPER_ENABLED,
-  wallpaperAgentReactive: DYNAMIC_WALLPAPER_ENABLED,
+  wallpaperInteractive: true,
+  wallpaperAgentReactive: true,
   wallpaperVideoClickAction: "burst",
   wallpaperPauseMode: "inactive",
   wallpaperPaused: false,
@@ -196,11 +197,8 @@ function normalizeWallpaperConfig(raw: unknown): WallpaperConfig | null {
   const width = typeof w.width === "number" && w.width > 0 ? w.width : 1920;
   const height = typeof w.height === "number" && w.height > 0 ? w.height : 1080;
   const name = typeof w.name === "string" && w.name ? w.name : w.path.split("/").pop() ?? "wallpaper";
-  const preset = isWallpaperPreset(w.preset)
-    ? w.preset
-    : w.path.startsWith("preset:") && isWallpaperPreset(w.path.slice(7))
-      ? (w.path.slice(7) as WallpaperPreset)
-      : undefined;
+  const preset = resolveWallpaperPreset(w.preset)
+    ?? (w.path.startsWith("preset:") ? resolveWallpaperPreset(w.path.slice(7)) : undefined);
   const kind: WallpaperKind =
     w.kind === "video" || w.kind === "shader" || w.kind === "image"
       ? w.kind
@@ -219,7 +217,6 @@ function normalizeWallpaperConfig(raw: unknown): WallpaperConfig | null {
     kind,
     ...(preset ? { preset } : {}),
   };
-  if (!DYNAMIC_WALLPAPER_ENABLED && isDynamicWallpaperConfig(config)) return null;
   return config;
 }
 
@@ -253,6 +250,9 @@ export async function loadPrefs() {
       const rawGroups = Array.isArray(parsed.collapsedGroups) ? parsed.collapsedGroups : DEFAULTS.collapsedGroups;
       const collapsedGroups = parsed.archivedSessions === undefined && !rawGroups.includes("archived") ? [...rawGroups, "archived"] : rawGroups;
       const normalizedWallpaper = normalizeWallpaperConfig(parsed.wallpaper);
+      const effectiveWallpaperEffect: WallpaperEffect = isAvailableWallpaperEffect(parsed.wallpaperEffect)
+        ? parsed.wallpaperEffect
+        : "none";
       prefs.set({
         ...DEFAULTS,
         ...parsed,
@@ -267,7 +267,10 @@ export async function loadPrefs() {
           : 0,
         sidebarWidth: typeof parsed.sidebarWidth === "number" ? clampSidebarWidth(parsed.sidebarWidth) : SIDEBAR_DEFAULT_WIDTH,
         wallpaper: normalizedWallpaper,
-        wallpaperEffect: isAvailableWallpaperEffect(parsed.wallpaperEffect) ? parsed.wallpaperEffect : "none",
+        // Stored choices the feature gate does not currently offer stay stored —
+        // hiding a feature must not delete what the user picked; the accessors
+        // mask anything unavailable so every reader sees a consistent state.
+        wallpaperEffect: isWallpaperEffect(parsed.wallpaperEffect) ? parsed.wallpaperEffect : "none",
         wallpaperFolder: typeof parsed.wallpaperFolder === "string" && parsed.wallpaperFolder ? parsed.wallpaperFolder : undefined,
         wallpaperSource:
           normalizedWallpaper && typeof parsed.wallpaperSource === "string" && parsed.wallpaperSource
@@ -277,19 +280,24 @@ export async function loadPrefs() {
           ? parsed.wallpaperHistory.filter((p): p is string => typeof p === "string" && p.length > 0)
           : [],
         wallpaperThemeColors: Boolean(parsed.wallpaperThemeColors),
-        wallpaperInteractive: DYNAMIC_WALLPAPER_ENABLED
-          ? (parsed.wallpaperInteractive !== undefined ? Boolean(parsed.wallpaperInteractive) : true)
-          : false,
-        wallpaperAgentReactive: DYNAMIC_WALLPAPER_ENABLED
-          ? (parsed.wallpaperAgentReactive !== undefined ? Boolean(parsed.wallpaperAgentReactive) : true)
-          : false,
+        wallpaperInteractive:
+          parsed.wallpaperInteractive !== undefined ? Boolean(parsed.wallpaperInteractive) : true,
+        wallpaperAgentReactive:
+          parsed.wallpaperAgentReactive !== undefined ? Boolean(parsed.wallpaperAgentReactive) : true,
         wallpaperVideoClickAction: isWallpaperVideoClickAction(parsed.wallpaperVideoClickAction)
           ? parsed.wallpaperVideoClickAction
           : "burst",
         wallpaperPauseMode: isWallpaperPauseMode(parsed.wallpaperPauseMode)
           ? parsed.wallpaperPauseMode
           : "inactive",
-        wallpaperPaused: DYNAMIC_WALLPAPER_ENABLED ? Boolean(parsed.wallpaperPaused) : false,
+        // A pause belongs to the wallpaper it was set on: one stored for a
+        // still image under a static effect can never be expressed, and would
+        // only freeze interactive behaviour until a dynamic wallpaper applied.
+        // (While the feature gate is closed the raw value stays stored — the
+        // accessor masks it — so reopening the feature keeps the choice.)
+        wallpaperPaused:
+          Boolean(parsed.wallpaperPaused) &&
+          (!DYNAMIC_WALLPAPER_ENABLED || isPausableWallpaper(normalizedWallpaper, effectiveWallpaperEffect)),
         wallpaperMuted: parsed.wallpaperMuted !== undefined ? Boolean(parsed.wallpaperMuted) : true,
       });
     }
@@ -310,7 +318,8 @@ function applyAppearance(appearance: Appearance) {
 }
 
 function applyWallpaperTheme() {
-  const { wallpaperThemeColors: enabled, wallpaper: wp } = prefs();
+  const wp = wallpaper();
+  const enabled = prefs().wallpaperThemeColors;
   if (enabled && wp?.dominantColor) {
     const tinted = buildWallpaperTintedTheme(wp.dominantColor);
     if (tinted) {
@@ -347,18 +356,35 @@ export const runInBackground = () => prefs().runInBackground;
 export const storedAgentOverrides = () => prefs().agentOverrides;
 export const storedCustomAgents = () => prefs().customAgents;
 export const storedSessionChoice = (agentId: string): AgentSessionChoice | undefined => prefs().agentSessionChoices[agentId];
-export const wallpaper = () => prefs().wallpaper;
-export const wallpaperEffect = () => prefs().wallpaperEffect;
+// The stored wallpaper/effect may name a dynamic kind the feature gate hides;
+// readers must agree with the render gate (`EffectSurface.canRender`), so the
+// accessors report such a config/effect as absent rather than let the shell
+// dress an empty underlay in glass.
+export const wallpaper = (): WallpaperConfig | null => {
+  const w = prefs().wallpaper;
+  return DYNAMIC_WALLPAPER_ENABLED || !isDynamicWallpaperConfig(w) ? w : null;
+};
+// An effect is a shader pass over a still image: while a video or a live
+// shader holds the slot it would only lay a second animation over the first,
+// so the stored choice is masked — kept, for when an image takes the slot
+// again — rather than applied where it cannot belong.
+export const wallpaperEffect = (): WallpaperEffect => {
+  const eff = prefs().wallpaperEffect;
+  const w = wallpaper();
+  return w && !isDynamicWallpaperConfig(w) && isAvailableWallpaperEffect(eff) ? eff : "none";
+};
 export const wallpaperFolder = () => prefs().wallpaperFolder;
 export const wallpaperSource = () => prefs().wallpaperSource;
 export const wallpaperHistory = () => prefs().wallpaperHistory;
 export const wallpaperThemeColors = () => prefs().wallpaperThemeColors;
 export const wallpaperInteractive = () => DYNAMIC_WALLPAPER_ENABLED && prefs().wallpaperInteractive;
 export const wallpaperAgentReactive = () => DYNAMIC_WALLPAPER_ENABLED && prefs().wallpaperAgentReactive;
-export const wallpaperVideoClickAction = () => prefs().wallpaperVideoClickAction;
-export const wallpaperPauseMode = () => prefs().wallpaperPauseMode;
+export const wallpaperVideoClickAction = (): WallpaperVideoClickAction =>
+  DYNAMIC_WALLPAPER_ENABLED ? prefs().wallpaperVideoClickAction : "burst";
+export const wallpaperPauseMode = (): WallpaperPauseMode =>
+  DYNAMIC_WALLPAPER_ENABLED ? prefs().wallpaperPauseMode : "never";
 export const wallpaperPaused = () => DYNAMIC_WALLPAPER_ENABLED && prefs().wallpaperPaused;
-export const wallpaperMuted = () => prefs().wallpaperMuted;
+export const wallpaperMuted = () => (DYNAMIC_WALLPAPER_ENABLED ? prefs().wallpaperMuted : true);
 
 export function setAppearance(next: Appearance) {
   change({ appearance: next });
@@ -570,6 +596,10 @@ export function setWallpaperPref(
     wallpaper: normalized,
     wallpaperSource: normalized ? sourcePath : undefined,
     wallpaperHistory: history,
+    // A wallpaper that was just applied always starts playing: pausing is a
+    // state of the wallpaper it was set on, and letting it leak onto the next
+    // one reads as "the switch did nothing" (a frozen live wallpaper).
+    wallpaperPaused: false,
   });
   applyWallpaperTheme();
 }
@@ -587,7 +617,13 @@ export function setWallpaperAdjustmentPref(adjustment: WallpaperAdjustment) {
 
 export function setWallpaperEffectPref(effect: WallpaperEffect) {
   if (!isAvailableWallpaperEffect(effect)) return;
-  change({ wallpaperEffect: effect });
+  change({
+    wallpaperEffect: effect,
+    // Dropping the one animated thing (rain → a static overlay on a still)
+    // leaves nothing for a pause to hold — a pause kept with no control left
+    // to undo it would only freeze the wallpaper's interactivity invisibly.
+    wallpaperPaused: prefs().wallpaperPaused && isPausableWallpaper(prefs().wallpaper, effect),
+  });
 }
 
 export function setWallpaperFolderPref(folder: string | undefined) {
@@ -600,10 +636,13 @@ export function setWallpaperThemeColorsPref(enabled: boolean) {
   applyWallpaperTheme();
 }
 
-export function setWallpaperDimensionsPref(width: number, height: number) {
+export function setWallpaperDimensionsPref(path: string, width: number, height: number) {
   if (!DYNAMIC_WALLPAPER_ENABLED) return;
   const current = prefs().wallpaper;
-  if (!current || width <= 0 || height <= 0) return;
+  // A video reports its true size asynchronously; by then the user may already
+  // have switched wallpapers, so only accept the report while the media that
+  // sent it is still the current one.
+  if (!current || current.path !== path || width <= 0 || height <= 0) return;
   if (current.width === width && current.height === height) return;
   change({
     wallpaper: {
@@ -636,6 +675,10 @@ export function setWallpaperPauseModePref(mode: WallpaperPauseMode) {
 
 export function setWallpaperPausedPref(paused: boolean) {
   if (!DYNAMIC_WALLPAPER_ENABLED) return;
+  // Pausing only exists where something animates (a video, a live shader, or an
+  // animated overlay effect); latching it onto a still image just freezes the
+  // next dynamic wallpaper the user applies. Resuming is always allowed.
+  if (paused && !isPausableWallpaper(prefs().wallpaper, prefs().wallpaperEffect)) return;
   change({ wallpaperPaused: Boolean(paused) });
 }
 

@@ -18,9 +18,9 @@ const VARIANT: Record<Variant, string> = {
 const ICON_TONE: Record<Variant, Tone> = { primary: "brand-foreground", secondary: "foreground", ghost: "muted-foreground", danger: "destructive" };
 
 const SIZE: Record<Size, string> = {
-  sm: "h-6 gap-1.5 rounded-md px-2 text-sm",
-  md: "h-7 gap-1.5 rounded-md px-2.5 text-base",
-  lg: "h-8 gap-2 rounded-lg px-3.5 text-base",
+  sm: "h-6 gap-1.5 rounded-md corner-squircle px-2 text-sm",
+  md: "h-7 gap-1.5 rounded-md corner-squircle px-2.5 text-base",
+  lg: "h-8 gap-2 rounded-lg corner-squircle px-3.5 text-base",
 };
 
 /** The app's button: a label, an optional icon before it and shortcut after it. */
@@ -69,7 +69,7 @@ export function IconButton(props: {
       selected={props.selected}
       accessibilityLabel={props.label}
       tooltip={tip(props.label, props.shortcut, props.tipPlacement)}
-      class={`shrink-0 items-center justify-center rounded-md ${PRESS} active:scale-[0.94] disabled:active:scale-100 motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-accent active:bg-accent selected:bg-accent disabled:opacity-40 ${props.size === "sm" ? "size-6" : "size-7"} ${props.class ?? ""}`}
+      class={`shrink-0 items-center justify-center rounded-md corner-squircle ${PRESS} active:scale-[0.94] disabled:active:scale-100 motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-accent active:bg-accent selected:bg-accent disabled:opacity-40 ${props.size === "sm" ? "size-6" : "size-7"} ${props.class ?? ""}`}
     >
       <Icon name={props.icon} tone={props.tone ?? "muted-foreground"} />
     </BaseButton>
@@ -78,7 +78,7 @@ export function IconButton(props: {
 
 /** A keystroke as the platform writes it, in a quiet keycap. */
 export function Kbd(props: { keys: string }) {
-  return <Text class="shrink-0 rounded-sm border border-border bg-muted px-1 text-2xs text-muted-foreground">{keymap.label(props.keys)}</Text>;
+  return <Text class="shrink-0 rounded-sm corner-squircle border border-border bg-muted px-1 text-2xs text-muted-foreground">{keymap.label(props.keys)}</Text>;
 }
 
 /** A chip: a compact control that shows a current choice and opens something to change it. */
@@ -90,7 +90,7 @@ export function Chip(props: { label: string; icon?: IconName; iconOnly?: boolean
       disabled={props.disabled}
       tooltip={props.tipText ? tip(props.tipText) : undefined}
       accessibilityLabel={props.label}
-      class={`h-6 min-w-0 max-w-52 shrink flex-row items-center gap-1.5 rounded-md px-1.5 text-sm text-muted-foreground ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent hover:text-foreground active:bg-accent aria-expanded:bg-accent disabled:opacity-50 ${props.class ?? ""}`}
+      class={`h-6 min-w-0 max-w-52 shrink flex-row items-center gap-1.5 rounded-md corner-squircle px-1.5 text-sm text-muted-foreground ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent hover:text-foreground active:bg-accent aria-expanded:bg-accent disabled:opacity-50 ${props.class ?? ""}`}
     >
       {props.leading}
       {props.icon ? <Icon name={props.icon} size={14} /> : null}

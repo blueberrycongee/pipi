@@ -256,7 +256,7 @@ function WelcomeProject() {
           tooltip={tip(tildePath(current(), home))}
           class={`h-7 flex-row items-center gap-1.5 ${PRESS} ${FOCUS_RING} ${
             // Over a wallpaper the words cannot stand on the picture: they get the composer's glass, as a capsule.
-            wallpaper() ? "rounded-full border-[0.5px] border-hairline bg-card/65 pl-3 pr-2.5 hover:bg-card/85 dark:bg-card/58 dark:hover:bg-card/75" : "rounded-md px-1.5 hover:bg-accent"
+            wallpaper() ? "rounded-full border-[0.5px] border-hairline bg-card/65 pl-3 pr-2.5 hover:bg-card/85 dark:bg-card/58 dark:hover:bg-card/75" : "rounded-md corner-squircle px-1.5 hover:bg-accent"
           }`}
           style={wallpaper() ? GLASS_REGULAR : undefined}
         >
@@ -271,7 +271,7 @@ function WelcomeProject() {
             <BaseButton
               selected={cwd() === current()}
               onPress={() => pick(cwd())}
-              class={`min-h-9 flex-row items-center gap-2.5 rounded-md px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+              class={`min-h-9 flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
             >
               <Icon name={cwd() === current() ? "folderOpen" : "folder"} size={15} tone={cwd() === current() ? "foreground" : "muted-foreground"} />
               <View class="min-w-0 flex-1">
@@ -289,7 +289,7 @@ function WelcomeProject() {
           open.set(false);
           void chooseWorkspace();
         }}
-        class={`mt-1 min-h-9 flex-row items-center gap-2.5 rounded-md px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+        class={`mt-1 min-h-9 flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
       >
         <Icon name="folderPlus" size={15} tone="muted-foreground" />
         <Text class="flex-1 truncate text-base text-foreground">{tr("Add Project Folder…", "添加项目文件夹…")}</Text>
@@ -434,7 +434,7 @@ function Failure(props: { title: string; detail: string }) {
   const agentName = () => activeAgent().name;
   return (
     <Stage title={props.title} size={80}>
-      <View class="max-h-48 w-full max-w-130 overflow-hidden rounded-lg border border-border bg-sunken p-3" selectable>
+      <View class="max-h-48 w-full max-w-130 overflow-hidden rounded-lg corner-squircle border border-border bg-sunken p-3" selectable>
         <Text class="font-mono text-xs leading-relaxed text-muted-foreground">{props.detail}</Text>
       </View>
       <View class="flex-row flex-wrap justify-center gap-2">
@@ -809,6 +809,13 @@ export function Chat() {
     lastY = y;
     lastDistance = distance;
     lastMax = e.contentSize.height - e.size.height;
+    // A scroll asked while its commit settled is re-asked as the list reports
+    // its passes — each lands on the end the layout now says. A gesture of the
+    // reader's ends it: theirs wins.
+    if (endSettlePasses > 0) {
+      endSettlePasses--;
+      if (following() && Date.now() - inputAt > INPUT_WINDOW_MS) list?.scrollTo({ y: 1e7, animated: false });
+    }
   };
   const onInput = () => {
     inputAt = Date.now();
@@ -960,6 +967,12 @@ export function Chat() {
   let listKey = -1;
   let listReady = false;
   let scrollArmed = false;
+  // The commit that asks for the end may still be settling — a cleared draft
+  // shrinks the foot, a staged row has yet to measure: an offset taken then is
+  // past the end the content will have, and the list paints blank until its
+  // clamp pass. As the list reports its own passes as scrolls, the ask is made
+  // again through them — it answers the end either way, early or late.
+  let endSettlePasses = 0;
   effect(() => {
     scrollToEndTick();
     if (!scrollArmed) {
@@ -974,6 +987,7 @@ export function Chat() {
       // `scrollTo` during that synchronous swap would hit the outgoing list or cancel the pass.
       if (list && listKey === conversationKey() && listReady) {
         list.scrollTo({ y: 1e7, animated: false });
+        endSettlePasses = 3;
       }
     });
   });

@@ -18,6 +18,13 @@
 // Prompts containing "cancel" hang until cancelled. Diagnostics go to stderr
 // as `LOG {...}` lines so a driver can assert what the client sent.
 //
+// Prompts containing "wedge" start a turn (thought + tool call) and then die
+// silently the way a wedged Antigravity worker does mid-dispatch: the prompt is
+// never resolved, `session/cancel` is received but changes nothing, and the
+// process stays alive. With `FAKE_ACP_WEDGE=full` the RPC loop itself stops
+// answering too — every later request vanishes (a dead stdin path); otherwise
+// `session/list` and friends keep answering while the turn engine is gone.
+//
 // DSH reports no token usage, and neither does this by default. With
 // `FAKE_ACP_USAGE=1` a finished prompt carries the protocol's per-turn `usage`,
 // as an agent that reports one does (cached tokens counted on top of the input).
@@ -29,6 +36,9 @@ let seq = 0;
 let clientReqId = 1000;
 const clientPending = new Map(); // our outgoing request id → resolve
 let inflightPrompt = undefined; // { id, sessionId, cancelled }
+// "engine": the turn died, the RPC loop lives — list/cancel still answer, the
+// prompt does not. "full": every later request vanishes.
+let wedged = undefined;
 
 const MODEL_OPTIONS = [
   {
@@ -187,7 +197,23 @@ function requestPermission(sessionId, toolCallId) {
 
 async function runTurn(sessionId, text) {
   update(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `Thinking about: ${text.slice(0, 40)}` } });
+  if (/wedge/i.test(text)) {
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: `tc_${seq++}`, title: "bash", kind: "other", status: "in_progress", rawInput: { command: "nsh test ." } });
+    wedged = process.env.FAKE_ACP_WEDGE === "full" ? "full" : "engine";
+    return new Promise(() => {}); // mid-turn silent death: never resolved, never cancelled
+  }
   if (/cancel/i.test(text)) return "wait-for-cancel";
+  if (/tick/i.test(text)) {
+    // Slow steady work: a heartbeat of thoughts until cancelled — the watchdog's
+    // proof that a turn producing output is never mistaken for a wedge.
+    let ticks = 0;
+    const timer = setInterval(() => {
+      update(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `tick ${++ticks}. ` } });
+      if (inflightPrompt === undefined) clearInterval(timer);
+    }, Number(process.env.FAKE_ACP_TICK_MS || 100));
+    timer.unref?.();
+    return "wait-for-cancel";
+  }
   if (AGY && /background/i.test(text)) return backgroundTurn(sessionId, text);
   const toolCallId = `tc_${seq++}`;
   const editTool = /edit/i.test(text);
@@ -211,6 +237,7 @@ async function runTurn(sessionId, text) {
 }
 
 async function handle(msg) {
+  if (wedged === "full") return; // dead stdin path: nothing is ever answered
   if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
     const waiter = clientPending.get(msg.id);
     if (waiter) {
@@ -224,7 +251,8 @@ async function handle(msg) {
   const p = msg.params || {};
   switch (msg.method) {
     case "session/cancel":
-      if (inflightPrompt) {
+      // A wedged engine takes the cancel and still never resolves the prompt.
+      if (inflightPrompt && !wedged) {
         reply(inflightPrompt.id, { stopReason: "cancelled" });
         inflightPrompt = undefined;
       }
