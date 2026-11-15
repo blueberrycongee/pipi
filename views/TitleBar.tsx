@@ -10,7 +10,6 @@ import {
   currentTitle,
   isCurrentSessionArchived,
   isRenaming,
-  isRunning,
   newSession,
   openDaemonSession,
   openWorkspace,
@@ -24,7 +23,7 @@ import {
 import { setSidebarOpen, sidebarOpen } from "../store/prefs";
 import { Button, Chip, IconButton } from "../ui/Button";
 import { Icon } from "../ui/Icon";
-import { animateLayoutOn, enter, Presence } from "../ui/motion";
+import { enter, Presence } from "../ui/motion";
 import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, HEADER_GLASS, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 
@@ -82,7 +81,6 @@ export function TitleBar() {
   /** The session this one was started under — its label leads back there. */
   const parent = () => currentParentSession();
   const worktree = () => currentDaemonSession()?.worktree;
-  animateLayoutOn(() => !!parent(), 220, () => !isRunning());
   return (
     <View
       desktop={{ windowDrag: true }}

@@ -13,6 +13,7 @@ import type {
 } from "../agents/types";
 import { activeLanguage, tr } from "../lib/i18n";
 import { answersTo, type ComposerCommand, parseSlashLine } from "../lib/slash";
+import { markVeilsSeeded } from "../lib/veil";
 import {
   chooseRandomWallpaperCandidate,
   DEFAULT_WALLPAPER_ADJUSTMENT,
@@ -54,7 +55,7 @@ import type {
 import { type SessionSnapshot, type SessionSummary, sessionTitle } from "../pi/sessions";
 import { EMPTY_USAGE, type UsageStats } from "../pi/usage";
 import { killAllSidecars, SidecarError } from "../pi/sidecar";
-import { type Row, Transcript, withoutHandoff, withoutImageNotes } from "../pi/transcript";
+import { type Row, sameVisualRows, Transcript, withoutHandoff, withoutImageNotes } from "../pi/transcript";
 import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
@@ -420,9 +421,10 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
     if (!shown) {
       const snapFile = goal.file ?? (goal.daemonId ? daemonSessionOfId(goal.daemonId)?.file : undefined);
       if (snapFile) {
+        const snapHeld = (goal.daemonId ? daemonSessionOfId(goal.daemonId) : undefined) ?? daemonSessionByFile(snapFile);
         const epoch = ++snapshotEpoch;
         void backend()
-          .readSessionSnapshot(snapFile)
+          .readSessionSnapshot(snapFile, { keepBackgroundTools: Boolean(snapHeld?.loaded) })
           .then((snap) => {
             if (!snap?.messages.length) return;
             // A newer change took over, the change reverted (`stayPut`), or a destination already landed — nothing to paint.
@@ -951,42 +953,31 @@ function stashTranscript() {
   }
 }
 
-/** Whether two transcripts show the same conversation (row ids and live-vs-disk timing skew do not change content). */
-function sameRows(a: Row[], b: Row[]) {
-  if (a.length !== b.length) return false;
-  const shape = (rows: Row[]) =>
-    JSON.stringify(rows, (key, value) => {
-      if (key === "id" || key === "t0" || key === "durationMs" || key === "queued") return undefined;
-      if (key === "turnMs") return value === undefined ? undefined : true;
-      return value;
-    });
-  return shape(a) === shape(b);
-}
-
 /**
  * Puts the open session's messages on screen. A conversation shown ahead from
- * `visited` that the agent's history matches stays as it is — the same rows,
- * nothing for the list to do; one that moved on since is replaced.
+ * `visited` or `landSnapshot` that the agent's history matches stays as it is
+ * — the same rows, nothing for the list to do; one that moved on since is
+ * replaced while keeping `===` row references on unchanged turns (`succeed`).
  *
- * When switching back to a still-running session the agent's history does not
- * include the in-progress message yet, so it has fewer rows than what the
- * stash showed. Keep the stash in that case — the re-attached event stream
- * will fill in what happens next without a visible gap.
- *
- * Replaced, the conversation is still the same one: it keeps its key, and the
- * rows both hold keep their ids (`succeed`), so what the reader folded and
- * unfolded there is as they left it.
+ * When switching back to a still-working session (including external harnesses
+ * where the daemon reports `working`/`blocked` even while `isStreaming` is not
+ * set), the session history may omit in-progress rows that the stash already
+ * holds. Keep the stash when history is a visual prefix — the re-attached event
+ * stream will fill in what happens next without a visible gap.
  */
 function landHistory(messages: AgentMessage[]) {
   const known = state();
-  const file = known?.sessionFile ?? currentDaemonSession()?.file;
+  const heldSession = currentDaemonSession();
+  const file = known?.sessionFile ?? heldSession?.file;
   const did = openDaemonId();
+  const held = heldSession ?? (did ? daemonSessionOfId(did) : undefined) ?? (file ? daemonSessionByFile(file) : undefined);
+  const working = Boolean(known?.isStreaming) || held?.status === "working" || held?.status === "blocked";
   const shown = ahead?.transcript === transcript;
   ahead = undefined;
   early = false;
   const fresh = new Transcript(() => activeLanguage());
   // A session the daemon kept working is still on its last turn: nothing in it has stopped.
-  fresh.load(messages, Boolean(known?.isStreaming));
+  fresh.load(messages, working);
   // The conversation as it last stood on screen, when it is still held: shown ahead, or set aside under its file / daemon id.
   const before = shown
     ? transcript
@@ -1001,10 +992,10 @@ function landHistory(messages: AgentMessage[]) {
   const countUsers = (list: readonly Row[]) => list.reduce((n, r) => (r.kind === "user" ? n + 1 : n), 0);
   if (
     before &&
-    (sameRows(fresh.rows(), before.rows()) ||
-      (Boolean(known?.isStreaming) &&
+    (sameVisualRows(fresh.rows(), before.rows()) ||
+      (working &&
         fresh.rows().length < before.rows().length &&
-        sameRows(fresh.rows(), before.rows().slice(0, fresh.rows().length))))
+        sameVisualRows(fresh.rows(), before.rows().slice(0, fresh.rows().length))))
   ) {
     // The same rows, or the agent's history is an exact prefix of the stashed view: an in-progress
     // run has not yet written its streaming message to the session file. Keep
@@ -1027,9 +1018,11 @@ function landHistory(messages: AgentMessage[]) {
   });
 }
 
-/** Marks every row the transcript can put on screen as already seen: a landing never replays row entrances. */
+/** Marks every row the transcript can put on screen as already seen: a landing never replays row entrances or streaming veils. */
 function markTranscriptSeen() {
-  markRowsSeen(displayRowIds(transcript.rows()));
+  const ids = displayRowIds(transcript.rows());
+  markRowsSeen(ids);
+  markVeilsSeeded(ids);
 }
 
 /**
@@ -1406,7 +1399,8 @@ async function launch(
     if ((reopen || daemonId) && !preserveRows) {
       batch(() => {
         state.set(first);
-        if (first.isStreaming || currentDaemonSession()?.status === "working") {
+        const heldStatus = currentDaemonSession()?.status;
+        if (first.isStreaming || heldStatus === "working" || heldStatus === "blocked") {
           if (!running()) runStartedAt.set(Date.now());
           running.set(true);
           if (activity().kind === "idle") activity.set({ kind: "thinking" });
@@ -1600,7 +1594,9 @@ function revive(agentLabel: string, cutShort: boolean, lost: Extract<Phase, { na
       ]);
       if (mine !== generation) return;
       state.set(next);
-      if (next.isStreaming && !running()) {
+      const heldStatus = currentDaemonSession()?.status;
+      const sessionWorking = Boolean(next.isStreaming) || heldStatus === "working" || heldStatus === "blocked";
+      if (sessionWorking && !running()) {
         runStartedAt.set(Date.now());
         running.set(true);
         if (activity().kind === "idle") activity.set({ kind: "thinking" });
@@ -1609,8 +1605,8 @@ function revive(agentLabel: string, cutShort: boolean, lost: Extract<Phase, { na
       // no file has, and a session that could not be opened again is not the one shown: then the file speaks.
       if (!ahead && (cutShort || (file !== undefined && next.sessionFile !== file))) {
         const fresh = new Transcript(() => activeLanguage());
-        fresh.load(history.messages, Boolean(next.isStreaming));
-        if (!sameRows(fresh.rows(), transcript.rows())) {
+        fresh.load(history.messages, sessionWorking);
+        if (!sameVisualRows(fresh.rows(), transcript.rows())) {
           // The session opened again is the conversation on screen: the reader's folds stay on it.
           if (next.sessionFile === file) succeed(transcript, fresh);
           transcript = fresh;
@@ -1988,7 +1984,8 @@ async function refreshState() {
   state.set(next);
   if (next.sessionFile) reportSessionFile();
   // A session the daemon kept working — reopened or revived — says so through its state, not an `agent_start` the attach missed.
-  if (next.isStreaming && !running()) {
+  const heldStatus = currentDaemonSession()?.status;
+  if ((next.isStreaming || heldStatus === "working" || heldStatus === "blocked") && !running()) {
     runStartedAt.set(Date.now());
     running.set(true);
     if (activity().kind === "idle") activity.set({ kind: "thinking" });
@@ -2826,8 +2823,8 @@ async function dispatchPrompt(
       runStartedAt.set(Date.now());
       activity.set({ kind: "thinking" });
     }
+    scrollToEnd.set(0);
   });
-  scrollToEnd.set(0);
   try {
     const { disposition } = await activeClient.request("prompt", {
       message: wirePrompt,
@@ -2838,16 +2835,22 @@ async function dispatchPrompt(
     if (client !== activeClient) {
       if (disposition === "queued") runTranscript.markStagedQueued(stagedId);
       else if (disposition === "handled") runTranscript.dropStagedUser(stagedId);
+      else if (queued && disposition === "started") runTranscript.markStagedStarted(stagedId);
       return;
     }
-    if (disposition === "handled" || disposition === "queued") {
+    if (disposition === "handled" || disposition === "queued" || (queued && disposition === "started")) {
       batch(() => {
         if (disposition === "queued") runTranscript.markStagedQueued(stagedId);
-        else runTranscript.dropStagedUser(stagedId);
+        else if (disposition === "handled") runTranscript.dropStagedUser(stagedId);
+        else runTranscript.markStagedStarted(stagedId);
         if (runTranscript === transcript) flush();
         if (!queued && disposition === "handled") {
           running.set(false);
           activity.set({ kind: "idle" });
+        } else if (queued && disposition === "started" && !running()) {
+          running.set(true);
+          runStartedAt.set(Date.now());
+          activity.set({ kind: "thinking" });
         }
       });
     }

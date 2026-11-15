@@ -17,6 +17,8 @@ export type QueueMode = "all" | "one-at-a-time";
 export interface TextContent {
   type: "text";
   text: string;
+  /** The bridge's mark on the still-open block of a `stopReason: "pending"` message. */
+  streaming?: boolean;
 }
 
 export interface ImageContent {
@@ -29,6 +31,8 @@ export interface ThinkingContent {
   type: "thinking";
   thinking: string;
   redacted?: boolean;
+  /** The bridge's mark on the still-open block of a `stopReason: "pending"` message. */
+  streaming?: boolean;
 }
 
 export interface ToolCall {

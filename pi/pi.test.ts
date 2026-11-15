@@ -1,9 +1,10 @@
 import { expect, test } from "nsh/test";
+import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
 import { PiClient, type Transport } from "./client";
 import { DaemonClient } from "./daemon";
 import { createLineSplitter } from "./jsonl";
-import { Transcript, toolSummary, withoutHandoff, withoutImageNotes } from "./transcript";
-import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, describeToolsSummary, displayRowIds, type TurnHeaderRow } from "./turns";
+import { firstVisualRowDiff, type Row, sameVisualRows, Transcript, toolSummary, withoutHandoff, withoutImageNotes } from "./transcript";
+import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, describeToolsSummary, displayRowIds, stableDisplayRows, type TurnHeaderRow } from "./turns";
 
 test("splits records on LF only, across chunks, keeping U+2028", () => {
   const lines: string[] = [];
@@ -1271,3 +1272,303 @@ test("a queued staged bubble reconciles with the agent's queue: delivered echoes
 
 
 
+
+test("a pending assistant message in get_messages rebuilds the live stream so deltas keep their rows", () => {
+  // What the bridge carries mid-turn: the turn's settled messages — tool
+  // results ahead of the one assistant message calling them — and the
+  // in-flight message as a `stopReason: "pending"` snapshot, open blocks
+  // marked `streaming`, running calls `background`.
+  const live = new Transcript();
+  const liveUpdate = (assistantMessageEvent: object) => live.apply({ type: "message_update", assistantMessageEvent } as never);
+  live.apply({ type: "message_start", message: { role: "user", content: "go", timestamp: 1 } });
+  live.apply({ type: "message_end", message: { role: "user", content: "go", timestamp: 1 } });
+  live.apply({ type: "message_start", message: { role: "assistant", content: [], stopReason: "pending", turnStart: true } as never });
+  liveUpdate({ type: "thinking_start", contentIndex: 0 });
+  liveUpdate({ type: "thinking_delta", contentIndex: 0, delta: "Plan: read." });
+  liveUpdate({ type: "thinking_end", contentIndex: 0, content: "Plan: read." });
+  liveUpdate({ type: "text_start", contentIndex: 1 });
+  liveUpdate({ type: "text_delta", contentIndex: 1, delta: "First I'll read. " });
+  liveUpdate({ type: "text_end", contentIndex: 1, content: "First I'll read. " });
+  liveUpdate({ type: "toolcall_start", contentIndex: 2, id: "c1", toolName: "read" });
+  liveUpdate({ type: "toolcall_end", contentIndex: 2, toolCall: { type: "toolCall", id: "c1", name: "read", arguments: { path: "a.ts" } } });
+  live.apply({ type: "tool_execution_start", toolCallId: "c1", toolName: "read", args: { path: "a.ts" } });
+  live.apply({ type: "tool_execution_end", toolCallId: "c1", toolName: "read", result: { content: [{ type: "text", text: "ok" }] }, isError: false });
+  live.apply({ type: "message_end", message: { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 2 } as never });
+  liveUpdate({ type: "text_start", contentIndex: 3 });
+  liveUpdate({ type: "text_delta", contentIndex: 3, delta: "Now the answer " });
+
+  // Re-attached: the same turn, rebuilt from history plus the pending snapshot.
+  const fresh = new Transcript();
+  fresh.load(
+    [
+      { role: "user", content: "go", timestamp: 1 } as never,
+      { role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 2 } as never,
+      {
+        role: "assistant",
+        turnStart: true,
+        stopReason: "pending",
+        content: [
+          { type: "thinking", thinking: "Plan: read." },
+          { type: "text", text: "First I'll read. " },
+          { type: "toolCall", id: "c1", name: "read", arguments: { path: "a.ts" } },
+          { type: "text", text: "Now the answer ", streaming: true },
+        ],
+        timestamp: 3,
+      } as never,
+    ],
+    true,
+  );
+  expect(fresh.rows()).toMatchObject([
+    { kind: "user", text: "go" },
+    { kind: "thinking", text: "Plan: read.", streaming: false, turnStart: true },
+    { kind: "text", text: "First I'll read. ", streaming: false },
+    { kind: "tool", id: "c1", status: "done", output: "ok" },
+    { kind: "text", text: "Now the answer ", streaming: true },
+  ]);
+
+  // The stash's row ids win where the conversations pair up (`succeed`), and
+  // the stream the attach missed goes on writing to them — no phantom row.
+  fresh.adopt(live.rows());
+  const update = (assistantMessageEvent: object) => fresh.apply({ type: "message_update", assistantMessageEvent } as never);
+  update({ type: "text_delta", contentIndex: 3, delta: "lands whole." });
+  expect(fresh.rows()).toHaveLength(5);
+  expect(fresh.rows().at(-1)).toMatchObject({ kind: "text", text: "Now the answer lands whole.", streaming: true });
+
+  // The message's own end settles its rows — a final answer, its turn measured.
+  fresh.apply({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      turnStart: true,
+      stopReason: "stop",
+      content: [
+        { type: "thinking", thinking: "Plan: read." },
+        { type: "text", text: "First I'll read. " },
+        { type: "toolCall", id: "c1", name: "read", arguments: { path: "a.ts" } },
+        { type: "text", text: "Now the answer lands whole." },
+      ],
+      timestamp: 4,
+    } as never,
+  });
+  fresh.apply({ type: "agent_settled" });
+  const rows = fresh.rows();
+  expect(rows).toHaveLength(5);
+  expect(rows.at(-1)).toMatchObject({ kind: "text", text: "Now the answer lands whole.", streaming: false, final: true });
+});
+
+test("sameVisualRows is invariant to object key order and live-only compaction estimate text, and firstVisualRowDiff pinpoints real diffs", () => {
+  const snapRows: Row[] = [
+    { kind: "user", id: "u-1", text: "compact", images: 0 },
+    { kind: "summary", id: "c-1", title: "Context compacted from 120k tokens", text: "summary body" },
+    {
+      kind: "tool",
+      id: "call_1",
+      callId: "call_1",
+      name: "read",
+      args: { b: 2, a: 1 },
+      status: "done",
+      output: "ok",
+      images: 0,
+      details: { y: [1, { z: 3, x: 2 }], w: true },
+      turnStart: true,
+      turnMs: 850,
+    },
+  ];
+  const histRows: Row[] = [
+    { kind: "user", id: "u-99", text: "compact", images: 0, queued: false },
+    { kind: "summary", id: "c-99", title: "Context compacted from 120k to about 28k tokens", text: "summary body" },
+    {
+      turnMs: 1200,
+      turnStart: true,
+      kind: "tool",
+      id: "call_99",
+      callId: "call_1",
+      name: "read",
+      args: { a: 1, b: 2 },
+      status: "done",
+      output: "ok",
+      images: 0,
+      durationMs: 42,
+      t0: 1000,
+      details: { w: true, y: [1, { x: 2, z: 3 }] },
+    },
+  ];
+  expect(sameVisualRows(snapRows, histRows)).toBe(true);
+  expect(firstVisualRowDiff(snapRows, histRows)).toBeUndefined();
+
+  const changed: Row[] = [histRows[0]!, histRows[1]!, { ...(histRows[2] as Extract<Row, { kind: "tool" }>), output: "different" }];
+  expect(sameVisualRows(snapRows, changed)).toBe(false);
+  expect(firstVisualRowDiff(snapRows, changed)).toMatchObject({ index: 2, a: { output: "ok" }, b: { output: "different" } });
+});
+
+test("Transcript.adopt preserves === row and display-row references for unchanged turns and pairs tool calls by wire callId without collisions", () => {
+  // Snapshot missed Turn 1's `item_0` call, so its Turn 2 call got id `item_0` (callId `item_0`).
+  // Agent history includes Turn 1's `item_0` AND Turn 2's `item_0#2` (callId `item_0`) plus a repeated "continue" prompt.
+  const before = new Transcript();
+  before.load(
+    [
+      { role: "user", content: "continue", timestamp: 1 } as never,
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "First reply" }], timestamp: 2 } as never,
+      { role: "user", content: "continue", timestamp: 3 } as never,
+      {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "item_0", name: "bash", arguments: { command: "ls" } }],
+        timestamp: 4,
+      } as never,
+      { role: "toolResult", toolCallId: "item_0", toolName: "bash", content: [{ type: "text", text: "a.ts" }], isError: false, timestamp: 5 } as never,
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Listed files." }], timestamp: 6 } as never,
+    ],
+    false,
+  );
+  const beforeRows = before.rows();
+  const stabilize = stableDisplayRows();
+  const beforeDisplay = stabilize(buildDisplayRows(beforeRows, false));
+
+  // Case 1: History extends `before` with a new turn — every earlier row AND projected DisplayRow stays `===` identical!
+  const extended = new Transcript();
+  extended.load(
+    [
+      { role: "user", content: "continue", timestamp: 1 } as never,
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "First reply" }], timestamp: 2 } as never,
+      { role: "user", content: "continue", timestamp: 3 } as never,
+      {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "item_0", name: "bash", arguments: { command: "ls" } }],
+        timestamp: 4,
+      } as never,
+      { role: "toolResult", toolCallId: "item_0", toolName: "bash", content: [{ type: "text", text: "a.ts" }], isError: false, timestamp: 5 } as never,
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Listed files." }], timestamp: 6 } as never,
+      { role: "user", content: "next question", timestamp: 7 } as never,
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Next answer." }], timestamp: 8 } as never,
+    ],
+    false,
+  );
+  extended.adopt(beforeRows);
+  const extRows = extended.rows();
+  for (let i = 0; i < beforeRows.length; i++) {
+    expect(extRows[i]).toBe(beforeRows[i]);
+  }
+  const extDisplay = stabilize(buildDisplayRows(extRows, false));
+  for (let i = 0; i < beforeDisplay.length; i++) {
+    expect(extDisplay[i]).toBe(beforeDisplay[i]);
+  }
+
+  // Case 2: History had an earlier `item_0` tool call that shifted Turn 2's minted id to `item_0#2`.
+  // `adopt` reclaims `item_0` for Turn 2's tool row without colliding with Turn 1's inserted tool row!
+  const shifted = new Transcript();
+  shifted.load(
+    [
+      { role: "user", content: "continue", timestamp: 1 } as never,
+      {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "item_0", name: "read", arguments: { path: "pkg.json" } }],
+        timestamp: 1.5,
+      } as never,
+      { role: "toolResult", toolCallId: "item_0", toolName: "read", content: [{ type: "text", text: "{}" }], isError: false, timestamp: 1.8 } as never,
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "First reply" }], timestamp: 2 } as never,
+      { role: "user", content: "continue", timestamp: 3 } as never,
+      {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "item_0", name: "bash", arguments: { command: "ls" } }],
+        timestamp: 4,
+      } as never,
+      { role: "toolResult", toolCallId: "item_0", toolName: "bash", content: [{ type: "text", text: "a.ts" }], isError: false, timestamp: 5 } as never,
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Listed files." }], timestamp: 6 } as never,
+    ],
+    false,
+  );
+  shifted.adopt(beforeRows);
+  const shiftedTools = shifted.rows().filter((r) => r.kind === "tool");
+  expect(shiftedTools).toHaveLength(2);
+  // Unique ids preserved, and Turn 2's bash call kept its `item_0` id and exact `===` row reference!
+  expect(new Set(shifted.rows().map((r) => r.id)).size).toBe(shifted.rows().length);
+  expect(shiftedTools[1]).toBe(beforeRows.find((r) => r.kind === "tool"));
+});
+
+test("live whitespace-only thinking/text blocks are cleaned up on message_end so stashed transcripts match history", () => {
+  const live = new Transcript();
+  const update = (assistantMessageEvent: object) => live.apply({ type: "message_update", assistantMessageEvent } as never);
+  live.apply({ type: "message_start", message: { role: "user", content: "hi", timestamp: 1 } });
+  live.apply({ type: "message_end", message: { role: "user", content: "hi", timestamp: 1 } });
+  live.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  update({ type: "thinking_start", contentIndex: 0 });
+  update({ type: "thinking_delta", contentIndex: 0, delta: "   \n  " });
+  update({ type: "thinking_end", contentIndex: 0, content: "   \n  " });
+  update({ type: "text_start", contentIndex: 1 });
+  update({ type: "text_delta", contentIndex: 1, delta: "Clean answer." });
+  update({ type: "text_end", contentIndex: 1, content: "Clean answer." });
+  const endMsg = {
+    role: "assistant" as const,
+    stopReason: "stop" as const,
+    content: [
+      { type: "thinking" as const, thinking: "   \n  " },
+      { type: "text" as const, text: "Clean answer." },
+    ],
+    timestamp: 2,
+  };
+  live.apply({ type: "message_end", message: endMsg as never });
+  live.apply({ type: "agent_settled" });
+
+  const reloaded = new Transcript();
+  reloaded.load([{ role: "user", content: "hi", timestamp: 1 } as never, endMsg as never], false);
+  expect(sameVisualRows(live.rows(), reloaded.rows())).toBe(true);
+});
+
+test("queued staged bubbles survive /skill wire expansion, concurrent queue updates, and immediate started disposition", () => {
+  const t = new Transcript();
+  const skillId = t.stageUser("/review src/app.ts", 0, true)!;
+  const inflightId = t.stageUser("second queued prompt", 0, true)!;
+
+  // Before `inflightId`'s RPC acks, a queue_update carrying only the expanded `/review` prompt arrives:
+  // `skillId` is covered by the unmatched wire slot, and `inflightId` (`!queueAcked`) is NOT marked `dropAt`.
+  t.reconcileQueue(["Expanded skill instructions for src/app.ts..."], []);
+  expect(t.dropDeadline()).toBeUndefined();
+
+  // Once both are in the wire queue, neither has a drop deadline.
+  t.reconcileQueue(["Expanded skill instructions for src/app.ts...", "second queued prompt"], []);
+  expect(t.dropDeadline()).toBeUndefined();
+
+  // `clear_queue` returning the expanded `/review` text drops `skillId` immediately via unmatched slot coverage.
+  t.dropQueuedMatching(["Expanded skill instructions for src/app.ts..."]);
+  expect(t.rows().map((r) => r.id)).toEqual([inflightId]);
+
+  // If an optimistically-queued send actually returned `disposition: "started"`, `markStagedStarted` clears `queued`
+  // so `reconcileQueue([], [])` never sweeps it out from under the starting run.
+  t.markStagedStarted(inflightId);
+  expect(t.rows()[0]).toEqual({ kind: "user", id: inflightId, text: "second queued prompt", images: 0 });
+  t.reconcileQueue([], []);
+  expect(t.dropDeadline()).toBeUndefined();
+});
+
+test("roughUserLines calibrates grapheme clusters for CJK, Latin, and surrogate/ZWJ emojis without borderline false pre-folds", () => {
+  // Borderline CJK (170–250 chars): 5–7 lines (< USER_PREFOLD_LINES = 8), so Frame 1 never falsely folds & pops open!
+  const cjk180 = "这是一段用于测试聊天气泡折行精度的中文消息文本，包含常见标点符号。" .repeat(6); // 198 chars
+  const cjk245 = "这是一段用于测试聊天气泡折行精度的中文消息文本，包含常见标点符号。" .repeat(7) + "补充十四字刚好两百四十五字。";
+  expect(roughUserLines(cjk180)).toBeLessThan(USER_PREFOLD_LINES);
+  expect(roughUserLines(cjk245)).toBeLessThan(USER_PREFOLD_LINES);
+
+  // Unambiguously long CJK (330 chars): >= USER_PREFOLD_LINES, pre-folds on Frame 1.
+  const cjk330 = "这是一段用于测试聊天气泡折行精度的中文消息文本，包含常见标点符号。" .repeat(10);
+  expect(roughUserLines(cjk330)).toBeGreaterThanOrEqual(USER_PREFOLD_LINES);
+
+  // Borderline English (450 chars): <= 6 lines (< USER_PREFOLD_LINES).
+  const en450 = "The quick brown fox jumps over the lazy dog while measuring proportional glyph widths. ".repeat(5).trim();
+  expect(en450.length).toBeGreaterThan(415);
+  expect(en450.length).toBeLessThan(500);
+  expect(roughUserLines(en450)).toBeLessThanOrEqual(USER_FOLD_LINES);
+  expect(roughUserLines(en450)).toBeLessThan(USER_PREFOLD_LINES);
+
+  // Surrogate-pair and ZWJ family emojis: 30 `👨‍👩‍👧‍👦` clusters (330 UTF-16 code units!) fit in 1–2 lines, never 9+!
+  const zwj30 = "👨‍👩‍👧‍👦".repeat(30);
+  expect(zwj30.length).toBe(330);
+  expect(roughUserLines(zwj30)).toBeLessThanOrEqual(2);
+  const grinning60 = "😀".repeat(60);
+  expect(roughUserLines(grinning60)).toBeLessThanOrEqual(3);
+
+  // Explicit >6 hard line breaks are detected directly via `hardBreakLines`.
+  expect(hardBreakLines("1\n2\n3\n4\n5\n6\n7")).toBe(7);
+});

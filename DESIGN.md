@@ -275,23 +275,30 @@ control offers it and no state claims it.
 What plays answers the room the way Wallpaper Engine's do. The pointer drags
 a small parallax and a ripple pulse on a click (`notifyWallpaperPointerMove`,
 `triggerWallpaperInteraction`); the agent's mood feeds an `energy` uniform —
-shaders run faster and videos push their playback rate while it works — and
+shaders swim harder and videos push their playback rate while it works — and
 `reduceMotion`, `wallpaperPaused` or the auto-pause mode stills it all. Each
 of these is a live binding on the one mounted surface, which is why the
 surface is chosen through `<If>`s, not an if/else: the element must be the
 kind's own, remounted when the kind changes, or a video stays mounted playing
 whatever path the next wallpaper hands it.
 
-The four built-in shaders are subjects, not fields: `jelly` swims an
-ASCII-rendered jellyfish through the deep — its bell pulses to swim, the
-pointer is a current it flees, a click is a contraction dart — `flock`
-ribbons a murmuration whose birds ride one drifting attractor, parting for
-the cursor and scattering on a click, `orbit` shears a ring of dust around
-a dark seed that snaps loose on a click and spirals home, and `aurora`
-breathes two curtains of light over mountain ridges doubled in a still
-lake, leaning toward the cursor and carrying a meteor on each click. A
-stored `preset:` that outlives its name is upgraded to its successor,
-never left unlit.
+The built-in shaders are one medium, not a set of scenes
+(`lib/wallpaper-presets.ts`): the page itself — the `background` color, so
+the pane's washes change nothing of it but the ink — under a fixed grid of
+digits, a 0 or a 1 to each 9pt cell, in one ink (the brand's blue deepened;
+pale on dark). A creature is not drawn on the grid, it passes through it:
+each is a translucent body, and a cell shows how much of that body the eye
+looks through there — the digit takes its ink first, and past that the
+paper under it tints. Nothing is outlined; an edge is where the body runs
+out. `jelly` is a jellyfish seen from a little below: a bell that is a
+veil over a hollow (densest where the eye looks along its wall, eight
+ribs, the ring of its mouth), four arms that twist as they hang, tentacles
+one cell wide. It keeps to the open water right of what stands in the
+middle of the pane, leans away from the pointer, takes a stroke at once on
+a click, and swims harder while the agent works. A preset lies still under
+the window: it takes no parallax, the pointer it reads is eased after the
+cursor, and a click's pulse fades over 1.4s. A stored `preset:` that
+outlives its name is upgraded to its successor, never left unlit.
 
 Each region is a depth of the same glass over it:
 

@@ -11,6 +11,7 @@ import {
   isDynamicWallpaperConfig,
   isPausableWallpaper,
   WALLPAPER_PAUSE_MODES,
+  WALLPAPER_PRESET_META,
   WALLPAPER_PRESETS,
   WALLPAPER_VIDEO_CLICK_ACTIONS,
   type WallpaperEffect,
@@ -1001,16 +1002,7 @@ function wallpaperEffectDescription(effect: WallpaperEffect) {
 }
 
 function wallpaperPresetLabel(preset: WallpaperPreset) {
-  switch (preset) {
-    case "flock":
-      return tr("Flock", "群鸟");
-    case "orbit":
-      return tr("Orbit", "星环");
-    case "aurora":
-      return tr("Aurora", "极光");
-    case "jelly":
-      return tr("Jelly", "水母");
-  }
+  return tr(WALLPAPER_PRESET_META[preset].en, WALLPAPER_PRESET_META[preset].zh);
 }
 
 function wallpaperVideoClickLabel(action: WallpaperVideoClickAction) {
@@ -1134,8 +1126,8 @@ function General() {
             <SettingRow
               title={tr("Live wallpaper presets", "内置动态壁纸")}
               description={tr(
-                "Built-in GPU procedural wallpapers with real-time cursor & agent reactivity.",
-                "无需本地文件即可启用的内置 GPU 实时交互动态壁纸。",
+                "Creatures passing through a sheet of digits, drawn live. They answer the pointer and a click.",
+                "游过一页数字的生物，实时绘制，会回应指针与点击。",
               )}
             >
               <View class="flex-row items-center gap-1.5">

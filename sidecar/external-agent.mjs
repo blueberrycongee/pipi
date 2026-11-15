@@ -653,6 +653,8 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
   let thinkIdx = undefined;
   let thinkBuf = "";
   const blocks = [];
+  /** Each closed block's contentIndex — close order is not start order. */
+  const blockIdx = [];
   const openTools = new Map();
   // What the engine reported for this turn: stamped on the turn's last
   // assistant message, the way Pi stamps each of its own.
@@ -689,6 +691,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
     const idx = thinkIdx;
     thinkIdx = undefined;
     blocks.push({ type: "thinking", thinking: thinkBuf });
+    blockIdx.push(idx);
     emitTurn({ type: "message_update", usage: zeroUsage, assistantMessageEvent: { type: "thinking_end", contentIndex: idx, content: thinkBuf } });
   };
 
@@ -697,10 +700,11 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
     const idx = textIdx;
     textIdx = undefined;
     blocks.push({ type: "text", text: textBuf });
+    blockIdx.push(idx);
     emitTurn({ type: "message_update", usage: zeroUsage, assistantMessageEvent: { type: "text_end", contentIndex: idx, content: textBuf } });
   };
 
-  return {
+  const api = {
     get textBuf() {
       return textBuf;
     },
@@ -709,6 +713,34 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
     },
     get hasBlocks() {
       return blocks.length > 0;
+    },
+    /**
+     * The in-flight message as `get_messages` carries it (`stopReason:
+     * "pending"`): what a (re)attached client rebuilds its live rows from, in
+     * contentIndex order — blocks close out of order, so they are placed by the
+     * index they opened at, not appended. The still-open block is marked
+     * `streaming`, a call still running `background`.
+     */
+    pending() {
+      if (sessionEpoch !== turnEpoch || !msgOpen || finished) return undefined;
+      const content = new Array(nextIdx);
+      for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i];
+        content[blockIdx[i]] = b.type === "toolCall" && openTools.has(b.id) ? { ...b, background: true } : b;
+      }
+      if (thinkIdx !== undefined) content[thinkIdx] = { type: "thinking", thinking: thinkBuf, streaming: true };
+      if (textIdx !== undefined) content[textIdx] = { type: "text", text: textBuf, streaming: true };
+      if (!content.length || content.some((b) => !b)) return undefined;
+      return {
+        role: "assistant",
+        content,
+        provider: currentModel.provider,
+        model: currentModel.id,
+        usage: zeroUsage,
+        stopReason: "pending",
+        ...(startTurn ? { turnStart: true } : {}),
+        timestamp: Date.now(),
+      };
     },
     /** Tokens or cost the engine reported for this turn. After the answer, it is the session's all the same. */
     usage(part) {
@@ -730,6 +762,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
     thinkDelta(delta) {
       if (!delta) return;
       openMsg();
+      closeText();
       if (thinkIdx === undefined) {
         thinkIdx = nextIdx++;
         thinkBuf = "";
@@ -763,6 +796,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       const name = normalizeToolName(rawName);
       const tc = { type: "toolCall", id, name, arguments: args || {} };
       blocks.push(tc);
+      blockIdx.push(idx);
       calledTools.add(id);
       openTools.set(id, { name, startedAt: Date.now() });
       emitTurn({ type: "message_update", usage: zeroUsage, assistantMessageEvent: { type: "toolcall_start", contentIndex: idx, id, toolName: name } });
@@ -811,6 +845,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
         emitTurn({ type: "message_end", message: assistantMsg });
         msgOpen = false;
         nextIdx = 0;
+        blockIdx.splice(0);
         startTurn = true;
       }
       saidText = "";
@@ -822,6 +857,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       closeText();
       const usage = toUsage(usageParts.splice(0));
       finished = true;
+      if (liveTurnStream === api) liveTurnStream = undefined;
       const counted = sessionEpoch === turnEpoch;
       if (msgOpen || errorMessage) {
         openMsg();
@@ -849,6 +885,8 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       emitTurn({ type: "turn_end" });
     },
   };
+  liveTurnStream = api;
+  return api;
 }
 
 function spawnJsonlProcess(bin, args, extraEnv, onLine, stdinPayload) {
@@ -1404,6 +1442,8 @@ let acpLoadSession = false;
 let acpRpcId = 1;
 const acpPending = new Map(); // rpc id → {resolve, reject}
 let acpStream = undefined; // stream helper of the in-flight prompt
+/** The turn stream accumulating right now, on any driver: its `pending()` is what `get_messages` adds so a (re)attached client sees the in-flight message. */
+let liveTurnStream = undefined;
 let acpOutBuf = "";
 let acpErrBuf = "";
 // Last byte the peer wrote — the liveness signal the prompt watchdog reads:
@@ -2794,8 +2834,13 @@ async function handleCommand(cmd) {
         return { levels: [...new Set(["off", ...efforts])] };
       }
       return { levels: currentModel?.reasoning ? ["off", "low", "medium", "high"] : ["off"] };
-    case "get_messages":
-      return { messages };
+    case "get_messages": {
+      // The in-flight turn's message so far: a reattached client rebuilds its
+      // live rows from it instead of losing them to a history that holds a
+      // turn's tool results ahead of the one message calling them.
+      const pending = liveTurnStream?.pending();
+      return { messages: pending ? [...messages, pending] : messages };
+    }
     case "get_commands":
       return { commands: agentCommands };
     case "get_session_stats": {

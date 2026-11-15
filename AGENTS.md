@@ -129,6 +129,11 @@ multi-agent orchestration, and settings.
 - `nsh test WallpaperLook.test.tsx --target macos` — the app under a wallpaper,
   every surface it reaches, in `.nsh/shots/wallpaper-*.png` (`harness.wallpaper`
   lays one; name any image in the test's `PICTURE`)
+- `nsh test PresetStage.test.tsx --target macos` — each built-in live wallpaper
+  alone on a bare stage (`dev/WallpaperStage.tsx`), light and dark, in
+  `.nsh/shots/stage-*.png`: a shot's `uniforms` set any member of the shader's
+  `struct Uniforms` (`phase` adds seconds to its clock); `PresetLook.test.tsx`
+  shoots the same presets under the welcome screen (`preset-*.png`)
 - `nsh test Update.test.tsx --target macos` — the update card found,
   downloading and ready, in `.nsh/shots/update-*.png` (`harness.update`
   scripts the updater); `UpdateFilm.test.tsx` films it frame by frame into

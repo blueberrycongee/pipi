@@ -7,6 +7,10 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { decodeLumGridAsync, pixelDiff } from "./dev/frames";
+import { WALLPAPER_PRESET_META, WALLPAPER_PRESETS } from "./lib/wallpaper";
+
+const PRESET = WALLPAPER_PRESETS[0];
+const PRESET_META = WALLPAPER_PRESET_META[PRESET];
 
 const OUT = ".nsh/shots/settings";
 
@@ -143,13 +147,13 @@ test("dynamic wallpaper entry points show in Settings and Command Palette, and s
         workspaces: ["/Users/pip/code/pipi"],
         activeWorkspace: "/Users/pip/code/pipi",
         wallpaper: {
-          path: "preset:aurora",
-          name: "Aurora Ridge",
+          path: `preset:${PRESET}`,
+          name: PRESET_META.name,
           width: 1920,
           height: 1080,
           adjustment: { focalX: 0.5, focalY: 0.5, zoom: 1 },
           kind: "shader",
-          preset: "aurora",
+          preset: PRESET,
         },
         wallpaperEffect: "ripple",
         wallpaperInteractive: true,
@@ -165,7 +169,7 @@ test("dynamic wallpaper entry points show in Settings and Command Palette, and s
   const settingsTexts = app.texts();
   // A stored live shader wallpaper loads as itself — not normalized away.
   expect(settingsTexts).toContain("Live wallpaper presets");
-  expect(settingsTexts).toContain("Aurora");
+  expect(settingsTexts).toContain(PRESET_META.en);
   expect(settingsTexts).toContain("Interactive wallpaper");
   expect(settingsTexts).toContain("React to agent activity");
   expect(settingsTexts).toContain("Auto-pause");

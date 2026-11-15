@@ -4,6 +4,7 @@ import { Collapsible, TextView } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { clip, duration } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
+import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
 import type { Row, ToolRow } from "../pi/transcript";
 import {
   type ActivityRow,
@@ -325,7 +326,7 @@ export function turnDefault(id: string, working: boolean, following: boolean, ha
   const key = conversationKey();
   if (watched.key !== key) watched = { key, seen: new Set(), owed: new Set() };
   if (working) {
-    if (hasDetails) watched.seen.add(id);
+    watched.seen.add(id);
     return true;
   }
   if (!watched.seen.has(id)) return false;
@@ -384,8 +385,6 @@ export function enterConversation(key: number) {
   clearProseState();
 }
 
-/** A sent message lays out past this many lines and the bubble folds to a preview. */
-const USER_FOLD_LINES = 6;
 /**
  * The laid-out height of each user bubble's text, by row id. The text's own
  * layout reports it while it runs free; a folded pass reports at most the
@@ -394,24 +393,6 @@ const USER_FOLD_LINES = 6;
  */
 const userLineCounts = signal<Record<string, number>>({});
 
-/** Visual column width of a line (wide CJK/emoji glyphs count as two narrow columns). */
-function visualColumns(line: string): number {
-  let cols = 0;
-  for (let i = 0; i < line.length; i++) {
-    cols += line.charCodeAt(i) >= 0x2e80 ? 2 : 1;
-  }
-  return cols;
-}
-
-/** A rough line count before the text's first layout: wraps per paragraph so CJK and Latin bubbles start already folded without a second-frame jump. */
-function roughLines(text: string): number {
-  let total = 0;
-  for (const line of text.split("\n")) {
-    total += Math.max(1, Math.ceil(visualColumns(line) / 68));
-  }
-  return total;
-}
-
 function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   // The fork command names a message by its place among the user's messages on screen.
   const ordinal = () =>
@@ -419,7 +400,11 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
       .filter((row) => row.kind === "user")
       .findIndex((row) => row.id === props.row.id);
   const open = () => isOpen(props.row.id, false);
-  const foldable = () => (userLineCounts()[props.row.id] ?? roughLines(props.row.text)) > USER_FOLD_LINES;
+  const foldable = () => {
+    const measured = userLineCounts()[props.row.id];
+    if (measured !== undefined) return measured > USER_FOLD_LINES;
+    return hardBreakLines(props.row.text) > USER_FOLD_LINES || roughUserLines(props.row.text) >= USER_PREFOLD_LINES;
+  };
   const folded = () => foldable() && !open();
   const fold = () => toggle(props.row.id, false);
   /** The queue still holds this message: its bubble stands where it was sent, but reads as waiting — not said into the run yet. */
@@ -452,8 +437,8 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
               style={folded() ? { maskImage: "linear-gradient(to bottom, black 64%, transparent 94%)" } : undefined}
               onTextLayout={(e) => {
                 const n = e.lines.length;
-                // Fewer lines than the text's own breaks is not a real layout pass (the headless engine reports one box).
-                if (n < props.row.text.split("\n").length) return;
+                // Fewer lines than the text's own breaks (or a zero-height headless stub box) is not a real layout pass.
+                if (n < hardBreakLines(props.row.text) || (n === 1 && (e.lines[0]?.bounds.size.height ?? 0) === 0)) return;
                 if (folded() && n >= USER_FOLD_LINES) return;
                 if (n !== userLineCounts()[props.row.id]) userLineCounts.update((all) => ({ ...all, [props.row.id]: n }));
               }}

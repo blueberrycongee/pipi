@@ -80,18 +80,78 @@ test("an external session reads its header and flat message records", () => {
   expect((snap.messages[0] as { timestamp: number }).timestamp).toBe(Date.parse("2026-01-01T00:00:01.000Z"));
 });
 
-test("a stale background flag on a saved tool call does not survive the read", () => {
+test("a stale background flag on a saved tool call does not survive the read unless the daemon process is still warm", () => {
+  const raw = [
+    JSON.stringify({ type: "pipi_external_session", agentId: "claude" }),
+    JSON.stringify({
+      type: "message",
+      message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", background: true, arguments: {} }] },
+    }),
+  ].join("\n");
+  const cold = parseSessionSnapshot(raw)!;
+  expect((cold.messages[0] as { content: { background?: boolean }[] }).content[0].background).toBeUndefined();
+
+  const warm = parseSessionSnapshot(raw, { keepBackgroundTools: true })!;
+  expect((warm.messages[0] as { content: { background?: boolean }[] }).content[0].background).toBe(true);
+});
+
+test("Pi projection matches SessionManager: wrapped context_edit replacements, nested compactions, empty branch summaries, legacy hookMessage, and latest assistant model", () => {
   const snap = parseSessionSnapshot(
     [
-      JSON.stringify({ type: "pipi_external_session", agentId: "claude" }),
+      JSON.stringify(PI_HEADER),
+      user("u0", null, "very old"),
+      assistant("a0", "u0", "old reply", { model: "claude-old", provider: "anthropic" }),
+      JSON.stringify({
+        type: "compaction",
+        id: "c1",
+        parentId: "a0",
+        timestamp: "2026-01-01T00:00:03.000Z",
+        tokensBefore: 50000,
+        firstKeptEntryId: "u1",
+        summary: "Earlier summary that a later compaction supersedes",
+      }),
+      user("u1", "c1", "before second compaction"),
+      JSON.stringify({
+        type: "compaction",
+        id: "c2",
+        parentId: "u1",
+        timestamp: "2026-01-01T00:00:04.000Z",
+        tokensBefore: 120000,
+        firstKeptEntryId: "u1",
+        summary: "Latest compaction summary",
+      }),
+      assistant("a1", "c2", "raw verbose output", { model: "claude-sonnet-4-5", provider: "anthropic" }),
+      JSON.stringify({
+        type: "context_edit",
+        id: "ce1",
+        parentId: "a1",
+        timestamp: "2026-01-01T00:00:05.000Z",
+        targetId: "a1",
+        replacement: { content: [{ type: "text", text: "[trimmed tool output]" }] },
+      }),
+      JSON.stringify({
+        type: "branch_summary",
+        id: "bs_empty",
+        parentId: "ce1",
+        timestamp: "2026-01-01T00:00:06.000Z",
+        summary: "   ",
+      }),
       JSON.stringify({
         type: "message",
-        message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "bash", background: true, arguments: {} }] },
+        id: "hm1",
+        parentId: "bs_empty",
+        timestamp: "2026-01-01T00:00:07.000Z",
+        message: { role: "hookMessage", customType: "note", display: true, content: "Hook note", timestamp: 1735689607000 },
       }),
+      assistant("a2", "hm1", "final answer", { model: "claude-opus-4-6", provider: "anthropic", thinkingLevel: "high" }),
     ].join("\n"),
   )!;
-  const block = (snap.messages[0] as { content: { background?: boolean }[] }).content[0];
-  expect(block.background).toBeUndefined();
+
+  expect(snap.model).toEqual({ id: "claude-opus-4-6", provider: "anthropic" });
+  expect(snap.thinkingLevel).toBe("high");
+  expect(snap.messages.map((m) => m.role)).toEqual(["compactionSummary", "user", "assistant", "custom", "assistant"]);
+  expect((snap.messages[0] as { summary: string }).summary).toBe("Latest compaction summary");
+  expect((snap.messages[2] as { content: { text: string }[] }).content).toEqual([{ type: "text", text: "[trimmed tool output]" }]);
 });
 
 test("CRLF endings parse, U+2028 inside a string is not a break, and a torn tail is skipped", () => {

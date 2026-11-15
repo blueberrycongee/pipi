@@ -5,10 +5,14 @@ import { titleBar } from "nsh/desktop";
 import { edgeStep, edgeTarget } from "../lib/edge-scroll";
 import { basename, tildePath } from "../lib/format";
 import { tr } from "../lib/i18n";
+import { markVeilsSeeded } from "../lib/veil";
+import type { Mood } from "../mascot/geometry";
 import { Pip } from "../mascot/Pip";
 import {
   activeAgent,
   chooseWorkspace,
+  composerAttachments,
+  composerDraft,
   conversationKey,
   currentActivity,
   hasModel,
@@ -177,11 +181,12 @@ function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void }) {
  * on the composer's top edge and what follows hangs from its lower one. Both are placed from the
  * composer's own box, so the three are one figure whatever the composer grows to.
  */
-function Stage(props: { title: string | (() => string); detail?: string; size?: number; around?: boolean; children?: JSX.Element }) {
+function Stage(props: { title: string | (() => string); detail?: string; size?: number; around?: boolean; mood?: () => Mood; children?: JSX.Element }) {
   const titleText = () => (typeof props.title === "function" ? props.title() : props.title);
+  const mood = () => (props.mood ? props.mood() : pipMood());
   const pip = (
     <View style={enterStagger(0)}>
-      <Pip size={props.size ?? 96} mood={pipMood()} />
+      <Pip size={props.size ?? 96} mood={mood()} />
     </View>
   );
   const words = (
@@ -303,9 +308,15 @@ function WelcomeProject() {
  * the stage wrapper stay mounted when the CLI finishes waking up instead of
  * unmounting and replaying `enterStagger` (which flickers the whole center).
  */
-function HeroStage(props: { mode: () => "welcome" | "starting" }) {
+function HeroStage(props: { mode: () => "welcome" | "starting"; fading?: () => boolean }) {
   const agentName = () => activeAgent().name;
   const slow = signal(false);
+  let lastMood: Mood = untracked(pipMood);
+  const stageMood = (): Mood => {
+    if (props.fading?.()) return lastMood;
+    lastMood = pipMood();
+    return lastMood;
+  };
   let timer: ReturnType<typeof setTimeout> | undefined;
   effect(() => {
     const starting = props.mode() === "starting";
@@ -322,7 +333,7 @@ function HeroStage(props: { mode: () => "welcome" | "starting" }) {
       ? tr(`Waking ${agentName()}…`, `正在唤醒 ${agentName()}…`)
       : tr("What are we building?", "今天要构建什么？");
   return (
-    <Stage around title={title}>
+    <Stage around title={title} mood={stageMood}>
       <If
         when={props.mode() === "welcome"}
         else={
@@ -726,6 +737,7 @@ export function Chat() {
   const viewHeight = signal(0);
   /** The composer's figure as laid out: the composer and what stands on it. The conversation's foot is placed from it (`footOf`). */
   const figure = signal(0);
+  let heroFigure = 0;
   /** How far the pane goes on under the composer in the middle, as laid out: the way down to the dock. */
   let drop = 0;
   /** The same before it is laid out, for the way up: the lower spacer's share of the free height. */
@@ -758,9 +770,12 @@ export function Chat() {
       const reduced = reduceMotion();
       const way = middle ? dropAhead() : drop || dropAhead();
       const from = slideNow() + (middle ? way : -way);
+      // Sending a multi-line draft or attachment from Welcome clears the composer in the same frame it docks:
+      // compensate `stand` by the composer's height drop so `bottom-full` hero content stays pinned while fading out.
+      const shrink = !middle && heroFigure > FIGURE_REST && !composerDraft() && !composerAttachments().length ? heroFigure - FIGURE_REST : 0;
       travel = undefined;
       // Up: the stage is where it will be, and the composer comes to it. Down: it stays where it was.
-      stand.set(middle ? 0 : -way);
+      stand.set(middle ? 0 : -(way + shrink));
       if (reduced) slide.set(0);
       else {
         const mine = (travel = { from, at: Date.now() });
@@ -814,7 +829,9 @@ export function Chat() {
     // reader's ends it: theirs wins.
     if (endSettlePasses > 0) {
       endSettlePasses--;
-      if (following() && Date.now() - inputAt > INPUT_WINDOW_MS) list?.scrollTo({ y: 1e7, animated: false });
+      if (following() && Date.now() - inputAt > INPUT_WINDOW_MS && Math.abs(distance) > 1) {
+        list?.scrollTo({ y: Math.max(0, e.contentSize.height - e.size.height), animated: false });
+      }
     }
   };
   const onInput = () => {
@@ -936,12 +953,47 @@ export function Chat() {
     untracked(measureEnd);
   });
 
+  let listKey = -1;
+  let listReady = false;
+  let scrollArmed = false;
+  // Defer imperative un-animated end-scrolls until this turn's layout pass has
+  // settled (`targetList.measure()`), and measure the exact remaining gap to the
+  // footer anchor so a shrinking composer or unmeasured bubble never overshoots
+  // `maxScroll` into a 1-frame blank band before clamping back.
+  let endSettlePasses = 0;
+  let endSettleEpoch = 0;
+  const scheduleEndSettle = (passes = 2) => {
+    const epoch = ++endSettleEpoch;
+    const expectedKey = untracked(conversationKey);
+    const targetList = list;
+    if (!targetList || listKey !== expectedKey || !listReady) return;
+    endSettlePasses = passes;
+    void Promise.all([targetList.measure(), ending?.measure()]).then(([frame, end]) => {
+      if (epoch !== endSettleEpoch) return;
+      if (!untracked(following) || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
+      if (!frame || list !== targetList || listKey !== expectedKey || !listReady) return;
+      const pad = untracked(foot).end;
+      if (end && frame.bounds.size.height > 0) {
+        const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
+        if (Math.abs(gap) <= 1 || (gap < 0 && (lastY === undefined || lastY <= 0.5))) {
+          endSettlePasses = 0;
+          distanceFromEnd.set(0);
+          return;
+        }
+        if (lastY !== undefined) {
+          targetList.scrollTo({ y: Math.max(0, lastY + gap), animated: false });
+          return;
+        }
+      }
+      targetList.scrollTo({ y: 1e7, animated: false });
+    });
+  };
+
   const follow = (animated: boolean) => {
     inputAt = 0;
     following.set(true);
-    // An offset past any end is the end, with no pass through the top on the way (`scrollToEnd`'s).
     if (animated) list?.scrollToEnd({ animated: true });
-    else list?.scrollTo({ y: 1e7, animated: false });
+    else scheduleEndSettle(2);
   };
 
   // A fold the reader presses grows or shrinks the rows under it, not those above: let go of the end.
@@ -964,15 +1016,6 @@ export function Chat() {
   // A reply still growing moves the end under an animated scroll: go there at once.
   const jumpToLatest = () => follow(!reduceMotion() && !isChatActive());
 
-  let listKey = -1;
-  let listReady = false;
-  let scrollArmed = false;
-  // The commit that asks for the end may still be settling — a cleared draft
-  // shrinks the foot, a staged row has yet to measure: an offset taken then is
-  // past the end the content will have, and the list paints blank until its
-  // clamp pass. As the list reports its own passes as scrolls, the ask is made
-  // again through them — it answers the end either way, early or late.
-  let endSettlePasses = 0;
   effect(() => {
     scrollToEndTick();
     if (!scrollArmed) {
@@ -986,8 +1029,7 @@ export function Chat() {
       // `initialScrollAtEnd` (before its first frame, following while rows measure); calling
       // `scrollTo` during that synchronous swap would hit the outgoing list or cancel the pass.
       if (list && listKey === conversationKey() && listReady) {
-        list.scrollTo({ y: 1e7, animated: false });
-        endSettlePasses = 3;
+        scheduleEndSettle(3);
       }
     });
   });
@@ -1018,7 +1060,7 @@ export function Chat() {
     footEnd = end;
     if (!rose || !untracked(following)) return;
     if (untracked(hasInlinePrompt) && !untracked(reduceMotion)) list?.scrollToEnd({ animated: true });
-    else list?.scrollTo({ y: 1e7, animated: false });
+    else scheduleEndSettle(2);
   });
   /**
    * One more mount batch shortly after the transcript's big changes. The
@@ -1058,13 +1100,8 @@ export function Chat() {
     }
     untracked(() => {
       pokeRepaint();
-      const expectedKey = conversationKey();
-      if (following() && list && listKey === expectedKey && listReady) {
-        queueMicrotask(() => {
-          if (untracked(following) && list && listKey === expectedKey && listReady) {
-            list.scrollTo({ y: 1e7, animated: false });
-          }
-        });
+      if (following() && list && listKey === conversationKey() && listReady) {
+        scheduleEndSettle(2);
       }
     });
   });
@@ -1125,11 +1162,15 @@ export function Chat() {
       inputAt = 0;
       lastY = undefined;
       selected = "";
+      endSettleEpoch++;
+      endSettlePasses = 0;
       endSelecting();
       following.set(true);
       distanceFromEnd.set(0);
       enterConversation(key);
-      markRowsSeen(displayRowIds(transcriptRows()));
+      const seenIds = displayRowIds(transcriptRows());
+      markRowsSeen(seenIds);
+      markVeilsSeeded(seenIds);
       pokeRepaint();
     });
   });
@@ -1223,13 +1264,21 @@ export function Chat() {
         }}
       >
         <View style={{ flexGrow: hero() ? HERO.rise : 1, flexShrink: 1, flexBasis: hero() ? HERO.head : 0 }} />
-        <View class="relative" style={{ transform: [{ translateY: slide }] }} onLayout={(e) => figure.set(Math.round(e.bounds.size.height))}>
+        <View
+          class="relative"
+          style={{ transform: [{ translateY: slide }] }}
+          onLayout={(e) => {
+            const h = Math.round(e.bounds.size.height);
+            figure.set(h);
+            if (untracked(hero)) heroFigure = h;
+          }}
+        >
           <View class="absolute inset-0" style={{ transform: [{ translateY: Animated.subtract(stand, slide) }] }}>
             <If when={stage() !== undefined}>
               {/* The stage is the pane's content: it dims and lands with it, and fades on its own once the composer has left it. */}
               <View class="absolute inset-0" style={{ opacity: hero() ? pane : stageFade }}>
                 <If when={stage() === "welcome" || stage() === "starting"}>
-                  <HeroStage mode={() => (stage() === "starting" ? "starting" : "welcome")} />
+                  <HeroStage mode={() => (stage() === "starting" ? "starting" : "welcome")} fading={() => !hero()} />
                 </If>
               </View>
             </If>

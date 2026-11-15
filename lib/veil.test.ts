@@ -4,6 +4,7 @@ import {
   chunkAlpha,
   clearVeils,
   commonPrefix,
+  markVeilsSeeded,
   rowVeil,
   settleVeil,
   sliceChunks,
@@ -114,6 +115,14 @@ test("rowVeil: a row first seen non-streaming seeds; a live row's first chunk fa
   const chunks = advanceVeil(live, "first text", 0);
   expect(chunks).toHaveLength(1);
   expect(chunks[0].start).toBe(0);
+  // A short streaming row seeded on session landing (`markVeilsSeeded`) treats its initial text as committed baseline,
+  // and only fades subsequent live deltas.
+  markVeilsSeeded(["landed-short"]);
+  const landed = rowVeil("landed-short");
+  expect(advanceVeil(landed, "short baseline", 0)).toHaveLength(0);
+  const delta = advanceVeil(landed, "short baseline + live delta", 40);
+  expect(delta).toHaveLength(1);
+  expect(delta[0].start).toBe("short baseline".length);
   clearVeils();
 });
 

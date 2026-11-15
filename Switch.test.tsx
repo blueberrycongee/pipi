@@ -159,3 +159,48 @@ test("starting a new session again while a new-session switch is still in flight
   expect(seen.some((frame) => frame.includes("Waking Pi"))).toBe(false);
   expect(seen.some((frame) => frame.includes("No model"))).toBe(false);
 });
+
+test("sending a borderline CJK + emoji message in a settled session never flashes fold state or loses follow", async () => {
+  const app = await launch("welcome");
+  await app.waitFor("text:What are we building?");
+  await app.press(row(REFACTOR));
+  await app.waitUntil(() => shows(app, REFACTOR));
+  // Let the session finish attaching so the send runs in an ordinary settled session.
+  await app.wait(DELAY + 200);
+
+  // ~200 CJK chars + ZWJ family emojis: previously overestimated >6 lines on Frame 1 (`Expand message`) before un-clamping.
+  const borderline = `${"这是一段用于测试聊天气泡折行精度的中文消息文本，包含常见标点符号。".repeat(6)}${"👨‍👩‍👧‍👦".repeat(6)}`;
+  await app.paste("label:Message", { text: borderline });
+  await app.submit("label:Message");
+
+  const seen = await frames(app, () => ({
+    hasRefactor: shows(app, REFACTOR),
+    hasSent: app.texts().some((t) => t.includes("这是一段用于测试聊天气泡折行精度的中文消息文本")),
+    folded: app.shows("label:Expand message"),
+    pill: app.shows("label:Scroll to bottom"),
+  }));
+  expect(seen.every((f) => f.hasRefactor && f.hasSent)).toBe(true);
+  expect(seen.some((f) => f.folded)).toBe(false);
+  expect(seen.some((f) => f.pill)).toBe(false);
+});
+
+test("welcome-to-dock first message send transitions cleanly across every frame even from a multiline draft", async () => {
+  const app = await launch("welcome");
+  await app.waitFor("text:What are we building?");
+
+  const multiline = "First line of prompt\nSecond line of prompt\nThird line of prompt\nFourth line of prompt";
+  await app.paste("label:Message", { text: multiline });
+  await app.submit("label:Message");
+  expect(app.value("label:Message") ?? "").toBe("");
+
+  const seen = await frames(app, () => ({
+    hasPrompt: app.texts().some((t) => t.includes("First line of prompt")),
+    folded: app.shows("label:Expand message"),
+    pill: app.shows("label:Scroll to bottom"),
+    waking: app.texts().some((t) => t.includes("Waking Pi")),
+  }));
+  expect(seen.every((f) => f.hasPrompt)).toBe(true);
+  expect(seen.some((f) => f.folded)).toBe(false);
+  expect(seen.some((f) => f.pill)).toBe(false);
+  expect(seen.some((f) => f.waking)).toBe(false);
+});

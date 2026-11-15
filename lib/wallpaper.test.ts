@@ -20,6 +20,7 @@ import {
   wallpaperPresetUniforms,
   wallpaperShaderUniforms,
 } from "./wallpaper";
+import { LEGACY_WALLPAPER_PRESETS } from "./wallpaper-presets";
 
 function makeMp4WithTkhd(width: number, height: number): Uint8Array {
   const buf = new Uint8Array(128);
@@ -78,7 +79,7 @@ test("dynamic wallpapers are enabled: videos, presets, animated effects and stat
   ).toBe(true);
   expect(
     isDynamicWallpaperConfig({
-      path: "preset:flock",
+      path: `preset:${WALLPAPER_PRESETS[0]}`,
     }),
   ).toBe(true);
   expect(
@@ -94,8 +95,10 @@ test("dynamic wallpapers are enabled: videos, presets, animated effects and stat
       path: "preset:stellar",
     }),
   ).toBe(true);
-  expect(resolveWallpaperPreset("dotwave")).toBe("orbit");
-  expect(resolveWallpaperPreset("stellar")).toBe("aurora");
+  expect(resolveWallpaperPreset("dotwave")).toBe(LEGACY_WALLPAPER_PRESETS.dotwave);
+  expect(resolveWallpaperPreset("stellar")).toBe(LEGACY_WALLPAPER_PRESETS.stellar);
+  expect(WALLPAPER_PRESETS).toContain(LEGACY_WALLPAPER_PRESETS.dotwave);
+  expect(WALLPAPER_PRESETS).toContain(LEGACY_WALLPAPER_PRESETS.stellar);
   expect(DEFAULT_WALLPAPER_ADJUSTMENT.zoom).toBe(1);
 });
 
@@ -106,7 +109,12 @@ test("isPausableWallpaper is true only where something animates", () => {
   expect(isPausableWallpaper({ path: "/w/scene.png", kind: "image" }, "rain")).toBe(true);
   expect(isPausableWallpaper({ path: "/w/scene.png", kind: "image" }, "ripple")).toBe(true);
   expect(isPausableWallpaper({ path: "/w/loop.mp4", kind: "video" }, "none")).toBe(true);
-  expect(isPausableWallpaper({ path: "preset:flock", kind: "shader", preset: "flock" }, "none")).toBe(true);
+  expect(
+    isPausableWallpaper(
+      { path: `preset:${WALLPAPER_PRESETS[0]}`, kind: "shader", preset: WALLPAPER_PRESETS[0] },
+      "none",
+    ),
+  ).toBe(true);
 
   expect(isAnimatedWallpaperEffect("ripple")).toBe(true);
   expect(isAnimatedWallpaperEffect("rain")).toBe(true);
@@ -191,6 +199,9 @@ test("dynamic shader effects and procedural presets provide WGSL sources and uni
 
   for (const preset of WALLPAPER_PRESETS) {
     expect(WALLPAPER_PRESET_SHADERS[preset]).toContain("fn shade(uv: vec2f) -> vec4f");
+    for (const k of Object.keys(wallpaperPresetUniforms(true))) {
+      expect(WALLPAPER_PRESET_SHADERS[preset]).toMatch(new RegExp("\\b" + k + ": f32"));
+    }
   }
   const presetU = wallpaperPresetUniforms(false, 0.55);
   expect(presetU.dark).toBe(0);

@@ -69,12 +69,20 @@ import { GLASS_REGULAR, HEADER_GLASS, PAGE_GLASS, POPUP, SCRIM, WALLPAPER_FROST 
 
 const cursorX = createAnimatedValue(0.5);
 const cursorY = createAnimatedValue(0.5);
+// The pointer a preset sees: it drifts after the cursor instead of tracking
+// it, so a creature leans away rather than snapping to it.
+const lureX = createAnimatedValue(0.5);
+const lureY = createAnimatedValue(0.5);
+// Where the last click landed, and the agent's activity eased into a level —
+// a preset reads both continuously, so neither may step.
+const pingX = createAnimatedValue(0.5);
+const pingY = createAnimatedValue(0.5);
 const clickPulse = createAnimatedValue(0.0);
+const energyLevel = createAnimatedValue(0.0);
 const videoSpeedBoost = signal(1.0);
 const videoSeekTick = signal(0);
 
 let windowViewport = { width: 1200, height: 800 };
-let pulseTimer: ReturnType<typeof setTimeout> | undefined;
 let burstTimer: ReturnType<typeof setTimeout> | undefined;
 
 function clamp01(v: number): number {
@@ -92,12 +100,17 @@ export function notifyWallpaperPointerMove(pageX: number, pageY: number) {
   const ny = clamp01(pageY / Math.max(windowViewport.height, 1));
   cursorX.set(nx);
   cursorY.set(ny);
+  void lureX.timing(nx, { duration: 900, easing: EASING.out });
+  void lureY.timing(ny, { duration: 900, easing: EASING.out });
 }
 
 export function notifyWallpaperPointerLeave() {
   if (!DYNAMIC_WALLPAPER_ENABLED || !wallpaper()) return;
   cursorX.set(0.5);
   cursorY.set(0.5);
+  // Off the top of the window: a preset reads it as "no pointer".
+  void lureX.timing(0.5, { duration: 900, easing: EASING.out });
+  void lureY.timing(-0.6, { duration: 900, easing: EASING.out });
 }
 
 /**
@@ -111,13 +124,12 @@ export function triggerWallpaperInteraction(pageX?: number, pageY?: number) {
   if (typeof pageX === "number" && typeof pageY === "number") {
     cursorX.set(clamp01(pageX / Math.max(windowViewport.width, 1)));
     cursorY.set(clamp01(pageY / Math.max(windowViewport.height, 1)));
+    pingX.set(clamp01(pageX / Math.max(windowViewport.width, 1)));
+    pingY.set(clamp01(pageY / Math.max(windowViewport.height, 1)));
   }
 
-  clearTimeout(pulseTimer);
   clickPulse.set(1.0);
-  pulseTimer = setTimeout(() => {
-    clickPulse.set(0.0);
-  }, 220);
+  void clickPulse.timing(0, { duration: 1400, easing: EASING.out });
 
   const kind = wp.kind ?? (isVideoWallpaperPath(wp.path) ? "video" : "image");
   if (kind === "video") {
@@ -218,6 +230,14 @@ function EffectSurface(props: {
   let seekSegment = 0;
 
   effect(() => {
+    if (props.paused) return;
+    const e = agentActivityEnergy();
+    untracked(() => {
+      void energyLevel.timing(e, { duration: 1200, easing: EASING.out });
+    });
+  });
+
+  effect(() => {
     const tick = videoSeekTick();
     if (!DYNAMIC_WALLPAPER_ENABLED || tick <= 0 || props.paused) return;
     untracked(() => {
@@ -235,13 +255,14 @@ function EffectSurface(props: {
     return Math.min(2.5, Math.round(base * boost * 100) / 100);
   };
 
-  const worldStyle = (): ViewStyle => {
+  // The cover-fit placement of the wallpaper's box inside the viewport: the
+  // scale, and the offset the focal point leaves. A shader preset lies still —
+  // no parallax, no interactive overscan — so it counts as not interactive.
+  const coverFit = () => {
     const vp = viewport();
     const { width, height } = props.config;
-    if (!vp || width <= 0 || height <= 0) {
-      return { position: "absolute", width: 0, height: 0 };
-    }
-    const interactive = interactiveActive();
+    if (!vp || width <= 0 || height <= 0) return null;
+    const interactive = interactiveActive() && kind() !== "shader";
     const overscan = interactive ? WALLPAPER_INTERACTIVE_OVERSCAN : WALLPAPER_OVERSCAN;
     const s =
       Math.max(vp.width / width, vp.height / height) *
@@ -249,6 +270,15 @@ function EffectSurface(props: {
       overscan;
     const baseX = -Math.max(width * s - vp.width, 0) * props.adjustment.focalX;
     const baseY = -Math.max(height * s - vp.height, 0) * props.adjustment.focalY;
+    return { vp, width, height, s, baseX, baseY, interactive };
+  };
+
+  const worldStyle = (): ViewStyle => {
+    const fit = coverFit();
+    if (!fit) {
+      return { position: "absolute", width: 0, height: 0 };
+    }
+    const { width, height, s, baseX, baseY, interactive } = fit;
     const range = interactive ? PARALLAX_MAX_PX : 0;
     return {
       position: "absolute",
@@ -290,13 +320,27 @@ function EffectSurface(props: {
   };
 
   const activePresetUniforms = () => {
-    const base = wallpaperPresetUniforms(isDark(), agentActivityEnergy());
+    // The window's rectangle inside the shader's box, in its uv — while the
+    // viewport is unknown the defaults keep the window filling the box.
+    const fit = coverFit();
+    const view: Record<string, number> = fit
+      ? {
+          unit: 1 / fit.s,
+          viewX: -fit.baseX / (fit.s * fit.width),
+          viewY: -fit.baseY / (fit.s * fit.height),
+          viewW: fit.vp.width / (fit.s * fit.width),
+          viewH: fit.vp.height / (fit.s * fit.height),
+        }
+      : {};
+    const base = { ...wallpaperPresetUniforms(isDark(), 0), ...view, energy: energyLevel };
     if (interactiveActive()) {
       return {
         ...base,
-        mouseX: cursorX,
-        mouseY: cursorY,
+        mouseX: lureX,
+        mouseY: lureY,
         pulse: clickPulse,
+        pingX,
+        pingY,
       };
     }
     return base;

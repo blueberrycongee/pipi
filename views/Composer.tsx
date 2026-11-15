@@ -35,7 +35,7 @@ import {
 } from "../store/app";
 import { IconButton } from "../ui/Button";
 import { Icon } from "../ui/Icon";
-import { animateLayoutOn, EASING, enter, keepLast, Presence, Reveal, SPRING } from "../ui/motion";
+import { EASING, enter, keepLast, Presence, Reveal, SPRING } from "../ui/motion";
 import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { AgentPicker, PermissionPicker } from "./AgentPicker";
@@ -485,8 +485,6 @@ export function Composer() {
   const actionOpacity = createAnimatedValue(1);
   let lastShowStop = untracked(showStop);
 
-  animateLayoutOn(() => height(), 180, () => !working());
-
   effect(() => {
     const stopNow = showStop();
     if (stopNow === lastShowStop) return;
@@ -515,6 +513,7 @@ export function Composer() {
     if (draft !== trackedDraft) {
       trackedDraft = draft;
       selection = { start: draft.length, end: draft.length };
+      if (!draft) height.set(MIN_HEIGHT);
     }
   });
 

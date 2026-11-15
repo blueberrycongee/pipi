@@ -31,7 +31,131 @@ export interface TurnStamp {
 const isTurnRow = (row: Row): row is Extract<Row, { kind: "text" | "thinking" | "tool" }> =>
   row.kind === "text" || row.kind === "thinking" || row.kind === "tool";
 
-/** What a row says, apart from its id: two loads of a conversation pair their rows up by it (`adopt`). */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj)
+    .filter((k) => obj[k] !== undefined)
+    .sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(",")}}`;
+}
+
+function sameJsonValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!sameJsonValue(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  const ao = a as Record<string, unknown>;
+  const bo = b as Record<string, unknown>;
+  const aKeys = Object.keys(ao).filter((k) => ao[k] !== undefined);
+  const bKeys = Object.keys(bo).filter((k) => bo[k] !== undefined);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const k of aKeys) {
+    if (!(k in bo) || bo[k] === undefined || !sameJsonValue(ao[k], bo[k])) return false;
+  }
+  return true;
+}
+
+const COMPACTION_AFTER_EN = / to about [\d.]+[kM]?(?= tokens$)/;
+const COMPACTION_AFTER_ZH = /，压缩至约 [\d.]+[kM]?$/;
+const normalizeSummaryTitle = (title: string) =>
+  title.replace(COMPACTION_AFTER_EN, "").replace(COMPACTION_AFTER_ZH, "");
+
+/** Whether two rows render the same conversation content on screen (ignoring row ids and live-vs-disk timing skew). */
+export function sameVisualRow(a: Row, b: Row): boolean {
+  if (a === b) return true;
+  if (a.kind !== b.kind) return false;
+  if (isTurnRow(a) && isTurnRow(b)) {
+    if (Boolean(a.turnStart) !== Boolean(b.turnStart)) return false;
+    if ((a.turnMs !== undefined) !== (b.turnMs !== undefined)) return false;
+  }
+  switch (a.kind) {
+    case "user": {
+      const bu = b as Extract<Row, { kind: "user" }>;
+      return a.text === bu.text && a.images === bu.images && Boolean(a.queued) === Boolean(bu.queued);
+    }
+    case "text": {
+      const bt = b as Extract<Row, { kind: "text" }>;
+      return a.text === bt.text && a.streaming === bt.streaming && Boolean(a.final) === Boolean(bt.final);
+    }
+    case "thinking": {
+      const bth = b as Extract<Row, { kind: "thinking" }>;
+      return a.text === bth.text && a.streaming === bth.streaming && a.redacted === bth.redacted;
+    }
+    case "tool": {
+      const btool = b as ToolRow;
+      return (
+        a.name === btool.name &&
+        a.status === btool.status &&
+        a.output === btool.output &&
+        a.images === btool.images &&
+        Boolean(a.background) === Boolean(btool.background) &&
+        sameJsonValue(a.args, btool.args) &&
+        sameJsonValue(a.details, btool.details)
+      );
+    }
+    case "bash": {
+      const bb = b as Extract<Row, { kind: "bash" }>;
+      return (
+        a.command === bb.command &&
+        a.output === bb.output &&
+        a.running === bb.running &&
+        a.exitCode === bb.exitCode &&
+        a.cancelled === bb.cancelled &&
+        a.truncated === bb.truncated
+      );
+    }
+    case "notice": {
+      const bn = b as Extract<Row, { kind: "notice" }>;
+      return a.tone === bn.tone && a.title === bn.title && a.text === bn.text;
+    }
+    case "summary": {
+      const bs = b as Extract<Row, { kind: "summary" }>;
+      return a.text === bs.text && normalizeSummaryTitle(a.title) === normalizeSummaryTitle(bs.title);
+    }
+    case "delivery": {
+      const bd = b as Extract<Row, { kind: "delivery" }>;
+      return (
+        a.from === bd.from &&
+        a.fromTitle === bd.fromTitle &&
+        a.agent === bd.agent &&
+        a.status === bd.status &&
+        a.text === bd.text
+      );
+    }
+  }
+}
+
+/** Whether two row lists show the same visual conversation. */
+export function sameVisualRows(a: readonly Row[], b: readonly Row[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!sameVisualRow(a[i], b[i])) return false;
+  }
+  return true;
+}
+
+/** Diagnostic helper returning the first index where two row lists visually diverge (`undefined` when identical). */
+export function firstVisualRowDiff(
+  a: readonly Row[],
+  b: readonly Row[],
+): { index: number; a?: Row; b?: Row } | undefined {
+  const max = Math.max(a.length, b.length);
+  for (let i = 0; i < max; i++) {
+    if (i >= a.length || i >= b.length || !sameVisualRow(a[i], b[i])) {
+      return { index: i, a: a[i], b: b[i] };
+    }
+  }
+  return undefined;
+}
+
+/** What a row says, apart from its minted row id: two loads of a conversation pair their rows up by it (`adopt`). */
 const signature = (row: Row): string => {
   switch (row.kind) {
     case "user":
@@ -40,13 +164,13 @@ const signature = (row: Row): string => {
     case "thinking":
       return `${row.kind}\n${row.text}`;
     case "tool":
-      return `tool\n${row.id}`;
+      return `tool\n${row.callId ?? row.id}\n${row.name}\n${canonicalJson(row.args)}`;
     case "bash":
       return `bash\n${row.command}`;
     case "notice":
       return `notice\n${row.title}\n${row.text}`;
     case "summary":
-      return `summary\n${row.text}`;
+      return `summary\n${normalizeSummaryTitle(row.title)}\n${row.text}`;
     case "delivery":
       return `delivery\n${row.from}\n${row.text}`;
   }
@@ -64,6 +188,8 @@ const answeredTurn = (message: AssistantMessage): boolean => {
 export interface ToolRow extends TurnStamp {
   kind: "tool";
   id: string;
+  /** The wire `toolCallId` from the harness (before any `~k` occurrence suffix). */
+  callId?: string;
   name: string;
   /** The arguments once the call is complete; while it streams, what has parsed so far. */
   args: Record<string, unknown>;
@@ -135,6 +261,14 @@ export function withoutImageNotes(text: string): string {
 }
 
 const HANDOFF_PREFIX = /^<conversation_handoff\b[^>]*>[\s\S]*?<\/conversation_handoff>\n\nUser message:\n/;
+
+interface StagedUserEntry {
+  row: Extract<Row, { kind: "user" }>;
+  t0: number;
+  queued?: boolean;
+  queueAcked?: boolean;
+  dropAt?: number;
+}
 
 /** Strips a prepended Portable Context Handoff block so the user bubble shows only what the person wrote. */
 export function withoutHandoff(text: string): string {
@@ -248,9 +382,9 @@ export class Transcript {
    * on screen for a grace while the echo may still land, and `sweepDrops`
    * withdraws it when none does.
    */
-  #staged: { row: Extract<Row, { kind: "user" }>; t0: number; queued?: boolean; dropAt?: number }[] = [];
+  #staged: StagedUserEntry[] = [];
   /** The assistant message being streamed: its key, and what its tool calls have of their arguments. */
-  #live: { key: string; toolIds: Map<number, string>; toolJson: Map<number, string>; thinkingSince: Map<number, number>; argsAt: Map<number, number> } | undefined;
+  #live: { key: string; rowIds: Map<number, string>; toolIds: Map<number, string>; toolJson: Map<number, string>; thinkingSince: Map<number, number>; argsAt: Map<number, number> } | undefined;
   /** Start timestamps for running tool executions so external engines without `durationMs` still measure elapsed time. */
   #toolSince = new Map<string, number>();
   /**
@@ -346,7 +480,8 @@ export class Transcript {
         this.#turnStart = this.#now();
         this.#newTurn = true;
       }
-      this.#append(message);
+      if (message.role === "assistant" && message.stopReason === "pending") this.#pendingMessage(message);
+      else this.#append(message);
     }
     if (working) {
       this.#flushResults();
@@ -370,42 +505,148 @@ export class Transcript {
    * keeps its new id, so the worst a mismatch costs is that row's default look.
    */
   adopt(before: readonly Row[]) {
-    const waiting = new Map<string, number[]>();
-    const streaming: number[] = [];
-    before.forEach((row, at) => {
-      const key = signature(row);
-      const list = waiting.get(key);
-      if (list) list.push(at);
-      else waiting.set(key, [at]);
-      if ((row.kind === "text" || row.kind === "thinking") && row.streaming) streaming.push(at);
-    });
-    const taken = new Set(this.#rows.map((row) => row.id));
-    const renamed = new Map<string, string>();
-    // A conversation's order does not change: a pair is looked for after the last one made.
-    let from = 0;
-    let changed = false;
-    this.#rows = this.#rows.map((row) => {
-      const list = waiting.get(signature(row));
-      while (list?.length && list[0] < from) list.shift();
-      let at = list?.shift();
-      if (at === undefined && (row.kind === "text" || row.kind === "thinking")) {
-        at = streaming.find((index) => {
-          const old = before[index];
-          if (index < from || old.kind !== row.kind) return false;
-          // Nothing written yet begins anything: only the row next in line is taken for it.
-          return old.text ? row.text.startsWith(old.text) : index === from;
-        });
+    if (!before.length || !this.#rows.length) return;
+    const beforeSigs = before.map(signature);
+    const freshSigs = this.#rows.map(signature);
+
+    // Unique-signature anchors + LIS keep global turn alignment even when one load
+    // has an extra/missing row or reused short prompts ("continue", "ok") earlier on.
+    const beforeCounts = new Map<string, number>();
+    const beforePos = new Map<string, number>();
+    for (let i = 0; i < beforeSigs.length; i++) {
+      const s = beforeSigs[i];
+      beforeCounts.set(s, (beforeCounts.get(s) ?? 0) + 1);
+      beforePos.set(s, i);
+    }
+    const freshCounts = new Map<string, number>();
+    for (let j = 0; j < freshSigs.length; j++) {
+      const s = freshSigs[j];
+      freshCounts.set(s, (freshCounts.get(s) ?? 0) + 1);
+    }
+    const candidates: { b: number; f: number }[] = [];
+    for (let j = 0; j < freshSigs.length; j++) {
+      const s = freshSigs[j];
+      if (freshCounts.get(s) === 1 && beforeCounts.get(s) === 1) {
+        candidates.push({ b: beforePos.get(s)!, f: j });
       }
-      if (at === undefined) return row;
-      from = at + 1;
-      const old = before[at];
+    }
+    const anchors: { b: number; f: number }[] = [];
+    if (candidates.length > 0) {
+      const tails: number[] = [];
+      const prev = new Int32Array(candidates.length).fill(-1);
+      for (let k = 0; k < candidates.length; k++) {
+        const val = candidates[k].b;
+        let lo = 0;
+        let hi = tails.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (candidates[tails[mid]].b < val) lo = mid + 1;
+          else hi = mid;
+        }
+        if (lo > 0) prev[k] = tails[lo - 1];
+        tails[lo] = k;
+      }
+      for (let cur = tails[tails.length - 1]; cur >= 0; cur = prev[cur]) {
+        anchors.push(candidates[cur]);
+      }
+      anchors.reverse();
+    }
+
+    const pairedBefore: (number | undefined)[] = new Array(this.#rows.length);
+    const matchGap = (bStart: number, bEnd: number, fStart: number, fEnd: number) => {
+      if (bStart >= bEnd || fStart >= fEnd) return;
+      const waiting = new Map<string, number[]>();
+      const streaming: number[] = [];
+      for (let at = bStart; at < bEnd; at++) {
+        const key = beforeSigs[at];
+        const list = waiting.get(key);
+        if (list) list.push(at);
+        else waiting.set(key, [at]);
+        const old = before[at];
+        if ((old.kind === "text" || old.kind === "thinking") && old.streaming) streaming.push(at);
+      }
+      let from = bStart;
+      for (let j = fStart; j < fEnd; j++) {
+        const row = this.#rows[j];
+        const list = waiting.get(freshSigs[j]);
+        while (list?.length && list[0] < from) list.shift();
+        let at = list?.shift();
+        if (at === undefined && (row.kind === "text" || row.kind === "thinking")) {
+          at = streaming.find((index) => {
+            const old = before[index];
+            if (index < from || old.kind !== row.kind) return false;
+            // Nothing written yet begins anything: only the row next in line is taken for it.
+            return old.text ? row.text.startsWith(old.text) : index === from;
+          });
+        } else if (at === undefined && row.kind === "tool") {
+          for (let index = from; index < bEnd; index++) {
+            const old = before[index];
+            if (
+              old.kind === "tool" &&
+              (old.callId ?? old.id) === (row.callId ?? row.id) &&
+              old.name === row.name
+            ) {
+              at = index;
+              break;
+            }
+          }
+        }
+        if (at === undefined) continue;
+        from = at + 1;
+        pairedBefore[j] = at;
+      }
+    };
+
+    let prevB = 0;
+    let prevF = 0;
+    for (const anchor of anchors) {
+      matchGap(prevB, anchor.b, prevF, anchor.f);
+      pairedBefore[anchor.f] = anchor.b;
+      prevB = anchor.b + 1;
+      prevF = anchor.f + 1;
+    }
+    matchGap(prevB, before.length, prevF, this.#rows.length);
+
+    // Paired rows claim their `before` ids first so an earlier unpaired occurrence of
+    // a reused wire id (`item_0`) never blocks a paired row from keeping its cell id.
+    const claimed = new Set<string>();
+    const targetIds: string[] = new Array(this.#rows.length);
+    for (let j = 0; j < this.#rows.length; j++) {
+      const at = pairedBefore[j];
+      if (at === undefined) continue;
+      const oldId = before[at].id;
+      if (!claimed.has(oldId)) {
+        claimed.add(oldId);
+        targetIds[j] = oldId;
+      }
+    }
+    for (let j = 0; j < this.#rows.length; j++) {
+      if (targetIds[j] !== undefined) continue;
+      const row = this.#rows[j];
       let id = row.id;
-      if (old.id !== row.id && !taken.has(old.id)) {
-        taken.delete(row.id);
-        taken.add(old.id);
-        id = old.id;
-        renamed.set(row.id, old.id);
+      if (claimed.has(id)) {
+        const base = row.kind === "tool" ? (row.callId ?? row.id) : row.id;
+        let count = (this.#callCounts.get(base) ?? 1) + 1;
+        id = `${base}~${count}`;
+        while (claimed.has(id) || this.#index.has(id)) id = `${base}~${++count}`;
+        if (row.kind === "tool") this.#callCounts.set(base, count);
       }
+      claimed.add(id);
+      targetIds[j] = id;
+    }
+
+    const renamed = new Map<string, string>();
+    let changed = false;
+    this.#rows = this.#rows.map((row, j) => {
+      const id = targetIds[j];
+      if (id !== row.id) renamed.set(row.id, id);
+      const at = pairedBefore[j];
+      if (at === undefined) {
+        if (id === row.id) return row;
+        changed = true;
+        return { ...row, id } as Row;
+      }
+      const old = before[at];
       const keepTurnMs =
         isTurnRow(row) &&
         isTurnRow(old) &&
@@ -413,6 +654,7 @@ export class Transcript {
         ((row.turnMs !== undefined && row.turnMs !== old.turnMs) || (row.turnMs === undefined && this.#closed))
           ? old.turnMs
           : undefined;
+      const effectiveTurnMs = keepTurnMs ?? (isTurnRow(row) ? row.turnMs : undefined);
       const keepDuration =
         (row.kind === "thinking" || row.kind === "tool") &&
         old.kind === row.kind &&
@@ -420,6 +662,26 @@ export class Transcript {
         old.durationMs !== undefined
           ? old.durationMs
           : undefined;
+      const effectiveDuration =
+        keepDuration ?? (row.kind === "thinking" || row.kind === "tool" ? row.durationMs : undefined);
+      // Returning `old` (`===`) whenever visually & structurally unchanged keeps the
+      // exact row reference on screen so `buildDisplayRows`, `stableDisplayRows`, and
+      // `<List>` do zero re-measurement on unaffected prefix rows.
+      if (
+        id === old.id &&
+        sameVisualRow(old, row) &&
+        (!isTurnRow(row) ||
+          !isTurnRow(old) ||
+          ((old.t0 === undefined) === (row.t0 === undefined) &&
+            (old.turnMs === undefined) === (effectiveTurnMs === undefined))) &&
+        (row.kind !== "thinking" && row.kind !== "tool"
+          ? true
+          : (old as { durationMs?: number }).durationMs === effectiveDuration) &&
+        (row.kind !== "tool" || (old as ToolRow).callId === row.callId)
+      ) {
+        if (old !== row) changed = true;
+        return old;
+      }
       if (id === row.id && keepTurnMs === undefined && keepDuration === undefined) return row;
       changed = true;
       return {
@@ -450,6 +712,11 @@ export class Transcript {
           const to = renamed.get(id);
           if (to) this.#live.toolIds.set(contentIndex, to);
         }
+        // Rows a still-open message's deltas write by contentIndex follow the same renames.
+        for (const [contentIndex, id] of this.#live.rowIds) {
+          const to = renamed.get(id);
+          if (to) this.#live.rowIds.set(contentIndex, to);
+        }
       }
     }
     this.version++;
@@ -461,7 +728,7 @@ export class Transcript {
       case "message_start":
         if (event.message.role === "assistant") {
           if (!event.message.turnStart && this.#staged.length) this.#commitStaged();
-          this.#live = { key: `m${++seq}`, toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
+          this.#live = { key: `m${++seq}`, rowIds: new Map(), toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
           if (event.message.turnStart) {
             this.#closeTurn();
             this.#turnStart = this.#now();
@@ -482,13 +749,23 @@ export class Transcript {
       case "tool_execution_start": {
         const rowId = this.#callRow(event.toolCallId);
         if (!this.#toolSince.has(rowId)) this.#toolSince.set(rowId, Date.now());
-        this.#tool(rowId, (row) => ({ ...row, name: event.toolName, args: event.args ?? row.args, status: "running" }), event.toolName);
+        this.#tool(
+          rowId,
+          (row) => ({ ...row, callId: row.callId ?? event.toolCallId, name: event.toolName, args: event.args ?? row.args, status: "running" }),
+          event.toolName,
+          event.toolCallId,
+        );
         break;
       }
       case "tool_execution_update": {
         const rowId = this.#callRow(event.toolCallId);
         if (!this.#toolSince.has(rowId)) this.#toolSince.set(rowId, Date.now());
-        this.#tool(rowId, (row) => ({ ...row, ...this.#result(event.partialResult, row), status: "running" }), event.toolName);
+        this.#tool(
+          rowId,
+          (row) => ({ ...row, callId: row.callId ?? event.toolCallId, ...this.#result(event.partialResult, row), status: "running" }),
+          event.toolName,
+          event.toolCallId,
+        );
         break;
       }
       case "tool_execution_end": {
@@ -502,12 +779,14 @@ export class Transcript {
             const { background: _bg, ...rest } = row;
             return {
               ...rest,
+              callId: rest.callId ?? event.toolCallId,
               ...this.#result(event.result, row),
               status: event.isError ? "error" : "done",
               durationMs: event.durationMs ?? row.durationMs ?? measured,
             };
           },
           event.toolName,
+          event.toolCallId,
         );
         break;
       }
@@ -601,9 +880,24 @@ export class Transcript {
   /** Marks a staged message as one the agent queued: it may yet be recalled before its echo. */
   markStagedQueued(id: string | undefined) {
     const item = this.#staged.find((entry) => entry.row.id === id);
-    if (!item || item.queued) return;
+    if (!item) return;
+    item.queueAcked = true;
+    if (item.queued) return;
     item.queued = true;
     item.row = { ...item.row, queued: true };
+    this.version++;
+  }
+
+  /** Marks an optimistically-queued staged message as actively started (the previous run settled before the prompt arrived). */
+  markStagedStarted(id: string | undefined) {
+    const item = this.#staged.find((entry) => entry.row.id === id);
+    if (!item) return;
+    item.queueAcked = true;
+    if (!item.queued && item.dropAt === undefined) return;
+    item.queued = false;
+    item.dropAt = undefined;
+    const { queued: _q, ...rest } = item.row;
+    item.row = rest;
     this.version++;
   }
 
@@ -613,18 +907,40 @@ export class Transcript {
    * back as delivered, and only a recall leaves it to `sweepDrops`.
    */
   reconcileQueue(steering: readonly string[], followUp: readonly string[]) {
-    const cover = this.#queueCover([...steering, ...followUp]);
+    const wireItems = [...steering, ...followUp];
+    const cover = this.#queueCover(wireItems);
     const now = Date.now();
     let changed = false;
+    const unmatched: StagedUserEntry[] = [];
     for (const item of this.#staged) {
       if (!item.queued) continue;
       const left = cover.get(item.row.text) ?? 0;
       if (left > 0) {
         cover.set(item.row.text, left - 1);
+        item.queueAcked = true;
         if (item.dropAt !== undefined) {
           item.dropAt = undefined;
           changed = true;
         }
+      } else {
+        unmatched.push(item);
+      }
+    }
+    let unmatchedWire = 0;
+    for (const count of cover.values()) unmatchedWire += count;
+    for (const item of unmatched) {
+      if (unmatchedWire > 0) {
+        // A `/skill` or template-expanded prompt in the agent's queue no longer matches
+        // the typed text verbatim, so remaining wire slots keep its bubble covered.
+        unmatchedWire--;
+        item.queueAcked = true;
+        if (item.dropAt !== undefined) {
+          item.dropAt = undefined;
+          changed = true;
+        }
+      } else if (wireItems.length > 0 && !item.queueAcked) {
+        // An earlier queue change arrived while this prompt's RPC is still in flight.
+        continue;
       } else if (item.dropAt === undefined) {
         item.dropAt = now + QUEUE_ECHO_GRACE_MS;
         changed = true;
@@ -639,12 +955,25 @@ export class Transcript {
    */
   dropQueuedMatching(cleared: readonly string[]) {
     const cover = this.#queueCover([...cleared]);
+    const exactDropped = new Set<StagedUserEntry>();
+    for (const item of this.#staged) {
+      if (!item.queued) continue;
+      const left = cover.get(item.row.text) ?? 0;
+      if (left > 0) {
+        cover.set(item.row.text, left - 1);
+        exactDropped.add(item);
+      }
+    }
+    let unmatchedCleared = 0;
+    for (const count of cover.values()) unmatchedCleared += count;
     const kept = this.#staged.filter((item) => {
       if (!item.queued) return true;
-      const left = cover.get(item.row.text) ?? 0;
-      if (left <= 0) return true;
-      cover.set(item.row.text, left - 1);
-      return false;
+      if (exactDropped.has(item)) return false;
+      if (unmatchedCleared > 0) {
+        unmatchedCleared--;
+        return false;
+      }
+      return true;
     });
     if (kept.length === this.#staged.length) return;
     this.#staged = kept;
@@ -851,9 +1180,34 @@ export class Transcript {
     this.version++;
   }
 
-  #tool(id: string, change: (row: ToolRow) => ToolRow, name: string) {
+  #removeRow(id: string) {
+    const at = this.#index.get(id);
+    if (at === undefined) return;
+    const removed = this.#rows[at];
+    const next = this.#rows[at + 1];
+    if (isTurnRow(removed)) {
+      if (next && isTurnRow(next)) {
+        let patched = next;
+        if (patched.t0 === undefined && removed.t0 !== undefined) patched = { ...patched, t0: removed.t0 };
+        if (removed.turnStart && !patched.turnStart) patched = { ...patched, turnStart: true };
+        if (patched.turnMs === undefined && removed.turnMs !== undefined) patched = { ...patched, turnMs: removed.turnMs };
+        if (patched !== next) this.#rows[at + 1] = patched;
+      } else {
+        if (removed.t0 !== undefined) this.#turnStart ??= removed.t0;
+        if (removed.turnStart) this.#newTurn = true;
+      }
+    }
+    this.#rows.splice(at, 1);
+    this.#index.delete(id);
+    for (let i = at; i < this.#rows.length; i++) this.#index.set(this.#rows[i].id, i);
+  }
+
+  #tool(id: string, change: (row: ToolRow) => ToolRow, name: string, callId?: string) {
     const row = this.#get(id);
-    const base: ToolRow = row?.kind === "tool" ? row : { kind: "tool", id, name, args: {}, status: "queued", output: "", images: 0 };
+    const base: ToolRow =
+      row?.kind === "tool"
+        ? row
+        : { kind: "tool", id, ...(callId ? { callId } : {}), name, args: {}, status: "queued", output: "", images: 0 };
     this.#set(change(base));
   }
 
@@ -866,9 +1220,10 @@ export class Transcript {
   #update(event: AssistantMessageEvent) {
     const live = this.#live;
     if (!live || !("contentIndex" in event)) return;
-    const id = `${live.key}.${event.contentIndex}`;
+    const id = live.rowIds.get(event.contentIndex) ?? `${live.key}.${event.contentIndex}`;
     switch (event.type) {
       case "text_start":
+        live.rowIds.set(event.contentIndex, id);
         this.#set({ kind: "text", id, text: "", streaming: true });
         break;
       case "text_delta": {
@@ -880,6 +1235,7 @@ export class Transcript {
         this.#set({ kind: "text", id, text: event.content, streaming: false });
         break;
       case "thinking_start":
+        live.rowIds.set(event.contentIndex, id);
         live.thinkingSince.set(event.contentIndex, Date.now());
         this.#set({ kind: "thinking", id, text: "", streaming: true, redacted: false });
         break;
@@ -896,8 +1252,9 @@ export class Transcript {
       case "toolcall_start": {
         const rowId = this.#mintToolId(event.id);
         live.toolIds.set(event.contentIndex, rowId);
+        live.rowIds.set(event.contentIndex, rowId);
         live.toolJson.set(event.contentIndex, "");
-        this.#set({ kind: "tool", id: rowId, name: event.toolName, args: {}, status: "call", output: "", images: 0 });
+        this.#set({ kind: "tool", id: rowId, callId: event.id, name: event.toolName, args: {}, status: "call", output: "", images: 0 });
         break;
       }
       case "toolcall_delta": {
@@ -917,8 +1274,17 @@ export class Transcript {
       case "toolcall_end": {
         const rowId = live.toolIds.get(event.contentIndex) ?? this.#callRow(event.toolCall.id);
         const row = this.#get(rowId);
-        const base: ToolRow = row?.kind === "tool" ? row : { kind: "tool", id: rowId, name: event.toolCall.name, args: {}, status: "queued", output: "", images: 0 };
-        this.#set({ ...base, name: event.toolCall.name, args: event.toolCall.arguments ?? {}, status: base.status === "call" ? "queued" : base.status });
+        const base: ToolRow =
+          row?.kind === "tool"
+            ? row
+            : { kind: "tool", id: rowId, callId: event.toolCall.id, name: event.toolCall.name, args: {}, status: "queued", output: "", images: 0 };
+        this.#set({
+          ...base,
+          callId: base.callId ?? event.toolCall.id,
+          name: event.toolCall.name,
+          args: event.toolCall.arguments ?? {},
+          status: base.status === "call" ? "queued" : base.status,
+        });
         break;
       }
     }
@@ -926,15 +1292,15 @@ export class Transcript {
 
   /** The authoritative message replaces what was reconstructed from deltas, row by row. */
   #finish(message: AssistantMessage) {
-    const live = this.#live ?? { key: `m${++seq}`, toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
+    const live = this.#live ?? { key: `m${++seq}`, rowIds: new Map(), toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
     this.#live = undefined;
-    this.#blocks(message, live.key, true, live.toolIds);
+    this.#blocks(message, live.key, true, live.toolIds, live.rowIds);
     // The answer is in: the turn took this long, whatever the provider still cleans up.
     // (A message that failed is no answer yet: a retry goes on in the same turn.)
     if (answeredTurn(message)) this.#closeTurn();
   }
 
-  #blocks(message: AssistantMessage, key: string, keepRuns: boolean, toolIds?: Map<number, string>) {
+  #blocks(message: AssistantMessage, key: string, keepRuns: boolean, toolIds?: Map<number, string>, rowIds?: Map<number, string>) {
     // A later assistant message is the attempt made again: it answers for the one that failed before it.
     this.#failure = undefined;
     const failed = message.stopReason === "error";
@@ -947,13 +1313,16 @@ export class Transcript {
     const lastStep = message.content.reduce((at, block, index) => (block.type === "text" ? at : index), -1);
     const final = (index: number) => !failed && (hasTools ? message.stopReason !== "toolUse" && index > lastStep : true);
     message.content.forEach((block, index) => {
-      const id = `${key}.${index}`;
+      const id = rowIds?.get(index) ?? `${key}.${index}`;
       if (block.type === "text") {
         if (block.text.trim()) this.#set({ kind: "text", id, text: block.text, streaming: false, final: final(index) });
+        else this.#removeRow(id);
       } else if (block.type === "thinking") {
         const before = this.#get(id);
         if (block.thinking.trim() || block.redacted) {
           this.#set({ kind: "thinking", id, text: block.thinking, streaming: false, redacted: !!block.redacted, durationMs: before?.kind === "thinking" ? before.durationMs : undefined });
+        } else {
+          this.#removeRow(id);
         }
       } else if (block.type === "toolCall") {
         // The block's own call is the one streamed at its content index, if
@@ -962,19 +1331,35 @@ export class Transcript {
         // before.
         const rowId = toolIds?.get(index) ?? this.#mintToolId(block.id);
         const before = this.#get(rowId);
-        const base: ToolRow = before?.kind === "tool" ? before : { kind: "tool", id: rowId, name: block.name, args: {}, status: "queued", output: "", images: 0 };
+        const base: ToolRow =
+          before?.kind === "tool"
+            ? before
+            : { kind: "tool", id: rowId, callId: block.id, name: block.name, args: {}, status: "queued", output: "", images: 0 };
         const bg = !!block.background && !failed && message.stopReason !== "aborted";
         // A call the failed message never got to run will not run: it does not go on spinning through the retries.
         if (failed && (base.status === "call" || base.status === "queued")) {
           const { background: _bg, ...rest } = base;
-          this.#set({ ...rest, name: block.name, args: block.arguments ?? {}, status: "error", output: base.output || this.#tr("Stopped before it finished.", "完成前已停止。") });
+          this.#set({
+            ...rest,
+            callId: rest.callId ?? block.id,
+            name: block.name,
+            args: block.arguments ?? {},
+            status: "error",
+            output: base.output || this.#tr("Stopped before it finished.", "完成前已停止。"),
+          });
         } else {
           const settled = base.status === "done" || base.status === "error";
           if (bg && !settled) {
-            this.#set({ ...base, name: block.name, args: block.arguments ?? {}, status: "running", background: true });
+            this.#set({ ...base, callId: base.callId ?? block.id, name: block.name, args: block.arguments ?? {}, status: "running", background: true });
           } else {
             const { background: _bg, ...rest } = base;
-            this.#set({ ...rest, name: block.name, args: block.arguments ?? {}, status: keepRuns && base.status !== "call" ? base.status : "queued" });
+            this.#set({
+              ...rest,
+              callId: rest.callId ?? block.id,
+              name: block.name,
+              args: block.arguments ?? {},
+              status: keepRuns && base.status !== "call" ? base.status : "queued",
+            });
           }
         }
         // A result read ahead of its call lands on the row now that the call is
@@ -984,12 +1369,21 @@ export class Transcript {
         const pending = pendings?.shift();
         if (pending) {
           if (!pendings!.length) this.#pendingResults.delete(block.id);
-          this.#tool(rowId, (row) => this.#applyToolResult(row, pending), pending.toolName);
+          this.#tool(rowId, (row) => this.#applyToolResult(row, pending), pending.toolName, block.id);
           // Its result consumed, the call is over: the id's next use is a new occurrence's.
           if (this.#callRows.get(block.id)?.id === rowId) this.#callRows.delete(block.id);
         }
       }
     });
+    if (rowIds) {
+      for (const [index, id] of rowIds) {
+        if (index < message.content.length) continue;
+        const leftover = this.#get(id);
+        if (leftover && ((leftover.kind === "text" && !leftover.text.trim()) || (leftover.kind === "thinking" && !leftover.text.trim() && !leftover.redacted))) {
+          this.#removeRow(id);
+        }
+      }
+    }
     if (failed) {
       this.#failure = message.errorMessage?.trim() || this.#tr("No details were given.", "未提供详细信息。");
     } else if (message.stopReason === "length") {
@@ -1020,6 +1414,46 @@ export class Transcript {
     this.#push({ kind: "notice", id: this.#id("notice"), tone: "error", title: this.#tr("The model returned an error", "模型返回了错误"), text });
   }
 
+  /**
+   * A still-streaming assistant message `get_messages` carried (the bridge's
+   * `stopReason: "pending"`): its rows go up as they stand — open blocks marked
+   * `streaming`, running calls marked `background` — and the live state with
+   * them, so the stream it was cut from keeps writing to the same rows.
+   */
+  #pendingMessage(message: AssistantMessage) {
+    const live = { key: `m${++seq}`, rowIds: new Map<number, string>(), toolIds: new Map<number, string>(), toolJson: new Map<number, string>(), thinkingSince: new Map<number, number>(), argsAt: new Map<number, number>() };
+    this.#live = live;
+    message.content.forEach((block, index) => {
+      const id = `${live.key}.${index}`;
+      if (block.type === "text") {
+        if (block.streaming === true || block.text.trim()) {
+          live.rowIds.set(index, id);
+          this.#set({ kind: "text", id, text: block.text, streaming: block.streaming === true });
+        }
+      } else if (block.type === "thinking") {
+        if (block.streaming === true || block.thinking.trim() || block.redacted) {
+          live.rowIds.set(index, id);
+          if (block.streaming === true) live.thinkingSince.set(index, Date.now());
+          this.#set({ kind: "thinking", id, text: block.thinking, streaming: block.streaming === true, redacted: !!block.redacted });
+        }
+      } else if (block.type === "toolCall") {
+        const rowId = this.#mintToolId(block.id);
+        live.toolIds.set(index, rowId);
+        live.rowIds.set(index, rowId);
+        this.#set({ kind: "tool", id: rowId, callId: block.id, name: block.name, args: block.arguments ?? {}, status: block.background ? "running" : "queued", output: "", images: 0 });
+        if (block.background) this.#toolSince.set(rowId, Date.now());
+        // A result read ahead of the call lands on the row now that the call is known.
+        const pendings = this.#pendingResults.get(block.id);
+        const pending = pendings?.shift();
+        if (pending) {
+          if (!pendings!.length) this.#pendingResults.delete(block.id);
+          this.#tool(rowId, (row) => this.#applyToolResult(row, pending), pending.toolName, block.id);
+          if (this.#callRows.get(block.id)?.id === rowId) this.#callRows.delete(block.id);
+        }
+      }
+    });
+  }
+
   /** A tool's result applied to its call's row: its output, images and outcome. */
   #applyToolResult(row: ToolRow, message: ToolResultMessage): ToolRow {
     const { background: _bg, ...rest } = row;
@@ -1038,7 +1472,7 @@ export class Transcript {
     for (const pendings of this.#pendingResults.values()) {
       for (const message of pendings) {
         const rowId = this.#callRow(message.toolCallId);
-        this.#tool(rowId, (row) => this.#applyToolResult(row, message), message.toolName);
+        this.#tool(rowId, (row) => this.#applyToolResult(row, message), message.toolName, message.toolCallId);
         this.#callRows.delete(message.toolCallId);
       }
     }
@@ -1082,7 +1516,7 @@ export class Transcript {
         // the block, in line behind any read before it.
         const open = this.#callRows.get(message.toolCallId);
         if (open && !open.ended && this.#get(open.id)?.kind === "tool") {
-          this.#tool(open.id, (row) => this.#applyToolResult(row, message), message.toolName);
+          this.#tool(open.id, (row) => this.#applyToolResult(row, message), message.toolName, message.toolCallId);
           this.#callRows.delete(message.toolCallId);
         } else {
           const waiting = this.#pendingResults.get(message.toolCallId) ?? [];

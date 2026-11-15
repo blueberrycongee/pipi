@@ -85,6 +85,12 @@ export interface RowVeil {
 }
 
 const rowVeils = new Map<string, RowVeil>();
+const seededVeilIds = new Set<string>();
+
+/** Marks row ids whose initial attach pass should seed existing text without re-fading from alpha 0. */
+export function markVeilsSeeded(ids: Iterable<string>): void {
+  for (const id of ids) seededVeilIds.add(id);
+}
 
 function createElemVeil(seed = ""): ElemVeil {
   return {
@@ -101,12 +107,14 @@ export function rowVeil(id: string): RowVeil {
   if (!v) {
     v = {
       elems: new Map(),
-      seeding: false,
+      seeding: seededVeilIds.delete(id),
       initialized: false,
       seenBlocks: 0,
       blockNodes: new Map(),
     };
     rowVeils.set(id, v);
+  } else if (!v.initialized && seededVeilIds.delete(id)) {
+    v.seeding = true;
   }
   return v;
 }
@@ -240,4 +248,5 @@ export function sliceChunks(chunks: readonly VeilChunk[], start: number, end: nu
 /** Clears all veil states across session switches. */
 export function clearVeils(): void {
   rowVeils.clear();
+  seededVeilIds.clear();
 }

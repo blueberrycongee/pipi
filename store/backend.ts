@@ -14,7 +14,15 @@ import type { Transport } from "../pi/client";
 import { DYNAMIC_WALLPAPER_ENABLED, SUPPORTED_WALLPAPER_EXTENSIONS } from "../lib/wallpaper";
 import { type CredentialKind, removeCredential, saveApiKey, storedCredentials } from "../pi/credentials";
 import { DaemonClient, type DaemonCallbacks } from "../pi/daemon";
-import { deleteSession, listSessions, listWorkspaceSessions, readSessionSnapshot, type SessionSnapshot, type SessionSummary } from "../pi/sessions";
+import {
+  deleteSession,
+  listSessions,
+  listWorkspaceSessions,
+  readSessionSnapshot,
+  type SessionSnapshot,
+  type SessionSnapshotOptions,
+  type SessionSummary,
+} from "../pi/sessions";
 import { usageStats, type UsageStats } from "../pi/usage";
 import { runHelper, spawnHelperTransport, startAgent, startPi } from "../pi/sidecar";
 
@@ -39,7 +47,7 @@ export interface Backend {
   listSessions(cwd: string): Promise<SessionSummary[]>;
   listWorkspaceSessions?(cwds: string[]): Promise<Record<string, SessionSummary[]>>;
   /** A saved session file's settled contents, read straight from disk: a switch can show it while the agent attaches and loads its own. */
-  readSessionSnapshot(path: string): Promise<SessionSnapshot | undefined>;
+  readSessionSnapshot(path: string, options?: SessionSnapshotOptions): Promise<SessionSnapshot | undefined>;
   /** Token use and cost across every saved session on this machine. */
   usageStats?(): Promise<UsageStats>;
   deleteSession(path: string): Promise<void>;

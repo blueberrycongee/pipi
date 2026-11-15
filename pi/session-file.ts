@@ -39,6 +39,11 @@ export interface SessionSnapshot {
   messages: AgentMessage[];
 }
 
+export interface SessionSnapshotOptions {
+  /** Keep `background: true` on external tool calls when attaching to a warm daemon process whose background tasks are still live. */
+  keepBackgroundTools?: boolean;
+}
+
 const THINKING_LEVELS = new Set<string>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 function asThinkingLevel(value: unknown): ThinkingLevel | undefined {
@@ -81,7 +86,7 @@ function stripStaleBackgroundFlags(messages: AgentMessage[]): AgentMessage[] {
   });
 }
 
-function parseExternalSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
+function parseExternalSnapshot(lines: Record<string, unknown>[], options?: SessionSnapshotOptions): SessionSnapshot {
   const header = lines[0];
   const rawMessages: AgentMessage[] = [];
   for (let i = 1; i < lines.length; i++) {
@@ -120,7 +125,7 @@ function parseExternalSnapshot(lines: Record<string, unknown>[]): SessionSnapsho
     model,
     thinkingLevel: asThinkingLevel(header.thinkingLevel),
     context,
-    messages: stripStaleBackgroundFlags(rawMessages),
+    messages: options?.keepBackgroundTools ? rawMessages : stripStaleBackgroundFlags(rawMessages),
   };
 }
 
@@ -131,38 +136,63 @@ interface PiTreeEntry extends Record<string, unknown> {
   timestamp?: string | number;
 }
 
+function normalizePiMessage(raw: AgentMessage): AgentMessage {
+  const stamped = normalizeMessageTimestamp(raw);
+  const role = (stamped as { role?: unknown }).role;
+  if (role === "hookMessage") {
+    const legacy = stamped as unknown as Record<string, unknown>;
+    return {
+      role: "custom",
+      customType: typeof legacy.customType === "string" ? legacy.customType : "extension",
+      content:
+        typeof legacy.content === "string" || Array.isArray(legacy.content)
+          ? (legacy.content as CustomMessage["content"])
+          : "",
+      display: Boolean(legacy.display),
+      timestamp: typeof legacy.timestamp === "number" ? legacy.timestamp : 0,
+    };
+  }
+  return stamped;
+}
+
 function applyContextReplacement(msg: AgentMessage, replacement: unknown): AgentMessage | undefined {
   if (replacement === null) return undefined;
   if (replacement === undefined) return msg;
+  const unwrapped =
+    replacement && typeof replacement === "object" && !Array.isArray(replacement) && "content" in replacement
+      ? (replacement as { content: unknown }).content
+      : replacement;
+  if (unwrapped === null) return undefined;
+  if (unwrapped === undefined) return msg;
   if (msg.role === "assistant") {
     const content: (TextContent | ThinkingContent | ToolCall)[] =
-      typeof replacement === "string"
-        ? [{ type: "text", text: replacement }]
-        : Array.isArray(replacement)
-          ? (replacement as (TextContent | ThinkingContent | ToolCall)[])
+      typeof unwrapped === "string"
+        ? [{ type: "text", text: unwrapped }]
+        : Array.isArray(unwrapped)
+          ? (unwrapped as (TextContent | ThinkingContent | ToolCall)[])
           : msg.content;
     return { ...msg, content };
   }
   if (msg.role === "toolResult") {
     const content: (TextContent | ImageContent)[] =
-      typeof replacement === "string"
-        ? [{ type: "text", text: replacement }]
-        : Array.isArray(replacement)
-          ? (replacement as (TextContent | ImageContent)[])
+      typeof unwrapped === "string"
+        ? [{ type: "text", text: unwrapped }]
+        : Array.isArray(unwrapped)
+          ? (unwrapped as (TextContent | ImageContent)[])
           : msg.content;
     return { ...msg, content } as ToolResultMessage;
   }
   if (msg.role === "user") {
     const content =
-      typeof replacement === "string" || Array.isArray(replacement)
-        ? (replacement as UserMessage["content"])
+      typeof unwrapped === "string" || Array.isArray(unwrapped)
+        ? (unwrapped as UserMessage["content"])
         : msg.content;
     return { ...msg, content };
   }
   if (msg.role === "custom") {
     const content =
-      typeof replacement === "string" || Array.isArray(replacement)
-        ? (replacement as CustomMessage["content"])
+      typeof unwrapped === "string" || Array.isArray(unwrapped)
+        ? (unwrapped as CustomMessage["content"])
         : msg.content;
     return { ...msg, content };
   }
@@ -207,7 +237,6 @@ function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
 
   let model: { id: string; provider?: string } | undefined;
   let thinkingLevel: ThinkingLevel | undefined;
-  const edits = new Map<string, unknown>();
 
   for (const entry of pathEntries) {
     if (entry.type === "session_info" && typeof entry.name === "string" && entry.name) {
@@ -220,16 +249,14 @@ function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
     } else if (entry.type === "thinking_level_change") {
       const lvl = asThinkingLevel(entry.thinkingLevel);
       if (lvl) thinkingLevel = lvl;
-    } else if (entry.type === "context_edit" && typeof entry.targetId === "string" && entry.targetId) {
-      edits.set(entry.targetId, entry.replacement);
     } else if (entry.type === "message" && entry.message && typeof entry.message === "object") {
       const msg = entry.message as AssistantMessage & { thinkingLevel?: unknown };
       if (msg.role === "assistant") {
-        if (!model && typeof msg.model === "string" && msg.model) {
+        if (typeof msg.model === "string" && msg.model) {
           model = { id: msg.model, provider: typeof msg.provider === "string" ? msg.provider : undefined };
         }
         const msgLvl = asThinkingLevel(msg.thinkingLevel);
-        if (!thinkingLevel && msgLvl) thinkingLevel = msgLvl;
+        if (msgLvl) thinkingLevel = msgLvl;
       }
     }
   }
@@ -255,16 +282,36 @@ function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
           break;
         }
       }
+    } else if (!firstKeptId && typeof compaction.firstKeptEntryIndex === "number") {
+      const legacyIdx = compaction.firstKeptEntryIndex;
+      if (legacyIdx >= 0 && legacyIdx < compactionIdx) keptIdx = legacyIdx;
     }
     const kept =
       keptIdx >= 0
         ? pathEntries
             .slice(keptIdx, compactionIdx)
-            .filter((e) => !(e.type === "message" && (e.message as { role?: unknown } | undefined)?.role === "system"))
+            .filter(
+              (e) =>
+                e.type !== "compaction" &&
+                !(e.type === "message" && (e.message as { role?: unknown } | undefined)?.role === "system"),
+            )
         : [];
     selected = [compaction, ...kept, ...pathEntries.slice(compactionIdx + 1)];
   } else {
     selected = pathEntries;
+  }
+
+  const edits = new Map<string, unknown>();
+  for (const entry of selected) {
+    if (entry.type === "context_edit") {
+      const target =
+        typeof entry.targetId === "string" && entry.targetId
+          ? entry.targetId
+          : typeof entry.targetEntryId === "string"
+            ? entry.targetEntryId
+            : "";
+      if (target) edits.set(target, entry.replacement);
+    }
   }
 
   const messages: AgentMessage[] = [];
@@ -281,9 +328,11 @@ function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
         break;
       }
       case "branch_summary": {
+        const summary = typeof entry.summary === "string" ? entry.summary : "";
+        if (!summary.trim()) break;
         const msg: BranchSummaryMessage = {
           role: "branchSummary",
-          summary: typeof entry.summary === "string" ? entry.summary : "",
+          summary,
           timestamp: parseTimestamp(entry.timestamp),
         };
         messages.push(msg);
@@ -306,7 +355,7 @@ function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
       }
       case "message": {
         if (!entry.message || typeof entry.message !== "object") break;
-        const raw = normalizeMessageTimestamp(entry.message as AgentMessage);
+        const raw = normalizePiMessage(entry.message as AgentMessage);
         if (raw.role === "system") break;
         const edited = entry.id && edits.has(entry.id) ? applyContextReplacement(raw, edits.get(entry.id)) : raw;
         if (edited) messages.push(edited);
@@ -329,7 +378,7 @@ function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
 }
 
 /** Parses raw JSONL session file contents into a `SessionSnapshot`; `undefined` if unrecognized or empty. */
-export function parseSessionSnapshot(raw: string): SessionSnapshot | undefined {
+export function parseSessionSnapshot(raw: string, options?: SessionSnapshotOptions): SessionSnapshot | undefined {
   if (!raw) return undefined;
   // Split strictly on LF (`\n`), never on U+2028/U+2029 which are valid inside JSON strings.
   const rawLines = raw.split("\n");
@@ -348,17 +397,17 @@ export function parseSessionSnapshot(raw: string): SessionSnapshot | undefined {
   }
   if (parsed.length === 0) return undefined;
   const firstType = parsed[0].type;
-  if (firstType === "pipi_external_session") return parseExternalSnapshot(parsed);
+  if (firstType === "pipi_external_session") return parseExternalSnapshot(parsed, options);
   if (firstType === "session") return parsePiSnapshot(parsed);
   return undefined;
 }
 
 /** Reads and parses a saved session `.jsonl` / `.pipi-agent.jsonl` file directly from disk. */
-export async function readSessionSnapshot(path: string): Promise<SessionSnapshot | undefined> {
+export async function readSessionSnapshot(path: string, options?: SessionSnapshotOptions): Promise<SessionSnapshot | undefined> {
   if (!path || (!path.endsWith(".jsonl") && !path.endsWith(".pipi-agent.jsonl"))) return undefined;
   try {
     const raw = await fs.readFile(path, "utf8");
-    return parseSessionSnapshot(raw);
+    return parseSessionSnapshot(raw, options);
   } catch {
     return undefined;
   }
