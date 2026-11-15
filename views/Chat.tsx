@@ -42,7 +42,7 @@ import { backend } from "../store/backend";
 import { recentWorkspaces } from "../store/prefs";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
-import { DURATION, EASING, enterStagger, markRowsSeen, popupHiddenStyle, popupLeavingStyle, popupStyle, PATIENCE_MS, SPRING } from "../ui/motion";
+import { DURATION, EASING, enterStagger, keepLast, markRowsSeen, popupHiddenStyle, popupLeavingStyle, popupStyle, PATIENCE_MS, Presence, SPRING } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
 import { tip } from "../ui/Tip";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
@@ -472,8 +472,8 @@ const RELEASE_SETTLE_MS = 300;
 const OWN_SEND_TOP_GAP = 10;
 /** How long (ms) a send's entry glide gets to land before the hold re-asserts the prompt's place absolutely. */
 const OWN_SEND_GLIDE_MS = 380;
-/** The longest a send's hold keeps the view without a filled runway releasing it first (zeron holds till the reply fills its room; a list that reports no passes would hold forever). */
-const OWN_SEND_HOLD_MAX_MS = 8000;
+/** The longest (ms) a settled hold's glide back to the end may take before the reservation is dropped anyway — a list that reports no passes lands the same way, only later. */
+const OWN_SEND_RETURN_MS = 900;
 
 /** How long (ms) a selection drag that has left the pane goes on scrolling after the selection last grew: the button going up out there is not heard. */
 const EDGE_BEAT_MS = 250;
@@ -639,85 +639,47 @@ function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: 
 }
 
 /**
- * A floating capsule at the pane's right edge: the prompt above the top of what
- * is being read, in its own words. A reply that outgrew its question leaves the
- * reader no way back to it but scrolling — the capsule is that way back, and
- * which prompt produced what is on screen is what it says. Pressing it again
- * and again walks the conversation's prompts up one by one.
+ * A floating bubble at the pane's top-right, on the line a sent prompt lands:
+ * the reader's own last question, in its own words and in the user bubble's own
+ * shape, while that question is out of view — above the top as its reply runs
+ * on, or below the bottom while older history is being read. Pressing it lands
+ * the view back on the prompt.
  */
-function PromptJumpPill(props: { visible: boolean; prompt: () => { index: number; text: string; images: number } | undefined; onPress: () => void }) {
-  const mounted = signal(false);
-  const opacity = createAnimatedValue(0);
-  const translateX = createAnimatedValue(8);
-  const scale = createAnimatedValue(0.94);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-
-  effect(() => {
-    // The show's boolean alone decides the motion: the prompt's words are read
-    // where they are drawn, so retargeting while the capsule stays never replays.
-    const show = props.visible;
-    const reduced = reduceMotion();
-    untracked(() => {
-      clearTimeout(timer);
-      if (show) {
-        mounted.set(true);
-        if (reduced) {
-          opacity.set(1);
-          translateX.set(0);
-          scale.set(1);
-        } else {
-          void opacity.timing(1, { duration: 160, easing: "easeOut" });
-          void translateX.spring(0, SPRING.snappy);
-          void scale.spring(1, SPRING.snappy);
-        }
-      } else if (mounted()) {
-        if (reduced) {
-          opacity.set(0);
-          mounted.set(false);
-        } else {
-          void opacity.timing(0, { duration: 140, easing: "easeIn" });
-          void translateX.timing(6, { duration: 140, easing: "easeIn" });
-          void scale.timing(0.95, { duration: 140, easing: "easeIn" });
-          timer = setTimeout(() => mounted.set(false), 150);
-        }
-      }
-    });
-  });
-
-  cleanup(() => {
-    clearTimeout(timer);
-    void opacity.stop();
-    void translateX.stop();
-    void scale.stop();
-  });
-
-  /** What the prompt says, on one line. */
-  const text = () => (props.prompt()?.text ?? "").replace(/\s*\n\s*/g, " ").replace(/\s+/g, " ").trim();
-  const images = () => props.prompt()?.images ?? 0;
+function PromptJumpPill(props: {
+  visible: boolean;
+  prompt: () => { index: number; text: string; images: number; below: boolean } | undefined;
+  top: number;
+  onPress: () => void;
+}) {
+  // `Presence` is the standard indicator show/hide; `keepLast` holds the
+  // prompt's words through the exit fade instead of blanking its first frame.
+  const prompt = keepLast(props.prompt);
+  const text = () => (prompt()?.text ?? "").replace(/\s*\n\s*/g, " ").replace(/\s+/g, " ").trim();
+  const images = () => prompt()?.images ?? 0;
+  const below = () => prompt()?.below ?? false;
   return (
-    <If when={mounted()}>
-      <View
-        class="pointer-events-none absolute inset-0 z-10 items-end justify-center pr-4"
-        style={{ opacity, transform: [{ translateX }, { scale }] }}
-      >
+    <View class="pointer-events-none absolute inset-x-0 z-10 items-end pr-4" style={{ top: props.top }}>
+      <Presence show={props.visible}>
         <BaseButton
           onPress={props.onPress}
-          accessibilityLabel={tr("Back to the prompt", "回到上一条提问")}
+          accessibilityLabel={below() ? tr("Forward to the last prompt", "前往最后一条提问") : tr("Back to the prompt", "回到上一条提问")}
           tooltip={tip(tr("Back to the prompt that produced this", "回到产生此内容的提问"), undefined, "left")}
-          class={`pointer-events-auto h-7 max-w-44 flex-row items-center gap-1.5 rounded-full px-3 ${POPUP} ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-muted/80 active:bg-muted`}
+          class={`pointer-events-auto h-7 max-w-44 flex-row items-center gap-1.5 rounded-2xl rounded-br-md px-3 ${POPUP} ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-muted/80 active:bg-muted`}
           style={GLASS_REGULAR}
         >
-          <Icon name="arrowUp" size={12} tone="muted-foreground" />
+          <View class={below() ? "rotate-180" : undefined}>
+            <Icon name="arrowUp" size={12} tone="muted-foreground" />
+          </View>
           <If when={text()}>
-            <Text class="min-w-0 truncate text-xs text-foreground">{text()}</Text>
+            <Text class="min-w-0 shrink truncate text-xs text-foreground">{text()}</Text>
           </If>
           <If when={!text() && images() > 0}>
             <Icon name="image" size={12} tone="muted-foreground" />
             <Text class="text-xs text-foreground">{tr(images() === 1 ? "1 image" : `${images()} images`, `${images()} 张图片`)}</Text>
           </If>
         </BaseButton>
-      </View>
-    </If>
+      </Presence>
+    </View>
   );
 }
 
@@ -746,11 +708,15 @@ export function Chat() {
    */
   const following = signal(true);
   const distanceFromEnd = signal(0);
-  /** The row at the top of the viewport: what the prompt capsule reads as the
-   * reader's place — the prompt above it is the one what they are reading
-   * answers. `onViewableItemsChange` feeds it where the platform reports; the
-   * scroll passes measure it (`measureTop`), which every platform answers. */
+  /** The rows at the viewport's top and bottom: the range the prompt bubble
+   * reads the last prompt against. `onViewableItemsChange` feeds both where the
+   * platform reports; the scroll passes measure the top (`measureTop`), which
+   * every platform answers, and the bottom follows from the last reported span —
+   * without a span only the top is certain and the below-view case stays dark. */
   const topRow = signal(-1);
+  const bottomRow = signal(-1);
+  /** Rows a screen held at the last full viewable report: `measureTop`'s estimate of the bottom when only the top is measured. */
+  let viewSpan = -1;
   let measuringTop = false;
   const measureTop = () => {
     if (measuringTop) return;
@@ -759,7 +725,10 @@ export function Chat() {
     measuringTop = true;
     void target.measureScrollPosition().then((at) => {
       measuringTop = false;
-      if (list === target && at) topRow.set(at.index);
+      if (list === target && at) {
+        topRow.set(at.index);
+        bottomRow.set(viewSpan < 0 ? -1 : at.index + viewSpan);
+      }
     });
   };
   /** When the reader last began a scroll gesture. */
@@ -834,27 +803,32 @@ export function Chat() {
   });
 
   /**
-   * The prompt the capsule offers: the last user row above the viewport's top —
-   * the message that produced what is being read. While one is up there the
-   * capsule stays, whatever the follow state: a long answer under way has its
-   * question as far off as one read later. The send's anchor is already its
-   * prompt pinned at the top, so while it holds the capsule is out of the way.
+   * The last prompt sent, while it is out of view — the bubble's only subject.
+   * Above the viewport's top while its reply is being read, or below the bottom
+   * while older history is being read (`below`): either way the reader's own
+   * question has scrolled off and the bubble offers the way back to it. Prompts
+   * passed on the way are never named. The send's anchor is already that prompt
+   * pinned at the top, so while it holds the bubble is out of the way.
    */
-  const promptAbove = computed(() => {
+  const promptAway = computed(() => {
     if (ownHold()) return undefined;
     const top = topRow();
+    if (top < 0) return undefined;
     const rows = displayRows();
-    if (top <= 0) return undefined;
-    for (let i = Math.min(top - 1, rows.length - 1); i >= 0; i--) {
+    for (let i = rows.length - 1; i >= 0; i--) {
       const row = rows[i];
-      if (row.kind === "user") return { index: i, text: row.text, images: row.images };
+      if (row.kind !== "user") continue;
+      if (i < top) return { index: i, text: row.text, images: row.images, below: false };
+      const bottom = bottomRow();
+      if (bottom >= 0 && i > bottom) return { index: i, text: row.text, images: row.images, below: true };
+      return undefined;
     }
     return undefined;
   });
 
   /** Back to that prompt: it lands where a sent prompt rests, just under the title bar. */
   const jumpToPrompt = () => {
-    const target = untracked(promptAbove);
+    const target = untracked(promptAway);
     if (!target) return;
     releaseOwnSend();
     inputAt = Date.now();
@@ -962,16 +936,26 @@ export function Chat() {
   /** Where the anchored prompt rests: just under the title bar's band, like zeron's `OWN_SEND_TOP_INSET_PX`. */
   const ownSendInset = () => untracked(topBarHeight) + OWN_SEND_TOP_GAP;
 
+  /**
+   * The return glide of a hold that ended short of a filled runway: the end
+   * the content will have once the reservation goes. The reservation is what
+   * let the pin stand there, so it stays until the glide lands — dropped
+   * first, the list would clamp the held offset at once and the prompt would
+   * snap back instead of settling.
+   */
+  let runwayLanding: { target: number } | undefined;
+
   /** The anchor ends: pin, hold and reservation gone at once (the pad sits under everything — removing it moves no row). */
   const dropOwnSend = () => {
     ownSend = undefined;
     ownHold.set(false);
     runway.set(0);
+    runwayLanding = undefined;
   };
 
   /** A scroll gesture of the reader's, or their press into what they were reading: the anchor's word is spent. */
   const releaseOwnSend = () => {
-    if (ownSend) dropOwnSend();
+    if (ownSend || runwayLanding) dropOwnSend();
   };
 
   /**
@@ -983,22 +967,49 @@ export function Chat() {
     const o = ownSend;
     if (!o) return;
     const ix = untracked(displayRows).findIndex((row) => row.id === o.id);
-    if (ix < 0) return dropOwnSend();
+    if (ix < 0) return settleOwnSend(false);
     list?.scrollToIndex({ index: ix, viewPosition: 0, viewOffset: ownSendInset(), animated: Date.now() < o.glideUntil });
   };
 
-  /** The anchor's natural end — a filled runway or an expired hold: the end-follow resumes. */
-  const settleOwnSend = () => {
+  /**
+   * The anchor's natural end. A filled runway hands off where it stands — the
+   * end is already in view, so the reservation can go at once. A hold ending
+   * short of it — the run over, the bubble gone — leaves the prompt somewhere
+   * the content cannot keep without the reservation, so the view first glides
+   * to the end it will have, and the pad goes when the glide lands (or when a
+   * quiet list has had long enough to land it): the return settles, it never
+   * snaps back.
+   */
+  const settleOwnSend = (filled: boolean) => {
     ownSend = undefined;
     ownHold.set(false);
-    runway.set(0);
     following.set(true);
-    scheduleEndSettle(2);
+    if (filled || untracked(reduceMotion) || untracked(isChatActive) || !list) {
+      runway.set(0);
+      runwayLanding = undefined;
+      scheduleEndSettle(2);
+      return;
+    }
+    endSettlePasses = 0;
+    const landing = (runwayLanding = { target: Math.max(0, lastMax - untracked(runway)) });
+    list.scrollTo({ y: landing.target, animated: true });
+    setTimeout(() => {
+      if (runwayLanding !== landing) return;
+      runwayLanding = undefined;
+      runway.set(0);
+      scheduleEndSettle(1);
+    }, OWN_SEND_RETURN_MS);
   };
 
   const onScroll = (e: ScrollEvent) => {
     const y = e.offset.y;
     const distance = e.contentSize.height - (y + e.size.height);
+    // The return glide has landed where the end will be: the reservation goes now.
+    if (runwayLanding && y <= runwayLanding.target + 0.5) {
+      runwayLanding = undefined;
+      runway.set(0);
+      scheduleEndSettle(1);
+    }
     if (ownSend) {
       // A scroll of the reader's inside the input window ends the hold (theirs wins);
       // the layout's own passes — the glide's, the fold's, the reply's — feed its step.
@@ -1154,7 +1165,7 @@ export function Chat() {
     untracked(() => {
       measureEnd();
       // Rows can change what the top row is without a scroll (a fold closing
-      // above a held view, history landing): measure keeps the capsule aimed.
+      // above a held view, history landing): measure keeps the bubble aimed.
       measureTop();
     });
   });
@@ -1170,12 +1181,22 @@ export function Chat() {
     untracked(() => {
       const o = ownSend;
       if (!o || !list || !ending || Date.now() < o.glideUntil) return;
-      if (untracked(displayRows).findIndex((row) => row.id === o.id) < 0) return dropOwnSend();
+      if (untracked(displayRows).findIndex((row) => row.id === o.id) < 0) return settleOwnSend(false);
       void Promise.all([list.measure(), ending.measure()]).then(([frame, end]) => {
         if (!frame || !end || ownSend !== o) return;
         const filled = end.pagePosition.y + end.bounds.size.height + untracked(foot).end >= frame.pagePosition.y + frame.bounds.size.height - 1;
-        if (filled) settleOwnSend();
+        if (filled) settleOwnSend(true);
       });
+    });
+  });
+
+  // The run a send anchored is over — nothing more fills the room the pin
+  // reserved: the hold hands the view back to the end. A timed cap once did
+  // this instead, cutting live runs short and snapping the prompt back.
+  effect(() => {
+    const running = isRunning();
+    untracked(() => {
+      if (!running && ownSend) settleOwnSend(false);
     });
   });
 
@@ -1273,23 +1294,21 @@ export function Chat() {
   const tryInstallAnchor = () => {
     const id = pendingAnchor;
     if (!id || !list || !listReady || untracked(screen) !== "transcript") return;
+    // A run already over holds nothing: the bubble rests where it landed.
+    if (!untracked(isRunning)) {
+      pendingAnchor = undefined;
+      return;
+    }
     const ix = untracked(displayRows).findIndex((row) => row.id === id);
     if (ix < 0) return;
     pendingAnchor = undefined;
     inputAt = 0;
     const reduced = untracked(reduceMotion);
-    const anchor = { id, glideUntil: Date.now() + (reduced ? 0 : OWN_SEND_GLIDE_MS) };
-    ownSend = anchor;
+    ownSend = { id, glideUntil: Date.now() + (reduced ? 0 : OWN_SEND_GLIDE_MS) };
     ownHold.set(true);
     following.set(false);
     // Sending is moving on: ends owed to the reader fold now, under the pin.
     untracked(foldOwedTurns);
-    // The hold lives on the list's own passes; a list that reports none would hold the
-    // view forever, so the hold itself is capped — its end is the same handoff the
-    // filled runway makes (a reader who took over meanwhile released it already).
-    setTimeout(() => {
-      if (ownSend === anchor) settleOwnSend();
-    }, OWN_SEND_HOLD_MAX_MS);
     // The runway is the room the prompt needs to reach the top: a viewport of
     // scrollable space under it, kept until the reply fills the view.
     runway.set(lastViewportH || untracked(viewHeight) || 600);
@@ -1444,6 +1463,8 @@ export function Chat() {
       following.set(true);
       distanceFromEnd.set(0);
       topRow.set(-1);
+      bottomRow.set(-1);
+      viewSpan = -1;
       enterConversation(key);
       const seenIds = displayRowIds(transcriptRows());
       markRowsSeen(seenIds);
@@ -1498,7 +1519,14 @@ export function Chat() {
                     scrollEventThrottle={16}
                     onScrollDragStart={onInput}
                     onMomentumStart={onInput}
-                    onViewableItemsChange={(info) => topRow.set(info.viewableItems[0]?.index ?? -1)}
+                    onViewableItemsChange={(info) => {
+                      const items = info.viewableItems;
+                      const first = items[0]?.index ?? -1;
+                      const last = items[items.length - 1]?.index ?? -1;
+                      topRow.set(first);
+                      bottomRow.set(last);
+                      if (first >= 0 && last >= first) viewSpan = last - first;
+                    }}
                     maintainVisibleContentPosition={following() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
                     class="flex-1"
                     contentStyle={{
@@ -1523,7 +1551,7 @@ export function Chat() {
             </Each>
           </View>
           <ScrollToBottomPill visible={!following() && !ownHold() && distanceFromEnd() > FOLLOW_THRESHOLD} bottom={foot().end} onPress={jumpToLatest} />
-          <PromptJumpPill visible={promptAbove() !== undefined} prompt={promptAbove} onPress={jumpToPrompt} />
+          <PromptJumpPill visible={promptAway() !== undefined} prompt={promptAway} top={ownSendInset()} onPress={jumpToPrompt} />
         </If>
         <If when={screen() === "connect"}>
           <Connect />

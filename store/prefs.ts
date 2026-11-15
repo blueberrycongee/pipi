@@ -29,9 +29,9 @@ export type Language = "system" | "en" | "zh";
 export const AUTO_ARCHIVE_DAYS = [0, 7, 14, 30, 90] as const;
 export type AutoArchiveDays = (typeof AUTO_ARCHIVE_DAYS)[number];
 export type AgentSendScope = "all" | "children";
-/** What the composer sends on a send press: the Enter default, an interrupt, or a queue. */
-export type SendMode = "send" | "interrupt" | "queue";
-export const SEND_MODES: readonly SendMode[] = ["send", "interrupt", "queue"];
+/** What a send press does while a run is on: the message goes in at the next step (`steer`), or waits the run out (`queue`). */
+export type SendMode = "steer" | "queue";
+export const SEND_MODES: readonly SendMode[] = ["steer", "queue"];
 export const SESSION_TREE_DEPTHS = [1, 2, 3] as const;
 export type SessionTreeDepth = (typeof SESSION_TREE_DEPTHS)[number];
 export const SESSION_TREE_MAX = [4, 8, 16] as const;
@@ -95,7 +95,7 @@ interface Prefs {
   sessionTreeMax: SessionTreeMax;
   /** Whether sessions keep running (the session daemon stays up) after the window closes. */
   runInBackground: boolean;
-  /** The send button's behavior (`"send"` | `"interrupt"` | `"queue"`), picked from its chevron menu. */
+  /** The send button's behavior while a run is on (`"steer"` | `"queue"`), picked from its chevron menu. */
   sendMode: SendMode;
   /** Per-agent binary path / launch flag overrides. */
   agentOverrides: Record<string, AgentOverride>;
@@ -157,7 +157,7 @@ const DEFAULTS: Prefs = {
   sessionTreeDepth: 2,
   sessionTreeMax: 8,
   runInBackground: false,
-  sendMode: "send",
+  sendMode: "steer",
   agentOverrides: {},
   customAgents: [],
   agentSessionChoices: {},
@@ -278,7 +278,7 @@ export async function loadPrefs() {
           ? (parsed.autoArchiveDays as AutoArchiveDays)
           : 0,
         sidebarWidth: typeof parsed.sidebarWidth === "number" ? clampSidebarWidth(parsed.sidebarWidth) : SIDEBAR_DEFAULT_WIDTH,
-        sendMode: SEND_MODES.includes(parsed.sendMode as SendMode) ? (parsed.sendMode as SendMode) : "send",
+        sendMode: SEND_MODES.includes(parsed.sendMode as SendMode) ? (parsed.sendMode as SendMode) : "steer",
         wallpaper: normalizedWallpaper,
         // Stored choices the feature gate does not currently offer stay stored —
         // hiding a feature must not delete what the user picked; the accessors

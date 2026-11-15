@@ -1,7 +1,7 @@
-// The capsule at the pane's right edge: while a reply runs long it names the
-// prompt above the viewport — the message's own words — and a press lands the
-// view back on it, just under the title bar. Pressing again walks the
-// conversation's prompts up one by one.
+// The bubble at the pane's top-right: while the last prompt sent is out of
+// view — run off the top by a long reply, or left below by a read into old
+// history — it names that prompt in the prompt's own words, and a press lands
+// the view back on it, just under the title bar.
 //
 // A sent prompt rests at the top while its reply streams below it, so the
 // capsule is for the reader who has scrolled into the answer — the tests scroll
@@ -15,6 +15,8 @@
 import { expect, open, test } from "nsh/test";
 
 const CAPSULE = "label:Back to the prompt";
+/** The same bubble when the last prompt sits below the view. */
+const CAPSULE_BELOW = "label:Forward to the last prompt";
 /** The prompt the capsule names: the text inside it, not the (always bound) rows. */
 const naming = (prompt: string) => `${CAPSULE} >> text:${prompt}`;
 
@@ -58,22 +60,43 @@ test("a reply that outgrew its prompt floats it at the right edge; a press lands
   await app.waitFor(CAPSULE, { state: "gone", timeout: 5000 });
 }, 60000);
 
-test("pressing again walks the prompts up one by one", async () => {
+test("only the last prompt is named: landed, the capsule leaves instead of walking up", async () => {
   const app = await launch();
   await longPlan(app);
   await app.type("label:Message", "make a long second answer");
   await app.submit("label:Message");
 
-  // Read into the second answer: the capsule names the second prompt.
+  // Read into the second answer: the capsule names the second (last) prompt.
   await readInto(app, "make a long second answer");
 
-  // Back to the second prompt: the first prompt becomes the one above.
-  await app.press(CAPSULE);
-  await app.waitFor(naming("make a long plan"), { timeout: 5000 });
-
-  // Once more: the first prompt is at the top and nothing is above it.
+  // The press lands on it — visible now, the capsule leaves; the first prompt
+  // above is never offered a turn of its own.
   await app.press(CAPSULE);
   await app.waitFor(CAPSULE, { state: "gone", timeout: 5000 });
+}, 90000);
+
+test("read to the top of history: the capsule names the last prompt below", async () => {
+  const app = await launch();
+  await longPlan(app);
+  await app.type("label:Message", "make a long second answer");
+  await app.submit("label:Message");
+  await readInto(app, "make a long second answer");
+
+  // Up past the last prompt: it is left below the view and the capsule turns forward.
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    await app.scroll("label:Conversation", -4000).catch(() => {});
+    try {
+      await app.waitFor(`${CAPSULE_BELOW} >> text:make a long second answer`, { timeout: 4000 });
+      break;
+    } catch (e) {
+      if (Date.now() > deadline) throw e;
+    }
+  }
+
+  // Back down at the last prompt, nothing below to chase: the capsule leaves.
+  await app.press(CAPSULE_BELOW);
+  await app.waitFor(CAPSULE_BELOW, { state: "gone", timeout: 5000 });
 }, 90000);
 
 test("a short reply keeps its prompt in view: no capsule", async () => {

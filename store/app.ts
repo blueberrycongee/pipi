@@ -892,8 +892,6 @@ const toastTimers = new Map<number, { timer: ReturnType<typeof setTimeout>; dead
 const heldToasts = new Map<number, number>();
 /** The reader asked the open run to stop. However it then ends is their doing: Pi settles a retry cancelled mid-wait as not aborted. */
 let stopAsked = false;
-/** Resolvers waiting on the next `agent_settled` (an interrupt send holds its prompt until the aborted run is down). */
-const settleWaiters = new Set<() => void>();
 let bashRequestId: string | undefined;
 let pendingSendCount = 0;
 let deferredSendTail: Promise<void> = Promise.resolve();
@@ -2281,7 +2279,6 @@ function onEvent(event: SessionEvent) {
     });
     if (wasRunning && !event.aborted && !stopAsked) celebrate();
     stopAsked = false;
-    for (const wake of [...settleWaiters]) wake();
     refreshState().catch(() => undefined);
     refreshStats();
     refreshSessions();
@@ -2986,77 +2983,6 @@ export async function stop() {
   }
   const did = openDaemonId();
   if (did) void daemonClient?.stopTree(did).catch(() => undefined);
-}
-
-/** Resolves on the next `agent_settled`, or after `ms` so a quiet agent cannot wedge a send. */
-function waitForSettled(ms = 8000): Promise<void> {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      settleWaiters.delete(finish);
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(finish, ms);
-    settleWaiters.add(finish);
-  });
-}
-
-/**
- * Sends the draft over the open run's body: the run aborts at once and the
- * message goes in as the next prompt once the session settles (a settle that
- * takes too long degrades to a steering message rather than swallowing it).
- * What the queue still held comes back to the composer, as `stop` leaves it —
- * an interrupt spends only the draft.
- */
-export async function interruptSend() {
-  const activeClient = client;
-  const live = running() || Boolean(state()?.isStreaming);
-  // An idle session has nothing to interrupt; a bash run just needs its own abort first.
-  if (!activeClient || !live) {
-    if (bashRunning()) void request("abort_bash").catch(() => undefined);
-    await send("steer");
-    return;
-  }
-  // pipi's own commands are not prompts: they run whatever the session is doing.
-  const text = draft().trim();
-  const line = text ? parseSlashLine(text) : undefined;
-  if (line && appCommands().some((own) => answersTo(own, line.name))) {
-    await send("steer");
-    return;
-  }
-  const images = attachments().map(({ type, data, mimeType }) => ({ type, data, mimeType }));
-  if (!text && !images.length) return;
-  pendingSendCount++;
-  try {
-    batch(() => {
-      draft.set("");
-      attachments.set([]);
-    });
-    let waiting = "";
-    try {
-      const cleared = await activeClient.request("clear_queue");
-      transcript.dropQueuedMatching([...cleared.steering, ...cleared.followUp]);
-      flushSoon();
-      waiting = [...cleared.steering, ...cleared.followUp].join("\n\n");
-    } catch {}
-    stopAsked = true;
-    try {
-      await activeClient.request("abort");
-    } catch {}
-    await waitForSettled();
-    // Whatever the queue held belongs back in the composer, as `stop` leaves it.
-    if (waiting) draft.set(draft() ? `${draft()}\n\n${waiting}` : waiting);
-    if (client !== activeClient) {
-      draft.set(draft() ? `${draft()}\n\n${text}` : text);
-      return;
-    }
-    await dispatchPrompt(text, images, "steer", false);
-  } finally {
-    pendingSendCount = Math.max(0, pendingSendCount - 1);
-  }
 }
 
 /** Stops a nested daemon session (and its children) from the sidebar's child row. */

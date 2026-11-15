@@ -16,7 +16,6 @@ import {
   extensionWidgets,
   focusComposer,
   hasModel,
-  interruptSend,
   isBashRunning,
   isDraftAhead,
   isRunning,
@@ -420,22 +419,17 @@ function ContextMeter() {
 }
 
 /**
- * What a send press does, picked from the send button's chevron menu. The
- * choice is remembered (a preference), and holds for the button and Enter
- * alike until changed again:
- * - `send`: the default — Enter sends; a run in progress is steered mid-turn.
- * - `interrupt`: the run stops at once and the message goes next.
+ * What a send press does while a run is on, picked from the send button's
+ * chevron menu. The choice is remembered (a preference), and holds for the
+ * button and Enter alike until changed again:
+ * - `steer`: the default — the message goes into the run at its next step.
  * - `queue`: the message waits for the run to finish, as ⌘↵ sends it.
  */
 const sendModeText = (mode: SendMode): { icon: IconName; label: string; hint: string } => {
-  switch (mode) {
-    case "interrupt":
-      return { icon: "stop", label: tr("Interrupt & send", "打断发送"), hint: tr("Stop the run, then send", "停止当前回合后发送") };
-    case "queue":
-      return { icon: "queue", label: tr("Queue", "排队发送"), hint: tr("⌘↵ — send after the run finishes", "⌘↵ — 本轮结束后再发送") };
-    default:
-      return { icon: "enter", label: tr("Send", "发送"), hint: tr("Enter — steers a run in progress", "Enter — 运行中转为引导") };
+  if (mode === "queue") {
+    return { icon: "queue", label: tr("Queue", "排队发送"), hint: tr("⌘↵ — send after the run finishes", "⌘↵ — 本轮结束后再发送") };
   }
+  return { icon: "steer", label: tr("Interrupt & send", "打断发送"), hint: tr("Sent at the run's next step", "在本轮的下一步发送") };
 };
 
 /** Where the user writes to Pi: the message, the model that answers, and send or stop. */
@@ -496,11 +490,7 @@ export function Composer() {
   const sendMenuOpen = signal(false);
   const wireMode = () => (sendMode() === "queue" ? ("followUp" as const) : ("steer" as const));
   /** A send press: an explicit mode wins; otherwise the menu's choice decides. */
-  const fireSend = (mode?: "steer" | "followUp") => {
-    if (mode) return void send(mode);
-    if (sendMode() === "interrupt") return void interruptSend();
-    void send(wireMode());
-  };
+  const fireSend = (mode?: "steer" | "followUp") => void send(mode ?? wireMode());
   /** Choosing a menu row runs it; one that needs more first is filled in for it, as Tab does. */
   const choose = (row: SlashRow, mode?: "steer" | "followUp") => {
     if (row.runs === undefined) return setDraft(row.completion);
@@ -523,21 +513,17 @@ export function Composer() {
   };
 
   const sendLabel = () =>
-    sendMode() === "interrupt"
-      ? tr("Interrupt & send", "打断发送")
-      : sendMode() === "queue"
-        ? tr("Queue", "排队发送")
-        : isRunning()
-          ? tr("Steer", "引导")
-          : tr("Send", "发送");
+    sendMode() === "queue"
+      ? tr("Queue", "排队发送")
+      : isRunning()
+        ? tr("Interrupt & send", "打断发送")
+        : tr("Send", "发送");
   const sendTipText = () =>
-    sendMode() === "interrupt"
-      ? tr("Interrupt & send — stops the run first", "打断发送 — 先停止当前回合")
-      : sendMode() === "queue"
-        ? tr("Queue — sends after the run finishes", "排队发送 — 本轮结束后发送")
-        : isRunning()
-          ? tr("Steer — ⌘↵ queues a follow-up", "引导 — ⌘↵ 排队追问")
-          : tr("Send — ⌘↵ queues a follow-up", "发送 — ⌘↵ 排队追问");
+    sendMode() === "queue"
+      ? tr("Queue — sends after the run finishes", "排队发送 — 本轮结束后发送")
+      : isRunning()
+        ? tr("Interrupt & send — sent at the run's next step", "打断发送 — 在本轮的下一步发送")
+        : tr("Send — ⌘↵ queues a follow-up", "发送 — ⌘↵ 排队追问");
 
   /**
    * A paste is attachments first, text second (`pasteBehavior="report"`):
