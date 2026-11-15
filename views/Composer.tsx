@@ -1,7 +1,7 @@
 import { readFile } from "fs/promises";
 import { Canvas, cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
 import type { InputRef, PasteEvent, ScrollRef, ViewRef } from "nsh";
-import { Button as BaseButton, Input } from "nsh/base";
+import { Button as BaseButton, Input, Popover } from "nsh/base";
 import { money } from "../lib/format";
 import { commandSourceLabel, tr } from "../lib/i18n";
 import { matchCommands, matchOptions, readSlashInput } from "../lib/slash";
@@ -14,12 +14,12 @@ import {
   composerFocusTick,
   extensionStatuses,
   extensionWidgets,
+  focusComposer,
   hasModel,
+  interruptSend,
   isBashRunning,
   isDraftAhead,
   isRunning,
-  messageQueue,
-  recallQueue,
   removeAttachment,
   send,
   sessionState,
@@ -33,9 +33,10 @@ import {
   transcriptRows,
   waitingCount,
 } from "../store/app";
+import { SEND_MODES, sendMode, setSendMode, type SendMode } from "../store/prefs";
 import { IconButton } from "../ui/Button";
-import { Icon } from "../ui/Icon";
-import { EASING, enter, keepLast, Presence, Reveal, SPRING } from "../ui/motion";
+import { Icon, type IconName } from "../ui/Icon";
+import { EASING, enter, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, SPRING } from "../ui/motion";
 import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { AgentPicker, PermissionPicker } from "./AgentPicker";
@@ -44,8 +45,6 @@ import { ModelPicker, ThinkingPicker } from "./ModelPicker";
 
 const MIN_HEIGHT = 32;
 const MAX_HEIGHT = 220;
-/** How many waiting messages the queue's tray lists before it counts the rest. */
-const QUEUE_ROWS = 3;
 
 /** The image types Pi's providers take; past its bound a paste stays a path instead. */
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"]);
@@ -295,53 +294,6 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
 }
 
 /**
- * The messages waiting for the run stand in line behind the composer: a tray
- * like the attachments', risen from behind its top edge, so the composer keeps
- * its own size and what it sent is not mistaken for what is being written. A
- * line each, in the order they go — an icon says what each will do — and past
- * `QUEUE_ROWS` the rest are counted. The pencil is the whole tray's: the queue
- * is taken back as one (`clear_queue`), so it stands beside the lines, not on one.
- */
-function QueueTray() {
-  const waiting = computed(() => [
-    ...messageQueue().steering.map((text) => ({ text, kind: "steer" as const })),
-    ...messageQueue().followUp.map((text) => ({ text, kind: "followUp" as const })),
-  ]);
-  const shown = keepLast(() => {
-    const list = waiting();
-    return list.length > 0 ? list : undefined;
-  }, [] as { text: string; kind: "steer" | "followUp" }[]);
-  const more = () => Math.max(0, (shown()?.length ?? 0) - QUEUE_ROWS);
-  return (
-    <Reveal open={waiting().length > 0} offset={6}>
-      <View
-        class="relative mx-4 -mb-2 flex-row items-center gap-1 rounded-t-2xl corner-squircle border-[0.5px] border-b-0 border-hairline bg-card/85 pb-3 pl-3 pr-1.5 pt-1 dark:bg-card/75"
-        accessibilityLabel={tr("Queued messages", "排队消息")}
-      >
-        <View class="min-w-0 flex-1">
-          <Each of={(shown() ?? []).slice(0, QUEUE_ROWS)} key="index">
-            {(item) => (
-              <View
-                class="h-7 flex-row items-center gap-2"
-                accessibilityLabel={item().kind === "steer" ? tr("Steering", "引导") : tr("Follow-up", "追问")}
-                tooltip={tip(item().kind === "steer" ? tr("Steering", "引导") : tr("Follow-up", "追问"))}
-              >
-                <Icon name={item().kind === "steer" ? "steer" : "queue"} size={14} tone="subtle" />
-                <Text class="min-w-0 flex-1 truncate text-sm text-muted-foreground">{item().text}</Text>
-              </View>
-            )}
-          </Each>
-          <If when={more() > 0}>
-            <Text class="h-6 pl-[22px] text-xs leading-6 text-subtle">{tr(`+${more()} more`, `还有 ${more()} 条`)}</Text>
-          </If>
-        </View>
-        <IconButton icon="pencil" size="sm" label={tr("Edit queued messages", "编辑排队消息")} onPress={() => void recallQueue()} />
-      </View>
-    </Reveal>
-  );
-}
-
-/**
  * Pasted images wait in a tray that rises from behind the composer's top edge:
  * a little narrower than the composer, its lower edge
  * tucked under it, so adding one never changes the input's own size. The
@@ -467,6 +419,25 @@ function ContextMeter() {
   );
 }
 
+/**
+ * What a send press does, picked from the send button's chevron menu. The
+ * choice is remembered (a preference), and holds for the button and Enter
+ * alike until changed again:
+ * - `send`: the default — Enter sends; a run in progress is steered mid-turn.
+ * - `interrupt`: the run stops at once and the message goes next.
+ * - `queue`: the message waits for the run to finish, as ⌘↵ sends it.
+ */
+const sendModeText = (mode: SendMode): { icon: IconName; label: string; hint: string } => {
+  switch (mode) {
+    case "interrupt":
+      return { icon: "stop", label: tr("Interrupt & send", "打断发送"), hint: tr("Stop the run, then send", "停止当前回合后发送") };
+    case "queue":
+      return { icon: "queue", label: tr("Queue", "排队发送"), hint: tr("⌘↵ — send after the run finishes", "⌘↵ — 本轮结束后再发送") };
+    default:
+      return { icon: "enter", label: tr("Send", "发送"), hint: tr("Enter — steers a run in progress", "Enter — 运行中转为引导") };
+  }
+};
+
 /** Where the user writes to Pi: the message, the model that answers, and send or stop. */
 export function Composer() {
   let input: InputRef | undefined;
@@ -522,18 +493,51 @@ export function Composer() {
     input?.focus();
   });
 
+  const sendMenuOpen = signal(false);
+  const wireMode = () => (sendMode() === "queue" ? ("followUp" as const) : ("steer" as const));
+  /** A send press: an explicit mode wins; otherwise the menu's choice decides. */
+  const fireSend = (mode?: "steer" | "followUp") => {
+    if (mode) return void send(mode);
+    if (sendMode() === "interrupt") return void interruptSend();
+    void send(wireMode());
+  };
   /** Choosing a menu row runs it; one that needs more first is filled in for it, as Tab does. */
-  const choose = (row: SlashRow, mode: "steer" | "followUp" = "steer") => {
+  const choose = (row: SlashRow, mode?: "steer" | "followUp") => {
     if (row.runs === undefined) return setDraft(row.completion);
     setDraft(row.runs);
-    void send(mode);
+    fireSend(mode);
   };
-  const submit = (mode: "steer" | "followUp" = "steer") => {
+  const submit = (mode?: "steer" | "followUp") => {
     const row = slash.current();
     if (row) return choose(row, mode);
-    void send(mode);
+    fireSend(mode);
   };
   keymap.bind("mod+enter", () => submit("followUp"), { when: "always" });
+
+  /** A menu choice is the send button's new behavior — and fires it at once when a draft waits. */
+  const pickSendMode = (mode: SendMode) => {
+    sendMenuOpen.set(false);
+    setSendMode(mode);
+    focusComposer();
+    if (canSend() && hasText()) submit();
+  };
+
+  const sendLabel = () =>
+    sendMode() === "interrupt"
+      ? tr("Interrupt & send", "打断发送")
+      : sendMode() === "queue"
+        ? tr("Queue", "排队发送")
+        : isRunning()
+          ? tr("Steer", "引导")
+          : tr("Send", "发送");
+  const sendTipText = () =>
+    sendMode() === "interrupt"
+      ? tr("Interrupt & send — stops the run first", "打断发送 — 先停止当前回合")
+      : sendMode() === "queue"
+        ? tr("Queue — sends after the run finishes", "排队发送 — 本轮结束后发送")
+        : isRunning()
+          ? tr("Steer — ⌘↵ queues a follow-up", "引导 — ⌘↵ 排队追问")
+          : tr("Send — ⌘↵ queues a follow-up", "发送 — ⌘↵ 排队追问");
 
   /**
    * A paste is attachments first, text second (`pasteBehavior="report"`):
@@ -632,7 +636,6 @@ export function Composer() {
       <View class="pointer-events-auto relative w-full max-w-190 self-center">
         <ExtensionPrompt />
         <SlashMenu menu={slash} onChoose={choose} />
-        <QueueTray />
         <AttachmentTray />
         <View class={`rounded-[22px] corner-squircle ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
           <ExtensionLines below={false} />
@@ -684,19 +687,63 @@ export function Composer() {
                 <If
                   when={showStop()}
                   else={
-                    <BaseButton
-                      onPress={() => submit()}
-                      disabled={!canSend() || !hasText()}
-                      accessibilityLabel={isRunning() ? tr("Steer", "引导") : tr("Send", "发送")}
-                      tooltip={tip(
-                        isRunning() ? tr("Steer — ⌘↵ queues a follow-up", "引导 — ⌘↵ 排队追问") : tr("Send — ⌘↵ queues a follow-up", "发送 — ⌘↵ 排队追问"),
-                        "enter",
-                        "top",
-                      )}
-                      class={`size-7 shrink-0 items-center justify-center rounded-full bg-primary shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:bg-muted disabled:shadow-none`}
-                    >
-                      <Icon name="arrowUp" tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
-                    </BaseButton>
+                    <View class={`h-7 shrink-0 flex-row items-stretch rounded-full shadow-sm ${canSend() && hasText() ? "bg-primary" : "bg-muted shadow-none"}`}>
+                      <BaseButton
+                        onPress={() => submit()}
+                        disabled={!canSend() || !hasText()}
+                        accessibilityLabel={sendLabel()}
+                        tooltip={tip(sendTipText(), "enter", "top")}
+                        class={`w-8 items-center justify-center rounded-l-full ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:hover:bg-transparent`}
+                      >
+                        <Icon name="arrowUp" tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
+                      </BaseButton>
+                      <View class={`my-1.5 w-px ${canSend() && hasText() ? "bg-brand-foreground/25" : "bg-foreground/10"}`} />
+                      <Popover
+                        open={sendMenuOpen()}
+                        onOpenChange={(e) => sendMenuOpen.set(e.open)}
+                        placement="top"
+                        align="end"
+                        offset={8}
+                        margin={12}
+                        popupClass={`w-64 p-1 ${POPUP}`}
+                        popupStyle={popupStyle("top", "end")}
+                        popupStartingStyle={popupHiddenStyle("top", "end")}
+                        popupEndingStyle={popupLeavingStyle("top", "end")}
+                        trigger={
+                          <BaseButton
+                            disabled={!canSend()}
+                            accessibilityLabel={tr("Send options", "发送选项")}
+                            tooltip={tip(tr("Send options", "发送选项"), undefined, "top")}
+                            class={`w-6 items-center justify-center rounded-r-full ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:hover:bg-transparent`}
+                          >
+                            <Icon name="chevronDown" size={12} tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
+                          </BaseButton>
+                        }
+                      >
+                        <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
+                          {tr("Send", "发送")}
+                        </Text>
+                        <Each of={SEND_MODES}>
+                          {(mode) => {
+                            const meta = () => sendModeText(mode());
+                            return (
+                              <BaseButton
+                                selected={mode() === sendMode()}
+                                onPress={() => pickSendMode(mode())}
+                                class={`min-h-9 flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+                              >
+                                <Icon name={meta().icon} size={15} tone={mode() === sendMode() ? "foreground" : "muted-foreground"} />
+                                <View class="min-w-0 flex-1">
+                                  <Text class="truncate text-base text-foreground">{meta().label}</Text>
+                                  <Text class="truncate text-xs text-subtle">{meta().hint}</Text>
+                                </View>
+                                <View class="w-4 shrink-0 items-center">{mode() === sendMode() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
+                              </BaseButton>
+                            );
+                          }}
+                        </Each>
+                      </Popover>
+                    </View>
                   }
                 >
                   <BaseButton

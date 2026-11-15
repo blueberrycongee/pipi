@@ -71,6 +71,7 @@ import {
   autoArchiveDays,
   autoRetryChoice,
   clearArchivedSessionPref,
+  markArchivedSessionGone,
   ensureWorkspaceListed,
   forgetWorkspace,
   isSessionArchived,
@@ -209,6 +210,8 @@ const composerFocus = signal(0, { equals: false });
 /** Ticks when something outside the model chip (`/model`) asks for its list. */
 const modelPickerAsk = signal(0, { equals: false });
 const scrollToEnd = signal(0, { equals: false });
+/** The staged row of a send that starts a fresh run: the chat glides it to the top of the view and holds it while the reply fills in under it (zeron's own-turn anchor). */
+const sendAnchor = signal<{ rowId: string } | undefined>(undefined, { equals: false });
 const landed = signal(0);
 const paletteOpen = signal(false);
 const compareOpen = signal(false);
@@ -272,7 +275,7 @@ export const archivedSessionItems = computed<ArchivedSessionItem[]>(() => {
   const collect = (cwd: string, list: readonly SessionSummary[]) => {
     for (const session of list) {
       const meta = map[session.path];
-      if (!meta || seen.has(session.path)) continue;
+      if (!meta || meta.gone || seen.has(session.path)) continue;
       seen.add(session.path);
       out.push({
         id: `archived:${session.path}`,
@@ -286,6 +289,28 @@ export const archivedSessionItems = computed<ArchivedSessionItem[]>(() => {
   for (const [cwd, list] of Object.entries(byCwd)) {
     if (cwd === activeCwd) continue;
     collect(cwd, list);
+  }
+  // A session started under another may be listed under no open folder (a worktree's, a folder since closed):
+  // the daemon's record of it stands in for the summary, so what was archived from the tree is in the archive.
+  for (const held of daemonSessionList()) {
+    const meta = held.file ? map[held.file] : undefined;
+    if (!held.file || !meta || meta.gone || seen.has(held.file)) continue;
+    seen.add(held.file);
+    out.push({
+      id: `archived:${held.file}`,
+      session: {
+        path: held.file,
+        id: held.id,
+        name: held.title,
+        firstMessage: held.title,
+        messageCount: 0,
+        created: held.createdAt,
+        modified: held.lastActive,
+        agentId: held.agentId,
+      },
+      cwd: meta.cwd || projectCwdOf(held.cwd, held),
+      archivedAt: meta.archivedAt || held.lastActive,
+    });
   }
   out.sort((a, b) => b.archivedAt - a.archivedAt || b.session.modified - a.session.modified);
   return out;
@@ -315,6 +340,8 @@ export const composerAttachments = () => attachments();
 export const composerFocusTick = () => composerFocus();
 export const modelPickerTick = () => modelPickerAsk();
 export const scrollToEndTick = () => scrollToEnd();
+/** The staged row of a send that began a fresh run: the chat's cue to anchor it at the top of the view. */
+export const sendAnchorTick = () => sendAnchor();
 export const isPaletteOpen = () => paletteOpen();
 export const isCompareOpen = () => compareOpen();
 export const isRenaming = () => renaming();
@@ -494,8 +521,12 @@ export function daemonSessionByFile(path: string | undefined) {
   return path ? daemonSessionList().find((session) => session.file === path) : undefined;
 }
 
-/** Cycle-safe depth-first walk of every descendant session under `rootId`. */
-function descendantSessionsOf(rootId: string | undefined, all = daemonSessionList()): DaemonSession[] {
+/**
+ * Cycle-safe depth-first walk of every descendant session under `rootId`.
+ * `listed` leaves out what the reader archived, with everything under it: the
+ * tree as the sidebar shows it. Work is counted on the whole tree.
+ */
+function descendantSessionsOf(rootId: string | undefined, listed = false, all = daemonSessionList()): DaemonSession[] {
   if (!rootId) return [];
   const out: DaemonSession[] = [];
   const seen = new Set<string>([rootId]);
@@ -503,6 +534,7 @@ function descendantSessionsOf(rootId: string | undefined, all = daemonSessionLis
     for (const s of all) {
       if (s.parentId === pid && !seen.has(s.id)) {
         seen.add(s.id);
+        if (listed && isSessionArchived(s.file)) continue;
         out.push(s);
         visit(s.id);
       }
@@ -514,7 +546,7 @@ function descendantSessionsOf(rootId: string | undefined, all = daemonSessionLis
 
 /** Sessions started under `sessionId` (every nested generation in tree order). */
 export function childSessionsOfDaemon(sessionId: string | undefined): DaemonSession[] {
-  return descendantSessionsOf(sessionId);
+  return descendantSessionsOf(sessionId, true);
 }
 
 /**
@@ -546,7 +578,7 @@ export function daemonRootEarnsRow(session: DaemonSession): boolean {
 export function childSessionsOf(path: string | undefined): DaemonSession[] {
   if (!path) return [];
   const own = daemonSessionByFile(path);
-  return descendantSessionsOf(own?.id);
+  return descendantSessionsOf(own?.id, true);
 }
 
 /** Sessions started under the OPEN session while it is still a draft (not yet in `savedSessions`). */
@@ -555,7 +587,7 @@ export function childSessionsOfOpen(): DaemonSession[] {
   if (!id) return [];
   const file = openFile();
   if (file && savedSessions().some((s) => s.path === file)) return [];
-  return descendantSessionsOf(id);
+  return descendantSessionsOf(id, true);
 }
 
 /** Maps a child worktree directory back to its owning project folder so child worktrees don't clutter Workspaces. */
@@ -860,9 +892,37 @@ const toastTimers = new Map<number, { timer: ReturnType<typeof setTimeout>; dead
 const heldToasts = new Map<number, number>();
 /** The reader asked the open run to stop. However it then ends is their doing: Pi settles a retry cancelled mid-wait as not aborted. */
 let stopAsked = false;
+/** Resolvers waiting on the next `agent_settled` (an interrupt send holds its prompt until the aborted run is down). */
+const settleWaiters = new Set<() => void>();
 let bashRequestId: string | undefined;
 let pendingSendCount = 0;
 let deferredSendTail: Promise<void> = Promise.resolve();
+/**
+ * What each waiting bubble went to the agent as, by row id: taking one message
+ * out of the queue clears it whole (`clear_queue` is all Pi's RPC has, and it
+ * answers with text alone), so the others go back in as they were first sent —
+ * images, handoff and all.
+ */
+interface QueuedSend {
+  /** The conversation its bubble stands in. */
+  held: Transcript;
+  wire: string;
+  images: ImageContent[];
+  mode: "steer" | "followUp";
+  handoff?: { fromAgent: string; toAgent: string; context: string };
+}
+const queuedSends = new Map<string, QueuedSend>();
+/** One queue edit at a time: each clears the queue and puts the rest back. */
+let queueEditTail: Promise<void> = Promise.resolve();
+let queueEditing = false;
+
+/** Forgets the sends whose bubbles no longer wait: delivered, taken back, or left with their conversation. */
+function pruneQueuedSends() {
+  if (!queuedSends.size) return;
+  const waiting = new Set<string>();
+  for (const row of transcript.rows()) if (row.kind === "user" && row.queued) waiting.add(row.id);
+  for (const [id, sent] of queuedSends) if (sent.held === transcript && !waiting.has(id)) queuedSends.delete(id);
+}
 /** Holds a detached client's pipe open briefly when an in-flight `send()` is finishing attachment reads before writing its prompt. */
 const clientSendHolds = new Map<PiClient, Set<Promise<void>>>();
 
@@ -1009,6 +1069,9 @@ function landHistory(messages: AgentMessage[]) {
     if (before) succeed(before, fresh);
     transcript = fresh;
   }
+  // The queue is shown in the conversation alone: one that landed before its history stands in it all the same.
+  const waiting = queue();
+  if (waiting.steering.length || waiting.followUp.length) transcript.reconcileQueue(waiting.steering, waiting.followUp);
   shownVersion = -1;
   markTranscriptSeen();
   batch(() => {
@@ -1427,23 +1490,20 @@ async function launch(
     failLaunch(error);
   }
 
-  /** Resolves models and user session choices before publishing `"ready"` so fresh sessions never flash default models or levels. */
+  /**
+   * Resolves models, levels and user session choices before publishing `"ready"` so fresh
+   * sessions never flash default models or levels. The lists around the session — its own
+   * commands, the saved sessions, credentials, git — are the sidebar's and the pickers',
+   * not the conversation's: they fill in behind the screen instead of holding it.
+   */
   async function finishFreshLaunch(first: SessionState, agentLabel: string) {
     const listCwd = projectCwdOf(cwd, currentDaemonSession());
-    await Promise.all([
-      refreshModels(effectiveAgentId),
-      refreshCommands(),
-      refreshSessions(listCwd),
-      refreshCredentials(),
-      refreshGitWorkspace(cwd),
-    ]);
+    void Promise.all([refreshCommands(), refreshSessions(listCwd), refreshCredentials(), refreshGitWorkspace(cwd)]);
+    const supporting = Promise.all([refreshModels(effectiveAgentId), refreshLevels()]);
+    const history = preserveRows ? undefined : await withStartupTimeout(request("get_messages"), agentLabel);
+    await supporting;
     if (mine !== generation) return;
     const chosen = await applySessionChoices(first, false);
-    if (mine !== generation) return;
-    const [, history] = await Promise.all([
-      refreshLevels(),
-      preserveRows ? Promise.resolve(undefined) : withStartupTimeout(request("get_messages"), agentLabel),
-    ]);
     if (mine !== generation) return;
     const resolved = await applyThinkingChoice(chosen, false);
     if (mine !== generation) return;
@@ -2221,6 +2281,7 @@ function onEvent(event: SessionEvent) {
     });
     if (wasRunning && !event.aborted && !stopAsked) celebrate();
     stopAsked = false;
+    for (const wake of [...settleWaiters]) wake();
     refreshState().catch(() => undefined);
     refreshStats();
     refreshSessions();
@@ -2295,6 +2356,7 @@ function onEvent(event: SessionEvent) {
     case "queue_update":
       queue.set({ steering: event.steering ?? [], followUp: event.followUp ?? [] });
       transcript.reconcileQueue(event.steering ?? [], event.followUp ?? []);
+      if (!event.steering?.length && !event.followUp?.length && !queueEditing) pruneQueuedSends();
       break;
     case "session_info_changed":
       state.update((s) => s && { ...s, sessionName: event.name });
@@ -2817,11 +2879,15 @@ async function dispatchPrompt(
     // The bubble shows at once even when the agent queues the message behind its
     // run: it lands after the turn's rows, where it belongs in the order sent.
     stagedId = runTranscript.stageUser(text, images.length, queued);
+    if (stagedId) queuedSends.set(stagedId, { held: runTranscript, wire: wirePrompt, images, mode, ...(handoff ? { handoff } : {}) });
     if (runTranscript === transcript) flush();
     if (!queued) {
       running.set(true);
       runStartedAt.set(Date.now());
       activity.set({ kind: "thinking" });
+      // A fresh run anchors on its own bubble: the prompt glides to the top and
+      // stays put while the reply fills the runway under it.
+      if (stagedId) sendAnchor.set({ rowId: stagedId });
     }
     scrollToEnd.set(0);
   });
@@ -2831,6 +2897,7 @@ async function dispatchPrompt(
       ...(images.length ? { images } : {}),
       ...(queued ? { streamingBehavior: mode } : {}),
     });
+    if (stagedId && disposition !== "queued") queuedSends.delete(stagedId);
     // The user may have switched sessions while the agent was answering: that run is the daemon's now, not this screen's.
     if (client !== activeClient) {
       if (disposition === "queued") runTranscript.markStagedQueued(stagedId);
@@ -2855,6 +2922,7 @@ async function dispatchPrompt(
       });
     }
   } catch (error) {
+    if (stagedId) queuedSends.delete(stagedId);
     // Detaching closes the virtual transport (`activeClient.closed`), rejecting local response waiters
     // after the `in` frame already went out to the daemon.
     if (client !== activeClient && activeClient.closed) return;
@@ -2920,6 +2988,77 @@ export async function stop() {
   if (did) void daemonClient?.stopTree(did).catch(() => undefined);
 }
 
+/** Resolves on the next `agent_settled`, or after `ms` so a quiet agent cannot wedge a send. */
+function waitForSettled(ms = 8000): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      settleWaiters.delete(finish);
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    settleWaiters.add(finish);
+  });
+}
+
+/**
+ * Sends the draft over the open run's body: the run aborts at once and the
+ * message goes in as the next prompt once the session settles (a settle that
+ * takes too long degrades to a steering message rather than swallowing it).
+ * What the queue still held comes back to the composer, as `stop` leaves it —
+ * an interrupt spends only the draft.
+ */
+export async function interruptSend() {
+  const activeClient = client;
+  const live = running() || Boolean(state()?.isStreaming);
+  // An idle session has nothing to interrupt; a bash run just needs its own abort first.
+  if (!activeClient || !live) {
+    if (bashRunning()) void request("abort_bash").catch(() => undefined);
+    await send("steer");
+    return;
+  }
+  // pipi's own commands are not prompts: they run whatever the session is doing.
+  const text = draft().trim();
+  const line = text ? parseSlashLine(text) : undefined;
+  if (line && appCommands().some((own) => answersTo(own, line.name))) {
+    await send("steer");
+    return;
+  }
+  const images = attachments().map(({ type, data, mimeType }) => ({ type, data, mimeType }));
+  if (!text && !images.length) return;
+  pendingSendCount++;
+  try {
+    batch(() => {
+      draft.set("");
+      attachments.set([]);
+    });
+    let waiting = "";
+    try {
+      const cleared = await activeClient.request("clear_queue");
+      transcript.dropQueuedMatching([...cleared.steering, ...cleared.followUp]);
+      flushSoon();
+      waiting = [...cleared.steering, ...cleared.followUp].join("\n\n");
+    } catch {}
+    stopAsked = true;
+    try {
+      await activeClient.request("abort");
+    } catch {}
+    await waitForSettled();
+    // Whatever the queue held belongs back in the composer, as `stop` leaves it.
+    if (waiting) draft.set(draft() ? `${draft()}\n\n${waiting}` : waiting);
+    if (client !== activeClient) {
+      draft.set(draft() ? `${draft()}\n\n${text}` : text);
+      return;
+    }
+    await dispatchPrompt(text, images, "steer", false);
+  } finally {
+    pendingSendCount = Math.max(0, pendingSendCount - 1);
+  }
+}
+
 /** Stops a nested daemon session (and its children) from the sidebar's child row. */
 export async function stopDaemonSession(sessionId: string) {
   await daemonClient?.stopTree(sessionId).catch(() => undefined);
@@ -2950,15 +3089,82 @@ export function openDaemonSession(sessionId: string) {
   void switchInto(session.cwd, undefined, session.agentId, session.id);
 }
 
-/** Puts the queued messages back in the composer without stopping the run. */
-export async function recallQueue() {
-  const cleared = await attempt(tr("Could not clear the queue", "无法清空队列"), () => request("clear_queue"));
-  if (!cleared) return;
-  transcript.dropQueuedMatching([...cleared.steering, ...cleared.followUp]);
-  flushSoon();
-  const waiting = [...cleared.steering, ...cleared.followUp].join("\n\n");
-  if (waiting) draft.set(draft() ? `${draft()}\n\n${waiting}` : waiting);
-  focusComposer();
+/**
+ * Takes one waiting message out of the queue, from its bubble: back into the
+ * composer to be written again (`edit`), or gone. Pi's RPC takes the queue back
+ * only whole (`clear_queue`), so the rest goes in again, in the order and the
+ * way each was sent. A message the run took meanwhile is the run's: it stays.
+ */
+export function takeQueued(id: string, edit: boolean) {
+  const next = queueEditTail.then(() => takeQueuedNow(id, edit));
+  queueEditTail = next.catch(() => undefined);
+  return next;
+}
+
+async function takeQueuedNow(id: string, edit: boolean) {
+  const held = transcript;
+  const activeClient = client;
+  const row = held.rows().find((item) => item.kind === "user" && item.id === id);
+  if (!activeClient || !row || row.kind !== "user" || !row.queued) return;
+  const sent = queuedSends.get(id);
+  const said = (wire: string) => withoutHandoff(withoutImageNotes(wire));
+  const mine = (wire: string) => (sent ? wire === sent.wire : said(wire) === row.text);
+  queueEditing = true;
+  try {
+    const cleared = await attempt(tr("Could not change the queue", "无法修改队列"), () => activeClient.request("clear_queue"));
+    if (!cleared) return;
+    const rest = [
+      ...cleared.steering.map((wire) => ({ wire, mode: "steer" as const })),
+      ...cleared.followUp.map((wire) => ({ wire, mode: "followUp" as const })),
+    ];
+    const order = sent?.mode === "followUp" ? [...rest].reverse() : rest;
+    const taken = order.find((item) => mine(item.wire)) ?? order.find((item) => said(item.wire) === row.text);
+    if (taken) {
+      rest.splice(rest.indexOf(taken), 1);
+      batch(() => {
+        held.dropStagedUser(id);
+        queuedSends.delete(id);
+        if (held === transcript) flush();
+        if (edit && client === activeClient) {
+          if (row.text) draft.set(draft() ? `${draft()}\n\n${row.text}` : row.text);
+          if (sent?.images.length) {
+            attachments.update((list) => [...list, ...sent.images.map((image, at) => ({ ...image, name: `image-${list.length + at + 1}` }))]);
+          }
+          if (sent?.handoff && !pendingHandoff()) pendingHandoff.set(sent.handoff);
+        }
+      });
+    }
+    // The others go back as they were sent. Their bubbles never left: the queue's next word covers them again.
+    const spare = [...queuedSends.values()];
+    const lost: string[] = [];
+    for (const item of rest) {
+      const at = spare.findIndex((known) => known.wire === item.wire && known.mode === item.mode);
+      const images = at >= 0 ? spare.splice(at, 1)[0].images : [];
+      try {
+        await activeClient.request("prompt", {
+          message: item.wire,
+          ...(images.length ? { images } : {}),
+          streamingBehavior: item.mode,
+        });
+      } catch {
+        lost.push(said(item.wire));
+      }
+    }
+    if (lost.length) {
+      // What could not go back is not lost: it is in the composer, and said once.
+      held.dropQueuedMatching(lost);
+      if (held === transcript) flushSoon();
+      if (client === activeClient) {
+        const text = lost.join("\n\n");
+        draft.set(draft() ? `${draft()}\n\n${text}` : text);
+      }
+      toast("warning", tr("Some queued messages could not be queued again; they are back in the composer.", "部分排队消息未能重新排队，已放回输入框。"));
+    }
+    if (edit && taken && client === activeClient) focusComposer();
+  } finally {
+    queueEditing = false;
+    pruneQueuedSends();
+  }
 }
 
 // ── Sessions ────────────────────────────────────────────────────────────────
@@ -3232,7 +3438,7 @@ export async function archiveSession(path: string, cwd = workspace(), options?: 
       ? currentTitle()
       : summary
         ? sessionTitle(summary, tr("Conversation", "对话"))
-        : tr("Conversation", "对话");
+        : (daemonSessionByFile(path)?.title ?? tr("Conversation", "对话"));
   const held = daemonSessionByFile(path);
   // A background session holding this file ends with it; the open one moves to a new file instead.
   if (held?.loaded && held.id !== openDaemonId()) quietKill(held.id);
@@ -3250,6 +3456,27 @@ export async function archiveSession(path: string, cwd = workspace(), options?: 
       onPress: () => showSettings("archive"),
     },
   });
+}
+
+/**
+ * A deleted file's archive mark goes with it — unless the daemon still holds a
+ * record of the session (one started under another, which its tree would list
+ * again, file or no file): there the mark stays, as `gone`.
+ */
+function forgetDeletedSession(path: string) {
+  if (daemonSessionByFile(path)) markArchivedSessionGone(path);
+  else clearArchivedSessionPref(path);
+}
+
+/**
+ * Archives a session the daemon started under another, from its row in the
+ * tree: its transcript goes to the archive as any session's does, and its row —
+ * with whatever it started in turn — leaves the tree until it is restored.
+ */
+export async function archiveDaemonSession(sessionId: string) {
+  const session = daemonSessionOfId(sessionId);
+  if (!session?.file) return;
+  await archiveSession(session.file, projectCwdOf(session.cwd, session));
 }
 
 /** Restores an archived session back into its workspace's active list. */
@@ -3285,7 +3512,7 @@ export async function deleteAllArchivedSessions() {
     if (held?.loaded && held.id !== openDaemonId()) quietKill(held.id);
     try {
       await backend().deleteSession(session.path);
-      clearArchivedSessionPref(session.path);
+      forgetDeletedSession(session.path);
       affectedCwds.add(cwd);
       deleted++;
     } catch {
@@ -3330,7 +3557,7 @@ export async function removeSession(path: string, cwd = workspace()) {
   if (held?.loaded && held.id !== openDaemonId()) quietKill(held.id);
   visited.delete(path);
   await attempt(tr("Could not delete the session", "无法删除会话"), () => backend().deleteSession(path));
-  clearArchivedSessionPref(path);
+  forgetDeletedSession(path);
   sessionsByWorkspace.update((all) => {
     const list = all[cwd];
     return list ? { ...all, [cwd]: list.filter((session) => session.path !== path) } : all;

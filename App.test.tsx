@@ -425,33 +425,55 @@ test("shows tool permission confirmation inline above the composer while keeping
   expect(app.texts()).toContain("Here is the plan.");
 });
 
-test("lines up what is sent during a run over the composer, and takes it back as a draft", async () => {
+test("shows what is sent during a run in the conversation alone, and takes each message back from its own bubble", async () => {
   const app = await launch("stream");
   await app.waitFor("text:What are we building?");
   await app.type("label:Message", "make a long plan");
   await app.submit("label:Message");
-  await app.waitFor("text:Part 10 of the plan", { timeout: 30000 });
+  await app.waitFor("text:Part 1 of the plan", { timeout: 30000 });
 
   await app.type("label:Message", "also update the readme");
   await app.keyboard.press("mod+enter");
   await app.type("label:Message", "keep the changelog in step");
   await app.submit("label:Message");
-  await app.waitFor("text:keep the changelog in step");
-  // The bubbles show in the order sent; the tray still lines up what steers first.
+  await app.type("label:Message", "then tag the release");
+  await app.keyboard.press("mod+enter");
+  await app.waitFor("label:Conversation >> text:then tag the release");
+  // The bubbles show in the order sent, each once: nothing lists them a second time over the composer.
   const texts = app.texts();
   expect(texts.indexOf("also update the readme")).toBeLessThan(texts.indexOf("keep the changelog in step"));
-  expect(texts.lastIndexOf("keep the changelog in step")).toBeLessThan(texts.lastIndexOf("also update the readme"));
-  expect(app.value("label:Message")).toBe("");
-  expect(texts.some((text) => /^Part \d+ of the plan$/.test(text))).toBe(true);
-
-  await app.press("label:Edit queued messages");
-  await app.waitUntil(() => app.value("label:Message") === "keep the changelog in step\n\nalso update the readme");
+  for (const text of ["also update the readme", "keep the changelog in step", "then tag the release"]) {
+    expect(texts.filter((item) => item === text).length).toBe(1);
+  }
   expect(app.count("label:Queued messages")).toBe(0);
-  // Recalled before delivery: their bubbles leave the conversation with the tray.
-  expect(app.count("label:Conversation >> text:keep the changelog in step")).toBe(0);
-  expect(app.count("label:Conversation >> text:also update the readme")).toBe(0);
+  expect(app.value("label:Message")).toBe("");
+  // Every waiting bubble carries its own controls.
+  await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 3);
+  expect(app.count("label:Edit queued message")).toBe(3);
+  expect(app.count("label:Remove from queue")).toBe(3);
+
+  // Edit the second one: it alone comes back as a draft, the others keep waiting.
+  await app.press("label:Edit queued message >> nth=1");
+  await app.waitUntil(() => app.value("label:Message") === "keep the changelog in step");
+  await app.waitUntil(() => app.count("label:Conversation >> text:keep the changelog in step") === 0);
+  await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 2);
+  expect(app.count("label:Conversation >> text:also update the readme")).toBe(1);
+  expect(app.count("label:Conversation >> text:then tag the release")).toBe(1);
+
+  // Remove the first: gone from the queue, and not into the composer.
+  await app.press("label:Remove from queue >> nth=0");
+  await app.waitUntil(() => app.count("label:Conversation >> text:also update the readme") === 0);
+  expect(app.value("label:Message")).toBe("keep the changelog in step");
+  await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 1);
   expect(app.texts().some((text) => /^Part \d+ of the plan$/.test(text))).toBe(true);
-});
+
+  // The one left is delivered in its turn, and only it.
+  await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 0, { timeout: 60000 });
+  await app.wait(3500);
+  expect(app.count("label:Conversation >> text:then tag the release")).toBe(1);
+  expect(app.count("label:Conversation >> text:also update the readme")).toBe(0);
+  expect(app.count("label:Conversation >> text:keep the changelog in step")).toBe(0);
+}, 120000);
 
 test("keeps a run going in the background when switching sessions, and resumes it", async () => {
   const app = await launch("slow");
@@ -524,22 +546,22 @@ test("preserves queued steering and follow-up messages across session switches a
   await app.type("label:Message", "keep the changelog in step");
   await app.submit("label:Message");
   await app.waitFor("text:keep the changelog in step");
-  expect(app.count("label:Queued messages")).toBeGreaterThan(0);
+  await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 2);
 
   // Switch to another session while Turn 1 is still streaming and 2 messages are queued.
   await app.press("id:sidebar-workspaces >> text:Refactor the transcript reducer");
   await app.waitFor("text:Here is the plan.");
-  expect(app.count("label:Queued messages")).toBe(0);
+  expect(app.count("label:Conversation >> text:Queued")).toBe(0);
 
-  // Switch back mid-run: the daemon replays `queue_update` so the queue tray is restored intact.
+  // Switch back mid-run: the daemon replays `queue_update`, and the waiting bubbles stand in the conversation again.
   await app.press("id:sidebar-workspaces >> text:make a plan");
-  await app.waitFor("label:Queued messages", { timeout: 10000 });
+  await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 2, { timeout: 10000 });
   const midTexts = app.texts();
   expect(midTexts).toContain("keep the changelog in step");
   expect(midTexts).toContain("also update the readme");
-  // Bubbles in the order sent, the restored tray in delivery order.
+  // Bubbles in the order sent, each once.
   expect(midTexts.indexOf("also update the readme")).toBeLessThan(midTexts.indexOf("keep the changelog in step"));
-  expect(midTexts.lastIndexOf("keep the changelog in step")).toBeLessThan(midTexts.lastIndexOf("also update the readme"));
+  expect(midTexts.filter((text) => text === "also update the readme").length).toBe(1);
 
   // Switch away again and let the session drain all queued messages in the background.
   await app.press("id:sidebar-workspaces >> text:Refactor the transcript reducer");
@@ -550,7 +572,7 @@ test("preserves queued steering and follow-up messages across session switches a
   await app.press("id:sidebar-workspaces >> text:make a plan");
   await app.waitFor("text:also update the readme", { timeout: 10000 });
   await app.waitFor("label:Send", { timeout: 10000 });
-  expect(app.count("label:Queued messages")).toBe(0);
+  expect(app.count("label:Conversation >> text:Queued")).toBe(0);
   const finalTexts = app.texts();
   expect(finalTexts).toContain("make a plan");
   expect(finalTexts).toContain("keep the changelog in step");
@@ -619,11 +641,11 @@ test("shows a message sent mid-run as a bubble in the conversation at once, and 
   await app.waitFor("text:Part 3 of the plan", { timeout: 30000 });
 
   // Sent while the reply still streams: the bubble joins the conversation under
-  // the turn's rows at once — the tray is no longer the only place it shows.
+  // the turn's rows at once — the only place it shows.
   await app.type("label:Message", "also check the tests");
   await app.submit("label:Message");
   await app.waitFor("label:Conversation >> text:also check the tests", { timeout: 5000 });
-  expect(app.count("label:Queued messages")).toBeGreaterThan(0);
+  expect(app.count("label:Edit queued message")).toBe(1);
   // Its bubble reads as waiting in line, not said into the run yet.
   expect(app.count("label:Conversation >> text:Queued")).toBe(1);
 
@@ -635,7 +657,7 @@ test("shows a message sent mid-run as a bubble in the conversation at once, and 
   // Delivered in turn: the same bubble is answered — never a second copy of it, no waiting mark left.
   await app.waitFor("label:Send", { timeout: 60000 });
   expect(app.count("label:Conversation >> text:also check the tests")).toBe(1);
-  expect(app.count("label:Queued messages")).toBe(0);
+  expect(app.count("label:Edit queued message")).toBe(0);
   expect(app.count("label:Conversation >> text:Queued")).toBe(0);
 }, 90000);
 

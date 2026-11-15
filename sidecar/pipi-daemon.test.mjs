@@ -41,6 +41,9 @@ if (process.argv[2] === "run" && process.argv[3] === "--format") {
 }
 
 const SESSION_DIR = ${JSON.stringify(sessionDir)};
+if (process.env.PIPI_MOCK_BOOTLOG) {
+  try { fs.appendFileSync(process.env.PIPI_MOCK_BOOTLOG, String(process.pid) + "\\n"); } catch {}
+}
 let seq = 0;
 let sessionFile = path.join(SESSION_DIR, \`sess-\${process.pid}-\${Date.now()}.jsonl\`);
 let messages = [];
@@ -1304,4 +1307,80 @@ test("a mid-run crash delivers what was queued, and session_send says queued hon
   const sendLive = await ctrl.call("tool", { name: "session_send", args: { session: idleOne.id, message: "to-the-living" } });
   assert.equal(sendLive.result.queued, false);
   await ctrl.waitUntil(async () => (await ctrl.readMessages(idleOne.id)).lastAnswer?.includes("to-the-living"));
+});
+
+test("a fresh attach adopts the standby the last attach warmed — invisibly, and only within its TTL", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-pool-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+  const bootlog = path.join(tmp, "boot.log");
+  const POOL_TTL = 1200;
+
+  const ctrl = await openControl(homeDir, { HOME: tmp, PIPI_MOCK_BOOTLOG: bootlog, PIPI_DAEMON_POOL_TTL_MS: String(POOL_TTL) });
+  t.after(async () => {
+    ctrl.client.close();
+    try {
+      const inst = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+      process.kill(inst.pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+
+  const spec = { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" };
+  const first = await ctrl.call("attach", { session: spec });
+  const sid1 = first.session.id;
+
+  // The attach warms a standby for the same spec in the background: the second
+  // mock agent boots without ever being announced as a session. The session's
+  // own process and the standby boot together, so the log's order is not the
+  // spawn's — sid1's own prompt says which pid is the session's.
+  const boots = await ctrl.waitUntil(() => {
+    try {
+      const lines = fs.readFileSync(bootlog, "utf8").trim().split("\n").filter(Boolean).map(Number);
+      return lines.length >= 2 ? lines : undefined;
+    } catch {
+      return undefined;
+    }
+  });
+  assert.equal(ctrl.sessions.size, 1, "the pooled standby is never pushed as a session");
+
+  ctrl.client.send({ type: "in", sessionId: sid1, line: JSON.stringify({ id: "p0", type: "prompt", message: "inspect-env" }) });
+  await ctrl.waitUntil(() => ctrl.events.some((e) => e.type === "out" && e.line?.includes("agent_settled")));
+  const read1 = await ctrl.readMessages(sid1);
+  const env1 = JSON.parse(read1.messages.at(-1).text);
+  const standby = boots.find((pid) => pid !== env1.pid);
+  assert.ok(standby, "the standby is the second booted process");
+
+  const second = await ctrl.call("attach", { session: spec });
+  const sid2 = second.session.id;
+  assert.notEqual(sid2, sid1);
+  assert.equal(ctrl.sessions.size, 2);
+
+  // The adopted session runs on the standby's already-booted process, and the
+  // process's own session id is the adopted session's.
+  ctrl.events.length = 0;
+  ctrl.client.send({ type: "in", sessionId: sid2, line: JSON.stringify({ id: "p1", type: "prompt", message: "inspect-env" }) });
+  await ctrl.waitUntil(() => ctrl.events.some((e) => e.type === "out" && e.line?.includes("agent_settled")));
+  const read2 = await ctrl.readMessages(sid2);
+  const env2 = JSON.parse(read2.messages.at(-1).text);
+  assert.equal(env2.pid, standby, "the fresh session adopted the standby process");
+  assert.equal(env2.sessionId, sid2);
+
+  // The adoption refills the pool once; that standby too stays invisible and
+  // expires with the TTL — the next fresh attach after it spawns on its own.
+  const boots3 = await ctrl.waitUntil(() => {
+    const lines = fs.readFileSync(bootlog, "utf8").trim().split("\n").filter(Boolean).map(Number);
+    return lines.length >= 3 ? lines : undefined;
+  });
+  await new Promise((resolve) => setTimeout(resolve, POOL_TTL + 800));
+  assert.equal(ctrl.sessions.size, 2, "an expired standby leaves no session behind");
+  const third = await ctrl.call("attach", { session: spec });
+  const sid3 = third.session.id;
+  ctrl.client.send({ type: "in", sessionId: sid3, line: JSON.stringify({ id: "p2", type: "prompt", message: "inspect-env" }) });
+  await ctrl.waitUntil(() => ctrl.events.filter((e) => e.type === "out" && e.line?.includes("agent_settled")).length >= 2);
+  const read3 = await ctrl.readMessages(sid3);
+  const env3 = JSON.parse(read3.messages.at(-1).text);
+  assert.ok(!boots3.includes(env3.pid), "an expired standby is not adopted — a fresh process took it");
 });

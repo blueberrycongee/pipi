@@ -904,7 +904,10 @@ export class Transcript {
   /**
    * Reconciles staged queued bubbles with the agent's queue: an entry still
    * queued keeps its bubble; one that left gets `dropAt` — it normally echoes
-   * back as delivered, and only a recall leaves it to `sweepDrops`.
+   * back as delivered, and only a recall leaves it to `sweepDrops`. An entry
+   * no bubble stands for (the queue of a session attached anew: its bubbles
+   * went with the screen that sent them) gets one — the conversation is where
+   * the queue is shown and taken back, so every entry must stand in it.
    */
   reconcileQueue(steering: readonly string[], followUp: readonly string[]) {
     const wireItems = [...steering, ...followUp];
@@ -928,6 +931,7 @@ export class Transcript {
     }
     let unmatchedWire = 0;
     for (const count of cover.values()) unmatchedWire += count;
+    const spare = unmatchedWire;
     for (const item of unmatched) {
       if (unmatchedWire > 0) {
         // A `/skill` or template-expanded prompt in the agent's queue no longer matches
@@ -944,6 +948,24 @@ export class Transcript {
       } else if (item.dropAt === undefined) {
         item.dropAt = now + QUEUE_ECHO_GRACE_MS;
         changed = true;
+      }
+    }
+    // A prompt sent as a fresh run that the agent queued instead is staged, not yet marked: a slot is its own.
+    unmatchedWire -= this.#staged.filter((item) => !item.queued).length;
+    if (unmatchedWire > 0) {
+      // The entries left over, in the order the queue will deliver them; the first `spare - unmatchedWire` stand already.
+      const left: string[] = [];
+      for (const raw of wireItems) {
+        const text = withoutHandoff(withoutImageNotes(raw));
+        const n = cover.get(text) ?? 0;
+        if (n <= 0) continue;
+        cover.set(text, n - 1);
+        left.push(text);
+      }
+      for (const text of left.slice(spare - unmatchedWire)) {
+        const id = this.stageUser(text, 0, true);
+        const item = id ? this.#staged.find((entry) => entry.row.id === id) : undefined;
+        if (item) item.queueAcked = true;
       }
     }
     if (changed) this.version++;

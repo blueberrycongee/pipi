@@ -224,6 +224,8 @@ function persistDeliveries(session) {
 }
 
 function pushSession(session) {
+  // A pooled standby is not a session yet: nothing outside may hear of it until an attach takes it.
+  if (session.pooled) return;
   const info = sessionInfo(session);
   persist({ type: "session_update", id: session.id, info });
   for (const conn of controlClients) send(conn, { type: "session", session: info });
@@ -233,7 +235,7 @@ function touch(session) {
   session.lastActive = now();
 }
 
-function createSession(spec) {
+function buildSession(spec) {
   const parent = spec.parentId ? sessions.get(spec.parentId) : undefined;
   const rawMode = isRuntimeMode(spec.runtimeMode) ? spec.runtimeMode : parent?.runtimeMode || "full-access";
   const runtimeMode = parent ? minMode(minMode(ancestorCeiling({ parentId: parent.id }), parent.runtimeMode), rawMode) : rawMode;
@@ -283,16 +285,30 @@ function createSession(spec) {
   if (session.file && !session.titleLocked && session.title === "New session") {
     session.title = titleOfFile(session.file) || session.title;
   }
+  return session;
+}
+
+/** Puts a built session into the registry: persisted, keyed by file, announced. */
+function registerSession(session) {
   sessions.set(session.id, session);
   if (session.file) sessionsByFile.set(session.file, session.id);
   persist({ type: "session", info: { ...sessionInfo(session), token: session.token, titleLocked: session.titleLocked || undefined }, launch: session.launch });
   pushSession(session);
+}
+
+function createSession(spec) {
+  const session = buildSession(spec);
+  registerSession(session);
   return session;
 }
 
 function setFile(session, file) {
   const next = file || undefined;
   if (session.file === next) return;
+  if (session.pooled) {
+    session.file = next;
+    return;
+  }
   if (session.file && sessionsByFile.get(session.file) === session.id) sessionsByFile.delete(session.file);
   session.file = next;
   if (next) sessionsByFile.set(next, session.id);
@@ -561,6 +577,83 @@ function killProcess(session) {
   }, 1500).unref?.();
 }
 
+// ── Warm pool ────────────────────────────────────────────────────────────────
+//
+// A fresh session's wait is mostly its agent's own boot: `pi --mode rpc` (or
+// the bridge) takes a moment before it answers. Each UI attach leaves one
+// standby process for the same launch spec already up, so the next fresh
+// session adopts it instead of spawning. A pooled session is not a session
+// yet: unregistered, unpersisted and unannounced until an attach takes it —
+// and one not taken inside `POOL_TTL_MS` is simply put down again.
+const POOL_TTL_MS = Number(process.env.PIPI_DAEMON_POOL_TTL_MS) > 0 ? Number(process.env.PIPI_DAEMON_POOL_TTL_MS) : 4 * 60_000;
+const POOL_LIMIT = 2;
+const pool = new Map();
+
+/** The launch-relevant shape of an attach spec: two specs adopt the same standby iff these match. */
+function poolKeyOf(spec) {
+  return JSON.stringify({
+    c: spec.cwd ?? "",
+    a: spec.agentId || "pi",
+    d: spec.driver || (spec.agentId === "pi" || !spec.agentId ? "pi" : spec.agentId),
+    m: isRuntimeMode(spec.runtimeMode) ? spec.runtimeMode : "full-access",
+    b: spec.binaryPath ?? null,
+    e: spec.extraArgs ?? null,
+    u: spec.customAgent ?? null,
+  });
+}
+
+function dropPooled(session) {
+  for (const [key, entry] of pool) {
+    if (entry.session !== session) continue;
+    clearTimeout(entry.timer);
+    pool.delete(key);
+    return true;
+  }
+  return false;
+}
+
+/** Hands a matching standby to `spec` as a registered session, or none. */
+function takePooled(spec) {
+  // Only the shapes `warmPool` makes standbys for: plain fresh sessions, no
+  // parent ceiling to recompute and no worktree the process was never told of.
+  if (spec.parentId || spec.worktree) return undefined;
+  const key = poolKeyOf(spec);
+  const entry = pool.get(key);
+  if (!entry) return undefined;
+  const session = entry.session;
+  if (!session.proc || session.proc.killed || !session.loaded) {
+    dropPooled(session);
+    return undefined;
+  }
+  pool.delete(key);
+  clearTimeout(entry.timer);
+  session.pooled = false;
+  if (spec.title) {
+    session.title = spec.title;
+    session.titleLocked = spec.titleLocked === true;
+  }
+  registerSession(session);
+  return session;
+}
+
+/** Spawns a standby process for `spec` — the boot the next fresh session would otherwise wait on. */
+function warmPool(spec) {
+  if (process.env.PIPI_DAEMON_POOL === "0") return;
+  if (!spec.cwd || spec.parentId || spec.worktree) return;
+  const key = poolKeyOf(spec);
+  if (pool.has(key) || pool.size >= POOL_LIMIT) return;
+  const session = buildSession({ ...spec, file: undefined, title: undefined, initiator: "user" });
+  session.pooled = true;
+  const timer = setTimeout(() => {
+    if (dropPooled(session)) killProcess(session);
+  }, POOL_TTL_MS);
+  timer.unref?.();
+  pool.set(key, { session, timer });
+  void startProcess(session).then((ok) => {
+    if (!ok) dropPooled(session);
+  });
+}
+
 function failSession(session, reason) {
   session.lastError = reason;
   const suppress = session.suppressStopDelivery;
@@ -575,6 +668,7 @@ function failSession(session, reason) {
 }
 
 function onSessionExit(session, code, signal, expected) {
+  dropPooled(session);
   session.loaded = false;
   pushSession(session);
   if (session.status === "working" || session.status === "blocked") {
@@ -1449,7 +1543,9 @@ async function controlOp(conn, msg) {
       } else if (spec.file && sessionsByFile.has(spec.file)) {
         session = sessions.get(sessionsByFile.get(spec.file));
       } else {
-        session = createSession({ ...spec, initiator: "user" });
+        // A fresh attach takes a matching standby when the pool has one — the
+        // process is already booted, so the session answers at once.
+        session = (!spec.id && !spec.file ? takePooled(spec) : undefined) ?? createSession({ ...spec, initiator: "user" });
         created = true;
       }
       // Re-key fileless sessions the moment a file is named for them.
@@ -1500,8 +1596,10 @@ async function controlOp(conn, msg) {
       session.attached.add(conn);
       conn.attachedSessions.add(session.id);
       respond(conn, id, "attached", { session: sessionInfo(session) });
+      // The session just opened is the best guess for the next fresh one: keep one like it up already.
+      void warmPool(spec);
       // Replay queued steering / follow-up messages so reattaching mid-run
-      // restores the QueueTray immediately.
+      // puts the waiting bubbles back in the conversation at once.
       if (session.pendingQueue.steering.length > 0 || session.pendingQueue.followUp.length > 0) {
         send(conn, {
           type: "out",
@@ -1745,6 +1843,12 @@ async function controlOp(conn, msg) {
         config.linger = msg.linger;
         checkWindowlessExit();
       }
+      // Standby processes were booted under the previous roster/tools config.
+      for (const entry of [...pool.values()]) {
+        clearTimeout(entry.timer);
+        killProcess(entry.session);
+      }
+      pool.clear();
       respond(conn, id, "ok", {});
       return;
     }
@@ -2200,6 +2304,16 @@ async function main() {
         } catch {}
       }
     }
+    for (const entry of pool.values()) {
+      clearTimeout(entry.timer);
+      if (entry.session.proc) {
+        entry.session.exitExpected = true;
+        try {
+          entry.session.proc.kill("SIGTERM");
+        } catch {}
+      }
+    }
+    pool.clear();
     persistQueue.length = 0;
     try {
       const tmpRegistry = `${REGISTRY_FILE}.tmp.${process.pid}`;

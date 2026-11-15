@@ -120,9 +120,10 @@ multi-agent orchestration, and settings.
   (`external-usage.test.mjs`, on `dev/fake-acp.mjs` with `FAKE_ACP_USAGE=1`)
 - `nsh test Shots.test.tsx --target macos` — screenshots of every state in
   `.nsh/shots/` (design review); `Gallery.test.tsx` does Pip and the icons
-- `nsh test QueueLook.test.tsx --target macos` — the queue's tray over the
-  composer while a long reply streams, in `.nsh/shots/queue-*.png` (the reply
-  must end clear of it)
+- `nsh test QueueLook.test.tsx --target macos` — the messages sent
+  into a long streaming reply, in `.nsh/shots/queue-*.png`: each a waiting
+  bubble in the conversation with its own edit and remove, none over the
+  composer; one taken back (`takeQueued`) leaves the others waiting
 - `nsh test UserFold.test.tsx` — a sent message laid out past six lines folds
   to a fading preview; the chevron at the bubble's foot opens and closes it
   (`--target macos` films `.nsh/shots/userfold-*.png`)
@@ -296,7 +297,7 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   delta: `scrollToEnd` passes through offset 0 on its way.
 - The conversation's foot is measured from the composer's figure (`footOf`,
   `figure` in `views/Chat.tsx`), never a constant: whatever stands on the
-  composer — the queue's tray, attachments, a long draft, an inline prompt —
+  composer — attachments, a long draft, an inline prompt —
   raises the end, the fade and "Jump to latest" together. When the foot
   rises under a following view, scroll to the end again (the effect beside
   `foot`): the list loses its place and paints blank otherwise. When it

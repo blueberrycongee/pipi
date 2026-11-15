@@ -45,7 +45,7 @@ test("scrolling up while a reply streams releases the view, and it holds", async
 
 test("a small upward scroll also releases the view", async () => {
   const app = await launch();
-  await streamTo(app, 6);
+  await streamTo(app, 10); // enough reply for the conversation to overflow the window
   await app.scroll("label:Conversation", -60);
   await app.waitFor(PILL, { timeout: 2000 });
   for (let i = 0; i < 6; i++) {

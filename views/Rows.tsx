@@ -5,7 +5,7 @@ import { Menu } from "nsh/desktop";
 import { clip, duration } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
 import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
-import type { Row, ToolRow } from "../pi/transcript";
+import { type Row, type ToolRow, withoutHandoff, withoutImageNotes } from "../pi/transcript";
 import {
   type ActivityRow,
   describeActiveStep,
@@ -19,12 +19,13 @@ import {
   thinkingLabel,
   type TurnHeaderRow,
 } from "../pi/turns";
-import { conversationKey, copyMessage, copyText, daemonSessionOfId, forkFrom, openDaemonSession, transcriptRows } from "../store/app";
+import { conversationKey, copyMessage, copyText, daemonSessionOfId, forkFrom, messageQueue, openDaemonSession, takeQueued, transcriptRows } from "../store/app";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS } from "../ui/styles";
+import { tip } from "../ui/Tip";
 import { clearProseState, PROSE, ProseBlock, type ProseRow } from "./Prose";
 
 /**
@@ -409,6 +410,12 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   const fold = () => toggle(props.row.id, false);
   /** The queue still holds this message: its bubble stands where it was sent, but reads as waiting — not said into the run yet. */
   const queued = () => props.row.queued === true;
+  /** How it will go: into the run at its next step, or after the run is done. The queue keeps wire text; the row's is stripped. */
+  const followsUp = () => {
+    const said = (wire: string) => withoutHandoff(withoutImageNotes(wire));
+    const q = messageQueue();
+    return q.followUp.some((wire) => said(wire) === props.row.text) && !q.steering.some((wire) => said(wire) === props.row.text);
+  };
   return (
     <View class="group items-end">
       <View
@@ -419,7 +426,12 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
             [
               { label: tr("Copy", "复制"), onSelect: () => void copyText(props.row.text) },
               // There is nothing in the session to fork at until the agent takes the message.
-              ...(queued() ? [] : [{ label: tr("Fork From Here", "从此处创建分支"), onSelect: () => void forkFrom(ordinal()) }]),
+              ...(queued()
+                ? [
+                    { label: tr("Edit", "编辑"), onSelect: () => void takeQueued(props.row.id, true) },
+                    { label: tr("Remove From Queue", "从队列中移除"), onSelect: () => void takeQueued(props.row.id, false) },
+                  ]
+                : [{ label: tr("Fork From Here", "从此处创建分支"), onSelect: () => void forkFrom(ordinal()) }]),
             ],
             e.pagePosition,
           )
@@ -473,11 +485,32 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
       </View>
       {/* Shown while the pointer is on the message (or just after a copy), so the bubbles stay quiet. */}
       <View class="h-6 select-none flex-row items-center gap-1.5 pt-0.5">
+        {/* A waiting message is still the reader's: each one is taken back from its own bubble, to write again or to drop. */}
         <If when={queued()}>
-          <View class="flex-row items-center gap-1 pr-1">
-            <Icon name="queue" size={12} tone="subtle" />
+          <View
+            class="flex-row items-center gap-1 pr-1"
+            accessibilityLabel={followsUp() ? tr("Follow-up", "追问") : tr("Steering", "引导")}
+            tooltip={tip(followsUp() ? tr("Follow-up: sent when the run is done", "追问：本轮结束后发送") : tr("Steering: sent at the run's next step", "引导：在本轮的下一步发送"))}
+          >
+            <Icon name={followsUp() ? "queue" : "steer"} size={12} tone="subtle" />
             <Text class="text-xs text-subtle">{tr("Queued", "排队中")}</Text>
           </View>
+          <IconButton
+            icon="pencil"
+            tone="subtle"
+            size="sm"
+            tipPlacement="bottom"
+            label={tr("Edit queued message", "编辑排队消息")}
+            onPress={() => void takeQueued(props.row.id, true)}
+          />
+          <IconButton
+            icon="x"
+            tone="subtle"
+            size="sm"
+            tipPlacement="bottom"
+            label={tr("Remove from queue", "从队列中移除")}
+            onPress={() => void takeQueued(props.row.id, false)}
+          />
         </If>
         <If when={props.row.text}>
           <CopyButton

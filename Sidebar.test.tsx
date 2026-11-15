@@ -423,3 +423,43 @@ test("a session in Recent keeps its place when it takes a message; only a new on
   await frames(app, () => 0);
   expect(recent()).toEqual(titles);
 });
+
+test("a child session archives from its row in the tree, and comes back when restored", async () => {
+  const app = await launch("welcome");
+  await app.waitFor("text:What are we building?");
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+  const roots = app.count("id:sidebar-workspaces >> label:Archive");
+
+  await app.keyboard.press("mod+shift+o");
+  await app.waitFor("text:Compare Agents");
+  await app.type("label:Comparison task", "Audit security and add rate limiting");
+  await app.press("text:Launch Comparison");
+  const title = "Claude Code · Audit security and add rate limiting";
+  const sibling = "Pi · Audit security and add rate limiting";
+  await app.waitUntil(() => app.count(`id:sidebar-workspaces >> text:${title}`) === 1);
+  // Its transcript is what the archive keeps: each child's row offers Archive once it has one.
+  await app.waitUntil(() => app.count("id:sidebar-workspaces >> label:Archive") === roots + 3, { timeout: 20000 });
+
+  // The children hang under the second saved row, in the order started: Pi, Claude Code, Codex.
+  // The action shows (and only answers a press) while its row sits under the pointer.
+  await app.hover(`id:sidebar-workspaces >> text:${title}`);
+  await app.press("id:sidebar-workspaces >> label:Archive >> nth=3");
+  await app.waitUntil(() => app.count(`id:sidebar-workspaces >> text:${title}`) === 0);
+  // It left both trees, its siblings stay, and it is in the archive.
+  expect(app.count(`id:sidebar-recents >> text:${title}`)).toBe(0);
+  expect(app.count(`id:sidebar-workspaces >> text:${sibling}`)).toBe(1);
+  expect(app.count(`id:sidebar-recents >> text:${sibling}`)).toBe(1);
+  // In the archive it reads as any saved session does: by its own title.
+  await app.waitFor("text:Archived");
+  const saved = "id:sidebar-archived >> text:Audit security and add rate limiting";
+  if (app.count(saved) === 0) await app.press("text:Archived");
+  await app.waitUntil(() => app.count(saved) === 1);
+
+  // Restored from the archive, it hangs under its parent again.
+  await app.hover(saved);
+  await app.press("id:sidebar-archived >> label:Unarchive");
+  await app.waitUntil(() => app.count(`id:sidebar-workspaces >> text:${title}`) === 1);
+  expect(app.count(`id:sidebar-recents >> text:${title}`)).toBe(1);
+  expect(app.count(saved)).toBe(0);
+}, 60000);

@@ -1,5 +1,5 @@
-// The queue's tray over the composer while a long reply streams: what stands at
-// the foot of the conversation, and that the reply ends clear of it.
+// The messages sent into a long streaming reply: waiting bubbles at the foot of
+// the conversation, each with its own edit and remove, and one taken back.
 //
 //   nsh test QueueLook.test.tsx --target macos   # writes .nsh/shots/queue-*.png
 import { open, test } from "nsh/test";
@@ -29,7 +29,7 @@ test("queue over a streaming reply", async () => {
     await queue("and tag the release");
     await app.paste("label:Message", { files: ["icon.png"] });
     await app.screenshot(`.nsh/shots/queue-more-${scheme}.png`);
-    await app.press("label:Edit queued messages");
+    await app.press("label:Edit queued message >> nth=1");
     await app.wait(400);
     await app.screenshot(`.nsh/shots/queue-recalled-${scheme}.png`);
   }

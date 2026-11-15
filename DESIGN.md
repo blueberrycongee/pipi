@@ -214,12 +214,15 @@ button is the next step, not the composer.
 What belongs to the composer but is not the draft stands on it as a tray
 risen from behind its top edge: 16 in from either side, the top corners
 `rounded-2xl`, a hairline on three sides, `bg-card` a step more see-through
-than the composer, tucked 8 under it. Attachments have one, and so do the
-messages sent during a run (`QueueTray`, `views/Composer.tsx`): a 28pt line
-each in `text-sm` `muted-foreground`, in the order they go, an icon saying
-what each will do (steer, follow up), three at most and the rest counted.
-The queue is taken back as one, so its pencil stands beside the lines, not
-on one. The composer itself keeps its size: only the draft grows it.
+than the composer, tucked 8 under it. Attachments have one. The composer
+itself keeps its size: only the draft grows it.
+
+The messages sent during a run are not listed there: each is a bubble in the
+conversation, where it was sent, and said once. A waiting bubble is dimmed
+(`opacity-60`), and the line under it is its control surface, always shown
+while it waits: an icon saying what it will do (steer, follow up), "Queued",
+a pencil that takes that one message back into the composer and an ✕ that
+drops it (`takeQueued`, `store/app.ts`). Every waiting message has its own.
 
 The conversation ends 16 above the composer's top edge (`footOf`,
 `views/Chat.tsx`), and the activity line's 36pt slot is the last thing in it:

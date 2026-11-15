@@ -29,6 +29,9 @@ export type Language = "system" | "en" | "zh";
 export const AUTO_ARCHIVE_DAYS = [0, 7, 14, 30, 90] as const;
 export type AutoArchiveDays = (typeof AUTO_ARCHIVE_DAYS)[number];
 export type AgentSendScope = "all" | "children";
+/** What the composer sends on a send press: the Enter default, an interrupt, or a queue. */
+export type SendMode = "send" | "interrupt" | "queue";
+export const SEND_MODES: readonly SendMode[] = ["send", "interrupt", "queue"];
 export const SESSION_TREE_DEPTHS = [1, 2, 3] as const;
 export type SessionTreeDepth = (typeof SESSION_TREE_DEPTHS)[number];
 export const SESSION_TREE_MAX = [4, 8, 16] as const;
@@ -39,6 +42,11 @@ export interface ArchivedSessionMeta {
   archivedAt: number;
   /** Working directory of the project that owns this session. */
   cwd?: string;
+  /**
+   * The file was deleted. A session the daemon started under another keeps its
+   * record there, file and all, so the mark stays: its row never comes back.
+   */
+  gone?: true;
 }
 
 /** What the user last picked on one agent's pickers; every fresh session on that agent restores it. */
@@ -87,6 +95,8 @@ interface Prefs {
   sessionTreeMax: SessionTreeMax;
   /** Whether sessions keep running (the session daemon stays up) after the window closes. */
   runInBackground: boolean;
+  /** The send button's behavior (`"send"` | `"interrupt"` | `"queue"`), picked from its chevron menu. */
+  sendMode: SendMode;
   /** Per-agent binary path / launch flag overrides. */
   agentOverrides: Record<string, AgentOverride>;
   /** User-configured custom ACP / CLI coding agents. */
@@ -147,6 +157,7 @@ const DEFAULTS: Prefs = {
   sessionTreeDepth: 2,
   sessionTreeMax: 8,
   runInBackground: false,
+  sendMode: "send",
   agentOverrides: {},
   customAgents: [],
   agentSessionChoices: {},
@@ -184,6 +195,7 @@ function normalizeArchivedSessions(raw: unknown): Record<string, ArchivedSession
       out[path] = {
         archivedAt: typeof m.archivedAt === "number" ? m.archivedAt : 0,
         ...(typeof m.cwd === "string" && m.cwd ? { cwd: m.cwd } : {}),
+        ...(m.gone === true ? { gone: true as const } : {}),
       };
     }
   }
@@ -266,6 +278,7 @@ export async function loadPrefs() {
           ? (parsed.autoArchiveDays as AutoArchiveDays)
           : 0,
         sidebarWidth: typeof parsed.sidebarWidth === "number" ? clampSidebarWidth(parsed.sidebarWidth) : SIDEBAR_DEFAULT_WIDTH,
+        sendMode: SEND_MODES.includes(parsed.sendMode as SendMode) ? (parsed.sendMode as SendMode) : "send",
         wallpaper: normalizedWallpaper,
         // Stored choices the feature gate does not currently offer stay stored —
         // hiding a feature must not delete what the user picked; the accessors
@@ -353,6 +366,7 @@ export const agentSendScope = () => prefs().agentSendScope;
 export const sessionTreeDepth = () => prefs().sessionTreeDepth;
 export const sessionTreeMax = () => prefs().sessionTreeMax;
 export const runInBackground = () => prefs().runInBackground;
+export const sendMode = () => prefs().sendMode;
 export const storedAgentOverrides = () => prefs().agentOverrides;
 export const storedCustomAgents = () => prefs().customAgents;
 export const storedSessionChoice = (agentId: string): AgentSessionChoice | undefined => prefs().agentSessionChoices[agentId];
@@ -429,6 +443,10 @@ function notifyDaemonPrefs() {
 
 export function setPreferredRuntimeMode(mode: RuntimeMode) {
   change({ runtimeMode: mode });
+}
+
+export function setSendMode(mode: SendMode) {
+  change({ sendMode: mode });
 }
 
 export function setWorktreeIsolationDefault(enabled: boolean) {
@@ -549,6 +567,13 @@ export function archiveSessionsBatch(entries: readonly { path: string; cwd?: str
 
 export function clearArchivedSessionPref(path: string) {
   setSessionArchived(path, false);
+}
+
+/** Keeps a deleted session out of every list for good (`ArchivedSessionMeta.gone`). */
+export function markArchivedSessionGone(path: string) {
+  if (!path) return;
+  const current = prefs().archivedSessions;
+  change({ archivedSessions: { ...current, [path]: { archivedAt: current[path]?.archivedAt ?? Date.now(), gone: true } } });
 }
 
 export function setAutoArchiveDays(days: AutoArchiveDays) {

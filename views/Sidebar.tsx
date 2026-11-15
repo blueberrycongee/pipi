@@ -12,6 +12,7 @@ import {
   activeAgentId,
   activeProjectPath,
   archivedSessionItems,
+  archiveDaemonSession,
   archiveSession,
   availableAgents,
   childSessionsOf,
@@ -239,6 +240,8 @@ const allRecents = computed<RecentItem[]>(() => {
   const tops = new Map<string, DaemonSession>();
   for (const ds of daemonSessions()) {
     if (ds.file && listed.has(ds.file)) continue;
+    // Archived from its tree: it is in 已归档, and leads no row here.
+    if (isSessionArchived(ds.file)) continue;
     const { claimed, top } = daemonTreePlace(ds, listed);
     if (claimed || top.id !== ds.id) continue;
     if (ds.id === currentDaemonId() && isDraftSession()) continue;
@@ -845,6 +848,8 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
     if (!nested()) return 0;
     return props.group === "recents" ? Math.max(0, session().depth - 1) : Math.max(1, session().depth);
   };
+  /** Its transcript is what the archive keeps: a session that has none yet has nothing to put there. */
+  const archivable = () => file() !== undefined;
   return (
     <View class={hoverGroup()} onContextMenu={(e) => Menu.popup(childMenuItems(session()), e.pagePosition)}>
       <BaseButton
@@ -865,15 +870,16 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
           sessionRowClass(
             props.group === "workspaces" || nested(),
             working() || unread() || failed(),
-            false,
+            archivable(),
             rowDepth(),
+            working(),
           ),
         )}
       >
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{session().title}</Text>
       </BaseButton>
-      <View class={TRAILING_SLOT}>
+      <View class={working() || !archivable() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`}>
         <Presence
           show={working() && !blocked()}
           testID="sidebar-child-running"
@@ -906,6 +912,19 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
           <View class="size-1.5 rounded-full bg-brand" />
         </Presence>
       </View>
+      <If when={archivable()}>
+        <IconButton
+          icon="archive"
+          size="sm"
+          label={tr("Archive", "归档")}
+          tipPlacement="right"
+          onPress={() => {
+            animateSidebarList();
+            void archiveDaemonSession(session().id);
+          }}
+          class={`absolute ${working() ? "right-7" : "right-1"} top-0.5 transition-opacity ${inert(HOVER_REVEAL)}`}
+        />
+      </If>
     </View>
   );
 }
@@ -926,7 +945,7 @@ function statusLabel(status: DaemonSession["status"]) {
   }
 }
 
-/** A nested session's right-click: open it, or stop it outright. */
+/** A nested session's right-click: open it, stop it outright, or archive it out of its tree. */
 function childMenuItems(session: DaemonSession): MenuItem[] {
   return [
     { label: tr("Open", "打开"), onSelect: () => openDaemonSession(session.id) },
@@ -934,6 +953,14 @@ function childMenuItems(session: DaemonSession): MenuItem[] {
       label: tr("Stop session", "停止会话"),
       disabled: session.status !== "working" && session.status !== "blocked",
       onSelect: () => void stopDaemonSession(session.id),
+    },
+    {
+      label: tr("Archive", "归档"),
+      disabled: !session.file,
+      onSelect: () => {
+        animateSidebarList();
+        void archiveDaemonSession(session.id);
+      },
     },
   ];
 }

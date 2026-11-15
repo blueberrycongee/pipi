@@ -1572,3 +1572,26 @@ test("roughUserLines calibrates grapheme clusters for CJK, Latin, and surrogate/
   // Explicit >6 hard line breaks are detected directly via `hardBreakLines`.
   expect(hardBreakLines("1\n2\n3\n4\n5\n6\n7")).toBe(7);
 });
+
+test("a queue no bubble stands for gets its bubbles: the conversation is where the queue shows", () => {
+  const t = new Transcript();
+  t.load([{ role: "user", content: "make a plan", timestamp: 1 }], true);
+  // Attached anew mid-run: the daemon replays the queue, and nothing was staged on this screen.
+  t.reconcileQueue(["steer this"], ["follow up on this", '<pipi-message from="s1" title="Child" agent="Pi" status="done">\ndone\n</pipi-message>']);
+  const waiting = () => t.rows().filter((r) => r.kind === "user" && r.queued).map((r) => (r.kind === "user" ? r.text : ""));
+  expect(waiting()).toEqual(["steer this", "follow up on this"]);
+  // The same queue again adds nothing; an entry going leaves its bubble to the echo or the grace.
+  t.reconcileQueue(["steer this"], ["follow up on this"]);
+  expect(waiting()).toEqual(["steer this", "follow up on this"]);
+  t.apply({ type: "message_start", message: { role: "user", content: "steer this", timestamp: 2 } });
+  t.reconcileQueue([], ["follow up on this"]);
+  expect(waiting()).toEqual(["follow up on this"]);
+  expect(t.rows().filter((r) => r.kind === "user")).toHaveLength(3);
+
+  // A prompt sent as a fresh run that the agent queued: its own bubble takes the slot, no second one.
+  const late = new Transcript();
+  const id = late.stageUser("one more thing", 0);
+  late.reconcileQueue([], ["one more thing, expanded"]);
+  late.markStagedQueued(id);
+  expect(late.rows().filter((r) => r.kind === "user")).toHaveLength(1);
+});
