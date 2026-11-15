@@ -1080,7 +1080,7 @@ fn luma(c: vec3f) -> f32 {
 }
 
 fn paperColor(dark: f32) -> vec3f {
-  return select(vec3f(0.973, 0.965, 0.945), vec3f(0.067, 0.067, 0.063), dark > 0.5);
+  return select(vec3f(0.973, 0.965, 0.945), vec3f(0.086, 0.086, 0.082), dark > 0.5);
 }
 
 fn snapUv(uv: vec2f, size: vec2f, stepPx: vec2f) -> vec2f {

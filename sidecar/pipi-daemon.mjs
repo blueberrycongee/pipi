@@ -592,6 +592,8 @@ function onSessionExit(session, code, signal, expected) {
     pushSession(session);
     resolveWaiters(session);
     checkWindowlessExit();
+    // Queued deliveries still own a wake-up: put the process back for them.
+    if (!expected && session.deliverQueue.length > 0) void revive(session);
     return;
   }
   session.suppressStopDelivery = false;
@@ -603,6 +605,7 @@ function onSessionExit(session, code, signal, expected) {
   }
   resolveWaiters(session);
   checkWindowlessExit();
+  if (!expected && session.deliverQueue.length > 0) void revive(session);
 }
 
 // ── Wire-level routing ───────────────────────────────────────────────────────
@@ -905,33 +908,39 @@ function deliverToInitiator(from, text, status, explicitTarget) {
   deliverMessage(target, envelope(from, text, status), returnInitiatorFor(target, from.id));
 }
 
-/** Puts a `<pipi-message>` into `target`: now if it can take it, queued otherwise. */
+/** Puts a `<pipi-message>` into `target`: now if it can take it, queued otherwise. True when it queued. */
 function deliverMessage(target, text, initiator) {
   if (target.status === "failed" || target.status === "interrupted") {
     target.deliverQueue.push({ text, initiator });
     persistDeliveries(target);
     void revive(target);
-    return;
+    return true;
   }
   if (target.status === "working" || target.status === "blocked") {
     target.deliverQueue.push({ text, initiator });
     persistDeliveries(target);
-    return;
+    return true;
   }
   if (!target.loaded) {
     target.deliverQueue.push({ text, initiator });
     persistDeliveries(target);
     void revive(target);
-    return;
+    return true;
   }
-  writePrompt(target, text, initiator);
+  if (!writePrompt(target, text, initiator)) {
+    // The pipe died between the check and the write — queue it for the revive.
+    target.deliverQueue.push({ text, initiator });
+    persistDeliveries(target);
+    void revive(target);
+    return true;
+  }
+  return false;
 }
 
 async function revive(session) {
   const ok = await startProcess(session);
   if (!ok) {
-    session.deliverQueue.length = 0;
-    persistDeliveries(session);
+    // Keep the queue — the next delivery or a restart hands it over.
     resolveWaiters(session);
     return;
   }
@@ -940,13 +949,16 @@ async function revive(session) {
 
 function flushDeliveries(session) {
   if (!session.loaded || session.status === "working" || session.status === "blocked") return;
+  if (!session.deliverQueue.length) return;
   const queue = session.deliverQueue.splice(0);
-  if (!queue.length) return;
-  persistDeliveries(session);
   const explicit = [...queue].reverse().find((item) => item.initiator && item.initiator !== "user");
   const initiator = explicit ? explicit.initiator : queue[queue.length - 1].initiator;
   const text = queue.map((item) => item.text).join("\n\n");
-  writePrompt(session, text, initiator);
+  if (!writePrompt(session, text, initiator)) {
+    // Restore — the exit's revive or a later delivery retries instead of losing it.
+    session.deliverQueue.push(...queue);
+  }
+  persistDeliveries(session);
 }
 
 function notifyBlocked(session) {
@@ -1196,8 +1208,7 @@ async function callSessionTool(caller, name, args = {}) {
         target.initiator = sender;
         return { id: target.id, steered: true };
       }
-      const queued = target.status === "working" || target.status === "blocked";
-      deliverMessage(target, text, sender);
+      const queued = deliverMessage(target, text, sender);
       return { id: target.id, queued };
     }
     case "session_start": {
@@ -1484,6 +1495,7 @@ async function controlOp(conn, msg) {
           respondError(conn, id, session.lastError || `${session.agentName} could not start`);
           return;
         }
+        flushDeliveries(session);
       }
       session.attached.add(conn);
       conn.attachedSessions.add(session.id);

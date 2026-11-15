@@ -184,6 +184,14 @@ async function runSingleTurn(promptText) {
     await new Promise(() => {});
   }
 
+  if (cmdText.startsWith("die:")) {
+    // Crash mid-run on its own: agent_start went out, then the process exits —
+    // an exit the daemon never asked for.
+    const ms = Number(cmdText.slice(4)) || 300;
+    setTimeout(() => process.exit(1), ms);
+    await new Promise(() => {});
+  }
+
   if (cmdText.startsWith("slow:")) {
     const [, msStr, ...rest] = cmdText.split(":");
     const ms = Number(msStr) || 500;
@@ -1247,4 +1255,53 @@ test("stop puts down a bridge that answers abort but never settles its run", asy
   await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.status === "idle", 10000);
   const read = await ctrl.readMessages(sid);
   assert.equal(read.messages.at(-1).text, "echo:back from the dead");
+});
+
+test("a mid-run crash delivers what was queued, and session_send says queued honestly", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-crash-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+
+  const ctrl = await openControl(homeDir, { HOME: tmp });
+  t.after(async () => {
+    ctrl.client.close();
+    try {
+      const inst = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+      process.kill(inst.pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+
+  // The run dies on its own while a delivery sits in the queue: the exit must
+  // put the process back and hand the queued message over — not strand it.
+  const crashRes = await ctrl.call("start_session", {
+    input: { title: "Crashy", agentId: "pi", cwd: workDir, message: "die:400" },
+  });
+  const crashy = crashRes.session;
+  await ctrl.waitUntil(() => ctrl.sessions.get(crashy.id)?.status === "working");
+  const sendRes = await ctrl.call("tool", { name: "session_send", args: { session: crashy.id, message: "land-after-crash" } });
+  assert.equal(sendRes.result.queued, true);
+  await ctrl.waitUntil(async () => {
+    const r = await ctrl.readMessages(crashy.id);
+    return r.lastAnswer?.includes("land-after-crash") && ctrl.sessions.get(crashy.id)?.status === "idle";
+  }, 15_000);
+
+  // A killed/unloaded target queues behind a revive — the receipt says so.
+  const idleRes = await ctrl.call("start_session", {
+    input: { title: "IdleOne", agentId: "pi", cwd: workDir, message: "echo:hi" },
+  });
+  const idleOne = idleRes.session;
+  await ctrl.call("wait", { sessionId: idleOne.id });
+  await ctrl.call("kill", { sessionId: idleOne.id });
+  await ctrl.waitUntil(() => ctrl.sessions.get(idleOne.id)?.loaded === false);
+  const sendDead = await ctrl.call("tool", { name: "session_send", args: { session: idleOne.id, message: "to-the-dead" } });
+  assert.equal(sendDead.result.queued, true, "a dead target is queued behind its revive, not sent");
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(idleOne.id)).lastAnswer?.includes("to-the-dead"));
+
+  // And an idle+loaded target is sent at once — the receipt says that too.
+  const sendLive = await ctrl.call("tool", { name: "session_send", args: { session: idleOne.id, message: "to-the-living" } });
+  assert.equal(sendLive.result.queued, false);
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(idleOne.id)).lastAnswer?.includes("to-the-living"));
 });

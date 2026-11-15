@@ -242,7 +242,7 @@ fn shade(uv: vec2f) -> vec4f {
   let t = nsh.time + uniforms.phase;
   let dark = uniforms.dark > 0.5;
   let live = clamp(uniforms.energy, 0.0, 1.0);
-  let paper = select(vec3f(0.987, 0.990, 0.995), vec3f(0.055, 0.062, 0.074), dark);
+  let paper = select(vec3f(0.987, 0.990, 0.995), vec3f(0.075, 0.082, 0.094), dark);
   let ink = select(vec3f(0.123, 0.178, 0.781), vec3f(0.742, 0.816, 1.000), dark);
   let wash = select(vec3f(0.506, 0.610, 0.891), vec3f(0.135, 0.223, 0.632), dark);
 
