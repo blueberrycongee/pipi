@@ -488,6 +488,8 @@ export function Composer() {
   });
 
   const sendMenuOpen = signal(false);
+  /** When a press closed the menu as an outside press, so the button it landed on doesn't reopen it on release. */
+  let sendMenuClosedAt = 0;
   const wireMode = () => (sendMode() === "queue" ? ("followUp" as const) : ("steer" as const));
   /** A send press: an explicit mode wins; otherwise the menu's choice decides. */
   const fireSend = (mode?: "steer" | "followUp") => void send(mode ?? wireMode());
@@ -623,7 +625,7 @@ export function Composer() {
         <ExtensionPrompt />
         <SlashMenu menu={slash} onChoose={choose} />
         <AttachmentTray />
-        <View class={`rounded-[22px] corner-squircle ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
+        <View class={`relative rounded-[22px] corner-squircle ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
           <ExtensionLines below={false} />
           <Input
             ref={input}
@@ -652,11 +654,17 @@ export function Composer() {
             autoCapitalize="none"
             autoCorrect={false}
             disabled={sidecarPhase().name === "failed"}
-            placeholder={placeholder()}
             accessibilityLabel={tr("Message", "消息")}
-            class="mx-4 mt-4 text-md text-foreground caret-brand placeholder:text-subtle"
+            class="mx-4 mt-4 text-md text-foreground caret-brand"
             style={{ height: height() }}
           />
+          {/* The hint is app-drawn, not the host's placeholder: host text re-rasterizes at
+              integer offsets under the dock's transform and visibly steps a frame late. */}
+          <If when={composerDraft().length === 0}>
+            <View class="pointer-events-none absolute left-4 right-4 top-4">
+              <Text class="truncate text-md text-subtle">{placeholder()}</Text>
+            </View>
+          </If>
           <ExtensionLines below />
           <View class="flex-row items-end justify-between gap-2 pb-2 pl-2.5 pr-2 pt-2">
             <View class="min-w-0 flex-1 flex-row flex-wrap items-center gap-0.5">
@@ -675,7 +683,10 @@ export function Composer() {
                   else={
                     <View class={`h-7 shrink-0 flex-row items-stretch rounded-full shadow-sm ${canSend() && hasText() ? "bg-primary" : "bg-muted shadow-none"}`}>
                       <BaseButton
-                        onPress={() => submit()}
+                        onPress={() => {
+                          sendMenuOpen.set(false);
+                          submit();
+                        }}
                         disabled={!canSend() || !hasText()}
                         accessibilityLabel={sendLabel()}
                         tooltip={tip(sendTipText(), "enter", "top")}
@@ -684,51 +695,21 @@ export function Composer() {
                         <Icon name="arrowUp" tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
                       </BaseButton>
                       <View class={`my-1.5 w-px ${canSend() && hasText() ? "bg-brand-foreground/25" : "bg-foreground/10"}`} />
-                      <Popover
-                        open={sendMenuOpen()}
-                        onOpenChange={(e) => sendMenuOpen.set(e.open)}
-                        placement="top"
-                        align="end"
-                        offset={8}
-                        margin={12}
-                        popupClass={`w-64 p-1 ${POPUP}`}
-                        popupStyle={popupStyle("top", "end")}
-                        popupStartingStyle={popupHiddenStyle("top", "end")}
-                        popupEndingStyle={popupLeavingStyle("top", "end")}
-                        trigger={
-                          <BaseButton
-                            disabled={!canSend()}
-                            accessibilityLabel={tr("Send options", "发送选项")}
-                            tooltip={tip(tr("Send options", "发送选项"), undefined, "top")}
-                            class={`w-6 items-center justify-center rounded-r-full ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:hover:bg-transparent`}
-                          >
-                            <Icon name="chevronDown" size={12} tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
-                          </BaseButton>
-                        }
+                      <BaseButton
+                        onPress={() => {
+                          if (Date.now() - sendMenuClosedAt < 400) {
+                            sendMenuClosedAt = 0;
+                            return;
+                          }
+                          sendMenuOpen.update((v) => !v);
+                        }}
+                        disabled={!canSend()}
+                        accessibilityLabel={tr("Send options", "发送选项")}
+                        tooltip={sendMenuOpen() ? undefined : tip(tr("Send options", "发送选项"), undefined, "top")}
+                        class={`w-6 items-center justify-center rounded-r-full ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:hover:bg-transparent`}
                       >
-                        <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
-                          {tr("Send", "发送")}
-                        </Text>
-                        <Each of={SEND_MODES}>
-                          {(mode) => {
-                            const meta = () => sendModeText(mode());
-                            return (
-                              <BaseButton
-                                selected={mode() === sendMode()}
-                                onPress={() => pickSendMode(mode())}
-                                class={`min-h-9 flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
-                              >
-                                <Icon name={meta().icon} size={15} tone={mode() === sendMode() ? "foreground" : "muted-foreground"} />
-                                <View class="min-w-0 flex-1">
-                                  <Text class="truncate text-base text-foreground">{meta().label}</Text>
-                                  <Text class="truncate text-xs text-subtle">{meta().hint}</Text>
-                                </View>
-                                <View class="w-4 shrink-0 items-center">{mode() === sendMode() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
-                              </BaseButton>
-                            );
-                          }}
-                        </Each>
-                      </Popover>
+                        <Icon name="chevronDown" size={12} tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
+                      </BaseButton>
                     </View>
                   }
                 >
@@ -745,6 +726,52 @@ export function Composer() {
             </View>
           </View>
         </View>
+        {/* The send menu's anchor: an invisible column at the composer's right edge,
+            so the menu stands on the box's top-right corner like the surfaces that
+            rise from behind its top edge, rather than straddling it off the pill.
+            It takes no presses — they reach the send controls below — so the chevron
+            press that closes it as an outside press must not reopen it on release
+            (`sendMenuClosedAt`). */}
+        <Popover
+          open={sendMenuOpen()}
+          onOpenChange={(e) => {
+            if (!e.open && e.reason === "pressOutside") sendMenuClosedAt = Date.now();
+            sendMenuOpen.set(e.open);
+          }}
+          placement="top"
+          align="end"
+          offset={8}
+          margin={12}
+          class="pointer-events-none absolute bottom-0 right-0 top-0 w-10"
+          popupClass={`w-64 p-1 ${POPUP}`}
+          popupStyle={popupStyle("top", "end")}
+          popupStartingStyle={popupHiddenStyle("top", "end")}
+          popupEndingStyle={popupLeavingStyle("top", "end")}
+          trigger={<View class="pointer-events-none absolute bottom-0 right-0 top-0 w-10" />}
+        >
+          <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
+            {tr("Send", "发送")}
+          </Text>
+          <Each of={SEND_MODES}>
+            {(mode) => {
+              const meta = () => sendModeText(mode());
+              return (
+                <BaseButton
+                  selected={mode() === sendMode()}
+                  onPress={() => pickSendMode(mode())}
+                  class={`min-h-9 flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+                >
+                  <Icon name={meta().icon} size={15} tone={mode() === sendMode() ? "foreground" : "muted-foreground"} />
+                  <View class="min-w-0 flex-1">
+                    <Text class="truncate text-base text-foreground">{meta().label}</Text>
+                    <Text class="truncate text-xs text-subtle">{meta().hint}</Text>
+                  </View>
+                  <View class="w-4 shrink-0 items-center">{mode() === sendMode() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
+                </BaseButton>
+              );
+            }}
+          </Each>
+        </Popover>
       </View>
       <Reveal open={Boolean(statusLine())}>
         <Text class="w-full max-w-190 self-center truncate px-3 pt-2 text-center text-xs text-subtle">{shownStatus()}</Text>

@@ -173,7 +173,7 @@ export class DaemonClient {
         const set = this.streams.get(sessionId);
         if (set) {
           this.streams.delete(sessionId);
-          const exitPayload: Exit = { code: msg.code as number | null, signal: msg.signal as string | undefined };
+          const exitPayload: Exit = { code: msg.code as number | null, signal: msg.signal as string | undefined, expected: msg.expected === true ? true : undefined };
           for (const stream of [...set]) {
             if (stream.readyExit) {
               for (const h of stream.exit.splice(0)) h(exitPayload);

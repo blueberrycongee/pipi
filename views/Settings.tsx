@@ -59,6 +59,7 @@ import {
   saveCustomAgent,
   saveProviderKey,
   sessionState,
+  sessionsReady,
   type SettingsSection,
   setAutoCompaction,
   setAutoRetry,
@@ -806,11 +807,13 @@ function SessionsPage() {
   };
 
   const copyMcp = () => {
-    void externalMcpConfig().then((snippet) => {
-      copyText(snippet);
-      mcpCopied.set(true);
-      setTimeout(() => mcpCopied.set(false), 1800);
-    });
+    void externalMcpConfig()
+      .then((snippet) => {
+        copyText(snippet);
+        mcpCopied.set(true);
+        setTimeout(() => mcpCopied.set(false), 1800);
+      })
+      .catch(() => toast("error", tr("Could not read the MCP config", "无法读取 MCP 配置")));
   };
 
   return (
@@ -1561,18 +1564,20 @@ function ArchivePage() {
       <If
         when={allItems().length > 0 && !noMatches()}
         else={
-          <SettingGroup>
-            <View class="items-center gap-1 py-8">
-              <Text class="text-base font-medium text-foreground">
-                {noMatches() ? tr("No matching archived items", "没有匹配的归档内容") : tr("No archived conversations", "暂无已归档的对话")}
-              </Text>
-              <If when={!noMatches()}>
-                <Text class="text-center text-sm text-muted-foreground">
-                  {tr("Conversations hidden from the sidebar can also be restored here.", "从侧边栏隐藏的对话也可在这里恢复。")}
+          <If when={sessionsReady()}>
+            <SettingGroup>
+              <View class="items-center gap-1 py-8">
+                <Text class="text-base font-medium text-foreground">
+                  {noMatches() ? tr("No matching archived items", "没有匹配的归档内容") : tr("No archived conversations", "暂无已归档的对话")}
                 </Text>
-              </If>
-            </View>
-          </SettingGroup>
+                <If when={!noMatches()}>
+                  <Text class="text-center text-sm text-muted-foreground">
+                    {tr("Conversations hidden from the sidebar can also be restored here.", "从侧边栏隐藏的对话也可在这里恢复。")}
+                  </Text>
+                </If>
+              </View>
+            </SettingGroup>
+          </If>
         }
       >
         <View class="gap-5" testID="settings-archive-list">

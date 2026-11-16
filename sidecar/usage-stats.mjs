@@ -15,130 +15,63 @@
 // did the work, when the engine names them). Nothing here is estimated: an agent
 // that reports nothing has sessions and no figures, and `unpriced` tokens are in
 // no cost.
+//
+// The per-file fold is `session-index.mjs`'s — each file's contribution is
+// cached by (size, mtimeMs), so a rescan only reads sessions written since the
+// last run instead of every byte of history.
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { agentDirPath } from "./env-paths.mjs";
+import { indexEntry, loadIndex, saveIndex } from "./session-index.mjs";
 
 const ZERO = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
 
-function addUsage(tokens, usage) {
-  if (!usage || typeof usage !== "object") return 0;
-  tokens.input += Number(usage.input) || 0;
-  tokens.output += Number(usage.output) || 0;
-  tokens.cacheRead += Number(usage.cacheRead) || 0;
-  tokens.cacheWrite += Number(usage.cacheWrite) || 0;
-  tokens.total += Number(usage.totalTokens ?? usage.total) || 0;
-  return Number(usage.cost?.total) || 0;
-}
-
-/** Local YYYY-MM-DD for bucketing — the page is read in the machine's timezone. */
-function dayKey(ms) {
-  const d = new Date(ms);
-  if (Number.isNaN(d.getTime())) return undefined;
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
-function entryMs(entry) {
-  const stamp = entry.timestamp ?? entry.message?.timestamp;
-  if (typeof stamp === "number") return stamp;
-  const ms = Date.parse(stamp || "");
-  return Number.isNaN(ms) ? 0 : ms;
+function addTokens(tokens, add) {
+  tokens.input += add.input;
+  tokens.output += add.output;
+  tokens.cacheRead += add.cacheRead;
+  tokens.cacheWrite += add.cacheWrite;
+  tokens.total += add.total;
 }
 
 function blankBucket() {
   return { tokens: ZERO(), cost: 0, unpriced: 0, messages: 0, sessions: 0 };
 }
 
-const totalOf = (usage) => Number(usage?.totalTokens ?? usage?.total) || 0;
-
-/** Fold one session file into the totals. Returns false when it isn't a session. */
-function scanSession(raw, agentId, into) {
-  const lines = raw.split("\n").filter(Boolean);
-  if (!lines.length) return false;
-  let header;
-  try {
-    header = JSON.parse(lines[0]);
-  } catch {
-    return false;
-  }
-  const isPi = header?.type === "session";
-  const isExternal = header?.type === "pipi_external_session";
-  if (!isPi && !isExternal) return false;
-  const owner = isExternal ? header.agentId || header.driver || "external" : agentId;
-  // Before version 2 an external session's messages carried a running total, not their own usage.
-  const unread = isExternal && (header.version ?? 1) < 2;
-
+/**
+ * Folds one file's cached contribution into the totals — the same merge the old
+ * full scan did, including its order: an uncounted file drops its owner's bucket
+ * when nothing counted for it yet.
+ */
+function applyContribution(c, into) {
+  const owner = c.agent ?? "external";
   const agent = into.agents.get(owner) ?? blankBucket();
   into.agents.set(owner, agent);
-  let counted = false;
-
-  for (const line of lines.slice(1)) {
-    let entry;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const day = dayKey(entryMs(entry));
-    const touch = (usage, provider, model) => {
-      if (!usage || typeof usage !== "object" || unread) return;
-      counted = true;
-      const cost = addUsage(into.total.tokens, usage);
-      const unpriced = usage.unpriced ? totalOf(usage) : 0;
-      into.total.cost += cost;
-      into.total.unpriced += unpriced;
-      addUsage(agent.tokens, usage);
-      agent.cost += cost;
-      agent.unpriced += unpriced;
-      // The models the engine named, else the one on the message. Nothing at all is not a model.
-      const named = Array.isArray(usage.models) ? usage.models.filter((part) => part && typeof part.model === "string" && part.model) : [];
-      const parts = named.length ? named.map((part) => ({ model: part.model, usage: { ...part, cost: { total: Number(part.cost) || 0 } } })) : [{ model, usage }];
-      for (const part of parts) {
-        if (!totalOf(part.usage) && !part.usage.cost?.total) continue;
-        const key = provider && part.model ? `${provider}·${part.model}` : "·unknown";
-        const bucket = into.models.get(key) ?? { provider: provider || "", model: part.model || "", tokens: ZERO(), cost: 0, unpriced: 0, messages: 0 };
-        into.models.set(key, bucket);
-        bucket.cost += addUsage(bucket.tokens, part.usage);
-        if (usage.unpriced) bucket.unpriced += totalOf(part.usage);
-        bucket.messages++;
-      }
-      if (day) {
-        const d = into.daily.get(day) ?? { day, tokens: 0, cost: 0 };
-        into.daily.set(day, d);
-        d.tokens += totalOf(usage);
-        d.cost += cost;
-      }
-    };
-
-    switch (entry.type) {
-      case "message": {
-        const message = entry.message;
-        if (message?.role === "user") {
-          into.total.userMessages++;
-          agent.messages++;
-          counted = true;
-        } else if (message?.role === "assistant") {
-          into.total.assistantMessages++;
-          agent.messages++;
-          touch(message.usage, message.provider, message.model);
-          const calls = Array.isArray(message.content) ? message.content.filter((b) => b?.type === "toolCall").length : 0;
-          into.total.toolCalls += calls;
-        } else if (message?.role === "toolResult" && message.usage) {
-          touch(message.usage, message.provider, message.model);
-        }
-        break;
-      }
-      case "usage":
-        touch(entry.usage, entry.provider, entry.model);
-        break;
-      case "compaction":
-      case "branch_summary":
-        touch(entry.usage, entry.provider, entry.model);
-        break;
-    }
+  into.total.userMessages += c.user;
+  into.total.assistantMessages += c.assistant;
+  into.total.toolCalls += c.toolCalls;
+  agent.messages += c.user + c.assistant;
+  addTokens(into.total.tokens, c.tokens);
+  into.total.cost += c.cost;
+  into.total.unpriced += c.unpriced;
+  addTokens(agent.tokens, c.tokens);
+  agent.cost += c.cost;
+  agent.unpriced += c.unpriced;
+  for (const [key, part] of Object.entries(c.models)) {
+    const bucket = into.models.get(key) ?? { provider: part.provider, model: part.model, tokens: ZERO(), cost: 0, unpriced: 0, messages: 0 };
+    into.models.set(key, bucket);
+    addTokens(bucket.tokens, part.tokens);
+    bucket.cost += part.cost;
+    bucket.unpriced += part.unpriced;
+    bucket.messages += part.messages;
   }
-  if (!counted) {
+  for (const [day, d] of Object.entries(c.daily)) {
+    const bucket = into.daily.get(day) ?? { day, tokens: 0, cost: 0 };
+    into.daily.set(day, bucket);
+    bucket.tokens += d.tokens;
+    bucket.cost += d.cost;
+  }
+  if (!c.counted) {
     if (!agent.sessions) into.agents.delete(owner);
     return false;
   }
@@ -184,6 +117,7 @@ async function* sessionFiles() {
   }
 }
 
+const index = await loadIndex();
 const into = {
   total: { tokens: ZERO(), cost: 0, unpriced: 0, userMessages: 0, assistantMessages: 0, toolCalls: 0 },
   agents: new Map(),
@@ -193,10 +127,10 @@ const into = {
 
 let sessions = 0;
 for await (const file of sessionFiles()) {
-  try {
-    if (scanSession(await fsp.readFile(file, "utf8"), "pi", into)) sessions++;
-  } catch {}
+  const entry = await indexEntry(index, file);
+  if (entry && entry.kind !== "other" && applyContribution(entry, into)) sessions++;
 }
+await saveIndex(index);
 
 const sortByCost = (a, b) => b.cost - a.cost || b.tokens.total - a.tokens.total;
 process.stdout.write(

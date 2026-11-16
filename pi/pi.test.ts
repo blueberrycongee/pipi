@@ -451,6 +451,35 @@ test("the turn the run is on shows its process; one a run left closed is not it,
   expect(again.durationMs).toBeUndefined();
 });
 
+test("only the newest row still working is live: one looping status cue at a time", () => {
+  const t = new Transcript();
+  const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
+  const actsOf = (rows: ReturnType<typeof buildDisplayRows>) => rows.filter((row) => row.kind === "activity") as ActivityRow[];
+  t.apply({ type: "message_start", message: asked("go") });
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  update({ type: "toolcall_start", contentIndex: 0, id: "c1", toolName: "read" });
+  update({ type: "text_delta", contentIndex: 1, delta: "Looking." });
+  update({ type: "toolcall_start", contentIndex: 2, id: "c2", toolName: "bash" });
+
+  // Two runs of work still going: the later one is live, the header and the earlier one stand still.
+  let rows = buildDisplayRows(t.rows(), true);
+  expect(actsOf(rows).map((row) => row.live === true)).toEqual([false, true]);
+  expect(turnsOf(rows)).toMatchObject([{ running: true }]);
+  expect(turnsOf(rows)[0].live).toBeUndefined();
+
+  // The process folded away: the header is the newest row still working on screen.
+  rows = buildDisplayRows(t.rows(), true, { chosen: () => false });
+  expect(actsOf(rows)).toHaveLength(0);
+  expect(turnsOf(rows)[0]).toMatchObject({ running: true, live: true });
+
+  // The run over: nothing is live.
+  t.apply({ type: "tool_execution_end", toolCallId: "c1", toolName: "read", result: { content: [] }, isError: false });
+  t.apply({ type: "tool_execution_end", toolCallId: "c2", toolName: "bash", result: { content: [] }, isError: false });
+  t.apply({ type: "message_end", message: answer("Done.", 6) });
+  rows = buildDisplayRows(t.rows(), false);
+  expect(rows.every((row) => (row as { live?: boolean }).live !== true)).toBe(true);
+});
+
 test("the reader's say on a turn holds; folding a working turn folds the work as it goes on past a message", () => {
   const t = new Transcript();
   const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);

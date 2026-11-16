@@ -23,6 +23,7 @@ import pipiDaemonAsset from "../sidecar/pipi-daemon.mjs?url";
 import pipiMcpStdioAsset from "../sidecar/pipi-mcp-stdio.mjs?url";
 import pipiOrchestratorExtensionAsset from "../sidecar/pipi-orchestrator-extension.mjs?url";
 import probeAgentsAsset from "../sidecar/probe-agents.mjs?url";
+import sessionIndexAsset from "../sidecar/session-index.mjs?url";
 import usageStatsAsset from "../sidecar/usage-stats.mjs?url";
 import worktreeAsset from "../sidecar/worktree.mjs?url";
 
@@ -39,6 +40,7 @@ void [
   pipiMcpStdioAsset,
   pipiOrchestratorExtensionAsset,
   probeAgentsAsset,
+  sessionIndexAsset,
   usageStatsAsset,
   worktreeAsset,
 ];

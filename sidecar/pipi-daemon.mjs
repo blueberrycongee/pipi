@@ -282,9 +282,6 @@ function buildSession(spec) {
     exitExpected: false,
     waiters: [],
   };
-  if (session.file && !session.titleLocked && session.title === "New session") {
-    session.title = titleOfFile(session.file) || session.title;
-  }
   return session;
 }
 
@@ -380,7 +377,7 @@ function launchArgs(session) {
 }
 
 let internalSeq = 0;
-function daemonCommand(session, type, data) {
+function daemonCommand(session, type, data, timeoutMs = 60_000) {
   const id = `${INTERNAL_PREFIX}${++internalSeq}`;
   return new Promise((resolve) => {
     const proc = session.proc;
@@ -390,7 +387,7 @@ function daemonCommand(session, type, data) {
     }
     const timer = setTimeout(() => {
       if (session.internalPending.delete(id)) resolve(undefined);
-    }, 60_000);
+    }, timeoutMs);
     timer.unref?.();
     session.internalPending.set(id, { resolve, timer });
     try {
@@ -424,9 +421,11 @@ function clampModeLine(session, line) {
   if ((record.type === "prompt" || record.type === "steer" || record.type === "follow_up") && typeof record.message === "string") {
     const trimmed = record.message.trimStart();
     const match = trimmed.match(/^\/pipi-runtime-mode(?:\s+(\S+))?([\s\S]*)$/);
-    if (match) {
+    // Only a mode argument is clamped — a bare `/pipi-runtime-mode` is a status
+    // query and passes as written, as does anything after the argument.
+    if (match && match[1] !== undefined) {
       const clamped = minMode(ceiling, match[1]);
-      return JSON.stringify({ ...record, message: `/pipi-runtime-mode ${clamped}` });
+      return JSON.stringify({ ...record, message: `/pipi-runtime-mode ${clamped}${match[2]}` });
     }
   }
   return line;
@@ -521,8 +520,11 @@ async function startProcess(session) {
         entry.resolve(undefined);
       }
       session.internalPending.clear();
-      for (const conn of session.attached) send(conn, { type: "exit", sessionId: session.id, code, signal });
+      // The state push lands before the exit frame: an attached client still reads the
+      // session as open when its status changes, so a death reports once — through the
+      // exit — never again as a "stopped in the background" push.
       onSessionExit(session, code, signal, expected);
+      for (const conn of session.attached) send(conn, { type: "exit", sessionId: session.id, code, signal, expected });
     });
 
     // Reopen the session's file before it answers its first commands.
@@ -654,6 +656,28 @@ function warmPool(spec) {
   });
 }
 
+// A standby spawned in the same breath as an attach races the session it is
+// meant to serve: on a cold boot that is a second full agent process fighting
+// the first one's startup for CPU. `POOL_DELAY_MS` lets the attach settle
+// first — the latest attach's spec wins, so switching sessions does not warm
+// what was left behind. `PIPI_DAEMON_POOL_DELAY_MS=0` restores the old timing.
+const POOL_DELAY_MS = Number(process.env.PIPI_DAEMON_POOL_DELAY_MS) >= 0 ? Number(process.env.PIPI_DAEMON_POOL_DELAY_MS) : 4_000;
+let poolWarmTimer;
+let pendingPoolSpec;
+
+function warmPoolSoon(spec) {
+  if (process.env.PIPI_DAEMON_POOL === "0") return;
+  pendingPoolSpec = spec;
+  clearTimeout(poolWarmTimer);
+  poolWarmTimer = setTimeout(() => {
+    poolWarmTimer = undefined;
+    const next = pendingPoolSpec;
+    pendingPoolSpec = undefined;
+    if (next) warmPool(next);
+  }, POOL_DELAY_MS);
+  poolWarmTimer.unref?.();
+}
+
 function failSession(session, reason) {
   session.lastError = reason;
   const suppress = session.suppressStopDelivery;
@@ -677,12 +701,20 @@ function onSessionExit(session, code, signal, expected) {
     session.suppressStopDelivery = false;
     const initiator = session.initiator;
     session.initiator = undefined;
-    if (initiator && initiator !== "user" && initiator !== session.id) {
-      if (!suppress) deliverToInitiator(session, `${session.title} (${session.agentName}) stopped mid-run: ${clip(why, 300)}`, "failed", initiator);
-    } else if (session.attached.size === 0) {
-      session.unread = true;
+    if (expected) {
+      // A stop that had to kill: the session stopped, it did not die.
+      if (initiator && initiator !== "user" && initiator !== session.id) {
+        if (!suppress) deliverToInitiator(session, `${session.title} (${session.agentName}) was stopped.`, "failed", initiator);
+      }
+      session.status = "idle";
+    } else {
+      if (initiator && initiator !== "user" && initiator !== session.id) {
+        if (!suppress) deliverToInitiator(session, `${session.title} (${session.agentName}) stopped mid-run: ${clip(why, 300)}`, "failed", initiator);
+      } else if (session.attached.size === 0) {
+        session.unread = true;
+      }
+      session.status = "failed";
     }
-    session.status = "failed";
     pushSession(session);
     resolveWaiters(session);
     checkWindowlessExit();
@@ -797,13 +829,46 @@ function clippedTitle(text) {
   return title || undefined;
 }
 
+// Title scans read the whole file looking for `session_info` renames — too
+// heavy to run on the event loop per attach, so results cache by
+// (size, mtime) and identical in-flight scans share one read.
+const titleCache = new Map(); // file -> {size, mtimeMs, title}
+const titleScans = new Map(); // file -> in-flight Promise
+const TITLE_CACHE_LIMIT = 128;
+
+async function titleOfFile(file) {
+  for (;;) {
+    const stat = await fsp.stat(file).catch(() => undefined);
+    if (!stat || !stat.isFile()) return undefined;
+    const hit = titleCache.get(file);
+    if (hit && hit.size === stat.size && hit.mtimeMs === stat.mtimeMs) return hit.title;
+    const inFlight = titleScans.get(file);
+    if (inFlight) {
+      await inFlight;
+      continue;
+    }
+    const scan = scanFileTitle(file)
+      .then((title) => {
+        titleCache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, title });
+        if (titleCache.size > TITLE_CACHE_LIMIT) titleCache.delete(titleCache.keys().next().value);
+        return title;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (titleScans.get(file) === scan) titleScans.delete(file);
+      });
+    titleScans.set(file, scan);
+    return scan;
+  }
+}
+
 /** The title a session file would list for itself — its `session_info` name when
  *  it has one, else its first user message — the same precedence the session
  *  list uses. `undefined` when the file is missing, empty, or has no title yet. */
-function titleOfFile(file) {
+async function scanFileTitle(file) {
   let lines;
   try {
-    lines = fs.readFileSync(file, "utf8").split("\n");
+    lines = (await fsp.readFile(file, "utf8")).split("\n");
   } catch {
     return undefined;
   }
@@ -837,10 +902,22 @@ function titleOfFile(file) {
  *  re-named from the file it is on now — a locked (given) name keeps standing. */
 function syncTitle(session) {
   if (session.titleLocked) return;
-  const title = (session.file && titleOfFile(session.file)) || "New session";
-  if (session.title === title) return;
-  session.title = title;
-  persist({ type: "session_update", id: session.id, info: { title } });
+  const file = session.file;
+  if (!file) {
+    if (session.title === "New session") return;
+    session.title = "New session";
+    persist({ type: "session_update", id: session.id, info: { title: session.title } });
+    return;
+  }
+  void titleOfFile(file).then((resolved) => {
+    // The file (or the lock) may have moved on while the scan was in flight.
+    if (session.file !== file || session.titleLocked) return;
+    const title = resolved || "New session";
+    if (session.title === title) return;
+    session.title = title;
+    persist({ type: "session_update", id: session.id, info: { title } });
+    pushSession(session);
+  });
 }
 
 /** A session nobody named takes its title from its first user message — what the session list shows. */
@@ -1201,6 +1278,7 @@ async function callSessionTool(caller, name, args = {}) {
         driver: agent.driver,
         statusText: agent.statusText,
         supportsTools: supportsTools(agent.driver),
+        supportedRuntimeModes: agent.supportedRuntimeModes,
         models: agent.models,
       }));
       return {
@@ -1425,7 +1503,7 @@ async function stopTree(session) {
         target.pendingQueue = { steering: [], followUp: [] };
         await daemonCommand(target, "clear_queue", {});
       }
-      await daemonCommand(target, "abort", {});
+      await daemonCommand(target, "abort", {}, 15_000);
       // Stop means stopped: a bridge that cannot settle its run within the
       // abort's own window is dead weight — the exit flips the session instead
       // of leaving it "working" behind a run that never answers.
@@ -1542,10 +1620,19 @@ async function controlOp(conn, msg) {
         session = sessions.get(spec.id);
       } else if (spec.file && sessionsByFile.has(spec.file)) {
         session = sessions.get(sessionsByFile.get(spec.file));
+      } else if (spec.id) {
+        // A named id that is gone is a stale attach, not a new session to create.
+        respondError(conn, id, "no such session");
+        return;
       } else {
         // A fresh attach takes a matching standby when the pool has one — the
         // process is already booted, so the session answers at once.
-        session = (!spec.id && !spec.file ? takePooled(spec) : undefined) ?? createSession({ ...spec, initiator: "user" });
+        if (spec.file && !spec.title && !spec.titleLocked) {
+          // Resolve the file's own title before the session exists — the first
+          // `session` push carries it, as the old synchronous read did.
+          spec.title = (await titleOfFile(spec.file)) || undefined;
+        }
+        session = takePooled(spec) ?? createSession({ ...spec, initiator: "user" });
         created = true;
       }
       // Re-key fileless sessions the moment a file is named for them.
@@ -1585,19 +1672,27 @@ async function controlOp(conn, msg) {
       persist({ type: "session_update", id: session.id, info: sessionInfo(session), launch: session.launch });
       if (metaChanged) pushSession(session);
       const fresh = !session.loaded;
+      (conn.attaching ??= new Set()).add(session.id);
       if (fresh) {
         const ok = await startProcess(session);
         if (!ok) {
+          conn.attaching.delete(session.id);
           respondError(conn, id, session.lastError || `${session.agentName} could not start`);
           return;
         }
         flushDeliveries(session);
       }
+      // A detach or drop that landed while the process started must not be undone:
+      // the conn is gone and only says it is attached if it still is.
+      if (conn.destroyed || !conn.attaching.delete(session.id)) {
+        respondError(conn, id, "detached before the session was ready");
+        return;
+      }
       session.attached.add(conn);
       conn.attachedSessions.add(session.id);
       respond(conn, id, "attached", { session: sessionInfo(session) });
       // The session just opened is the best guess for the next fresh one: keep one like it up already.
-      void warmPool(spec);
+      warmPoolSoon(spec);
       // Replay queued steering / follow-up messages so reattaching mid-run
       // puts the waiting bubbles back in the conversation at once.
       if (session.pendingQueue.steering.length > 0 || session.pendingQueue.followUp.length > 0) {
@@ -1620,6 +1715,7 @@ async function controlOp(conn, msg) {
     }
     case "detach": {
       const session = sessions.get(msg.sessionId);
+      conn.attaching?.delete(msg.sessionId);
       if (session) {
         session.attached.delete(conn);
         conn.attachedSessions.delete(session.id);
@@ -1970,6 +2066,7 @@ async function controlConnection(conn) {
     for (const sessionId of conn.attachedSessions ?? []) {
       sessions.get(sessionId)?.attached.delete(conn);
     }
+    conn.attaching?.clear();
     for (const entry of conn.waiters ?? []) {
       const idx = entry.session.waiters.indexOf(entry.waiter);
       if (idx >= 0) entry.session.waiters.splice(idx, 1);

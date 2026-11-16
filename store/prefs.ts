@@ -165,8 +165,8 @@ const DEFAULTS: Prefs = {
   wallpaperEffect: "none",
   wallpaperHistory: [],
   wallpaperThemeColors: false,
-  wallpaperInteractive: true,
-  wallpaperAgentReactive: true,
+  wallpaperInteractive: false,
+  wallpaperAgentReactive: false,
   wallpaperVideoClickAction: "burst",
   wallpaperPauseMode: "inactive",
   wallpaperPaused: false,
@@ -294,9 +294,9 @@ export async function loadPrefs() {
           : [],
         wallpaperThemeColors: Boolean(parsed.wallpaperThemeColors),
         wallpaperInteractive:
-          parsed.wallpaperInteractive !== undefined ? Boolean(parsed.wallpaperInteractive) : true,
+          parsed.wallpaperInteractive !== undefined ? Boolean(parsed.wallpaperInteractive) : false,
         wallpaperAgentReactive:
-          parsed.wallpaperAgentReactive !== undefined ? Boolean(parsed.wallpaperAgentReactive) : true,
+          parsed.wallpaperAgentReactive !== undefined ? Boolean(parsed.wallpaperAgentReactive) : false,
         wallpaperVideoClickAction: isWallpaperVideoClickAction(parsed.wallpaperVideoClickAction)
           ? parsed.wallpaperVideoClickAction
           : "burst",

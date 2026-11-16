@@ -1250,13 +1250,15 @@ test("stop puts down a bridge that answers abort but never settles its run", asy
 
   // The abort is answered but the run never settles — stop must kill, not report.
   await ctrl.call("stop", { sessionId: sid });
-  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.status === "failed", 6000);
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.status === "idle", 6000);
   assert.equal(ctrl.sessions.get(sid)?.loaded, false, "the wedged process is gone");
 
   // The session still works afterwards: a message revives it on a fresh process.
   await ctrl.call("send", { sessionId: sid, message: "back from the dead" });
-  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.status === "idle", 10000);
-  const read = await ctrl.readMessages(sid);
+  const read = await ctrl.waitUntil(async () => {
+    const got = await ctrl.readMessages(sid);
+    return got.messages.at(-1)?.text === "echo:back from the dead" ? got : undefined;
+  }, 10000);
   assert.equal(read.messages.at(-1).text, "echo:back from the dead");
 });
 

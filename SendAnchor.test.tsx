@@ -39,3 +39,49 @@ test("a send's pin holds through the run and hands back at its settle", async ()
   // names is once again one above what is being read.
   await app.waitFor(JUMP, { timeout: 20000 });
 }, 60000);
+
+// Regression: a scroll gesture under a sent prompt's anchor dropped the runway
+// reservation whole — the offset it was holding up snapped to the end and every
+// row fell with it ("the message gets pulled down"). The reserve is consumable
+// scroll room now: released, it stays the reader's to scroll through, going only
+// where they cannot see it — the view they release into is the one they scrolled
+// to, off the end, and the way back is offered ("Scroll to bottom").
+//
+//   nsh test SendAnchor.test.tsx
+//
+// "stream" paces the records, so the run — and the hold — is still on when the
+// scroll lands; a short reply keeps the reserve load-bearing (the end without
+// it is far above the pin). Before the fix the released offset clamped to that
+// end and the pill never showed.
+
+const launchStream = () =>
+  open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    storage: { "harness.scenario": "stream", "harness.distinct": "1", "harness.reply": "On it." },
+  });
+
+test("a scroll under the anchor leaves the view where the reader put it", async () => {
+  const app = await launchStream();
+  await app.waitFor("text:What are we building?", { timeout: 20000 });
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitFor("text:Here is the plan.", { timeout: 20000 });
+
+  await app.type("label:Message", "and then what");
+  await app.submit("label:Message");
+  await app.wait(900); // the entry glide has landed; the pin holds through the stream
+
+  await app.scroll("label:Conversation", -160);
+  const frames: { pill: boolean; prompt: boolean }[] = [];
+  for (let i = 0; i < 30; i++) {
+    frames.push({
+      pill: app.shows("label:Scroll to bottom"),
+      prompt: app.texts().some((t) => t.includes("and then what")),
+    });
+    await app.wait(16);
+  }
+  expect(frames.every((f) => f.prompt)).toBe(true);
+  expect(frames.some((f) => f.pill)).toBe(true);
+}, 120000);

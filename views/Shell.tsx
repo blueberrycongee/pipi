@@ -306,12 +306,14 @@ function SidebarSplit(props: { children: JSX.Element }) {
       transitioning.set(true);
       if (open) {
         sidebarMounted.set(true);
-        LayoutAnimation.configureNext({
-          duration: 260,
-          update: { type: "spring", springDamping: 0.96 },
-          create: { type: "easeOut", property: "opacity", duration: 180 },
-          delete: { type: "easeIn", property: "opacity", duration: 140 },
-        });
+        if (!isRunning()) {
+          LayoutAnimation.configureNext({
+            duration: 260,
+            update: { type: "spring", springDamping: 0.96 },
+            create: { type: "easeOut", property: "opacity", duration: 180 },
+            delete: { type: "easeIn", property: "opacity", duration: 140 },
+          });
+        }
         drawerOpacity.set(0.38);
         drawerSlideX.set(-16);
         drawerAnim = Animated.parallel([
@@ -324,12 +326,14 @@ function SidebarSplit(props: { children: JSX.Element }) {
           transitioning.set(false);
         }, 275);
       } else {
-        LayoutAnimation.configureNext({
-          duration: 200,
-          update: { type: "spring", springDamping: 0.98 },
-          create: { type: "easeOut", property: "opacity", duration: 150 },
-          delete: { type: "easeIn", property: "opacity", duration: 120 },
-        });
+        if (!isRunning()) {
+          LayoutAnimation.configureNext({
+            duration: 200,
+            update: { type: "spring", springDamping: 0.98 },
+            create: { type: "easeOut", property: "opacity", duration: 150 },
+            delete: { type: "easeIn", property: "opacity", duration: 120 },
+          });
+        }
         drawerAnim = Animated.parallel([
           Animated.timing(drawerOpacity, { toValue: 0, duration: 165, easing: EASING.out }),
           Animated.timing(drawerSlideX, { toValue: -12, duration: 185, easing: EASING.out }),
@@ -402,7 +406,7 @@ function SidebarSplit(props: { children: JSX.Element }) {
 
   const resetToDefaultWidth = () => {
     const target = Math.max(minW(), SIDEBAR_DEFAULT_WIDTH);
-    if (!reduceMotion()) {
+    if (!reduceMotion() && !isRunning()) {
       LayoutAnimation.configureNext({
         duration: 220,
         update: { type: "spring", springDamping: 0.96 },

@@ -39,3 +39,25 @@ test("the send button's menu picks how a message goes into a run, and Enter foll
   await app.waitUntil(() => app.count("label:Conversation >> text:Queued") >= 2);
   expect(app.texts()).toContain("do this instead");
 }, 90000);
+
+// The menu is anchored to an invisible column at the composer's right edge so
+// it stands on the box's top-right corner rather than straddling it off the
+// pill; the column takes no presses, so a press on the chevron below it is an
+// outside press — closing the menu — and must not reopen it on release.
+test("the send button's menu opens, toggles and dismisses from its anchor", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  await app.type("label:Message", "hello there");
+  await app.press("label:Send options");
+  await app.waitFor("text:Interrupt & send");
+  // A second press on the chevron toggles it shut.
+  await app.press("label:Send options");
+  await app.wait(300);
+  expect(app.texts()).not.toContain("Interrupt & send");
+  // Reopened, a press on another chip — outside the anchor — dismisses it.
+  await app.press("label:Send options");
+  await app.waitFor("text:Interrupt & send");
+  await app.press("id:agent-chip");
+  await app.wait(300);
+  expect(app.texts()).not.toContain("Interrupt & send");
+}, 60000);

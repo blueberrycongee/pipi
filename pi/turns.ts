@@ -54,6 +54,8 @@ export interface ActivityRow {
   steps: ProcessStep[];
   tools: ToolRow[];
   running: boolean;
+  /** The newest row still working: it alone loops its breathing cue, the rest stand still. */
+  live?: boolean;
   hasError: boolean;
   /** Sum of the steps' recorded durations when any has one. */
   durationMs?: number;
@@ -66,6 +68,8 @@ export interface TurnHeaderRow {
   id: string;
   /** The turn is still working towards its answer. */
   running: boolean;
+  /** The newest row still working: it alone loops its breathing cue, the rest stand still. */
+  live?: boolean;
   /** When the turn started, for the live timer. */
   startedAt?: number;
   /** How long the turn took, once it is over and that is known. */
@@ -833,6 +837,15 @@ export function buildDisplayRows(
     }
     out.push(...answer);
   }
+  // One looping status cue at a time: the newest row still working breathes,
+  // every one still working behind it stands still.
+  for (let i = out.length - 1; i >= 0; i--) {
+    const row = out[i];
+    if ((row.kind === "turn" || row.kind === "activity") && row.running) {
+      row.live = true;
+      break;
+    }
+  }
   return out;
 }
 
@@ -840,10 +853,11 @@ const sameList = (a: readonly unknown[], b: readonly unknown[]) => a.length === 
 
 function sameRow(a: DisplayRow, b: DisplayRow): boolean {
   if (a === b) return true;
-  if (a.kind === "activity" && b.kind === "activity") return sameList(a.steps, b.steps);
+  if (a.kind === "activity" && b.kind === "activity") return a.live === b.live && sameList(a.steps, b.steps);
   if (a.kind === "turn" && b.kind === "turn") {
     return (
       a.running === b.running &&
+      a.live === b.live &&
       a.startedAt === b.startedAt &&
       a.durationMs === b.durationMs &&
       a.open === b.open &&

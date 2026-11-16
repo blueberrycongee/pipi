@@ -31,11 +31,13 @@ try {
       process.stdout.write(JSON.stringify({ isGitRepo: false }));
       process.exit(0);
     }
-    const root = await git(cwd, ["rev-parse", "--show-toplevel"]);
-    const branch = await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => "HEAD");
-    const headCommit = await git(cwd, ["rev-parse", "--short", "HEAD"]).catch(() => "");
-    const porcelain = await git(cwd, ["status", "--porcelain"]).catch(() => "");
-    const rawList = await git(cwd, ["worktree", "list", "--porcelain"]).catch(() => "");
+    const [root, branch, headCommit, porcelain, rawList] = await Promise.all([
+      git(cwd, ["rev-parse", "--show-toplevel"]),
+      git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => "HEAD"),
+      git(cwd, ["rev-parse", "--short", "HEAD"]).catch(() => ""),
+      git(cwd, ["status", "--porcelain"]).catch(() => ""),
+      git(cwd, ["worktree", "list", "--porcelain"]).catch(() => ""),
+    ]);
     const worktrees = [];
     let current = {};
     for (const line of rawList.split("\n")) {

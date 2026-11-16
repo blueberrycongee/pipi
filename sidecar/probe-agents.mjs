@@ -4,6 +4,7 @@
 //
 // Never triggers browser OAuth popups or project hooks.
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +37,43 @@ async function readVersion(bin, args = ["--version"]) {
   } catch {
     return undefined;
   }
+}
+
+// `--version` on every installed agent is a boot-time burst of CLI spawns whose
+// answer only changes when the binary does: the last result is kept per binary
+// path, keyed by (size, mtimeMs), at `<agent-dir>/pipi-probe-cache.json`.
+const probeCachePath = () => path.join(agentDirPath(), "pipi-probe-cache.json");
+
+async function loadProbeCache() {
+  try {
+    const parsed = JSON.parse(await fsp.readFile(probeCachePath(), "utf8"));
+    if (parsed?.version === 1 && parsed.bins && typeof parsed.bins === "object") return parsed.bins;
+  } catch {}
+  return {};
+}
+
+async function saveProbeCache(bins) {
+  const target = probeCachePath();
+  const tmp = `${target}.tmp.${process.pid}`;
+  try {
+    await fsp.writeFile(tmp, JSON.stringify({ version: 1, bins }), { mode: 0o600 });
+    await fsp.rename(tmp, target);
+  } catch {}
+}
+
+const probeCache = await loadProbeCache();
+let probeCacheDirty = false;
+
+/** `bin`'s version line — the cached one while the binary's (size, mtime) stands. */
+async function versionFor(bin) {
+  const stat = fs.existsSync(bin) ? fs.statSync(bin) : undefined;
+  if (!stat) return undefined;
+  const hit = probeCache[bin];
+  if (hit && hit.size === stat.size && hit.mtimeMs === stat.mtimeMs) return hit.version;
+  const version = await readVersion(bin);
+  probeCache[bin] = { size: stat.size, mtimeMs: stat.mtimeMs, version };
+  probeCacheDirty = true;
+  return version;
 }
 
 function checkPiAuth() {
@@ -410,7 +448,7 @@ async function probeBuiltin(spec) {
   }
 
   const binBase = path.basename(resolved).replace(/\.(exe|cmd|bat|ps1)$/i, "");
-  const version = spec.skipVersion || binBase === "agy_acp_server" ? undefined : await readVersion(resolved);
+  const version = spec.skipVersion || binBase === "agy_acp_server" ? undefined : await versionFor(resolved);
   const authNote = spec.authFn ? spec.authFn() : "CLI ready";
   return {
     id: spec.id,
@@ -442,7 +480,7 @@ const results = await Promise.all([
     const dist = custom.distribution || "binary";
     const launcher = dist === "npx" ? "npx" : dist === "uvx" ? "uvx" : custom.command;
     const resolved = resolveBinary(launcher);
-    const version = resolved && dist === "binary" ? await readVersion(resolved).catch(() => undefined) : undefined;
+    const version = resolved && dist === "binary" ? await versionFor(resolved).catch(() => undefined) : undefined;
     const modelId = custom.defaultModel || "default";
     const hasApiKey = custom.envVar ? !!resolveAgentApiKey(custom.id, custom.envVar) : false;
     const cmdPreview =
@@ -485,3 +523,4 @@ const results = await Promise.all([
 ]);
 
 process.stdout.write(JSON.stringify(results));
+if (probeCacheDirty) await saveProbeCache(probeCache);

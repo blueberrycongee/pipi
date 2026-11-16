@@ -182,6 +182,9 @@ const draftGraduated = () => {
 
 /** Animates explicit sidebar list edits without ever touching layout animation during a run (`AGENTS.md`). */
 function animateSidebarList() {
+  // Animated or not (a run vetoes the motion but the rows still move), rows are
+  // about to pass under the pointer: it is resting until it says otherwise.
+  pointerResting.set(true);
   if (!isRunning()) animateNextLayout(220);
 }
 
@@ -1039,12 +1042,33 @@ function SidebarTree() {
   const recentCount = () => allRecents().length + (hasRecentDraft() ? 1 + childSessionsOfOpen().length : 0);
   const showRecents = () => recentCount() > 0;
 
-  // The rows under the pointer are about to move: a draft row opens or closes above them.
-  let draftShown = untracked(() => listSteady() && isDraftSession());
+  // The rows under the pointer are about to move: any relist is a move under a
+  // resting pointer — a draft row opening, a daemon push, a rescan, an
+  // auto-archive. The guard keys on the row set itself, so every path arms it.
+  const rowSignature = computed(() =>
+    [
+      projects().join(";"),
+      allRecents()
+        .map((item) => item.id)
+        .join(";"),
+      savedSessions()
+        .map((s) => s.path)
+        .join(";"),
+      ...Object.entries(workspaceSessions()).map(([cwd, list]) => `${cwd}=${list.map((s) => s.path).join(",")}`),
+      archivedSessionItems()
+        .map((item) => item.id)
+        .join(";"),
+      childSessionsOfOpen()
+        .map((c) => c.id)
+        .join(";"),
+      hasRecentDraft() ? "draft" : "",
+    ].join("|"),
+  );
+  let lastRows = untracked(rowSignature);
   effect(() => {
-    const shown = listSteady() && isDraftSession();
-    if (shown === draftShown) return;
-    draftShown = shown;
+    const sig = rowSignature();
+    if (sig === lastRows) return;
+    lastRows = sig;
     pointerResting.set(true);
   });
 

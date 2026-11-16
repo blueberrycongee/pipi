@@ -128,6 +128,13 @@ export function UpdateCard() {
     untracked(() => {
       if (s.phase !== "downloading") {
         stopBlob();
+        if (s.phase === "available") {
+          // Back from a failed download: the card's rest pose is an empty
+          // track, not the last fraction it reached.
+          void fill.stop();
+          fill.set(0);
+          pipPos.set(LEAD_INSET);
+        }
         if (s.phase === "ready" || s.phase === "installing") {
           if (reduced) {
             fill.set(1);

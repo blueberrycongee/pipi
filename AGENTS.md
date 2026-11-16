@@ -71,7 +71,11 @@ multi-agent orchestration, and settings.
   Usage. An agent that reports nothing (Kimi) gets no figures and
   no row; a cost is shown only where an engine named one. External
   session files older than header `version` 2 carried a running total
-  per message and are not counted.
+  per message and are not counted. Per-file parsing rides on
+  `sidecar/session-index.mjs` — one pass per file, cached at
+  `<agent-dir>/pipi-session-index.json` by (size, mtime), shared with
+  `list-sessions.mjs`, so a rescan reads only sessions written since
+  the last one.
 - The compare flow (`views/AgentPicker.tsx` → `CompareDialog`, ⌘⇧O) starts
   the same task in several sibling sessions at once — answers land as
   unread marks for the user, not as deliveries to the parent. Delegation
@@ -152,8 +156,8 @@ multi-agent orchestration, and settings.
 Developing without credentials: `node dev/mock-llm.mjs` serves a scripted
 OpenAI-compatible provider, and `PI_CODING_AGENT_DIR=$PWD/dev/agent nsh dev .`
 points the real Pi at it (prompts containing "tools", "error" or "slow"
-exercise tool calls, failures and steering). If port 8790 is taken, pass
-`--port`.
+exercise tool calls, failures and steering). It listens on port 8787; if
+that is taken, set `PORT`.
 
 ## Remotes and publishing
 
@@ -206,6 +210,7 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   `pipi-cli.mjs` (the `pipi` command), `worktree.mjs`,
   `env-paths.mjs`, `list-sessions.mjs` (Pi session `.jsonl` files under
   `<agent-dir>/sessions/`, documented format), `usage-stats.mjs`,
+  `session-index.mjs` (their shared per-file parse, disk-cached),
   `pipi-mcp-stdio.mjs`, `pipi-orchestrator-extension.mjs`
 - `theme.json`, `nsh.json` — design tokens, capabilities; `DESIGN.md` — the
   design system and Pip's drawing rules. Read it before UI work.
@@ -255,6 +260,29 @@ exercise tool calls, failures and steering). If port 8790 is taken, pass
   `retrying` until the attempt shows life. Live and reloaded history read
   the same. `nsh test Errors.test.tsx` plays these on the scripted Pi
   (prompts with "flaky", "outage", "refuse").
+- Every painted frame is a settled state (`DESIGN.md` → Motion): what would
+  be wrong frozen — an empty chat mid-switch, "waking", "No model", a blank
+  or re-laying list, a fold half-flipped, a bubble at an unclamped height —
+  is never painted. Hold the last settled state until the next is whole:
+  the outgoing rows stay until the destination lands (clearing first is the
+  blank flash), a collapsing row keeps its content to its last frame
+  (`keepLast`), and a quick landing interrupts the dim-out rather than
+  completing it — a dip, never a blank. A change is one motion between two
+  settled states, and the frame a thing appears on is already its settled
+  frame: a conversation lands at its end (`initialScrollAtEnd`), status
+  lines land whole (`id:rolling-born` marks only a live line's growth), and
+  mounted, recycled, or re-attached rows never replay an entrance
+  (`markRowsSeen`, `markVeilsSeeded`, `displayRowIds`). Only what is new
+  and live animates — once, opacity-led, never positional (streamed text is
+  in layout as it arrives, veiled per appended chunk; `lib/veil.ts`) — and
+  a wait shorter than `PATIENCE_MS` is not a state and never shows
+  (`delayedFade`). What the reader set holds through whatever renders after
+  it (folds, follow, scroll place), and a load that confirms what is shown
+  changes nothing on screen (`sameRows`: nothing for the list to do).
+  Verify frames, not states: probe every ~16ms on a manual clock
+  (`frames()` in `Switch.test.tsx`) and pixel-diff on `--target macos`
+  (`SwitchLand`, `SendFlashRepro`, `BubbleVanish`) — one-frame faults do
+  not show in `texts()`.
 - List rows are recycled: read `item()` where used; per-row state lives in a
   map by id (`views/Rows.tsx`).
 - The message flow (`pi/turns.ts`): a turn is a header, its

@@ -207,20 +207,26 @@ export function CompareDialog() {
           <IconButton icon="x" label={tr("Close", "关闭")} onPress={close} />
         </View>
 
-        <Input
-          multiline
-          autoFocus
-          scrollbar={false}
-          value={taskPrompt()}
-          onChange={({ value }) => taskPrompt.set(value)}
-          placeholder={
-            composerDraft().trim()
-              ? tr(`Using composer draft: "${composerDraft().trim().slice(0, 56)}…"`, `将使用输入框草稿：「${composerDraft().trim().slice(0, 48)}…」`)
-              : tr("Describe the task, files, and goal…", "描述要交给智能体执行的任务、目标与约束…")
-          }
-          accessibilityLabel={tr("Comparison task", "对比任务描述")}
-          class={`min-h-22 rounded-xl corner-squircle p-3 text-base text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
-        />
+        <View class="relative">
+          <Input
+            multiline
+            autoFocus
+            scrollbar={false}
+            value={taskPrompt()}
+            onChange={({ value }) => taskPrompt.set(value)}
+            accessibilityLabel={tr("Comparison task", "对比任务描述")}
+            class={`min-h-22 rounded-xl corner-squircle p-3 text-base text-foreground caret-brand ${FIELD_SURFACE}`}
+          />
+          <If when={taskPrompt().length === 0}>
+            <View class="pointer-events-none absolute left-3 right-3 top-3">
+              <Text class="text-base text-subtle">
+                {composerDraft().trim()
+                  ? tr(`Using composer draft: "${composerDraft().trim().slice(0, 56)}…"`, `将使用输入框草稿：「${composerDraft().trim().slice(0, 48)}…」`)
+                  : tr("Describe the task, files, and goal…", "描述要交给智能体执行的任务、目标与约束…")}
+              </Text>
+            </View>
+          </If>
+        </View>
 
         <View class="gap-2">
           <Text class="text-xs font-medium text-subtle">{tr("Agents to run side by side", "并行运行的编码智能体")}</Text>

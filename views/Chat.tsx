@@ -15,6 +15,8 @@ import {
   composerDraft,
   conversationKey,
   currentActivity,
+  currentDaemonSession,
+  headingDaemonSession,
   hasModel,
   isDraftAhead,
   isLeavingSession,
@@ -76,6 +78,9 @@ function isChatActive() {
 function activityLabel() {
   const dialog = pendingDialog();
   if (dialog) return tr("Waiting for confirmation", "等待确认");
+  // A blocked session is waiting before its dialog replay lands: the daemon's
+  // word is earlier than the attach's, and "thinking" would be a lie it tells.
+  if ((headingDaemonSession() ?? currentDaemonSession())?.status === "blocked") return tr("Waiting for confirmation", "等待确认");
   if (!isRunning()) {
     const waiting = waitingCount();
     if (waiting > 0) return tr(`Waiting on ${waiting} ${waiting === 1 ? "session" : "sessions"}`, `等待 ${waiting} 个会话`);
@@ -472,6 +477,10 @@ const RELEASE_SETTLE_MS = 300;
 const OWN_SEND_TOP_GAP = 10;
 /** How long (ms) a send's entry glide gets to land before the hold re-asserts the prompt's place absolutely. */
 const OWN_SEND_GLIDE_MS = 380;
+/** How quiet (ms) the offset must be after the glide's window to call the flight landed: re-asking sooner — animated or not — restarts or snaps the stretch still arriving. */
+const OWN_SEND_QUIET_MS = 50;
+/** The longest (ms) the landing wait runs before the pin takes over wherever the flight got to. */
+const OWN_SEND_LAND_MS = 900;
 /** The longest (ms) a settled hold's glide back to the end may take before the reservation is dropped anyway — a list that reports no passes lands the same way, only later. */
 const OWN_SEND_RETURN_MS = 900;
 
@@ -502,6 +511,7 @@ function maskRamp(from: number, to: number, start: number, end: number): string[
     const a = Math.round(Math.max(0, Math.min(1, from + (to - from) * smoothMask(t))) * 255)
       .toString(16)
       .padStart(2, "0");
+    // A mask channel only: the alpha carries the fade, the color is never seen.
     stops.push(`#000000${a} ${at}px`);
   }
   return stops;
@@ -735,6 +745,8 @@ export function Chat() {
   let inputAt = 0;
   let releasedAt = 0;
   let lastY: number | undefined;
+  /** When the offset last actually moved: the send's anchor reads it to know its glide has landed before pinning. */
+  let lastMoveAt = 0;
   let lastDistance = 0;
   let lastViewportH = 0;
   /**
@@ -744,7 +756,13 @@ export function Chat() {
    * scroll gesture of the reader's releases the hold; a filled runway hands the
    * view back to the end-follow.
    */
-  let ownSend: { id: string; glideUntil: number } | undefined;
+  /**
+   * `glideUntil`: the entry glide's retarget window. `seatBy`: how long its last
+   * flight may take to land before the pin takes over anyway; `seated`: it has.
+   * `askedIx`: the index the flying retarget was aimed at — only a new one is
+   * worth restarting the flight.
+   */
+  let ownSend: { id: string; glideUntil: number; seatBy: number; seated: boolean; askedIx?: number } | undefined;
   /** Scrollable room reserved under the anchored prompt (extra bottom pad): what lets it reach the top. It goes once the reply fills the view or the hold ends. */
   const runway = signal(0);
   /** Set while the anchor owns the view: the end-pin, the jump pill and the end-settle stay out of its way. */
@@ -812,6 +830,9 @@ export function Chat() {
    */
   const promptAway = computed(() => {
     if (ownHold()) return undefined;
+    // A reserve draining under an end-held view is the anchor still settling,
+    // not the reader having scrolled off: nothing to offer the way back from.
+    if (following() && runway() > 0) return undefined;
     const top = topRow();
     if (top < 0) return undefined;
     const rows = displayRows();
@@ -820,7 +841,10 @@ export function Chat() {
       if (row.kind !== "user") continue;
       if (i < top) return { index: i, text: row.text, images: row.images, below: false };
       const bottom = bottomRow();
-      if (bottom >= 0 && i > bottom) return { index: i, text: row.text, images: row.images, below: true };
+      // Below is only real where the scroll says the view left the end: a stale
+      // range report (a `viewSpan` measured on other rows) can put the last rows
+      // out of view while the offset still sits on the end.
+      if (bottom >= 0 && i > bottom && distanceFromEnd() > FOLLOW_THRESHOLD) return { index: i, text: row.text, images: row.images, below: true };
       return undefined;
     }
     return undefined;
@@ -945,30 +969,82 @@ export function Chat() {
    */
   let runwayLanding: { target: number } | undefined;
 
-  /** The anchor ends: pin, hold and reservation gone at once (the pad sits under everything — removing it moves no row). */
-  const dropOwnSend = () => {
+  /** The anchor's pin ends: the hold is lifted but the reservation stays — it is the reader's to scroll through now. */
+  const releasePin = () => {
     ownSend = undefined;
     ownHold.set(false);
-    runway.set(0);
-    runwayLanding = undefined;
   };
 
-  /** A scroll gesture of the reader's, or their press into what they were reading: the anchor's word is spent. */
-  const releaseOwnSend = () => {
-    if (ownSend || runwayLanding) dropOwnSend();
+  /** The anchor ends: pin, hold and reservation gone at once — only where no view stands on the reservation (a conversation change remounts the list whole). */
+  const dropOwnSend = () => {
+    releasePin();
+    runway.set(0);
+    runwayLanding = undefined;
+    if (runwayDrain !== undefined) {
+      cancelAnimationFrame(runwayDrain);
+      runwayDrain = undefined;
+    }
   };
 
   /**
-   * One layout pass of the anchor's pin, fed by the list's own scroll reports:
-   * retarget the entry glide, then hold the prompt at its inset absolutely
-   * (`scrollToIndex` resolves the row wherever folds and growth move it).
+   * The reservation is a consumable scroll room, never dropped while the view
+   * can see it — removing scrollable space under the offset clamps the list and
+   * snaps every row down. While released it is spent by the reader's own scroll
+   * (`onScroll`): out of sight it goes whole, under the view it keeps just the
+   * stretch they are inside, and at the end it drains away (`drainRunway`).
+   */
+  let runwayDrain: number | undefined;
+  const drainRunway = () => {
+    if (runwayDrain !== undefined) return;
+    const tick = () => {
+      runwayDrain = undefined;
+      if (ownSend || runwayLanding || !untracked(following)) return;
+      const room = untracked(runway);
+      if (room <= 0) return;
+      const next = room - Math.max(18, room * 0.18);
+      runway.set(next <= 2 ? 0 : next);
+      if (next > 2) runwayDrain = requestAnimationFrame(tick);
+    };
+    runwayDrain = requestAnimationFrame(tick);
+  };
+
+  /** A scroll gesture of the reader's, or their press into what they were reading: the anchor's word is spent — the reservation is theirs, to be consumed. */
+  const releaseOwnSend = () => {
+    if (!ownSend && !runwayLanding) return;
+    releasePin();
+    runwayLanding = undefined;
+  };
+
+  /**
+   * One layout pass of the anchor's pin, fed by the list's own scroll reports.
+   *
+   * The entry glide is re-asked only when the prompt's index has moved (a fold
+   * taking rows away above it): every animated re-ask starts the native flight
+   * over, so asking per report kept it restarting and arriving after the
+   * window — the pin then snapped its last stretch into a jump. Untouched, one
+   * flight lands it whole. After the window the last flight is given a beat of
+   * quiet to land (`seatBy` the cap), and only then does the pin assert the
+   * prompt's place absolutely (`scrollToIndex` resolves the row wherever folds
+   * and growth move it).
    */
   const ownSendStep = () => {
     const o = ownSend;
     if (!o) return;
     const ix = untracked(displayRows).findIndex((row) => row.id === o.id);
     if (ix < 0) return settleOwnSend(false);
-    list?.scrollToIndex({ index: ix, viewPosition: 0, viewOffset: ownSendInset(), animated: Date.now() < o.glideUntil });
+    const now = Date.now();
+    if (now < o.glideUntil) {
+      if (ix !== o.askedIx) {
+        o.askedIx = ix;
+        list?.scrollToIndex({ index: ix, viewPosition: 0, viewOffset: ownSendInset(), animated: true });
+      }
+      return;
+    }
+    if (!o.seated) {
+      if (now - lastMoveAt < OWN_SEND_QUIET_MS && now < o.seatBy) return;
+      o.seated = true;
+    }
+    list?.scrollToIndex({ index: ix, viewPosition: 0, viewOffset: ownSendInset(), animated: false });
   };
 
   /**
@@ -981,16 +1057,23 @@ export function Chat() {
    * snaps back.
    */
   const settleOwnSend = (filled: boolean) => {
-    ownSend = undefined;
-    ownHold.set(false);
+    releasePin();
     following.set(true);
-    if (filled || untracked(reduceMotion) || untracked(isChatActive) || !list) {
+    if (filled || untracked(reduceMotion) || !list) {
       runway.set(0);
       runwayLanding = undefined;
       scheduleEndSettle(2);
       return;
     }
     endSettlePasses = 0;
+    if (untracked(isChatActive)) {
+      // Work is still landing under the prompt: the reserve stays until the
+      // end's own passes consume it — it is never dropped from under a view
+      // that can see it.
+      scheduleEndSettle(2);
+      drainRunway();
+      return;
+    }
     const landing = (runwayLanding = { target: Math.max(0, lastMax - untracked(runway)) });
     list.scrollTo({ y: landing.target, animated: true });
     setTimeout(() => {
@@ -1029,10 +1112,21 @@ export function Chat() {
         follow(!reduceMotion() && !isChatActive());
       }
     }
+    if (lastY === undefined || Math.abs(y - lastY) > 0.5) lastMoveAt = Date.now();
     lastY = y;
     lastDistance = distance;
     lastViewportH = e.size.height;
     lastMax = e.contentSize.height - e.size.height;
+    // A released reservation is spent here, as the reader's scroll reaches it:
+    // none of it on screen — it goes whole; the reader inside it — it is their
+    // scroll room, spent by travelling; at the end — it drains away under the
+    // view. It is never dropped while they can see it: losing scrollable room
+    // under the offset clamps the list and snaps every row down.
+    const room = untracked(runway);
+    if (room > 0 && !ownSend && !runwayLanding) {
+      if (distance >= room - 0.5) runway.set(0);
+      else if (following()) drainRunway();
+    }
     // A scroll asked while its commit settled is re-asked as the list reports
     // its passes — each lands on the end the layout now says. A gesture of the
     // reader's ends it: theirs wins.
@@ -1242,6 +1336,8 @@ export function Chat() {
     following.set(true);
     if (animated) list?.scrollToEnd({ animated: true });
     else scheduleEndSettle(2);
+    // Already at the end reports no scroll pass: the reserve left over drains here.
+    if (untracked(runway) > 0) drainRunway();
   };
 
   // A fold the reader presses grows or shrinks the rows under it, not those above: let go of the end.
@@ -1304,7 +1400,9 @@ export function Chat() {
     pendingAnchor = undefined;
     inputAt = 0;
     const reduced = untracked(reduceMotion);
-    ownSend = { id, glideUntil: Date.now() + (reduced ? 0 : OWN_SEND_GLIDE_MS) };
+    const glideUntil = Date.now() + (reduced ? 0 : OWN_SEND_GLIDE_MS);
+    ownSend = { id, glideUntil, seatBy: glideUntil + OWN_SEND_LAND_MS, seated: reduced, askedIx: ix };
+    lastMoveAt = Date.now();
     ownHold.set(true);
     following.set(false);
     // Sending is moving on: ends owed to the reader fold now, under the pin.

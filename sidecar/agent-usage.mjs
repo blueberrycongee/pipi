@@ -112,10 +112,9 @@ export function dropLegacyUsage(messages) {
   return messages;
 }
 
-/** The growth of a running total since `before`; a total that went down started over. */
+/** The growth of a running total since `before`, key by key: one that went down started over. */
 function growth(now, before, keys) {
-  const grew = !!before && keys.every((key) => now[key] >= num(before[key]));
-  return Object.fromEntries(keys.map((key) => [key, grew ? now[key] - num(before[key]) : now[key]]));
+  return Object.fromEntries(keys.map((key) => [key, before && now[key] >= num(before[key]) ? now[key] - num(before[key]) : now[key]]));
 }
 
 // ── Claude Code ─────────────────────────────────────────────────────────────

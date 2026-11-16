@@ -23,7 +23,7 @@ import {
 import { setSidebarOpen, sidebarOpen } from "../store/prefs";
 import { Button, Chip, IconButton } from "../ui/Button";
 import { Icon } from "../ui/Icon";
-import { enter, Presence } from "../ui/motion";
+import { Presence } from "../ui/motion";
 import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, HEADER_GLASS, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 

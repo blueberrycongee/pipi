@@ -276,8 +276,44 @@ function normalizeToolName(raw) {
 }
 
 // ── Session Persistence (compatible with list-sessions.mjs) ─────────────────
+//
+// The `.jsonl` is the header (line 0) plus one line per message and usage
+// entry; saves append what is new instead of rewriting history. The header
+// fields that change every turn — `context`, `usageBaseline`, `modified` —
+// live in `<file>.state.json`, a few hundred bytes rewritten per save, and
+// load merges them back over the header. A structural header change
+// (name/model/driver/…) still rewrites the whole file; `flushed` tracks
+// what is on disk so that stays rare.
+let flushed = undefined; // {key, messages, usage, bytes} — what the .jsonl holds
+let flushedState = undefined; // serialized .state.json contents last written
+let messagesDirty = false; // an already-written message changed in place
+let saveChain = Promise.resolve(); // saves never overlap
 
-async function saveExternalSession() {
+function saveExternalSession() {
+  const run = saveChain.then(() => saveExternalSessionNow(), () => saveExternalSessionNow());
+  saveChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+/** The header minus the volatile fields that live in the state file. */
+function stableHeaderKey(header) {
+  const { usageBaseline, context, modified, ...stable } = header;
+  return JSON.stringify(stable);
+}
+
+async function writeSessionState(volatile) {
+  const text = JSON.stringify(volatile);
+  if (text === flushedState) return;
+  const target = `${sessionFile}.state.json`;
+  const tmp = `${target}.tmp.${process.pid}`;
+  try {
+    await fsp.writeFile(tmp, text, { mode: 0o600 });
+    await fsp.rename(tmp, target);
+    flushedState = text;
+  } catch {}
+}
+
+async function saveExternalSessionNow() {
   if (messages.length === 0) return;
   const dir = externalSessionsDir(cwd);
   if (!sessionFile) {
@@ -308,8 +344,40 @@ async function saveExternalSession() {
     created: messages[0]?.timestamp || Date.now(),
     modified: Date.now(),
   };
-  const lines = [JSON.stringify(header), ...messages.map((m) => JSON.stringify({ type: "message", message: m })), ...sessionUsageEntries.map((entry) => JSON.stringify(entry))];
-  await fsp.writeFile(sessionFile, `${lines.join("\n")}\n`, "utf8");
+  const key = stableHeaderKey(header);
+  const stat = await fsp.stat(sessionFile).catch(() => undefined);
+  const appendable =
+    flushed && !messagesDirty && stat && stat.size === flushed.bytes && flushed.key === key;
+  if (appendable) {
+    const newMsgs = messages.slice(flushed.messages);
+    const newUsage = sessionUsageEntries.slice(flushed.usage);
+    const tail = [
+      ...newMsgs.map((m) => JSON.stringify({ type: "message", message: m })),
+      ...newUsage.map((entry) => JSON.stringify(entry)),
+    ];
+    if (tail.length) {
+      const chunk = `${tail.join("\n")}\n`;
+      await fsp.appendFile(sessionFile, chunk, "utf8");
+      // Only the lines just written count as flushed — entries pushed while
+      // the write was in flight flush on the next save.
+      flushed.bytes += Buffer.byteLength(chunk);
+      flushed.messages += newMsgs.length;
+      flushed.usage += newUsage.length;
+    }
+  } else {
+    const msgCount = messages.length;
+    const usageCount = sessionUsageEntries.length;
+    const lines = [
+      JSON.stringify(header),
+      ...messages.map((m) => JSON.stringify({ type: "message", message: m })),
+      ...sessionUsageEntries.map((entry) => JSON.stringify(entry)),
+    ];
+    const body = `${lines.join("\n")}\n`;
+    await fsp.writeFile(sessionFile, body, "utf8");
+    flushed = { key, messages: msgCount, usage: usageCount, bytes: Buffer.byteLength(body) };
+    messagesDirty = false;
+  }
+  await writeSessionState({ usageBaseline, context: header.context, modified: header.modified });
 }
 
 async function loadExternalSession(targetPath) {
@@ -353,13 +421,33 @@ async function loadExternalSession(targetPath) {
   for (const m of loadedMessages) if (m.role === "assistant") addInto(sessionUsage, fromUsage(m.usage));
   for (const entry of loadedUsage) addInto(sessionUsage, fromUsage(entry.usage));
   sessionUsageEntries = loadedUsage;
+  // The volatile header fields live in the state file once the session has
+  // been saved incrementally; it wins over the (older) header copy.
+  let savedState;
+  try {
+    savedState = JSON.parse(await fsp.readFile(`${targetPath}.state.json`, "utf8"));
+  } catch {}
   if (header?.driver === driver) {
-    usageBaseline = header.usageBaseline && typeof header.usageBaseline === "object" ? header.usageBaseline : undefined;
-    contextTokens = typeof header.context?.tokens === "number" ? header.context.tokens : undefined;
-    contextWindow = typeof header.context?.window === "number" && header.context.window > 0 ? header.context.window : undefined;
+    const baseline = savedState?.usageBaseline ?? header.usageBaseline;
+    usageBaseline = baseline && typeof baseline === "object" ? baseline : undefined;
+    const ctx = savedState?.context ?? header.context;
+    contextTokens = typeof ctx?.tokens === "number" ? ctx.tokens : undefined;
+    contextWindow = typeof ctx?.window === "number" && ctx.window > 0 ? ctx.window : undefined;
+    try {
+      flushedState = savedState !== undefined ? JSON.stringify(savedState) : undefined;
+    } catch {
+      flushedState = undefined;
+    }
+  } else {
+    flushedState = undefined;
   }
-  clearStaleBackgroundTools(loadedMessages);
+  messagesDirty = false;
+  if (clearStaleBackgroundTools(loadedMessages)) messagesDirty = true;
   messages = loadedMessages;
+  // The file already holds what was loaded: appends continue from there, and
+  // the next structural header difference (a Pi header, a driver switch) falls
+  // back to a rewrite.
+  flushed = { key: stableHeaderKey(header || {}), messages: loadedMessages.length, usage: loadedUsage.length, bytes: Buffer.byteLength(raw) };
 }
 
 // ── Orchestration Guidance for External Coordinator Agents ──────────────────
@@ -660,7 +748,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
   // assistant message, the way Pi stamps each of its own.
   const usageParts = [];
   let sampled = false;
-  let lastSample = undefined;
+  const lastSample = new Set();
   let finished = false;
   // What this turn said and called, in full: what a replay of it is measured against (`acpWokenSince`).
   let saidText = "";
@@ -750,8 +838,12 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
     },
     /** One model request, from an engine that reports each as it happens; a repeat is dropped. */
     usageSample(sample) {
-      if (!sample || sample.sig === lastSample) return;
-      lastSample = sample.sig;
+      if (!sample || isBlank(sample)) return;
+      if (sample.sig !== undefined) {
+        if (lastSample.has(sample.sig)) return;
+        lastSample.add(sample.sig);
+        if (lastSample.size > 16) lastSample.delete(lastSample.values().next().value);
+      }
       sampled = true;
       this.usage(sample);
     },
@@ -1577,14 +1669,19 @@ function acpWakeSleep(ms) {
 }
 
 function clearStaleBackgroundTools(list = messages, onlyId = undefined) {
+  let cleared = false;
   for (const msg of list) {
     if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
     for (const block of msg.content) {
       if (block?.type === "toolCall" && block.background && (onlyId === undefined || block.id === onlyId)) {
         delete block.background;
+        cleared = true;
       }
     }
   }
+  // A line already on disk no longer matches memory — the next save rewrites.
+  if (cleared && list === messages) messagesDirty = true;
+  return cleared;
 }
 
 function forgetAcpWake() {
@@ -2363,13 +2460,17 @@ function handleAcpUpdate(u) {
     }
   } else if (kind === "usage_update") {
     acpUsage = { used: Number(u.used ?? 0), size: Number(u.size ?? 0) };
-    acpStream?.usageSample(acpMetaSample(u._meta));
     // The session's running cost: what it grew by since the last reading. A session
     // resumed with nothing to measure against only sets the mark for the next one.
     const known = usageBaseline?.thread === acpSessionId ? usageBaseline : undefined;
     const cost = acpCostPart(u.cost, known);
+    if (cost) usageBaseline = { thread: acpSessionId, ...cost.total };
+    if (acpReplay) {
+      // A replay's usage is history, not new spend: refresh the marks, record nothing.
+      return;
+    }
+    acpStream?.usageSample(acpMetaSample(u._meta));
     if (cost) {
-      usageBaseline = { thread: acpSessionId, ...cost.total };
       // Between prompts there is no turn to put it on: it is the session's all the same.
       if (known && acpStream) acpStream.usage(cost.part);
       else if (known && !isBlank(cost.part)) recordUsageEntry(toUsage([cost.part]), "late");
@@ -2867,7 +2968,7 @@ async function handleCommand(cmd) {
         tokens: { input: sessionUsage.input, output: sessionUsage.output, cacheRead: sessionUsage.cacheRead, cacheWrite: sessionUsage.cacheWrite, total },
         cost: sessionUsage.cost,
         // Tokens without a cost: the engine names none, so there is none to show.
-        costReported: sessionUsage.priced || total === 0,
+        costReported: sessionUsage.priced,
         contextUsage: {
           tokens: used,
           contextWindow: win,
@@ -2924,6 +3025,9 @@ async function handleCommand(cmd) {
         sessionFile = undefined;
         sessionName = undefined;
         nativeThreadId = undefined;
+        flushed = undefined;
+        flushedState = undefined;
+        messagesDirty = false;
         resetSessionUsage();
       });
       return { cancelled: false };
@@ -2935,9 +3039,13 @@ async function handleCommand(cmd) {
         sessionId = crypto.randomUUID();
         sessionFile = undefined;
         nativeThreadId = undefined;
+        flushed = undefined;
+        flushedState = undefined;
+        messagesDirty = false;
         // The clone starts a fresh native thread: the engine's context is the
         // next prompt alone, so the last fill no longer stands for it.
         contextTokens = undefined;
+        resetSessionUsage();
         await saveExternalSession();
       });
       return { cancelled: false };
@@ -3011,7 +3119,9 @@ async function handleCommand(cmd) {
       });
     }
     default:
-      return undefined;
+      // An honest no: a command this driver does not have fails like it does not
+      // have it — answering success would be work reported as done that never was.
+      throw new Error(`unsupported command "${cmd.type}"`);
   }
 }
 

@@ -1,5 +1,7 @@
 import { expect, test } from "nsh/test";
+import { BUILTIN_AGENTS } from "../agents/catalog";
 import manifest from "../nsh.json";
+import { PROVIDERS } from "./providers";
 import { DIRECT_NODE_COMMANDS, SidecarError, startError } from "./sidecar";
 
 // What nsh rejects a launch with, as its macOS host says it (nsh 0.5): the same
@@ -13,6 +15,20 @@ test("every command started by name is one nsh.json grants", () => {
   // The host shell starts a Node found by its path, and looks for the system-wide ones.
   expect(granted).toContain("sh");
   expect(granted).toContain("cmd");
+  // Helpers reach these by bare name too: lookups, dialogs, launchers, permissions.
+  for (const helper of ["where", "osascript", "powershell", "pwsh", "zenity", "kdialog", "chmod", "git", "npx", "uvx", "uv", "bun"]) {
+    expect(granted).toContain(helper);
+  }
+});
+
+test("a variable an agent or provider reads is one nsh.json passes on", () => {
+  const env: string[] = manifest.capabilities.process.env;
+  for (const agent of BUILTIN_AGENTS) {
+    if (agent.envVar) expect(env).toContain(agent.envVar);
+  }
+  for (const provider of PROVIDERS) {
+    expect(env).toContain(provider.env);
+  }
 });
 
 test("a folder outside the home directory is said as the folder", () => {

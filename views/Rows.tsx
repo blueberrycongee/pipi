@@ -330,15 +330,18 @@ export function turnDefault(id: string, working: boolean, following: boolean, ha
     watched.seen.add(id);
     return true;
   }
-  if (!watched.seen.has(id)) return false;
+  if (!watched.seen.has(id)) return pendingAutoClose.has(id);
   if (watched.owed.has(id)) return true;
   if (!following) {
     watched.owed.add(id);
     return true;
   }
   watched.seen.delete(id);
-  if (hasDetails && !untracked(reduceMotion)) scheduleAutoFold(id);
-  return false;
+  if (!hasDetails || untracked(reduceMotion)) return false;
+  scheduleAutoFold(id);
+  // The header holds its open frame until the fold's own pass: head and body
+  // fold in one commit — never a folded head over a still-open process.
+  return pendingAutoClose.has(id);
 }
 
 /** The reader follows the conversation again: the turns that ended while they read elsewhere fold now. */
@@ -896,7 +899,7 @@ function ToolCallRow(props: { row: ToolRow; compact?: boolean }) {
 function ActivityView(props: { row: ActivityRow }) {
   const open = () => isOpen(props.row.id, false);
   const title = () => describeActivity(props.row, activeLanguage());
-  const pulseOpacity = useBreathingOpacity(() => props.row.running, 0.55, 1300);
+  const pulseOpacity = useBreathingOpacity(() => props.row.live === true, 0.55, 1300);
   const only = () => (props.row.steps.length === 1 ? props.row.steps[0] : undefined);
   const onlySession = () => {
     const step = only();
@@ -962,7 +965,7 @@ function ActivityView(props: { row: ActivityRow }) {
  * which the list shows or leaves out; the header itself never changes height.
  */
 function TurnHeaderView(props: { row: TurnHeaderRow }) {
-  const pulseOpacity = useBreathingOpacity(() => props.row.running, 0.55, 1300);
+  const pulseOpacity = useBreathingOpacity(() => props.row.live === true, 0.55, 1300);
   const settleOpacity = createAnimatedValue(1);
   let trackedId = "";
   let wasRunning = false;

@@ -6,6 +6,8 @@ export interface Exit {
   code?: number | null;
   signal?: string | null;
   error?: string | null;
+  /** The daemon asked for this exit — a stop that had to kill, an unload, a shutdown. Not a death to recover from. */
+  expected?: boolean;
 }
 
 /**

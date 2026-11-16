@@ -877,11 +877,20 @@ export class Transcript {
     return true;
   }
 
+  /** A staged bubble's send is live again after waiting out a switch: the withdrawal clock its carry armed stands down. */
+  keepStaged(id: string | undefined) {
+    const item = this.#staged.find((entry) => entry.row.id === id);
+    if (!item || item.dropAt === undefined) return;
+    item.dropAt = undefined;
+    this.version++;
+  }
+
   /** Marks a staged message as one the agent queued: it may yet be recalled before its echo. */
   markStagedQueued(id: string | undefined) {
     const item = this.#staged.find((entry) => entry.row.id === id);
     if (!item) return;
     item.queueAcked = true;
+    item.dropAt = undefined;
     if (item.queued) return;
     item.queued = true;
     item.row = { ...item.row, queued: true };
@@ -1007,6 +1016,11 @@ export class Transcript {
     return this.#staged.length > 0;
   }
 
+  /** Whether a staged bubble with this row id still waits here — one staged before a switch may have ridden across a landing (`carryStagedTo`) or been withdrawn meanwhile. */
+  hasStagedId(id: string | undefined): boolean {
+    return id !== undefined && this.#staged.some((item) => item.row.id === id);
+  }
+
   /**
    * Whether a staged message still expects a run or an echo: one the queue took
    * back (`dropAt`) no longer does — its bubble only waits out the grace.
@@ -1039,6 +1053,21 @@ export class Transcript {
     if (!this.#staged.length) return;
     this.#commitStaged();
     this.version++;
+  }
+
+  /**
+   * Gives a transcript that replaces this one the staged bubbles its rows do not
+   * already show — this transcript belongs to the same conversation (a landing
+   * re-fetches its session). A bubble the file has not echoed yet survives the
+   * replacement with a grace: an echo still coming adopts it (`#takeStaged`
+   * matches on text), one that never comes withdraws it honestly instead of the
+   * send vanishing between frames or committing phantom later.
+   */
+  carryStagedTo(next: Transcript, now = Date.now()) {
+    for (const item of this.#staged) {
+      const echoed = next.rows().some((row) => row.kind === "user" && row.text === item.row.text && (row.images ?? 0) === item.row.images);
+      if (!echoed) next.#staged.push({ ...item, dropAt: item.dropAt ?? now + QUEUE_ECHO_GRACE_MS });
+    }
   }
 
   #commitStaged() {

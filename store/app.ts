@@ -620,6 +620,13 @@ export const currentSessionDaemonId = currentDaemonId;
 /** The daemon's record of the session on screen. */
 export const currentDaemonSession = computed(() => daemonSessionOfId(openDaemonId()));
 
+/** The daemon's record of the destination while a session change is still heading there — earlier than the attach's own word. */
+export const headingDaemonSession = computed(() => {
+  const target = heading();
+  if (!target) return undefined;
+  return target.daemonId ? daemonSessionOfId(target.daemonId) : daemonSessionByFile(target.file);
+});
+
 /** The active project folder in the sidebar (maps open child worktree sessions back to their parent project). */
 export const activeProjectPath = computed(() => {
   const target = heading();
@@ -1064,7 +1071,10 @@ function landHistory(messages: AgentMessage[]) {
     if (shown) return;
     transcript = before;
   } else {
-    if (before) succeed(before, fresh);
+    if (before) {
+      succeed(before, fresh);
+      before.carryStagedTo(fresh);
+    }
     transcript = fresh;
   }
   // The queue is shown in the conversation alone: one that landed before its history stands in it all the same.
@@ -1666,7 +1676,10 @@ function revive(agentLabel: string, cutShort: boolean, lost: Extract<Phase, { na
         fresh.load(history.messages, sessionWorking);
         if (!sameVisualRows(fresh.rows(), transcript.rows())) {
           // The session opened again is the conversation on screen: the reader's folds stay on it.
-          if (next.sessionFile === file) succeed(transcript, fresh);
+          if (next.sessionFile === file) {
+            succeed(transcript, fresh);
+            transcript.carryStagedTo(fresh);
+          }
           transcript = fresh;
           shownVersion = -1;
           markTranscriptSeen();
@@ -1784,18 +1797,23 @@ export function updatePreferredRuntimeMode(mode: RuntimeMode) {
 export async function changeRuntimeMode(mode: RuntimeMode) {
   const ceiling = currentRuntimeCeiling();
   const effective: RuntimeMode = runtimeModeRank(mode) > runtimeModeRank(ceiling) ? ceiling : mode;
+  const previous = currentRuntimeMode();
   currentRuntimeMode.set(effective);
   const did = openDaemonId();
   // The daemon's record first: it is the ceiling children and raw writes are clamped to.
   if (did) daemonClient?.setRuntimeMode(did, effective);
   if (phase().name === "ready" && client) {
-    if (currentAgentId() === "pi") {
-      // Update Pi's injected extension runtime mode live via slash command
-      await request("prompt", { message: `/pipi-runtime-mode ${effective}` }).catch(() => undefined);
-    } else {
-      (client as unknown as { request(t: string, a: Record<string, unknown>): Promise<unknown> })
-        .request("set_runtime_mode", { mode: effective })
-        .catch(() => undefined);
+    try {
+      if (currentAgentId() === "pi") {
+        // Update Pi's injected extension runtime mode live via slash command
+        await request("prompt", { message: `/pipi-runtime-mode ${effective}` });
+      } else {
+        await (client as unknown as { request(t: string, a: Record<string, unknown>): Promise<unknown> }).request("set_runtime_mode", { mode: effective });
+      }
+    } catch (error) {
+      // The pick was optimistic: a session that refused it is put back as it was.
+      currentRuntimeMode.set(previous);
+      toast("error", `${tr("Could not change the permission mode", "无法更改权限模式")}: ${message(error)}`);
     }
   }
 }
@@ -2258,6 +2276,11 @@ function onEvent(event: SessionEvent) {
     })();
     return;
   }
+  // While a destination is shown ahead, records still arriving belong to the
+  // session being left: applying them would write one conversation's state into
+  // another's. The landing's `get_messages`/`get_state` is authoritative for it.
+  if (ahead) return;
+
   if (event.type === "agent_settled") {
     // An idle-wake catch-up (`acpWakeBeforePrompt`) settles its own turn right before
     // the staged user prompt's `agent_start` arrives: settle the wake rows, keep the run live.
@@ -2455,6 +2478,25 @@ function routeExit(source: PiClient | undefined, exit: Exit, stderr: string, age
   // Only the open session's process ending is news: a detached one is a detach the store asked for.
   if (source !== client) return;
   client = undefined;
+  if (exit.expected) {
+    // The daemon asked for this exit — a stop that had to kill, an idle unload, a
+    // shutdown. It is not a death to put back: the screen stays as it is and the
+    // next send re-attaches, instead of reviving what was stopped.
+    batch(() => {
+      running.set(false);
+      bashRunning.set(false);
+      activity.set({ kind: "idle" });
+      queue.set({ steering: [], followUp: [] });
+      dialogs.set([]);
+      statuses.set({});
+      widgets.set({});
+      const known = state();
+      if (known) state.set({ ...known, isStreaming: false, isCompacting: false });
+    });
+    bashRequestId = undefined;
+    stopAsked = false;
+    return;
+  }
   const how = exit.signal
     ? tr(`signal ${exit.signal}`, `信号 ${exit.signal}`)
     : tr(`code ${exit.code ?? "unknown"}`, `退出码 ${exit.code ?? "未知"}`);
@@ -2760,7 +2802,14 @@ export async function send(mode: "steer" | "followUp" = "steer") {
             ...(images.length ? { images } : {}),
             ...(pinnedWasQueued ? { streamingBehavior: mode } : {}),
           })
-          .catch(() => undefined);
+          .catch((error) => {
+            // The bubble never left the held conversation, so the words go back to the composer.
+            batch(() => {
+              draft.set(draft() ? `${draft()}\n\n${text}` : text);
+              if (merged.length) attachments.update((list) => [...list, ...merged]);
+            });
+            toast("error", `${tr("The message was not sent", "消息未能发送")}: ${message(error)}`);
+          });
       }
       return;
     }
@@ -2773,6 +2822,7 @@ export async function send(mode: "steer" | "followUp" = "steer") {
     if (heading() || revival) {
       const text = draft().trim();
       const images = attachments().map(({ type, data, mimeType }) => ({ type, data, mimeType }));
+      const pendingAttachments = attachments();
       if (!text && !images.length) return;
       const line = parseSlashLine(text);
       if (line && appCommands().some((own) => answersTo(own, line.name))) {
@@ -2782,14 +2832,31 @@ export async function send(mode: "steer" | "followUp" = "steer") {
         await runAppCommand(text);
         return;
       }
+      // A destination already on screen — shown ahead of its attach, or kept
+      // through its revival — takes the bubble now: the send reads as waiting
+      // there rather than as nothing, and the landing carries it across.
+      const stageIn = ahead?.transcript === transcript || (revival && !heading()) ? transcript : undefined;
+      const preStagedId = stageIn?.stageUser(text, images.length);
       batch(() => {
         draft.set("");
         attachments.set([]);
+        if (preStagedId) {
+          enableLiveRowEntrance();
+          flush();
+          scrollToEnd.set(0);
+        }
       });
       const runDeferred = deferredSendTail.then(async () => {
         for (let wait = arrival; heading() && wait; wait = arrival === wait ? undefined : arrival) await wait;
         while (revival) await revival;
-        await dispatchPrompt(text, images, mode, false);
+        await dispatchPrompt(
+          text,
+          images,
+          mode,
+          false,
+          pendingAttachments,
+          stageIn && preStagedId ? { transcript: stageIn, id: preStagedId } : undefined,
+        );
       });
       deferredSendTail = runDeferred.catch(() => undefined);
       await runDeferred;
@@ -2818,10 +2885,19 @@ async function dispatchPrompt(
   images: ImageContent[],
   mode: "steer" | "followUp",
   clearComposer: boolean,
+  unsentAttachments: Attachment[] = [],
+  preStaged?: { transcript: Transcript; id: string },
 ) {
   const restoreUnsent = () => {
-    if (clearComposer || !text) return;
-    draft.set(draft() ? `${draft()}\n\n${text}` : text);
+    if (clearComposer) return;
+    if (text) draft.set(draft() ? `${draft()}\n\n${text}` : text);
+    if (unsentAttachments.length) {
+      const merged = [...attachments()];
+      for (const item of unsentAttachments) {
+        if (!merged.some((k) => k.data === item.data && k.mimeType === item.mimeType)) merged.push(item);
+      }
+      attachments.set(merged);
+    }
   };
 
   if (phase().name !== "ready") {
@@ -2844,7 +2920,18 @@ async function dispatchPrompt(
     return;
   }
 
-  const activeClient = client;
+  let activeClient = client;
+  if (!activeClient && openDaemonId() && phase().name === "ready" && !revival) {
+    // The session's process was let go — a stop that had to kill it, the daemon's
+    // unload. Sending is what puts the agent back under its conversation.
+    const label = activeAgent().name;
+    await revive(label, false, {
+      name: "failed",
+      title: tr(`${label} could not start`, `${label} 无法启动`),
+      detail: tr("The agent process is not running.", "智能体进程未在运行。"),
+    });
+    activeClient = client;
+  }
   if (!activeClient) {
     restoreUnsent();
     return;
@@ -2875,7 +2962,16 @@ async function dispatchPrompt(
     if (!queued) cheer.set(false);
     // The bubble shows at once even when the agent queues the message behind its
     // run: it lands after the turn's rows, where it belongs in the order sent.
-    stagedId = runTranscript.stageUser(text, images.length, queued);
+    // One staged ahead of the send's wait for its session keeps its row — it
+    // either rode the landing into this transcript under the same id, or sits in
+    // a transcript the landing left behind and is dropped there instead.
+    if (preStaged && runTranscript.hasStagedId(preStaged.id)) {
+      stagedId = preStaged.id;
+      runTranscript.keepStaged(stagedId);
+    } else {
+      if (preStaged) preStaged.transcript.dropStagedUser(preStaged.id);
+      stagedId = runTranscript.stageUser(text, images.length, queued);
+    }
     if (stagedId) queuedSends.set(stagedId, { held: runTranscript, wire: wirePrompt, images, mode, ...(handoff ? { handoff } : {}) });
     if (runTranscript === transcript) flush();
     if (!queued) {
@@ -2979,7 +3075,10 @@ export async function stop() {
       const waiting = [...cleared.steering, ...cleared.followUp].join("\n\n");
       if (waiting) draft.set(draft() ? `${draft()}\n\n${waiting}` : waiting);
     } catch {}
-    await attempt(tr("Could not stop", "无法停止"), () => request("abort"));
+    // The app's own abort is the graceful end, not a gate: an agent that never
+    // answers must not hold the daemon's stop (which kills it) — or quit, which
+    // goes through this on its way out.
+    void attempt(tr("Could not stop", "无法停止"), () => request("abort"));
   }
   const did = openDaemonId();
   if (did) void daemonClient?.stopTree(did).catch(() => undefined);
@@ -2987,7 +3086,7 @@ export async function stop() {
 
 /** Stops a nested daemon session (and its children) from the sidebar's child row. */
 export async function stopDaemonSession(sessionId: string) {
-  await daemonClient?.stopTree(sessionId).catch(() => undefined);
+  await attempt(tr("Could not stop", "无法停止"), () => daemonClient?.stopTree(sessionId) ?? Promise.resolve());
 }
 
 /** Stops every working or blocked daemon session across all trees (e.g. "Stop All & Quit"). */
@@ -2995,7 +3094,7 @@ export async function stopAllDaemonSessions() {
   if (running() || bashRunning() || state()?.isCompacting) {
     await stop();
   }
-  await daemonClient?.stopAll().catch(() => undefined);
+  await attempt(tr("Could not stop", "无法停止"), () => daemonClient?.stopAll() ?? Promise.resolve());
 }
 
 /** Opens a daemon session — by its saved transcript file when present, else by attaching its daemon id directly. */
@@ -3078,12 +3177,12 @@ async function takeQueuedNow(id: string, edit: boolean) {
     }
     if (lost.length) {
       // What could not go back is not lost: it is in the composer, and said once.
+      // The composer is the reader's wherever the switch landed — a detach does
+      // not make the texts die with the parked session.
       held.dropQueuedMatching(lost);
       if (held === transcript) flushSoon();
-      if (client === activeClient) {
-        const text = lost.join("\n\n");
-        draft.set(draft() ? `${draft()}\n\n${text}` : text);
-      }
+      const text = lost.join("\n\n");
+      draft.set(draft() ? `${draft()}\n\n${text}` : text);
       toast("warning", tr("Some queued messages could not be queued again; they are back in the composer.", "部分排队消息未能重新排队，已放回输入框。"));
     }
     if (edit && taken && client === activeClient) focusComposer();

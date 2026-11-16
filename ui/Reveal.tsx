@@ -53,12 +53,16 @@ export function Reveal(props: {
       return;
     }
     const d = untracked(shift);
+    // From the live values, like `Presence`/`FloatingLayer`: a re-open
+    // mid-collapse dips back open instead of blinking to 0 first.
+    void opacity.stop();
+    void translateY.stop();
     if (isOpen) {
-      opacity.keyframes([0, 1], { duration: DURATION.fast, easing: EASING.smoothOut });
-      translateY.keyframes([d, 0], { duration: DURATION.base, easing: EASING.smoothOut });
+      void opacity.timing(1, { duration: DURATION.fast, easing: EASING.smoothOut });
+      void translateY.timing(0, { duration: DURATION.base, easing: EASING.smoothOut });
     } else {
-      opacity.keyframes([1, 0], { duration: 150, easing: EASING.out });
-      translateY.keyframes([0, d], { duration: DURATION.fast, easing: EASING.out });
+      void opacity.timing(0, { duration: 150, easing: EASING.out });
+      void translateY.timing(d, { duration: DURATION.fast, easing: EASING.out });
     }
   });
 
@@ -130,14 +134,18 @@ export function Presence(props: {
       return;
     }
     const s0 = untracked(fromScale);
+    // Reversals continue from the live values — a mid-exit re-show dips back up,
+    // never snapping a visible indicator to 0 first (`FloatingLayer`'s pattern).
+    void opacity.stop();
+    void scale.stop();
     if (now) {
       mounted.set(true);
-      opacity.keyframes([0, 1], { duration: untracked(enterMs), easing: EASING.smoothOut });
-      scale.keyframes([s0, 1], { duration: untracked(enterMs), easing: EASING.smoothOut });
+      void opacity.timing(1, { duration: untracked(enterMs), easing: EASING.smoothOut });
+      void scale.timing(1, { duration: untracked(enterMs), easing: EASING.smoothOut });
     } else {
       const ms = untracked(exitMs);
-      opacity.keyframes([1, 0], { duration: ms, easing: EASING.out });
-      scale.keyframes([1, s0], { duration: ms, easing: EASING.out });
+      void opacity.timing(0, { duration: ms, easing: EASING.out });
+      void scale.timing(s0, { duration: ms, easing: EASING.out });
       timer = setTimeout(() => {
         if (seq === mySeq) mounted.set(false);
       }, ms);
