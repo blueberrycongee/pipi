@@ -47,7 +47,7 @@ test("states", async () => {
     await shot(app, `history-${scheme}`);
     await app.press("label:Settings");
     await shot(app, `settings-general-${scheme}`);
-    for (const section of ["agents", "usage", "about"]) {
+    for (const section of ["agents", "usage", "shortcuts", "about"]) {
       await app.press(`id:settings-nav-${section}`);
       await shot(app, `settings-${section}-${scheme}`);
     }

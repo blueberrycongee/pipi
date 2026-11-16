@@ -1624,3 +1624,21 @@ test("a queue no bubble stands for gets its bubbles: the conversation is where t
   late.markStagedQueued(id);
   expect(late.rows().filter((r) => r.kind === "user")).toHaveLength(1);
 });
+
+test("unwraps JSON provider error envelopes into readable text", () => {
+  const t = new Transcript();
+  const raw = '{"type":"error","error":{"type":"api_error","message":"passthrough stream idle timeout after 120s waiting for next chunk"}}';
+  t.load(
+    [
+      { role: "user", content: "build release", timestamp: 1 } as never,
+      { role: "assistant", content: [], stopReason: "error", errorMessage: raw, timestamp: 2 } as never,
+    ],
+    false,
+  );
+  const notice = t.rows()[t.rows().length - 1];
+  expect(notice).toMatchObject({
+    kind: "notice",
+    tone: "error",
+    text: "passthrough stream idle timeout after 120s waiting for next chunk (api_error)",
+  });
+});

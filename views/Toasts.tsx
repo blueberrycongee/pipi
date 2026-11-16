@@ -21,7 +21,7 @@ function ToastCard(props: { toast: Toast; leaving: boolean }) {
     enter: {
       keyframes: { opacity: [0, 1], translateY: [-12, 0], scale: [0.95, 1] },
       duration: 220,
-      easing: EASING.smoothOut,
+      easing: EASING.signature,
     },
   });
   const exitScale = createAnimatedValue(1);
@@ -36,7 +36,7 @@ function ToastCard(props: { toast: Toast; leaving: boolean }) {
         exitScale.set(1);
         return;
       }
-      void exitScale.timing(0.95, { duration: 150, easing: EASING.out });
+      void exitScale.timing(0.95, { duration: 150, easing: EASING.exit });
     });
   });
   cleanup(() => void exitScale.stop());

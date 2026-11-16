@@ -62,6 +62,17 @@ interface Prefs {
   workspaces: string[];
   /** Project folders whose session lists are collapsed in the sidebar. */
   collapsedWorkspaces: string[];
+  /**
+   * Standings a drag gave rows in 最近, keyed by session path or `daemon:<id>`:
+   * a number in the same timestamp domain as the list's natural standings,
+   * which it overrides — a session with no rank keeps its own place.
+   */
+  recentRanks: Record<string, number>;
+  /**
+   * Standings a drag gave sessions inside one project folder: cwd → session
+   * path → rank (same timestamp domain as `modified`, which it overrides).
+   */
+  sessionRanks: Record<string, Record<string, number>>;
   /** Sidebar functional groups folded away: `"workspaces"`, `"recents"`, `"archived"`. */
   collapsedGroups: string[];
   /** Saved sessions tucked into Archived (never deleted on disk), keyed by session `.jsonl` path. */
@@ -141,6 +152,8 @@ export const SIDEBAR_DEFAULT_WIDTH = 264;
 const DEFAULTS: Prefs = {
   workspaces: [],
   collapsedWorkspaces: [],
+  recentRanks: {},
+  sessionRanks: {},
   collapsedGroups: ["archived"],
   archivedSessions: {},
   autoArchiveDays: 0,
@@ -232,6 +245,25 @@ function normalizeWallpaperConfig(raw: unknown): WallpaperConfig | null {
   return config;
 }
 
+function normalizeRanks(raw: unknown): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === "number" && Number.isFinite(value)) out[key] = value;
+  }
+  return out;
+}
+
+function normalizeRankMap(raw: unknown): Record<string, Record<string, number>> {
+  const out: Record<string, Record<string, number>> = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [cwd, ranks] of Object.entries(raw as Record<string, unknown>)) {
+    const inner = normalizeRanks(ranks);
+    if (Object.keys(inner).length) out[cwd] = inner;
+  }
+  return out;
+}
+
 function normalizeSessionChoices(raw: unknown): Record<string, AgentSessionChoice> {
   if (!raw || typeof raw !== "object") return {};
   const out: Record<string, AgentSessionChoice> = {};
@@ -272,6 +304,8 @@ export async function loadPrefs() {
         customAgents: Array.isArray(parsed.customAgents) ? parsed.customAgents : [],
         agentSessionChoices: normalizeSessionChoices(parsed.agentSessionChoices),
         collapsedWorkspaces: Array.isArray(parsed.collapsedWorkspaces) ? parsed.collapsedWorkspaces : [],
+        recentRanks: normalizeRanks(parsed.recentRanks),
+        sessionRanks: normalizeRankMap(parsed.sessionRanks),
         collapsedGroups,
         archivedSessions: normalizeArchivedSessions(parsed.archivedSessions),
         autoArchiveDays: AUTO_ARCHIVE_DAYS.includes(parsed.autoArchiveDays as AutoArchiveDays)
@@ -346,6 +380,9 @@ function applyWallpaperTheme() {
 export const recentWorkspaces = () => prefs().workspaces;
 export const lastActiveWorkspace = () => prefs().activeWorkspace;
 export const collapsedWorkspaces = () => prefs().collapsedWorkspaces;
+export const recentRankOverrides = () => prefs().recentRanks;
+const NO_RANKS: Record<string, number> = {};
+export const sessionRankOverrides = (cwd: string) => prefs().sessionRanks[cwd] ?? NO_RANKS;
 export const isWorkspaceCollapsed = (path: string) => prefs().collapsedWorkspaces.includes(path);
 export const isGroupCollapsed = (id: string) => prefs().collapsedGroups.includes(id);
 export const archivedSessions = () => prefs().archivedSessions;
@@ -581,11 +618,31 @@ export function setAutoArchiveDays(days: AutoArchiveDays) {
   change({ autoArchiveDays: days });
 }
 
+/** A sidebar drag's result: the workspaces in the order they were dropped into. Folders not in `order` keep theirs at the end. */
+export function reorderWorkspaces(order: string[]) {
+  const current = prefs().workspaces;
+  const next = order.filter((path) => current.includes(path));
+  for (const path of current) if (!next.includes(path)) next.push(path);
+  if (next.every((path, i) => path === current[i])) return;
+  change({ workspaces: next });
+}
+
+export function setRecentRankOverrides(next: Record<string, number>) {
+  change({ recentRanks: next });
+}
+
+export function setSessionRankOverrides(cwd: string, next: Record<string, number>) {
+  change({ sessionRanks: { ...prefs().sessionRanks, [cwd]: next } });
+}
+
 export function forgetWorkspace(path: string) {
   const workspaces = prefs().workspaces.filter((p) => p !== path);
+  const sessionRanks = { ...prefs().sessionRanks };
+  delete sessionRanks[path];
   change({
     workspaces,
     collapsedWorkspaces: prefs().collapsedWorkspaces.filter((p) => p !== path),
+    sessionRanks,
     ...(prefs().activeWorkspace === path ? { activeWorkspace: workspaces[0] } : {}),
   });
 }
@@ -600,6 +657,7 @@ export function toggleWorkspaceCollapsed(path: string) {
 }
 
 export function setGroupCollapsed(id: string, collapsed: boolean) {
+  if (prefs().collapsedGroups.includes(id) === collapsed) return;
   const list = prefs().collapsedGroups.filter((g) => g !== id);
   change({ collapsedGroups: collapsed ? [...list, id] : list });
 }

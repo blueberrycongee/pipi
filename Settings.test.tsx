@@ -86,6 +86,31 @@ test("Settings switches sections and subpages without remounting or leaking hidd
   await app.waitUntil(() => app.count("id:settings-nav-agents") === 0);
 });
 
+test("Shortcuts lists the app's keys as platform caps", async () => {
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    storage: { "harness.scenario": "welcome" },
+  });
+  await app.waitFor("text:What are we building?");
+
+  await app.press("label:Settings");
+  await app.waitFor("id:settings-nav-shortcuts");
+  await app.press("id:settings-nav-shortcuts");
+  await app.waitFor("text:Complete the highlighted command");
+
+  const texts = app.texts();
+  for (const row of ["New session", "Compare agents", "Stop", "Send", "Queue a follow-up", "Slash commands", "Command palette", "Escape"]) {
+    expect(texts).toContain(row);
+  }
+  // On macOS a `keymap.label` cap renders with ⌘; literal caps stay literal.
+  for (const cap of ["⌘N", "⇧⌘O", "⌘.", "⌘↩", "/", "!", "!!", "⌘K", "⌘,"]) {
+    expect(texts).toContain(cap);
+  }
+});
+
 test("Settings section switches land settled on the first frame", async () => {
   const app = await open("./Harness.tsx", {
     width: 1180,

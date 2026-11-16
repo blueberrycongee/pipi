@@ -155,6 +155,8 @@ export function PermissionPicker() {
  */
 export function CompareDialog() {
   const taskPrompt = signal("");
+  /** An input method's marked text shows in the field while `taskPrompt` is still empty; the hint stays away for it. */
+  const composing = signal(false);
   const parallelSelected = signal<Record<string, boolean>>({ pi: true, claude: true, codex: true });
   const useWorktree = signal(worktreeIsolationDefault());
 
@@ -214,10 +216,11 @@ export function CompareDialog() {
             scrollbar={false}
             value={taskPrompt()}
             onChange={({ value }) => taskPrompt.set(value)}
+            onCompositionChange={({ composing: now }) => composing.set(now)}
             accessibilityLabel={tr("Comparison task", "对比任务描述")}
             class={`min-h-22 rounded-xl corner-squircle p-3 text-base text-foreground caret-brand ${FIELD_SURFACE}`}
           />
-          <If when={taskPrompt().length === 0}>
+          <If when={taskPrompt().length === 0 && !composing()}>
             <View class="pointer-events-none absolute left-3 right-3 top-3">
               <Text class="text-base text-subtle">
                 {composerDraft().trim()

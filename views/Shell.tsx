@@ -317,7 +317,7 @@ function SidebarSplit(props: { children: JSX.Element }) {
         drawerOpacity.set(0.38);
         drawerSlideX.set(-16);
         drawerAnim = Animated.parallel([
-          Animated.timing(drawerOpacity, { toValue: 1, duration: 220, easing: EASING.smoothOut }),
+          Animated.timing(drawerOpacity, { toValue: 1, duration: 220, easing: EASING.signature }),
           Animated.spring(drawerSlideX, { toValue: 0, stiffness: 340, damping: 34, mass: 1 }),
         ]);
         void drawerAnim.start();
@@ -335,8 +335,8 @@ function SidebarSplit(props: { children: JSX.Element }) {
           });
         }
         drawerAnim = Animated.parallel([
-          Animated.timing(drawerOpacity, { toValue: 0, duration: 165, easing: EASING.out }),
-          Animated.timing(drawerSlideX, { toValue: -12, duration: 185, easing: EASING.out }),
+          Animated.timing(drawerOpacity, { toValue: 0, duration: 165, easing: EASING.exit }),
+          Animated.timing(drawerSlideX, { toValue: -12, duration: 185, easing: EASING.exit }),
         ]);
         void drawerAnim.start();
         settleTimer = setTimeout(() => {

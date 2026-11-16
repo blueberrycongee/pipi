@@ -294,7 +294,7 @@ test("a working turn the reader folded is still folded when they come back to it
   expect(shows(app, SECOND)).toBe(false);
 });
 
-test("a turn that ended while the reader was reading its process folds once they move on", async () => {
+test("a turn that ends while the reader is inside its process folds all the same", async () => {
   const app = await launch("stream");
   await app.waitFor("text:What are we building?");
   await say(app, "make a plan in steps");
@@ -304,22 +304,20 @@ test("a turn that ended while the reader was reading its process folds once they
   await app.press("label:Conversation >> text:View reasoning");
   await app.waitUntil(() => shows(app, "The user wants this done in steps. I will look at the project first."));
 
-  // The answer arrives under a reader who is reading what would fold: it stays for them.
+  // The answer arrives: the turn folds as it would before a reader at the end.
   await app.waitUntil(() => shows(app, ANSWER), { timeout: 60000 });
   await app.waitFor("label:Send", { timeout: 20000 });
-  await app.wait(600);
-  expect(shows(app, FIRST)).toBe(true);
-
-  // The next message is them moving on: the turn folds as it would have, and stays folded.
-  await say(app, "make a plan");
   await app.waitUntil(() => !shows(app, FIRST));
+  expect(shows(app, ANSWER)).toBe(true);
+
+  // And stays folded: the next message is not owed its fold.
+  await say(app, "make a plan");
   await app.waitUntil(() => shows(app, "Steps"), { timeout: 60000 });
   await app.waitFor("label:Send", { timeout: 20000 });
   expect(shows(app, FIRST)).toBe(false);
-  expect(shows(app, ANSWER)).toBe(true);
 });
 
-test("leaving a turn held open for a reader folds it: back from an empty chat, it is as any finished turn", async () => {
+test("back from an empty chat a finished turn is folded, its inside presses kept under it", async () => {
   const app = await launch("stream");
   await app.waitFor("text:What are we building?");
   await app.press(session(REFACTOR));
@@ -329,10 +327,9 @@ test("leaving a turn held open for a reader folds it: back from an empty chat, i
   await app.press("label:Conversation >> text:View reasoning");
   await app.waitUntil(() => shows(app, ANSWER), { timeout: 60000 });
   await app.waitFor("label:Send", { timeout: 20000 });
-  await app.wait(600);
-  expect(shows(app, FIRST)).toBe(true);
+  await app.waitUntil(() => !shows(app, FIRST));
 
-  // An empty chat has no turn to show: nothing there says the reader stopped watching the one they left.
+  // An empty chat has no turn to show: coming back finds it folded as any finished turn.
   await app.keyboard.press("mod+n");
   await app.waitFor("text:What are we building?");
   await app.press(session(REFACTOR));

@@ -54,7 +54,6 @@ import { proseRows } from "./Prose";
 import {
   type ChatRow,
   enterConversation,
-  foldOwedTurns,
   isTurnClosing,
   onFoldSettled,
   onFoldToggle,
@@ -127,10 +126,10 @@ function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void }) {
           translateY.set(0);
         } else if (entering) {
           opacity.set(0);
-          void opacity.keyframes([0, 1], { duration: 160, delay: 45, easing: EASING.out });
+          void opacity.keyframes([0, 1], { duration: 160, delay: 45, easing: EASING.entrance });
           void translateY.spring(0, SPRING.snappy);
         } else {
-          void opacity.timing(1, { duration: 160, easing: "easeOut" });
+          void opacity.timing(1, { duration: 160, easing: EASING.entrance });
           void translateY.spring(0, SPRING.snappy);
         }
       } else if (shown()) {
@@ -138,8 +137,8 @@ function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void }) {
           opacity.set(0);
           shown.set(false);
         } else {
-          void opacity.timing(0, { duration: 200, easing: "easeOut" });
-          void translateY.timing(3, { duration: 200, easing: "easeOut" });
+          void opacity.timing(0, { duration: 200, easing: EASING.exit });
+          void translateY.timing(3, { duration: 200, easing: EASING.exit });
           exitTimer = setTimeout(() => shown.set(false), 210);
         }
       }
@@ -236,23 +235,52 @@ function Stage(props: { title: string | (() => string); detail?: string; size?: 
 }
 
 /** The project the new session will run in: its name, underlined as the switcher to another one. */
-function WelcomeProject() {
+function WelcomeProject(props: { onActiveChange?: (active: boolean) => void }) {
   const open = signal(false);
+  const closing = signal(false);
   const home = backend().home();
   const current = () => workspacePath();
-  const projects = computed(() => {
+  const buildProjects = () => {
     const active = current();
     const rest = recentWorkspaces().filter((path) => path !== active);
     return active ? [active, ...rest] : rest;
+  };
+  const shownCurrent = signal(untracked(current));
+  const shownProjects = signal<string[]>(untracked(buildProjects));
+  effect(() => {
+    const active = current();
+    const list = buildProjects();
+    if (!open() && !closing()) {
+      shownCurrent.set(active);
+      shownProjects.set(list);
+    }
   });
-  const pick = (cwd: string) => {
+  effect(() => {
+    props.onActiveChange?.(open() || closing());
+  });
+  cleanup(() => props.onActiveChange?.(false));
+  const closeAndRun = (action: () => void) => {
+    closing.set(true);
     open.set(false);
-    void newSessionInWorkspace(cwd);
+    setTimeout(action, 0);
+  };
+  const pick = (cwd: string) => {
+    closeAndRun(() => void newSessionInWorkspace(cwd));
   };
   return (
     <Popover
       open={open()}
-      onOpenChange={(e) => open.set(e.open)}
+      onOpenChange={(e) => {
+        if (e.open) {
+          closing.set(false);
+          shownCurrent.set(untracked(current));
+          shownProjects.set(untracked(buildProjects));
+        } else {
+          closing.set(true);
+        }
+        open.set(e.open);
+      }}
+      onClose={() => closing.set(false)}
       placement="bottom"
       align="center"
       offset={8}
@@ -264,7 +292,7 @@ function WelcomeProject() {
       trigger={
         <BaseButton
           accessibilityLabel={tr("Project this session works in", "会话所在项目")}
-          tooltip={tip(tildePath(current(), home))}
+          tooltip={open() || closing() ? undefined : tip(tildePath(current(), home))}
           class={`h-7 flex-row items-center gap-1.5 ${PRESS} ${FOCUS_RING} ${
             // Over a wallpaper the words cannot stand on the picture: they get the composer's glass, as a capsule.
             wallpaper() ? "rounded-full border-[0.5px] border-hairline bg-card/65 pl-3 pr-2.5 hover:bg-card/85 dark:bg-card/58 dark:hover:bg-card/75" : "rounded-md corner-squircle px-1.5 hover:bg-accent"
@@ -277,29 +305,26 @@ function WelcomeProject() {
       }
     >
       <Scroll class="max-h-72">
-        <Each of={projects()} key={(cwd) => cwd}>
+        <Each of={shownProjects()} key={(cwd) => cwd}>
           {(cwd) => (
             <BaseButton
-              selected={cwd() === current()}
+              selected={cwd() === shownCurrent()}
               onPress={() => pick(cwd())}
               class={`min-h-9 flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
             >
-              <Icon name={cwd() === current() ? "folderOpen" : "folder"} size={15} tone={cwd() === current() ? "foreground" : "muted-foreground"} />
+              <Icon name={cwd() === shownCurrent() ? "folderOpen" : "folder"} size={15} tone={cwd() === shownCurrent() ? "foreground" : "muted-foreground"} />
               <View class="min-w-0 flex-1">
-                <Text class={`truncate text-base ${cwd() === current() ? "text-foreground" : "text-muted-foreground"}`}>{basename(cwd())}</Text>
+                <Text class={`truncate text-base ${cwd() === shownCurrent() ? "text-foreground" : "text-muted-foreground"}`}>{basename(cwd())}</Text>
                 <Text class="truncate text-xs text-subtle">{tildePath(cwd(), home)}</Text>
               </View>
-              <View class="w-4 shrink-0 items-center">{cwd() === current() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
+              <View class="w-4 shrink-0 items-center">{cwd() === shownCurrent() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
             </BaseButton>
           )}
         </Each>
       </Scroll>
       <View class="mx-1 h-px bg-border" />
       <BaseButton
-        onPress={() => {
-          open.set(false);
-          void chooseWorkspace();
-        }}
+        onPress={() => closeAndRun(() => void chooseWorkspace())}
         class={`mt-1 min-h-9 flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
       >
         <Icon name="folderPlus" size={15} tone="muted-foreground" />
@@ -317,6 +342,7 @@ function WelcomeProject() {
 function HeroStage(props: { mode: () => "welcome" | "starting"; fading?: () => boolean }) {
   const agentName = () => activeAgent().name;
   const slow = signal(false);
+  const pickerActive = signal(false);
   let lastMood: Mood = untracked(pipMood);
   const stageMood = (): Mood => {
     if (props.fading?.()) return lastMood;
@@ -340,26 +366,22 @@ function HeroStage(props: { mode: () => "welcome" | "starting"; fading?: () => b
       : tr("What are we building?", "今天要构建什么？");
   return (
     <Stage around title={title} mood={stageMood}>
-      <If
-        when={props.mode() === "welcome"}
-        else={
-          <If when={slow()}>
-            <Text class="max-w-110 text-center text-xs text-subtle">
-              {tr(
-                "Taking longer than usual — you can restart the agent or start a fresh session.",
-                "响应时间较长，你可以重启智能体或开启新会话。",
-              )}
-            </Text>
-            <View class="flex-row flex-wrap justify-center gap-2">
-              <Button label={tr(`Restart ${agentName()}`, `重启 ${agentName()}`)} variant="primary" size="lg" icon="refresh" onPress={() => void restartPi()} />
-              <Button label={tr("New session", "新会话")} size="lg" icon="plus" onPress={() => void newSession()} />
-            </View>
-          </If>
-        }
-      >
-        <If when={workspacePath()}>
-          <WelcomeProject />
-        </If>
+      <If when={Boolean(workspacePath()) && (props.mode() === "welcome" || pickerActive())}>
+        <View class={props.mode() === "welcome" ? "items-center" : "pointer-events-none h-0 overflow-hidden opacity-0"}>
+          <WelcomeProject onActiveChange={(on) => pickerActive.set(on)} />
+        </View>
+      </If>
+      <If when={props.mode() === "starting" && slow()}>
+        <Text class="max-w-110 text-center text-xs text-subtle">
+          {tr(
+            "Taking longer than usual — you can restart the agent or start a fresh session.",
+            "响应时间较长，你可以重启智能体或开启新会话。",
+          )}
+        </Text>
+        <View class="flex-row flex-wrap justify-center gap-2">
+          <Button label={tr(`Restart ${agentName()}`, `重启 ${agentName()}`)} variant="primary" size="lg" icon="refresh" onPress={() => void restartPi()} />
+          <Button label={tr("New session", "新会话")} size="lg" icon="plus" onPress={() => void newSession()} />
+        </View>
       </If>
     </Stage>
   );
@@ -425,11 +447,11 @@ function Waiting(props: { show: boolean; around?: boolean }) {
         if (reduceMotion()) opacity.set(1);
         else {
           opacity.set(0);
-          opacity.keyframes([0, 1], { duration: DURATION.slower, delay: PATIENCE_MS, easing: EASING.smoothOut });
+          opacity.keyframes([0, 1], { duration: DURATION.slower, delay: PATIENCE_MS, easing: EASING.signature });
         }
       } else if (mounted()) {
         if (reduceMotion()) return mounted.set(false);
-        void opacity.timing(0, { duration: LEAVE_MS, easing: EASING.out });
+        void opacity.timing(0, { duration: LEAVE_MS, easing: EASING.exit });
         timer = setTimeout(() => mounted.set(false), LEAVE_MS + 10);
       }
     });
@@ -467,6 +489,14 @@ function Failure(props: { title: string; detail: string }) {
  * and the pill would hide at this distance anyway. */
 const FOLLOW_THRESHOLD = 72;
 
+/**
+ * How far the live end must stand below the view before the way back is offered
+ * while a send still holds the prompt: a turn still growing into the room
+ * under it is not out of reach, and the pill must not stand over a blank that
+ * is simply the room the reply is growing into.
+ */
+const JUMP_THRESHOLD = 200;
+
 /** How long (ms) after a scroll gesture of the reader's begins its scroll events are read as theirs. */
 const INPUT_WINDOW_MS = 1500;
 
@@ -474,9 +504,9 @@ const INPUT_WINDOW_MS = 1500;
 const RELEASE_SETTLE_MS = 300;
 
 /** How far under the title bar's band a sent prompt rests once its send anchors it there (zeron's own-send inset: the chrome plus the first row's air). */
-const OWN_SEND_TOP_GAP = 10;
+const OWN_SEND_TOP_GAP = 96;
 /** How long (ms) a send's entry glide gets to land before the hold re-asserts the prompt's place absolutely. */
-const OWN_SEND_GLIDE_MS = 380;
+const OWN_SEND_GLIDE_MS = 320;
 /** How quiet (ms) the offset must be after the glide's window to call the flight landed: re-asking sooner — animated or not — restarts or snaps the stretch still arriving. */
 const OWN_SEND_QUIET_MS = 50;
 /** The longest (ms) the landing wait runs before the pin takes over wherever the flight got to. */
@@ -601,7 +631,7 @@ function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: 
           translateY.set(0);
           scale.set(1);
         } else {
-          void opacity.timing(1, { duration: 160, easing: "easeOut" });
+          void opacity.timing(1, { duration: 160, easing: EASING.entrance });
           void translateY.spring(0, SPRING.snappy);
           void scale.spring(1, SPRING.snappy);
         }
@@ -610,9 +640,9 @@ function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: 
           opacity.set(0);
           mounted.set(false);
         } else {
-          void opacity.timing(0, { duration: 140, easing: "easeIn" });
-          void translateY.timing(6, { duration: 140, easing: "easeIn" });
-          void scale.timing(0.95, { duration: 140, easing: "easeIn" });
+          void opacity.timing(0, { duration: 140, easing: EASING.exit });
+          void translateY.timing(6, { duration: 140, easing: EASING.exit });
+          void scale.timing(0.95, { duration: 140, easing: EASING.exit });
           timer = setTimeout(() => mounted.set(false), 150);
         }
       }
@@ -629,7 +659,7 @@ function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: 
   return (
     <If when={mounted()}>
       <View
-        class="pointer-events-none absolute inset-x-0 z-10 items-center"
+        class="pointer-events-none absolute inset-x-0 z-10 items-end pr-4"
         style={{ bottom: props.bottom, opacity, transform: [{ translateY }, { scale }] }}
       >
         <BaseButton
@@ -751,10 +781,11 @@ export function Chat() {
   let lastViewportH = 0;
   /**
    * A send's own-turn anchor (zeron's send): its bubble glides to the top of the
-   * view and the view holds it there while the reply fills the runway reserved
-   * under it — the bubble never rides a folding turn or a growing stream. A
-   * scroll gesture of the reader's releases the hold; a filled runway hands the
-   * view back to the end-follow.
+   * view and the view holds it there while the reply grows into the runway
+   * reserved under it — the bubble never rides a folding turn or a growing
+   * stream. A scroll gesture of the reader's releases the hold; the reservation
+   * stays theirs to scroll through, and the view returns to the end only when
+   * the run settles (or when they ask for it).
    */
   /**
    * `glideUntil`: the entry glide's retarget window. `seatBy`: how long its last
@@ -763,7 +794,12 @@ export function Chat() {
    * worth restarting the flight.
    */
   let ownSend: { id: string; glideUntil: number; seatBy: number; seated: boolean; askedIx?: number } | undefined;
-  /** Scrollable room reserved under the anchored prompt (extra bottom pad): what lets it reach the top. It goes once the reply fills the view or the hold ends. */
+  /**
+   * Scrollable room reserved under the anchored prompt (extra bottom pad): what
+   * lets it reach the top. It is the blank the reply grows into, and stays part
+   * of the content while the reader scrolls — it is dropped only where it cannot
+   * be seen, or once a return glide has landed below it.
+   */
   const runway = signal(0);
   /** Set while the anchor owns the view: the end-pin, the jump pill and the end-settle stay out of its way. */
   const ownHold = signal(false);
@@ -792,10 +828,7 @@ export function Chat() {
       {
         chosen: turnChoice,
         said: turnSay,
-        // Under a send's hold the fold asks whether the reader is still watching under it:
-        // they are — an end under their prompt folds before them; they pressed into a
-        // process or scrolled — it is owed to them still, whatever the anchor pins.
-        byDefault: (id, working, hasDetails) => turnDefault(id, working, untracked(following) || ownHold(), hasDetails),
+        byDefault: turnDefault,
         keepMounted: isTurnClosing,
       },
       processOf,
@@ -830,8 +863,9 @@ export function Chat() {
    */
   const promptAway = computed(() => {
     if (ownHold()) return undefined;
-    // A reserve draining under an end-held view is the anchor still settling,
-    // not the reader having scrolled off: nothing to offer the way back from.
+    // A reserve standing under a view already following is the anchor still
+    // settling, not the reader having scrolled off: nothing to offer the way
+    // back from.
     if (following() && runway() > 0) return undefined;
     const top = topRow();
     if (top < 0) return undefined;
@@ -947,7 +981,7 @@ export function Chat() {
       void stageFade.stop();
       if (reduced || dimmedOut) return stage.set(undefined);
       stageFade.set(1);
-      void stageFade.timing(0, { duration: STAGE_OUT_MS, easing: EASING.out });
+      void stageFade.timing(0, { duration: STAGE_OUT_MS, easing: EASING.exit });
       stageTimer = setTimeout(() => stage.set(undefined), STAGE_OUT_MS + 10);
     });
   });
@@ -961,13 +995,14 @@ export function Chat() {
   const ownSendInset = () => untracked(topBarHeight) + OWN_SEND_TOP_GAP;
 
   /**
-   * The return glide of a hold that ended short of a filled runway: the end
-   * the content will have once the reservation goes. The reservation is what
-   * let the pin stand there, so it stays until the glide lands — dropped
-   * first, the list would clamp the held offset at once and the prompt would
-   * snap back instead of settling.
+   * A return glide to the end the content keeps once the reservation goes: from
+   * the offset it started at and where it is heading, so the flight is known to
+   * have landed from either side. The reservation is what let the held offset
+   * stand there, so it stays until the glide lands — dropped first, the list
+   * would clamp the held offset at once and the prompt would snap back instead
+   * of settling.
    */
-  let runwayLanding: { target: number } | undefined;
+  let runwayLanding: { from: number; target: number; ready: boolean } | undefined;
 
   /** The anchor's pin ends: the hold is lifted but the reservation stays — it is the reader's to scroll through now. */
   const releasePin = () => {
@@ -980,39 +1015,23 @@ export function Chat() {
     releasePin();
     runway.set(0);
     runwayLanding = undefined;
-    if (runwayDrain !== undefined) {
-      cancelAnimationFrame(runwayDrain);
-      runwayDrain = undefined;
-    }
   };
 
   /**
-   * The reservation is a consumable scroll room, never dropped while the view
-   * can see it — removing scrollable space under the offset clamps the list and
-   * snaps every row down. While released it is spent by the reader's own scroll
-   * (`onScroll`): out of sight it goes whole, under the view it keeps just the
-   * stretch they are inside, and at the end it drains away (`drainRunway`).
+   * The reservation under the view is never taken from it: removing scrollable
+   * space under the offset clamps the list and snaps every row down. It goes
+   * only where the view cannot see it (`onScroll`), or once a return glide has
+   * carried the view to the end the content keeps without it (`runwayLanding`).
    */
-  let runwayDrain: number | undefined;
-  const drainRunway = () => {
-    if (runwayDrain !== undefined) return;
-    const tick = () => {
-      runwayDrain = undefined;
-      if (ownSend || runwayLanding || !untracked(following)) return;
-      const room = untracked(runway);
-      if (room <= 0) return;
-      const next = room - Math.max(18, room * 0.18);
-      runway.set(next <= 2 ? 0 : next);
-      if (next > 2) runwayDrain = requestAnimationFrame(tick);
-    };
-    runwayDrain = requestAnimationFrame(tick);
-  };
 
-  /** A scroll gesture of the reader's, or their press into what they were reading: the anchor's word is spent — the reservation is theirs, to be consumed. */
+  /** A scroll gesture of the reader's, or their press into what they were reading: the anchor's word is spent — the reservation stays, theirs to scroll through. */
   const releaseOwnSend = () => {
     if (!ownSend && !runwayLanding) return;
     releasePin();
     runwayLanding = undefined;
+    // A native flight can still be in the air — the glide's or the return's:
+    // an unanimated ask where the view already is takes the scroll back from it.
+    if (lastY !== undefined) list?.scrollTo({ y: lastY, animated: false });
   };
 
   /**
@@ -1031,7 +1050,7 @@ export function Chat() {
     const o = ownSend;
     if (!o) return;
     const ix = untracked(displayRows).findIndex((row) => row.id === o.id);
-    if (ix < 0) return settleOwnSend(false);
+    if (ix < 0) return settleOwnSend();
     const now = Date.now();
     if (now < o.glideUntil) {
       if (ix !== o.askedIx) {
@@ -1048,68 +1067,125 @@ export function Chat() {
   };
 
   /**
-   * The anchor's natural end. A filled runway hands off where it stands — the
-   * end is already in view, so the reservation can go at once. A hold ending
-   * short of it — the run over, the bubble gone — leaves the prompt somewhere
-   * the content cannot keep without the reservation, so the view first glides
-   * to the end it will have, and the pad goes when the glide lands (or when a
-   * quiet list has had long enough to land it): the return settles, it never
-   * snaps back.
+   * Carry the view to the end the content keeps once the reservation goes, then
+   * drop it. The reservation is what lets the offset stand where it is: dropped
+   * first, the list clamps and every row falls; dropped after the glide lands,
+   * it takes away room the view has already left.
+   *
+   * Returns true while a flight is in the air — the landing is reported by
+   * `onScroll` (a list that reports no passes lands it on the timer).
    */
-  const settleOwnSend = (filled: boolean) => {
+  const landRealEnd = (animated: boolean): boolean => {
+    const room = untracked(runway);
+    if (room <= 0) return false;
+    if (!list) {
+      runway.set(0);
+      return false;
+    }
+    const from = lastY ?? 0;
+    const targetList = list;
+    // The end is measured, never taken from the last scroll report: a held
+    // view is not told how the reply grew under it, so its max offset is stale.
+    // The landing is asked at once, and only aimed once the measure lands.
+    const landing: { from: number; target: number; ready: boolean } = (runwayLanding = { from, target: from, ready: false });
+    void Promise.all([targetList.measure(), ending?.measure()]).then(([frame, end]) => {
+      if (runwayLanding !== landing) return;
+      const pad = untracked(foot).end;
+      // The view can have moved while the measure was on its way (a live reply
+      // growing under a view already following again): aim from where it is now.
+      const origin = lastY ?? from;
+      let target: number;
+      if (frame && end) {
+        const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
+        target = Math.max(0, origin + gap);
+      } else {
+        target = Math.max(0, lastMax - room);
+      }
+      landing.from = origin;
+      landing.target = target;
+      landing.ready = true;
+      if (!animated || untracked(reduceMotion)) {
+        targetList.scrollTo({ y: target, animated: false });
+        runwayLanding = undefined;
+        runway.set(0);
+        following.set(true);
+        scheduleEndSettle(2);
+        return;
+      }
+      targetList.scrollTo({ y: target, animated: true });
+      setTimeout(() => {
+        if (runwayLanding !== landing) return;
+        runwayLanding = undefined;
+        runway.set(0);
+        following.set(true);
+        scheduleEndSettle(1);
+      }, OWN_SEND_RETURN_MS);
+    });
+    return true;
+  };
+
+  /**
+   * The anchor's natural end. The reservation stays until the view has glided
+   * to the end the content keeps without it: a hold ending with the reservation
+   * still standing leaves the prompt somewhere the content cannot keep, and the
+   * view settles there rather than snapping back.
+   */
+  const settleOwnSend = () => {
     releasePin();
     following.set(true);
-    if (filled || untracked(reduceMotion) || !list) {
-      runway.set(0);
+    if (!landRealEnd(true)) {
       runwayLanding = undefined;
       scheduleEndSettle(2);
-      return;
     }
-    endSettlePasses = 0;
-    if (untracked(isChatActive)) {
-      // Work is still landing under the prompt: the reserve stays until the
-      // end's own passes consume it — it is never dropped from under a view
-      // that can see it.
-      scheduleEndSettle(2);
-      drainRunway();
-      return;
-    }
-    const landing = (runwayLanding = { target: Math.max(0, lastMax - untracked(runway)) });
-    list.scrollTo({ y: landing.target, animated: true });
-    setTimeout(() => {
-      if (runwayLanding !== landing) return;
-      runwayLanding = undefined;
-      runway.set(0);
-      scheduleEndSettle(1);
-    }, OWN_SEND_RETURN_MS);
   };
 
   const onScroll = (e: ScrollEvent) => {
     const y = e.offset.y;
     const distance = e.contentSize.height - (y + e.size.height);
-    // The return glide has landed where the end will be: the reservation goes now.
-    if (runwayLanding && y <= runwayLanding.target + 0.5) {
-      runwayLanding = undefined;
-      runway.set(0);
-      scheduleEndSettle(1);
+    // The reservation this report was measured against: dropping it below does
+    // not change where the real end is, only how far it can be scrolled to.
+    const roomBefore = untracked(runway);
+
+    // The return glide has landed where the end will be: the reservation goes
+    // now, taking away room the view has already left. A flight down and one up
+    // land from opposite sides.
+    const landing = runwayLanding;
+    if (landing?.ready) {
+      const arrived = landing.target >= landing.from ? y >= landing.target - 0.5 : y <= landing.target + 0.5;
+      if (arrived) {
+        runwayLanding = undefined;
+        runway.set(0);
+        following.set(true);
+        scheduleEndSettle(1);
+      }
     }
+
     if (ownSend) {
       // A scroll of the reader's inside the input window ends the hold (theirs wins);
       // the layout's own passes — the glide's, the fold's, the reply's — feed its step.
-      // Only the held phase checks drift: the glide's own frames move the offset legitimately.
-      if (lastY !== undefined && Date.now() >= ownSend.glideUntil && Date.now() - inputAt < INPUT_WINDOW_MS && Math.abs(y - lastY) > 0.5) releaseOwnSend();
-      ownSendStep();
+      if (lastY !== undefined && Date.now() - inputAt < INPUT_WINDOW_MS && Math.abs(y - lastY) > 0.5) {
+        releaseOwnSend();
+      } else {
+        ownSendStep();
+      }
     }
-    distanceFromEnd.set(distance);
+
     // The list reports its own layout passes too (a row measured, the fold
     // closing): only a move within a gesture of the reader's is theirs. Up and
     // away from the end releases; back down to within the threshold follows again.
+    // The end that counts is the real one: the reservation is dead room below it.
+    const toRealEnd = distance - roomBefore;
     if (lastY !== undefined && Date.now() - inputAt < INPUT_WINDOW_MS) {
       if (following() && y < lastY - 0.5 && distance > Math.max(lastDistance, 0) + 0.5) {
         following.set(false);
         releasedAt = Date.now();
-      } else if (!following() && y > lastY + 0.5 && distance <= FOLLOW_THRESHOLD && Date.now() - releasedAt > RELEASE_SETTLE_MS) {
-        follow(!reduceMotion() && !isChatActive());
+      } else if (!following() && y > lastY + 0.5) {
+        // A reservation still standing below the view is not something to
+        // reattach through: a downward move inside it is the reader's own,
+        // and following would carry them past it. Only the real end follows.
+        if (roomBefore <= 0 && toRealEnd >= -2 && toRealEnd <= FOLLOW_THRESHOLD && Date.now() - releasedAt > RELEASE_SETTLE_MS) {
+          follow(!reduceMotion() && !isChatActive());
+        }
       }
     }
     if (lastY === undefined || Math.abs(y - lastY) > 0.5) lastMoveAt = Date.now();
@@ -1117,16 +1193,19 @@ export function Chat() {
     lastDistance = distance;
     lastViewportH = e.size.height;
     lastMax = e.contentSize.height - e.size.height;
-    // A released reservation is spent here, as the reader's scroll reaches it:
-    // none of it on screen — it goes whole; the reader inside it — it is their
-    // scroll room, spent by travelling; at the end — it drains away under the
-    // view. It is never dropped while they can see it: losing scrollable room
-    // under the offset clamps the list and snaps every row down.
-    const room = untracked(runway);
-    if (room > 0 && !ownSend && !runwayLanding) {
-      if (distance >= room - 0.5) runway.set(0);
-      else if (following()) drainRunway();
+
+    // The reservation is never dropped while the view can see it — removing
+    // scrollable room under the offset clamps the list and snaps every row
+    // down. Off the bottom of the view it goes whole, taking nothing with it.
+    if (roomBefore > 0 && !ownSend && !runwayLanding && distance >= roomBefore - 0.5) {
+      runway.set(0);
     }
+
+    // The distance named to the pills never counts the reservation: nothing
+    // real stands where the pad does. Dropping it here does not change that
+    // distance — the same room simply stops being scrollable.
+    distanceFromEnd.set(Math.max(0, distance - roomBefore));
+
     // A scroll asked while its commit settled is re-asked as the list reports
     // its passes — each lands on the end the layout now says. A gesture of the
     // reader's ends it: theirs wins.
@@ -1246,11 +1325,16 @@ export function Chat() {
   let ending: ViewRef | undefined;
   const measureEnd = () => {
     if (untracked(following)) return;
-    const pad = untracked(foot).end + untracked(runway);
+    // The reserve is dead room, not anything to read: the pad stops at the foot.
+    const pad = untracked(foot).end;
     void Promise.all([list?.measure(), ending?.measure()]).then(([frame, end]) => {
       // Rows far from the end are not mounted: the distance the scroll reported stands.
       if (!frame || !end || untracked(following)) return;
-      distanceFromEnd.set(end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height));
+      const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
+      // The list is not told how content grew under a held offset; keep the max
+      // offset it would have from the measure, so a return knows where to go.
+      lastMax = Math.max(0, (lastY ?? 0) + gap + untracked(runway));
+      distanceFromEnd.set(Math.max(0, gap));
     });
   };
   effect(() => {
@@ -1264,33 +1348,13 @@ export function Chat() {
     });
   });
 
-  /**
-   * Whether the reply has reached the end of the view and filled the runway —
-   * measured the same way `measureEnd` finds the end, since scroll reports alone
-   * cannot say how the stream grew (a list that reports no passes still has its
-   * measures). Filled: the hold hands the view back to the end-follow.
-   */
-  effect(() => {
-    displayRows();
-    untracked(() => {
-      const o = ownSend;
-      if (!o || !list || !ending || Date.now() < o.glideUntil) return;
-      if (untracked(displayRows).findIndex((row) => row.id === o.id) < 0) return settleOwnSend(false);
-      void Promise.all([list.measure(), ending.measure()]).then(([frame, end]) => {
-        if (!frame || !end || ownSend !== o) return;
-        const filled = end.pagePosition.y + end.bounds.size.height + untracked(foot).end >= frame.pagePosition.y + frame.bounds.size.height - 1;
-        if (filled) settleOwnSend(true);
-      });
-    });
-  });
-
   // The run a send anchored is over — nothing more fills the room the pin
   // reserved: the hold hands the view back to the end. A timed cap once did
   // this instead, cutting live runs short and snapping the prompt back.
   effect(() => {
     const running = isRunning();
     untracked(() => {
-      if (!running && ownSend) settleOwnSend(false);
+      if (!running && ownSend) settleOwnSend();
     });
   });
 
@@ -1334,10 +1398,11 @@ export function Chat() {
     releaseOwnSend();
     inputAt = 0;
     following.set(true);
+    // A reservation still standing is left by the same glide a settled send
+    // takes: the view travels to the end the content keeps, then the pad goes.
+    if (landRealEnd(animated)) return;
     if (animated) list?.scrollToEnd({ animated: true });
     else scheduleEndSettle(2);
-    // Already at the end reports no scroll pass: the reserve left over drains here.
-    if (untracked(runway) > 0) drainRunway();
   };
 
   // A fold the reader presses grows or shrinks the rows under it, not those above: let go of the end.
@@ -1353,16 +1418,10 @@ export function Chat() {
     pokeRepaint();
     measureEnd();
   });
-  // A turn that ended while the reader was reading elsewhere kept its process open for them. Following
-  // again — back at the end, the pill, a message sent — they are done there: it folds as it would have.
-  effect(() => {
-    // Owed folds run under the send's hold too: the anchor keeps the prompt where it
-    // is while the turn above it folds, which is what the hold is for.
-    if (following() || ownHold()) untracked(foldOwedTurns);
-  });
 
-  // A reply still growing moves the end under an animated scroll: go there at once.
-  const jumpToLatest = () => follow(!reduceMotion() && !isChatActive());
+  // The way back to the end the reader asked for: a live reply still moves it
+  // under the flight, but the flight is theirs.
+  const jumpToLatest = () => follow(!reduceMotion());
 
   effect(() => {
     scrollToEndTick();
@@ -1384,8 +1443,8 @@ export function Chat() {
   });
   // A send that begins a fresh run anchors on its bubble instead of riding the
   // end: the prompt glides under the title bar's edge and holds there while the
-  // reply fills the runway reserved below it — the zeron send. What the reader
-  // sent never slides under a folding turn or a stream's own growth.
+  // reply grows into the runway reserved below it — the zeron send. What the
+  // reader sent never slides under a folding turn or a stream's own growth.
   let pendingAnchor: string | undefined;
   const tryInstallAnchor = () => {
     const id = pendingAnchor;
@@ -1402,13 +1461,15 @@ export function Chat() {
     const reduced = untracked(reduceMotion);
     const glideUntil = Date.now() + (reduced ? 0 : OWN_SEND_GLIDE_MS);
     ownSend = { id, glideUntil, seatBy: glideUntil + OWN_SEND_LAND_MS, seated: reduced, askedIx: ix };
+    // A return still in the air belonged to the send before this one: its
+    // landing must not take the room this send needs.
+    runwayLanding = undefined;
     lastMoveAt = Date.now();
     ownHold.set(true);
     following.set(false);
-    // Sending is moving on: ends owed to the reader fold now, under the pin.
-    untracked(foldOwedTurns);
     // The runway is the room the prompt needs to reach the top: a viewport of
-    // scrollable space under it, kept until the reply fills the view.
+    // scrollable space under it that the reply grows into. The view stays where
+    // it is while that happens; the room is dropped only once it cannot be seen.
     runway.set(lastViewportH || untracked(viewHeight) || 600);
     list.scrollToIndex({ index: ix, viewPosition: 0, viewOffset: ownSendInset(), animated: !reduced });
   };
@@ -1514,7 +1575,7 @@ export function Chat() {
       if (!leaving) return;
       dimmed = true;
       if (reduceMotion()) pane.set(0);
-      else void pane.timing(0, { duration: LEAVE_MS, easing: EASING.out });
+      else void pane.timing(0, { duration: LEAVE_MS, easing: EASING.exit });
     });
   });
   let arrivedAt = untracked(sessionArrivedTick);
@@ -1530,7 +1591,7 @@ export function Chat() {
         // welcome), the pane is already at 1 — snapping it to 0 first causes
         // a visible flash/flicker before fading back in.
         if (dimmed) {
-          void pane.timing(1, { duration: ARRIVE_MS, easing: EASING.out });
+          void pane.timing(1, { duration: ARRIVE_MS, easing: EASING.entrance });
         } else {
           pane.set(1);
         }
@@ -1617,6 +1678,7 @@ export function Chat() {
                     scrollEventThrottle={16}
                     onScrollDragStart={onInput}
                     onMomentumStart={onInput}
+                    onWheel={onInput}
                     onViewableItemsChange={(info) => {
                       const items = info.viewableItems;
                       const first = items[0]?.index ?? -1;
@@ -1648,7 +1710,11 @@ export function Chat() {
               }}
             </Each>
           </View>
-          <ScrollToBottomPill visible={!following() && !ownHold() && distanceFromEnd() > FOLLOW_THRESHOLD} bottom={foot().end} onPress={jumpToLatest} />
+          <ScrollToBottomPill
+            visible={!following() && (distanceFromEnd() > JUMP_THRESHOLD || (!ownHold() && distanceFromEnd() > FOLLOW_THRESHOLD))}
+            bottom={foot().end}
+            onPress={jumpToLatest}
+          />
           <PromptJumpPill visible={promptAway() !== undefined} prompt={promptAway} top={ownSendInset()} onPress={jumpToPrompt} />
         </If>
         <If when={screen() === "connect"}>

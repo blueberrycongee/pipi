@@ -100,8 +100,8 @@ export function notifyWallpaperPointerMove(pageX: number, pageY: number) {
   const ny = clamp01(pageY / Math.max(windowViewport.height, 1));
   cursorX.set(nx);
   cursorY.set(ny);
-  void lureX.timing(nx, { duration: 900, easing: EASING.out });
-  void lureY.timing(ny, { duration: 900, easing: EASING.out });
+  void lureX.timing(nx, { duration: 900, easing: EASING.entrance });
+  void lureY.timing(ny, { duration: 900, easing: EASING.entrance });
 }
 
 export function notifyWallpaperPointerLeave() {
@@ -109,8 +109,8 @@ export function notifyWallpaperPointerLeave() {
   cursorX.set(0.5);
   cursorY.set(0.5);
   // Off the top of the window: a preset reads it as "no pointer".
-  void lureX.timing(0.5, { duration: 900, easing: EASING.out });
-  void lureY.timing(-0.6, { duration: 900, easing: EASING.out });
+  void lureX.timing(0.5, { duration: 900, easing: EASING.entrance });
+  void lureY.timing(-0.6, { duration: 900, easing: EASING.entrance });
 }
 
 /**
@@ -129,7 +129,7 @@ export function triggerWallpaperInteraction(pageX?: number, pageY?: number) {
   }
 
   clickPulse.set(1.0);
-  void clickPulse.timing(0, { duration: 1400, easing: EASING.out });
+  void clickPulse.timing(0, { duration: 1400, easing: EASING.exit });
 
   const kind = wp.kind ?? (isVideoWallpaperPath(wp.path) ? "video" : "image");
   if (kind === "video") {
@@ -233,7 +233,7 @@ function EffectSurface(props: {
     if (props.paused) return;
     const e = agentActivityEnergy();
     untracked(() => {
-      void energyLevel.timing(e, { duration: 1200, easing: EASING.out });
+      void energyLevel.timing(e, { duration: 1200, easing: EASING.entrance });
     });
   });
 
@@ -577,13 +577,13 @@ function veilLayer(on: () => boolean) {
       if (show) {
         mounted.set(true);
         if (reduceMotion()) amount.set(1);
-        else void amount.timing(1, { duration: VEIL_MS, easing: EASING.out });
+        else void amount.timing(1, { duration: VEIL_MS, easing: EASING.entrance });
       } else if (mounted()) {
         if (reduceMotion()) {
           amount.set(0);
           mounted.set(false);
         } else {
-          void amount.timing(0, { duration: VEIL_MS, easing: EASING.out });
+          void amount.timing(0, { duration: VEIL_MS, easing: EASING.exit });
           timer = setTimeout(() => mounted.set(false), VEIL_MS + 10);
         }
       }

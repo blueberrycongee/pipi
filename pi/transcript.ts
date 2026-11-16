@@ -67,6 +67,32 @@ const COMPACTION_AFTER_ZH = /，压缩至约 [\d.]+[kM]?$/;
 const normalizeSummaryTitle = (title: string) =>
   title.replace(COMPACTION_AFTER_EN, "").replace(COMPACTION_AFTER_ZH, "");
 
+function formatProviderError(raw: string): string {
+  const trimmed = raw.trim();
+  const brace = trimmed.indexOf("{");
+  if (brace >= 0 && trimmed.endsWith("}")) {
+    const prefix = trimmed.slice(0, brace).trim();
+    try {
+      const parsed = JSON.parse(trimmed.slice(brace)) as Record<string, unknown>;
+      const inner = parsed.error && typeof parsed.error === "object" ? (parsed.error as Record<string, unknown>) : parsed;
+      const msg = typeof inner.message === "string" && inner.message.trim() ? inner.message.trim() : undefined;
+      if (msg) {
+        const meta: string[] = [];
+        if (prefix && /^\d{3}$/.test(prefix)) meta.push(prefix);
+        const code =
+          typeof inner.code === "string" && inner.code
+            ? inner.code
+            : typeof inner.type === "string" && inner.type && inner.type !== "error"
+              ? inner.type
+              : undefined;
+        if (code) meta.push(code);
+        return meta.length ? `${msg} (${meta.join(" · ")})` : msg;
+      }
+    } catch {}
+  }
+  return trimmed;
+}
+
 /** Whether two rows render the same conversation content on screen (ignoring row ids and live-vs-disk timing skew). */
 export function sameVisualRow(a: Row, b: Row): boolean {
   if (a === b) return true;
@@ -1462,7 +1488,13 @@ export class Transcript {
       if (row.kind !== "text") break;
       if (row.streaming || !row.final) this.#rows[at] = { ...row, streaming: false, final: true };
     }
-    this.#push({ kind: "notice", id: this.#id("notice"), tone: "error", title: this.#tr("The model returned an error", "模型返回了错误"), text });
+    this.#push({
+      kind: "notice",
+      id: this.#id("notice"),
+      tone: "error",
+      title: this.#tr("The model returned an error", "模型返回了错误"),
+      text: formatProviderError(text),
+    });
   }
 
   /**

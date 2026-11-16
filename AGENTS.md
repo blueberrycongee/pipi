@@ -146,7 +146,12 @@ multi-agent orchestration, and settings.
 - `nsh test E2E.test.tsx --target macos` — a real run through the real
   sidecar; needs a model (see below)
 - `nsh package .` — build an installable app package (targets the host OS;
-  `npm run package:windows` / `package:linux` force a target)
+  `npm run package:windows` / `package:linux` force a target). On macOS the
+  binary keeps nsh's linked-SDK stamp, so the window draws an older chrome
+  generation than the system's: `scripts/package-mac.sh` re-stamps it
+  (`scripts/stamp-macos-sdk.sh`, also run by `release:macos`); the script
+  takes the .app or a bare Mach-O, so `~/.nsh/runtime/macos/nsh-macos-*` can
+  be stamped once to fix `nsh dev` and every later `nsh package` too
 - `npm run release:macos` — signed and notarized release build (Developer ID +
   `notarytool`; needs the release signing credentials)
 - `npm install` — only regenerates the lockfile; there are no runtime

@@ -117,7 +117,7 @@ function RollingToken(props: { id?: () => string; ch: () => string; delay: () =>
   let swapping = false;
 
   const drop = () => {
-    void translateY.timing(0, { duration: 240, easing: EASING.smoothOut });
+    void translateY.timing(0, { duration: 240, easing: EASING.signature });
     void rotateX.spring(0, LAND);
   };
 
@@ -146,7 +146,7 @@ function RollingToken(props: { id?: () => string; ch: () => string; delay: () =>
           void rotateX.stop();
           void translateY.stop();
           void rotateX.spring(0, LAND);
-          void translateY.timing(0, { duration: 200, easing: EASING.smoothOut });
+          void translateY.timing(0, { duration: 200, easing: EASING.signature });
         }
         return;
       }
@@ -160,8 +160,8 @@ function RollingToken(props: { id?: () => string; ch: () => string; delay: () =>
       }
       void rotateX.stop();
       void translateY.stop();
-      void rotateX.timing(FLAP, { duration: OUT_MS, delay, easing: "easeIn" });
-      void translateY.timing(-3, { duration: OUT_MS, delay, easing: "easeIn" });
+      void rotateX.timing(FLAP, { duration: OUT_MS, delay, easing: EASING.exit });
+      void translateY.timing(-3, { duration: OUT_MS, delay, easing: EASING.exit });
       swapping = true;
       timer = setTimeout(() => {
         swapping = false;

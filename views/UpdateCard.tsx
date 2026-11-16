@@ -75,7 +75,7 @@ function Spark(props: { x: number; y: number; delay: number; size?: number }) {
       keyframes: { opacity: [0, 1, 1, 0], scale: [0.2, 1.2, 1, 0.9], translateY: [3, 0, -1, -4] },
       duration: 640,
       delay: props.delay,
-      easing: EASING.smoothOut,
+      easing: EASING.signature,
     });
   });
   return (
@@ -90,7 +90,7 @@ export function UpdateCard() {
     enter: {
       keyframes: { opacity: [0, 1], translateY: [10, 0], scale: [0.97, 1] },
       duration: 220,
-      easing: EASING.smoothOut,
+      easing: EASING.signature,
     },
   });
   /** The known-total fill, 0..1. */
@@ -155,7 +155,7 @@ export function UpdateCard() {
               void bump.play({
                 keyframes: { translateY: [0, -8, 1.5, 0], scale: [1, 1.08, 0.96, 1] },
                 duration: 380,
-                easing: EASING.smoothOut,
+                easing: EASING.expressive,
               });
             }, BONK_MS);
           }

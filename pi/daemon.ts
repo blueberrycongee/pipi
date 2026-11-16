@@ -1,3 +1,4 @@
+import { batch } from "nsh";
 import type { CustomAgentConfig, RuntimeMode, WorktreeInfo } from "../agents/types";
 import type { Exit, Transport } from "./client";
 import { createLineSplitter } from "./jsonl";
@@ -129,7 +130,9 @@ export class DaemonClient {
       case "hello": {
         const list = (msg.sessions as DaemonSession[]) ?? [];
         this.sessions = new Map(list.map((s) => [s.id, s]));
-        for (const session of list) this.callbacks.onSession(session);
+        batch(() => {
+          for (const session of list) this.callbacks.onSession(session);
+        });
         this._hello?.resolve();
         this._hello = undefined;
         return;

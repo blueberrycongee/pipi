@@ -58,11 +58,11 @@ export function Reveal(props: {
     void opacity.stop();
     void translateY.stop();
     if (isOpen) {
-      void opacity.timing(1, { duration: DURATION.fast, easing: EASING.smoothOut });
-      void translateY.timing(0, { duration: DURATION.base, easing: EASING.smoothOut });
+      void opacity.timing(1, { duration: DURATION.fast, easing: EASING.entrance });
+      void translateY.timing(0, { duration: DURATION.base, easing: EASING.signature });
     } else {
-      void opacity.timing(0, { duration: 150, easing: EASING.out });
-      void translateY.timing(d, { duration: DURATION.fast, easing: EASING.out });
+      void opacity.timing(0, { duration: 150, easing: EASING.exit });
+      void translateY.timing(d, { duration: DURATION.fast, easing: EASING.exit });
     }
   });
 
@@ -140,12 +140,12 @@ export function Presence(props: {
     void scale.stop();
     if (now) {
       mounted.set(true);
-      void opacity.timing(1, { duration: untracked(enterMs), easing: EASING.smoothOut });
-      void scale.timing(1, { duration: untracked(enterMs), easing: EASING.smoothOut });
+      void opacity.timing(1, { duration: untracked(enterMs), easing: EASING.entrance });
+      void scale.timing(1, { duration: untracked(enterMs), easing: EASING.entrance });
     } else {
       const ms = untracked(exitMs);
-      void opacity.timing(0, { duration: ms, easing: EASING.out });
-      void scale.timing(s0, { duration: ms, easing: EASING.out });
+      void opacity.timing(0, { duration: ms, easing: EASING.exit });
+      void scale.timing(s0, { duration: ms, easing: EASING.exit });
       timer = setTimeout(() => {
         if (seq === mySeq) mounted.set(false);
       }, ms);
@@ -297,10 +297,10 @@ export function FloatingLayer(props: {
             mounted.set(true);
           });
         }
-        void scrimOpacity.timing(1, { duration: DURATION.fast, easing: EASING.out });
-        void panelOpacity.timing(1, { duration: DURATION.fast, easing: EASING.smoothOut });
-        void panelScale.timing(1, { duration: DURATION.fast, easing: EASING.smoothOut });
-        void panelY.timing(0, { duration: DURATION.fast, easing: EASING.smoothOut });
+        void scrimOpacity.timing(1, { duration: DURATION.fast, easing: EASING.entrance });
+        void panelOpacity.timing(1, { duration: DURATION.fast, easing: EASING.signature });
+        void panelScale.timing(1, { duration: DURATION.fast, easing: EASING.signature });
+        void panelY.timing(0, { duration: DURATION.fast, easing: EASING.signature });
       } else if (mounted()) {
         if (reduced) {
           batch(() => {
@@ -311,10 +311,10 @@ export function FloatingLayer(props: {
           return;
         }
         const ms = 140;
-        void scrimOpacity.timing(0, { duration: ms, easing: EASING.out });
-        void panelOpacity.timing(0, { duration: ms, easing: EASING.out });
-        void panelScale.timing(0.98, { duration: ms, easing: EASING.out });
-        void panelY.timing(6, { duration: ms, easing: EASING.out });
+        void scrimOpacity.timing(0, { duration: ms, easing: EASING.exit });
+        void panelOpacity.timing(0, { duration: ms, easing: EASING.exit });
+        void panelScale.timing(0.98, { duration: ms, easing: EASING.exit });
+        void panelY.timing(6, { duration: ms, easing: EASING.exit });
         exitTimer = setTimeout(() => {
           if (seq === mySeq) mounted.set(false);
         }, ms + 10);

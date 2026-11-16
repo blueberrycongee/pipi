@@ -12,8 +12,19 @@ cd "$(dirname "$0")/.."
 
 APP="${1:-.nsh/out/pipi.app}"
 TARGET="${PIPI_MACOS_SDK_STAMP:-27.0}"
-EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")
-BIN="$APP/Contents/MacOS/$EXE"
+case "$APP" in
+  *.app|*.app/)
+    EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")
+    BIN="$APP/Contents/MacOS/$EXE"
+    SIGN_TARGET="$APP"
+    ;;
+  *)
+    # A bare Mach-O (e.g. ~/.nsh/runtime/macos/nsh-macos-app): same restamp,
+    # so `nsh dev` windows draw the current chrome generation too.
+    BIN="$APP"
+    SIGN_TARGET="$BIN"
+    ;;
+esac
 
 archs=$(lipo -archs "$BIN" 2>/dev/null || true)
 [ -n "$archs" ] || archs=$(uname -m)
@@ -59,5 +70,5 @@ if [ "$changed" = 0 ]; then
 fi
 # shellcheck disable=SC2086
 lipo -create $slices -output "$BIN" 2>/dev/null || cp $slices "$BIN"
-codesign --force --sign - "$APP"
+codesign --force --sign - "$SIGN_TARGET"
 echo "stamp-macos-sdk: re-signed ad hoc (the signing steps overwrite it)"

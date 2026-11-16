@@ -79,6 +79,8 @@ export function TextField(props: {
 }) {
   const layerActive = LayerActive();
   const focused = signal(false);
+  /** An input method's marked text shows in the field while `value` is still empty; the hint stays away for it. */
+  const composing = signal(false);
   let inputRef: InputRef | undefined;
   effect(() => {
     if (!layerActive() && untracked(focused)) {
@@ -96,7 +98,11 @@ export function TextField(props: {
         onChange={({ value }) => props.onChange(value)}
         onSubmit={props.onSubmit}
         onFocus={() => focused.set(true)}
-        onBlur={() => focused.set(false)}
+        onBlur={() => {
+          focused.set(false);
+          composing.set(false);
+        }}
+        onCompositionChange={({ composing: now }) => composing.set(now)}
         masked={props.masked}
         scrollbar={false}
         autoFocus={props.autoFocus}
@@ -105,7 +111,7 @@ export function TextField(props: {
         accessibilityLabel={props.label}
         class={`h-8 w-full rounded-lg corner-squircle px-2.5 text-base text-foreground caret-brand ${FIELD_SURFACE} ${props.mono ? "font-mono text-sm" : ""} ${props.inputClass ?? ""}`}
       />
-      <If when={props.placeholder !== undefined && props.value.length === 0}>
+      <If when={props.placeholder !== undefined && props.value.length === 0 && !composing()}>
         <View class={`pointer-events-none absolute inset-y-0 right-2.5 min-w-0 justify-center ${props.hintClass ?? "left-2.5"}`}>
           <Text class={`truncate text-subtle ${props.mono ? "font-mono text-sm" : "text-base"}`}>{props.placeholder}</Text>
         </View>

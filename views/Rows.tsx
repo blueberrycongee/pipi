@@ -103,13 +103,10 @@ const closingTurns = signal<Record<string, "arming" | "collapsing">>({});
 const openingTurns = signal<Record<string, "arming" | "expanding">>({});
 const pendingAutoClose = new Set<string>();
 const foldTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
-/** Ticks when a fold was decided outside the projection (one owed to the reader, made): it runs again. */
-const foldTick = signal(0);
 
 /** Read inside `displayRows` so projection re-runs when a turn finishes collapsing. */
 export function trackFoldState() {
   closingTurns();
-  foldTick();
 }
 
 /** Whether `id`'s process rows stay mounted in `displayRows` while collapsing to 0pt. */
@@ -158,7 +155,6 @@ function toggleTurn(id: string, open: boolean, running: boolean) {
   clearTurnTimers(id);
   // The turn is the reader's from here on: no fold of its own is left to make.
   watched.seen.delete(id);
-  watched.owed.delete(id);
   const work = running ? workOf(id) : undefined;
   if (reduceMotion()) {
     closingTurns.update(({ [id]: _, ...rest }) => rest);
@@ -271,11 +267,11 @@ function useProcessFold(id: () => string) {
         const delay = phase === "expanding" ? Math.min(at, 6) * 24 : 0;
         opacity.set(0);
         translateY.set(-6);
-        void opacity.timing(1, { duration: 200, delay, easing: EASING.smoothOut });
-        void translateY.timing(0, { duration: 240, delay, easing: EASING.smoothOut });
+        void opacity.timing(1, { duration: 200, delay, easing: EASING.entrance });
+        void translateY.timing(0, { duration: 240, delay, easing: EASING.signature });
       } else {
-        void opacity.timing(0, { duration: 150, easing: EASING.out });
-        void translateY.timing(-4, { duration: 180, easing: EASING.out });
+        void opacity.timing(0, { duration: 150, easing: EASING.exit });
+        void translateY.timing(-4, { duration: 180, easing: EASING.exit });
       }
     });
   });
@@ -300,12 +296,12 @@ function useProcessFold(id: () => string) {
 
 /**
  * The turns of the conversation on screen as the reader watched them: those
- * `seen` working, whose process was open under their eyes and so folds before
- * them when the turn is over, and those whose fold is `owed`. Nothing here
- * outlives the conversation's stay on screen: one the reader comes back to
- * shows each turn as it stands by then, with no fold left to play.
+ * `seen` working, whose process was open under their eyes and so folds when
+ * the turn is over. Nothing here outlives the conversation's stay on screen:
+ * one the reader comes back to shows each turn as it stands by then, with no
+ * fold left to play.
  */
-let watched = { key: -1, seen: new Set<string>(), owed: new Set<string>() };
+let watched = { key: -1, seen: new Set<string>() };
 
 /** The reader's own say on a turn's fold, if they pressed its header. */
 export const turnChoice = chosen;
@@ -318,42 +314,23 @@ export const turnSay = (id: string) => chosen(workOf(id));
 
 /**
  * Whether a turn's process shows when the reader said nothing on it: open
- * while the run is `working` on it, folded once it is over. The fold happens
- * before a reader who is following the reply. One who scrolled away is reading
- * what would fold: for them it stays, and the fold is owed — made once they
- * follow again (`foldOwedTurns`), not kept from them for good.
+ * while the run is `working` on it, folded once it is over — before a reader
+ * following the end and before one reading elsewhere alike.
  */
-export function turnDefault(id: string, working: boolean, following: boolean, hasDetails = true): boolean {
+export function turnDefault(id: string, working: boolean, hasDetails = true): boolean {
   const key = conversationKey();
-  if (watched.key !== key) watched = { key, seen: new Set(), owed: new Set() };
+  if (watched.key !== key) watched = { key, seen: new Set() };
   if (working) {
     watched.seen.add(id);
     return true;
   }
   if (!watched.seen.has(id)) return pendingAutoClose.has(id);
-  if (watched.owed.has(id)) return true;
-  if (!following) {
-    watched.owed.add(id);
-    return true;
-  }
   watched.seen.delete(id);
   if (!hasDetails || untracked(reduceMotion)) return false;
   scheduleAutoFold(id);
   // The header holds its open frame until the fold's own pass: head and body
   // fold in one commit — never a folded head over a still-open process.
   return pendingAutoClose.has(id);
-}
-
-/** The reader follows the conversation again: the turns that ended while they read elsewhere fold now. */
-export function foldOwedTurns() {
-  if (!watched.owed.size || watched.key !== untracked(conversationKey)) return;
-  const reduced = untracked(reduceMotion);
-  for (const id of watched.owed) {
-    watched.seen.delete(id);
-    if (!reduced) scheduleAutoFold(id);
-  }
-  watched.owed.clear();
-  foldTick.update((n) => n + 1);
 }
 
 /** How many conversations' folds are kept: those left longest ago go first. */
@@ -372,8 +349,8 @@ export function enterConversation(key: number) {
   closingTurns.set({});
   openingTurns.set({});
   // What was watched in the conversation left is not watched any more (one with no turn to show, an empty
-  // chat, asks `turnDefault` nothing and would leave it standing): coming back finds no fold owed or to play.
-  if (watched.key !== key) watched = { key: -1, seen: new Set(), owed: new Set() };
+  // chat, asks `turnDefault` nothing and would leave it standing): coming back finds no fold left to play.
+  if (watched.key !== key) watched = { key: -1, seen: new Set() };
 
   shownKeys = [...shownKeys.filter((shown) => shown !== key), key];
   if (shownKeys.length > CHOICES_KEPT) {
@@ -674,7 +651,7 @@ function LeadGlyph(props: {
         scale.set(0.72);
         opacity.set(0.4);
         void scale.spring(1, { stiffness: 520, damping: 28, mass: 0.9 });
-        void opacity.timing(1, { duration: 150, easing: "easeOut" });
+        void opacity.timing(1, { duration: 150, easing: EASING.entrance });
       } else {
         wasRunning = !settled;
       }
@@ -983,7 +960,7 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
       if (wasRunning && !running && !reduceMotion()) {
         wasRunning = false;
         settleOpacity.set(0.45);
-        void settleOpacity.timing(1, { duration: 180, easing: EASING.smoothOut });
+        void settleOpacity.timing(1, { duration: 180, easing: EASING.entrance });
       } else {
         wasRunning = running;
       }

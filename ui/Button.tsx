@@ -1,5 +1,5 @@
 import { keymap, Text } from "nsh";
-import type { JSX } from "nsh";
+import type { Edges, JSX } from "nsh";
 import { Button as BaseButton } from "nsh/base";
 import { Icon, type IconName, type Tone } from "./Icon";
 import { FOCUS_RING, PRESS, PRESS_SCALE } from "./styles";
@@ -58,6 +58,7 @@ export function IconButton(props: {
   disabled?: boolean;
   selected?: boolean;
   tipPlacement?: "top" | "bottom" | "left" | "right";
+  hitSlop?: number | Partial<Edges>;
   class?: string;
   testID?: string;
 }) {
@@ -67,6 +68,7 @@ export function IconButton(props: {
       onPress={props.onPress}
       disabled={props.disabled}
       selected={props.selected}
+      hitSlop={props.hitSlop}
       accessibilityLabel={props.label}
       tooltip={tip(props.label, props.shortcut, props.tipPlacement)}
       class={`shrink-0 items-center justify-center rounded-md corner-squircle ${PRESS} active:scale-[0.94] disabled:active:scale-100 motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-accent active:bg-accent selected:bg-accent disabled:opacity-40 ${props.size === "sm" ? "size-6" : "size-7"} ${props.class ?? ""}`}
@@ -76,9 +78,9 @@ export function IconButton(props: {
   );
 }
 
-/** A keystroke as the platform writes it, in a quiet keycap. */
-export function Kbd(props: { keys: string }) {
-  return <Text class="shrink-0 rounded-sm corner-squircle border border-border bg-muted px-1 text-2xs text-muted-foreground">{keymap.label(props.keys)}</Text>;
+/** A keystroke as the platform writes it, in a quiet keycap. `keys` is a `keymap` keystroke (`"mod+k"`); `text` is a literal cap for typed syntax (`"!"`). */
+export function Kbd(props: { keys?: string; text?: string }) {
+  return <Text class="shrink-0 rounded-sm corner-squircle border border-border bg-muted px-1 text-2xs text-muted-foreground">{props.keys ? keymap.label(props.keys) : props.text}</Text>;
 }
 
 /** A chip: a compact control that shows a current choice and opens something to change it. */

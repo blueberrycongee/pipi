@@ -135,7 +135,7 @@ import {
   worktreeIsolationDefault,
 } from "../store/prefs";
 import { AgentLogo } from "../ui/AgentLogo";
-import { Button, Chip, IconButton } from "../ui/Button";
+import { Button, Chip, IconButton, Kbd } from "../ui/Button";
 import { Rule, Segmented, SettingGroup, SettingRow, Switch, TextField } from "../ui/Controls";
 import { Icon, type IconName } from "../ui/Icon";
 import { animateNextLayout, delayedFade, FloatingLayer, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, ViewDeck } from "../ui/motion";
@@ -149,6 +149,7 @@ const SECTIONS: { id: SettingsSection; label: () => string; icon: IconName }[] =
   { id: "sessions", label: () => tr("Sessions", "会话"), icon: "layers" },
   { id: "archive", label: () => tr("Archive", "归档"), icon: "archive" },
   { id: "usage", label: () => tr("Usage", "用量"), icon: "bolt" },
+  { id: "shortcuts", label: () => tr("Shortcuts", "快捷键"), icon: "command" },
   { id: "about", label: () => tr("About", "关于"), icon: "info" },
 ];
 
@@ -1822,6 +1823,97 @@ function Usage() {
   );
 }
 
+// ── Shortcuts ───────────────────────────────────────────────────────────────
+
+/** One row of the cheat sheet: what it does on the left, its caps on the right. */
+function ShortcutRow(props: { title: string; description?: string; caps: JSX.Element }) {
+  return (
+    <SettingRow title={props.title} description={props.description}>
+      <View class="shrink-0 flex-row items-center gap-1.5">{props.caps}</View>
+    </SettingRow>
+  );
+}
+
+/** The keyboard's map of the app, in the same order the menus offer it. */
+function ShortcutsPage() {
+  return (
+    <Page title={tr("Shortcuts", "快捷键")} lead={tr("The keyboard's way around pipi.", "用键盘操作 pipi 的全部方式。")}>
+      <SettingGroup title={tr("Sessions", "会话")}>
+        <ShortcutRow title={tr("New session", "新建会话")} caps={<Kbd keys="mod+n" />} />
+        <Rule />
+        <ShortcutRow title={tr("Add project folder", "添加项目文件夹")} caps={<Kbd keys="mod+o" />} />
+        <Rule />
+        <ShortcutRow title={tr("Compare agents", "智能体并行对比")} caps={<Kbd keys="mod+shift+o" />} />
+        <Rule />
+        <ShortcutRow title={tr("Focus message", "聚焦输入框")} caps={<Kbd keys="mod+l" />} />
+        <Rule />
+        <ShortcutRow
+          title={tr("Stop", "停止")}
+          description={tr("Stops the run, a shell command, or queued sends.", "停止当前运行、shell 命令或排队发送。")}
+          caps={<Kbd keys="mod+." />}
+        />
+      </SettingGroup>
+      <SettingGroup title={tr("Composer", "输入框")}>
+        <ShortcutRow title={tr("Send", "发送")} caps={<Kbd keys="enter" />} />
+        <Rule />
+        <ShortcutRow
+          title={tr("Queue a follow-up", "排队追问")}
+          description={tr("Sends once the run finishes.", "本轮结束后发送。")}
+          caps={<Kbd keys="mod+enter" />}
+        />
+        <Rule />
+        <ShortcutRow
+          title={tr("Slash commands", "斜杠命令")}
+          description={tr("At the start of a message: the agent's own commands.", "在消息开头输入：智能体自带的命令。")}
+          caps={<Kbd text="/" />}
+        />
+        <Rule />
+        <ShortcutRow title={tr("Complete the highlighted command", "补全高亮命令")} caps={<Kbd keys="tab" />} />
+        <Rule />
+        <ShortcutRow
+          title={tr("Move through the menu", "在菜单中移动")}
+          caps={
+            <>
+              <Kbd keys="up" />
+              <Kbd keys="down" />
+            </>
+          }
+        />
+        <Rule />
+        <ShortcutRow
+          title={tr("Run a shell command", "运行 shell 命令")}
+          description={tr("! runs it and adds the output to the conversation; !! leaves it out.", "! 运行并把输出带入对话；!! 运行但不带入。")}
+          caps={
+            <>
+              <Kbd text="!" />
+              <Kbd text="!!" />
+            </>
+          }
+        />
+      </SettingGroup>
+      <SettingGroup title={tr("App", "应用")}>
+        <ShortcutRow title={tr("Command palette", "命令面板")} caps={<Kbd keys="mod+k" />} />
+        <Rule />
+        <ShortcutRow title={tr("Settings", "设置")} caps={<Kbd keys="mod+," />} />
+        <Rule />
+        <ShortcutRow title={tr("Show or hide the sidebar", "显示或隐藏侧边栏")} caps={<Kbd keys="mod+b" />} />
+        <Rule />
+        <ShortcutRow title={tr("Random wallpaper", "随机切换壁纸")} caps={<Kbd keys="mod+u" />} />
+        <Rule />
+        <ShortcutRow title={tr("Close window", "关闭窗口")} caps={<Kbd keys="mod+w" />} />
+        <Rule />
+        <ShortcutRow title={tr("Quit pipi", "退出 pipi")} caps={<Kbd keys="mod+q" />} />
+        <Rule />
+        <ShortcutRow
+          title={tr("Escape", "退出当前层")}
+          description={tr("Closes what's on top — a menu, dialog or Settings — and stops the run once nothing is.", "关闭最上层的菜单、对话框或设置页；没有可关闭的层时停止运行。")}
+          caps={<Kbd keys="escape" />}
+        />
+      </SettingGroup>
+    </Page>
+  );
+}
+
 /** What the Updates row in About says about the update checker right now. */
 function updateStatus() {
   const s = appUpdate();
@@ -1955,6 +2047,7 @@ export function Settings() {
     { id: "sessions", render: () => <SessionsPage /> },
     { id: "archive", render: () => <ArchivePage /> },
     { id: "usage", render: () => <Usage /> },
+    { id: "shortcuts", render: () => <ShortcutsPage /> },
     { id: "about", render: () => <About /> },
   ];
 

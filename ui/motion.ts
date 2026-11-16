@@ -28,26 +28,36 @@ export const DURATION = {
   instant: 120,
   fast: 180,
   base: 240,
-  slow: 360,
-  slower: 480,
+  slow: 320,
+  slower: 420,
 } as const;
 
-/** Shared easing curves. */
+/** Refined easing curves inspired by Apple's motion design language.
+ * Each curve is tuned for its semantic role: entrance, exit, or transformation. */
 export const EASING = {
   out: "easeOut" as const,
   inOut: "easeInOut" as const,
   in: "easeIn" as const,
+  /** Signature ease-out: smooth deceleration with gentle landing (replaces smoothOut). */
+  signature: [0.16, 1, 0.3, 1] as [number, number, number, number],
+  /** Crisp entrance: confident start with quick settle. */
+  entrance: [0.2, 0.92, 0.36, 1] as [number, number, number, number],
+  /** Graceful exit: smooth acceleration into fade. */
+  exit: [0.4, 0, 0.6, 1] as [number, number, number, number],
+  /** Expressive transform: playful overshoot for major transitions. */
+  expressive: [0.34, 1.26, 0.64, 1] as [number, number, number, number],
+  /** Legacy smooth-out kept for compatibility (prefer signature). */
   smoothOut: [0.22, 1, 0.36, 1] as [number, number, number, number],
 };
 
 /** Spring configurations for `AnimatedValue.spring`. */
 export const SPRING = {
-  /** Quick press / hover / small control settle. */
-  snappy: { stiffness: 520, damping: 34, mass: 1 },
-  /** Panels, sidebars, drawers, sliding indicators (~380ms critically damped). */
-  surface: { stiffness: 300, damping: 32, mass: 1 },
-  /** Gentle follow. */
-  gentle: { stiffness: 160, damping: 24, mass: 1 },
+  /** Quick press / hover / small control settle (~220ms). */
+  snappy: { stiffness: 480, damping: 32, mass: 0.95 },
+  /** Panels, sidebars, drawers, sliding indicators (~320ms critically damped). */
+  surface: { stiffness: 320, damping: 30, mass: 0.92 },
+  /** Gentle follow and organic motion. */
+  gentle: { stiffness: 180, damping: 22, mass: 0.88 },
 } as const;
 
 /** How long a wait goes unremarked: a passing state (a quick session switch) that ends sooner never shows at all. */
@@ -56,7 +66,7 @@ export const PATIENCE_MS = 600;
 /** Opacity that fades in once, slowly, after `delay`: a wait that ends sooner never flashes on screen. */
 export function delayedFade(delay: number = PATIENCE_MS, duration: number = DURATION.slower) {
   const opacity = createAnimatedValue(reduceMotion() ? 1 : 0);
-  if (!reduceMotion()) opacity.keyframes([0, 1], { duration, delay, easing: EASING.smoothOut });
+  if (!reduceMotion()) opacity.keyframes([0, 1], { duration, delay, easing: EASING.signature });
   return opacity;
 }
 
@@ -77,7 +87,7 @@ export function enterStagger(index: number, stepMs = 45) {
       enter: {
         keyframes: { opacity: [0, 1], translateY: [10, 0] },
         duration: DURATION.slow,
-        easing: EASING.smoothOut,
+        easing: EASING.signature,
         delay: Math.min(index, 6) * stepMs,
       },
     }).style,
@@ -167,7 +177,7 @@ const SLIDE_UP_SPEC: LeanSpec<"opacity" | "translateY"> = {
   tracks: {
     opacity: [
       { offset: 0, value: 0 },
-      { offset: 0.7, value: 1 },
+      { offset: 0.65, value: 1 },
       { offset: 1, value: 1 },
     ],
     translateY: [
@@ -175,8 +185,8 @@ const SLIDE_UP_SPEC: LeanSpec<"opacity" | "translateY"> = {
       { offset: 1, value: 0 },
     ],
   },
-  duration: 210,
-  easing: [0.22, 1, 0.36, 1],
+  duration: 240,
+  easing: EASING.signature,
 };
 
 const STREAM_FADE_SPEC: LeanSpec<"opacity" | "translateY"> = {
@@ -190,24 +200,27 @@ const STREAM_FADE_SPEC: LeanSpec<"opacity" | "translateY"> = {
       { offset: 1, value: 0 },
     ],
   },
-  duration: 160,
-  easing: [0.22, 1, 0.36, 1],
+  duration: 180,
+  easing: EASING.entrance,
 };
 
-/** Sent user bubbles start perceptibly present so they never visually trail the reply indicator below them. */
+/** Sent user bubbles arrive with refined grace: gentle fade-up paired with subtle glide.
+ * The opacity ramp is carefully tuned so the bubble reads as intentional from frame one,
+ * while the Y-offset provides spatial depth without overstating the motion. */
 const USER_ENTRANCE_SPEC: LeanSpec<"opacity" | "translateY"> = {
   tracks: {
     opacity: [
-      { offset: 0, value: 0.35 },
+      { offset: 0, value: 0.08 },
+      { offset: 0.4, value: 0.7 },
       { offset: 1, value: 1 },
     ],
     translateY: [
-      { offset: 0, value: 0 },
+      { offset: 0, value: -6 },
       { offset: 1, value: 0 },
     ],
   },
-  duration: 120,
-  easing: [0.22, 1, 0.36, 1],
+  duration: 280,
+  easing: EASING.signature,
 };
 
 /** Tracks which transcript row IDs have already animated in during the current
@@ -401,9 +414,9 @@ export function popupLeavingStyle(placement: "top" | "bottom" | "left" | "right"
 
 /** Dialog rise entrance spec. */
 export const DIALOG_RISE: MotionSpec = {
-  keyframes: { opacity: [0, 1], scale: [0.97, 1], translateY: [10, 0] },
+  keyframes: { opacity: [0, 1], scale: [0.96, 1], translateY: [12, 0] },
   duration: DURATION.base,
-  easing: EASING.smoothOut,
+  easing: EASING.signature,
 };
 
 export { type DeckPane, FloatingLayer, keepLast, LayerActive, Presence, Reveal, ViewDeck } from "./Reveal";

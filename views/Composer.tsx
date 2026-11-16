@@ -223,7 +223,7 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
           opacity.set(0);
           translateY.set(6);
           scale.set(0.97);
-          void opacity.timing(1, { duration: 160, easing: EASING.smoothOut });
+          void opacity.timing(1, { duration: 160, easing: EASING.entrance });
           void translateY.spring(0, SPRING.snappy);
           void scale.spring(1, SPRING.snappy);
         }
@@ -232,9 +232,9 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
           opacity.set(0);
           mounted.set(false);
         } else {
-          void opacity.timing(0, { duration: 130, easing: EASING.out });
-          void translateY.timing(4, { duration: 130, easing: EASING.out });
-          void scale.timing(0.98, { duration: 130, easing: EASING.out });
+          void opacity.timing(0, { duration: 130, easing: EASING.exit });
+          void translateY.timing(4, { duration: 130, easing: EASING.exit });
+          void scale.timing(0.98, { duration: 130, easing: EASING.exit });
           exitTimer = setTimeout(() => mounted.set(false), 135);
         }
       }
@@ -443,6 +443,9 @@ export function Composer() {
   const canSend = () => ready() || isDraftAhead();
   const working = () => isRunning() || isBashRunning() || waitingCount() > 0;
   const hasText = () => composerDraft().trim().length > 0 || composerAttachments().length > 0;
+  /** An input method's marked text shows in the field while `composerDraft` is still empty; the hint stays away for it. */
+  const composing = signal(false);
+  const showPlaceholder = computed(() => composerDraft().length === 0 && !composing());
   const statusLine = () => Object.values(extensionStatuses()).join("  ·  ");
   const shownStatus = keepLast(() => statusLine() || undefined, "");
   const showStop = () => working() && !hasText();
@@ -465,7 +468,7 @@ export function Composer() {
       actionScale.set(0.84);
       actionOpacity.set(0.55);
       void actionScale.spring(1, SPRING.snappy);
-      void actionOpacity.timing(1, { duration: 140, easing: EASING.out });
+      void actionOpacity.timing(1, { duration: 140, easing: EASING.entrance });
     });
   });
   cleanup(() => {
@@ -647,6 +650,7 @@ export function Composer() {
               selection = { start, end };
             }}
             onSubmit={() => submit()}
+            onCompositionChange={({ composing: now }) => composing.set(now)}
             onPaste={paste}
             pasteBehavior="report"
             onContentSizeChange={({ size }) => height.set(Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, Math.ceil(size.height))))}
@@ -660,7 +664,7 @@ export function Composer() {
           />
           {/* The hint is app-drawn, not the host's placeholder: host text re-rasterizes at
               integer offsets under the dock's transform and visibly steps a frame late. */}
-          <If when={composerDraft().length === 0}>
+          <If when={showPlaceholder()}>
             <View class="pointer-events-none absolute left-4 right-4 top-4">
               <Text class="truncate text-md text-subtle">{placeholder()}</Text>
             </View>

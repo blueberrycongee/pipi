@@ -204,3 +204,20 @@ test("welcome-to-dock first message send transitions cleanly across every frame 
   expect(seen.some((f) => f.pill)).toBe(false);
   expect(seen.some((f) => f.waking)).toBe(false);
 });
+
+test("switching project from the welcome project popover keeps the draft and settles cleanly", async () => {
+  const app = await launch("multi");
+  await app.waitFor("text:What are we building?");
+  await app.press("label:Collapse nsh");
+  await app.type("label:Message", "package a new build");
+
+  await app.press("label:Project this session works in");
+  await app.waitFor("text:~/code/nsh");
+  await app.press("text:~/code/nsh");
+
+  const seen = await frames(app, () => app.texts());
+  expect(seen.every((frame) => frame.includes("What are we building?"))).toBe(true);
+  expect(seen.some((frame) => frame.includes("Waking Pi"))).toBe(false);
+  expect(app.texts()).toContain("Pi · ~/code/nsh");
+  expect(app.value("label:Message")).toBe("package a new build");
+});

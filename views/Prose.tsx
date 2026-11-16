@@ -36,6 +36,7 @@ import {
   type VeilChunk,
 } from "../lib/veil";
 import { Icon } from "../ui/Icon";
+import { EASING } from "../ui/motion";
 
 /** Shared typography classes for `TextView` fallback blocks (alerts, math, settled code). */
 export const PROSE = {
@@ -406,7 +407,7 @@ function blockFadeNode(v: RowVeil, index: number): { opacity: AnimatedValue } | 
   if (!node) {
     node = createAnimatedValue(0);
     v.blockNodes.set(index, node);
-    void node.timing(1, { duration: BLOCK_FADE_MS, easing: "easeOut" });
+    void node.timing(1, { duration: BLOCK_FADE_MS, easing: EASING.entrance });
   }
   return { opacity: node };
 }

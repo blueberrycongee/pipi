@@ -8,9 +8,66 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 
+let cachedLoginShellDirs;
+
+/**
+ * Login shells to ask, in order: the session's `$SHELL`, the account's shell
+ * from the user database, then the platform default — first one to answer wins.
+ */
+function loginShellCandidates() {
+  const fallback = process.platform === "darwin" ? "/bin/zsh" : "/bin/bash";
+  const seen = new Set();
+  const candidates = [];
+  for (const candidate of [process.env.SHELL, os.userInfo().shell, fallback]) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    candidates.push(candidate);
+  }
+  return candidates;
+}
+
+/**
+ * The user's real PATH, from the horse's mouth: `$SHELL -ilc` sources the
+ * login/interactive rc files (~/.zprofile, ~/.zshrc, /etc/profile →
+ * path_helper, nvm/mise hooks, …) that a GUI-launched process never sees, and
+ * prints the PATH they build. Only what sits between the markers is ours —
+ * rc chatter, MOTDs and prompts around it are ignored. Bounded and silent: a
+ * slow, chatty or non-POSIX shell (nushell, …) just yields no dirs, and the
+ * hardcoded fallbacks below still apply. Resolved once per process — several
+ * helpers pay one rc read each, never per lookup.
+ */
+function loginShellPathDirs() {
+  if (cachedLoginShellDirs) return cachedLoginShellDirs;
+  cachedLoginShellDirs = [];
+  if (process.platform === "win32") return cachedLoginShellDirs;
+  const begin = "__PIPI_LOGIN_PATH_BEGIN__";
+  const end = "__PIPI_LOGIN_PATH_END__";
+  for (const shell of loginShellCandidates()) {
+    try {
+      const out = execFileSync(shell, ["-ilc", `command echo ${begin}; command printenv PATH || true; command echo ${end}`], {
+        encoding: "utf8",
+        timeout: 5000,
+        stdio: ["ignore", "pipe", "ignore"],
+        env: { ...process.env, TERM: "dumb" },
+        maxBuffer: 256 * 1024,
+      });
+      const line = out
+        .slice(out.lastIndexOf(begin) + begin.length, out.indexOf(end) === -1 ? out.length : out.lastIndexOf(end))
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l.startsWith("/"));
+      if (line) {
+        cachedLoginShellDirs = line.split(path.delimiter).filter(Boolean);
+        break;
+      }
+    } catch {}
+  }
+  return cachedLoginShellDirs;
+}
+
 export function expandedPathEnv() {
   const home = os.homedir();
-  const existing = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  const existing = [...loginShellPathDirs(), ...(process.env.PATH || "").split(path.delimiter)].filter(Boolean);
   const extra = [path.dirname(process.execPath)];
 
   if (process.platform === "win32") {

@@ -168,7 +168,7 @@ export interface Attachment extends ImageContent {
 
 /** Settings on `section`; `agent` names the agent whose configuration is open inside Agents. */
 export type View = { name: "chat" } | { name: "settings"; section: SettingsSection; agent?: string };
-export type SettingsSection = "general" | "agents" | "sessions" | "archive" | "usage" | "about";
+export type SettingsSection = "general" | "agents" | "sessions" | "archive" | "usage" | "shortcuts" | "about";
 
 const phase = signal<Phase>({ name: "starting" });
 const workspace = signal("");
@@ -511,14 +511,30 @@ function markSessionRead(path: string | undefined) {
 /** Every session in the daemon's registry: the app's own, agent-started children, compare runs. */
 export const daemonSessions = () => daemonSessionList();
 
+const daemonIndex = computed(() => {
+  const byId = new Map<string, DaemonSession>();
+  const byFile = new Map<string, DaemonSession>();
+  const byParent = new Map<string, DaemonSession[]>();
+  for (const s of daemonSessionList()) {
+    byId.set(s.id, s);
+    if (s.file && !byFile.has(s.file)) byFile.set(s.file, s);
+    if (s.parentId) {
+      let group = byParent.get(s.parentId);
+      if (!group) byParent.set(s.parentId, (group = []));
+      group.push(s);
+    }
+  }
+  return { byId, byFile, byParent };
+});
+
 /** A daemon session by its daemon id. */
 export function daemonSessionOfId(id: string | undefined) {
-  return id ? daemonSessionList().find((session) => session.id === id) : undefined;
+  return id ? daemonIndex().byId.get(id) : undefined;
 }
 
 /** A daemon session by the session file it holds. */
 export function daemonSessionByFile(path: string | undefined) {
-  return path ? daemonSessionList().find((session) => session.file === path) : undefined;
+  return path ? daemonIndex().byFile.get(path) : undefined;
 }
 
 /**
@@ -526,13 +542,16 @@ export function daemonSessionByFile(path: string | undefined) {
  * `listed` leaves out what the reader archived, with everything under it: the
  * tree as the sidebar shows it. Work is counted on the whole tree.
  */
-function descendantSessionsOf(rootId: string | undefined, listed = false, all = daemonSessionList()): DaemonSession[] {
+function descendantSessionsOf(rootId: string | undefined, listed = false): DaemonSession[] {
   if (!rootId) return [];
+  const { byParent } = daemonIndex();
   const out: DaemonSession[] = [];
   const seen = new Set<string>([rootId]);
   const visit = (pid: string) => {
-    for (const s of all) {
-      if (s.parentId === pid && !seen.has(s.id)) {
+    const children = byParent.get(pid);
+    if (!children) return;
+    for (const s of children) {
+      if (!seen.has(s.id)) {
         seen.add(s.id);
         if (listed && isSessionArchived(s.file)) continue;
         out.push(s);
@@ -556,12 +575,12 @@ export function childSessionsOfDaemon(sessionId: string | undefined): DaemonSess
  * the session itself when it stands alone.
  */
 export function daemonTreePlace(session: DaemonSession, files: ReadonlySet<string>): { claimed?: DaemonSession; top: DaemonSession } {
-  const all = daemonSessionList();
+  const { byId } = daemonIndex();
   const seen = new Set<string>([session.id]);
   let cur = session;
   while (cur.parentId && !seen.has(cur.parentId)) {
     seen.add(cur.parentId);
-    const up = all.find((s) => s.id === cur.parentId);
+    const up = byId.get(cur.parentId);
     if (!up) break;
     if (up.file && files.has(up.file)) return { claimed: up, top: up };
     cur = up;
@@ -595,12 +614,12 @@ export function projectCwdOf(cwd: string, session?: DaemonSession): string {
   if (!cwd) return cwd;
   if (session?.worktree?.baseCwd) return session.worktree.baseCwd;
   if (session?.parentId && cwd.includes("/.pipi-worktrees/")) {
-    const all = daemonSessionList();
+    const { byId } = daemonIndex();
     const seen = new Set<string>([session.id]);
     let cur: DaemonSession | undefined = session;
     while (cur?.parentId && !seen.has(cur.parentId)) {
       seen.add(cur.parentId);
-      const up = all.find((s) => s.id === cur!.parentId);
+      const up = byId.get(cur.parentId);
       if (!up) break;
       if (up.worktree?.baseCwd) return up.worktree.baseCwd;
       if (!up.cwd.includes("/.pipi-worktrees/")) return up.cwd;
@@ -639,20 +658,20 @@ export const activeProjectPath = computed(() => {
 
 /** The session that started the session whose file is `path`, for the title bar's parent tag. */
 export function sessionParentOf(path: string | undefined): { id: string; file?: string; cwd: string; title: string } | undefined {
-  const all = daemonSessionList();
-  const own = all.find((session) => session.file === path);
-  const parent = own?.parentId ? all.find((session) => session.id === own.parentId) : undefined;
+  const { byId, byFile } = daemonIndex();
+  const own = path ? byFile.get(path) : undefined;
+  const parent = own?.parentId ? byId.get(own.parentId) : undefined;
   return parent ? { id: parent.id, file: parent.file, cwd: parent.cwd, title: daemonSessionTitle(parent) } : undefined;
 }
 
 /** The parent of whichever session is currently open on screen (works with or without a session file). */
 export const currentParentSession = computed((): { id: string; file?: string; cwd: string; title: string } | undefined => {
-  const all = daemonSessionList();
+  const { byId, byFile } = daemonIndex();
   const target = heading();
   const own = target
-    ? (target.daemonId ? all.find((s) => s.id === target.daemonId) : target.file ? all.find((s) => s.file === target.file) : undefined)
-    : (daemonSessionOfId(openDaemonId()) ?? (openFile() ? all.find((s) => s.file === openFile()) : undefined));
-  const parent = own?.parentId ? all.find((s) => s.id === own.parentId) : undefined;
+    ? (target.daemonId ? byId.get(target.daemonId) : target.file ? byFile.get(target.file) : undefined)
+    : (daemonSessionOfId(openDaemonId()) ?? (openFile() ? byFile.get(openFile()!) : undefined));
+  const parent = own?.parentId ? byId.get(own.parentId) : undefined;
   return parent ? { id: parent.id, file: parent.file, cwd: parent.cwd, title: daemonSessionTitle(parent) } : undefined;
 });
 
@@ -673,14 +692,14 @@ export const activeDaemonSessionCount = computed(
 
 /** The highest runtime permission mode the open session is allowed to hold (clamped by all ancestors). */
 export const currentRuntimeCeiling = computed<RuntimeMode>(() => {
-  const all = daemonSessionList();
+  const { byId } = daemonIndex();
   const seen = new Set<string>();
   let ceiling: RuntimeMode = "full-access";
   let cur = currentDaemonSession();
   if (cur) seen.add(cur.id);
   while (cur?.parentId && !seen.has(cur.parentId)) {
     seen.add(cur.parentId);
-    const parent = all.find((s) => s.id === cur!.parentId);
+    const parent = byId.get(cur.parentId);
     if (!parent) break;
     if (runtimeModeRank(parent.runtimeMode) < runtimeModeRank(ceiling)) {
       ceiling = parent.runtimeMode;

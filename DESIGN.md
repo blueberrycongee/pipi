@@ -463,6 +463,12 @@ need it.
 Status mark: `brand` spinner (running), quiet tool/step icon (done), red cross
 (failed). Diff badges use `success` / `destructive` for `+N` / `-N`.
 
+A turn is headed by its own line — what it is doing while it works, how long
+it took once over — and its process sits under it: open while the turn works,
+folded once it is over, however it ended and wherever the reader is then. A
+press on the header is the reader's say on the fold and holds from then on:
+through the run going on, the next message, and a change of session and back.
+
 ## Voice
 
 Short, plain, sentence case; title case for buttons and menu items. Say what
