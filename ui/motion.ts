@@ -282,35 +282,67 @@ export function useRowEntrance(id: () => string, streaming?: () => boolean, skip
   };
 }
 
-/** Compositor-driven organic breathing opacity (`[1, minOpacity, 1]`) that runs
- * purely on the native UI thread and honors `reduceMotion()`. */
-export function useBreathingOpacity(active: () => boolean, minOpacity = 0.28, duration = 1150) {
-  const opacity = createAnimatedValue(1);
-  let anim: CompositeAnimation | null = null;
-  const stop = () => {
-    anim?.stop();
-    anim = null;
-    opacity.set(1);
+/** One breath, in ms — the tempo every "still working" cue inhales on;
+ * the update track's drift runs at twice it. */
+export const BREATH_MS = 1600;
+/** How deep a breath dims the words: enough to read as alive, quiet under a reply. */
+const BREATH_MIN = 0.68;
+/** When the last live label settles, the breath eases home over this instead of
+ * snapping a dimmed word back to full ink. */
+const BREATH_SETTLE_MS = 320;
+
+let breathValue: AnimatedValue | null = null;
+let breathAnim: CompositeAnimation | null = null;
+let breathHolders = 0;
+
+const breath = () => (breathValue ??= createAnimatedValue(1));
+
+const startBreath = () => {
+  void breath().stop();
+  breathAnim = Animated.keyframes(breath(), {
+    keyframes: [
+      { offset: 0, value: 1, easing: "easeInOut" },
+      { offset: 0.5, value: BREATH_MIN, easing: "easeInOut" },
+      { offset: 1, value: 1 },
+    ],
+    duration: BREATH_MS,
+    iterations: "infinite",
+  });
+  void breathAnim.start();
+};
+
+const settleBreath = () => {
+  breathAnim?.stop();
+  breathAnim = null;
+  void breath().timing(1, { duration: BREATH_SETTLE_MS, easing: EASING.signature });
+};
+
+/** The alive cue: every label still working breathes on one shared clock —
+ * a turn header and the step under it inhale together, and the cue handing
+ * from one row to the next carries on mid-breath instead of restarting.
+ * Compositor-driven, honors `reduceMotion()`. */
+export function useBreathingOpacity(active: () => boolean) {
+  const opacity = breath();
+  let holding = false;
+  const release = () => {
+    if (!holding) return;
+    holding = false;
+    if (--breathHolders === 0) settleBreath();
   };
   effect(() => {
     const on = active();
     const reduced = reduceMotion();
     untracked(() => {
-      stop();
-      if (!on || reduced) return;
-      anim = Animated.keyframes(opacity, {
-        keyframes: [
-          { offset: 0, value: 1, easing: "easeInOut" },
-          { offset: 0.5, value: minOpacity, easing: "easeInOut" },
-          { offset: 1, value: 1 },
-        ],
-        duration,
-        iterations: "infinite",
-      });
-      void anim.start();
+      if (on && !reduced) {
+        if (holding) return;
+        holding = true;
+        if (++breathHolders === 1) startBreath();
+      } else {
+        release();
+      }
     });
   });
-  cleanup(stop);
+  cleanup(release);
   return opacity;
 }
 

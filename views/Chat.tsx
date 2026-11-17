@@ -55,6 +55,7 @@ import { proseRows } from "./Prose";
 import {
   type ChatRow,
   enterConversation,
+  heldActions,
   isTurnClosing,
   onFoldSettled,
   onFoldToggle,
@@ -77,8 +78,19 @@ function isChatActive() {
   return isRunning() || waitingCount() > 0;
 }
 
-/** What the run is doing, in a word or two. */
-function activityLabel() {
+/**
+ * What the run is doing, in a word or two — when no row says it.
+ *
+ * The conversation says the work where it happens: the turn's header ("Working
+ * 12s"), the step under way ("Reading package.json"), the reply as it is
+ * written. Pip stands under them and feels it (`pipMood`); words here that
+ * restate the row a line above ("Running read" under "Reading package.json")
+ * are the same thing said three times, and the one said worst. So once the run
+ * has rows of its own on screen (`said`) the line keeps to Pip — and speaks for
+ * what no row says: a wait on the reader or on other sessions, a compaction, a
+ * retry, and the moment before the run's first row.
+ */
+function activityLabel(said: boolean) {
   const dialog = pendingDialog();
   if (dialog) return tr("Waiting for confirmation", "等待确认");
   // A blocked session is waiting before its dialog replay lands: the daemon's
@@ -90,18 +102,19 @@ function activityLabel() {
   }
   const activity = currentActivity();
   switch (activity.kind) {
-    case "writing":
-      return tr("Writing", "正在回复");
-    case "tool": {
-      const oneLine = activity.name.replace(/\s*\n\s*/g, " ; ").replace(/\s+/g, " ").trim();
-      return tr(`Running ${oneLine}`, `正在执行 ${oneLine}`);
-    }
     case "compacting":
       return tr("Compacting context", "正在压缩上下文");
     case "retrying":
       return tr(`Retrying (${activity.attempt} of ${activity.maxAttempts})`, `正在重试（${activity.attempt}/${activity.maxAttempts}）`);
+    case "writing":
+      return said ? "" : tr("Writing", "正在回复");
+    case "tool": {
+      if (said) return "";
+      const oneLine = activity.name.replace(/\s*\n\s*/g, " ; ").replace(/\s+/g, " ").trim();
+      return tr(`Running ${oneLine}`, `正在执行 ${oneLine}`);
+    }
     default:
-      return tr("Thinking", "正在思考");
+      return said ? "" : tr("Thinking", "正在思考");
   }
 }
 
@@ -109,7 +122,7 @@ function activityLabel() {
  * Reserves a constant 36pt (`h-9`) slot so starting, finishing or celebrating a run never
  * shifts the scroll content height or causes a layout jump at the end of a stream.
  * It is the last thing in the list, so where it stands is where the conversation ends (`anchor`). */
-function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void }) {
+function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void; said: () => boolean }) {
   const alreadyWorking = untracked(() => (isChatActive() || pipMood() === "happy") && transcriptRows().some((row) => row.kind !== "user"));
   const shown = signal(alreadyWorking);
   const opacity = createAnimatedValue(alreadyWorking ? 1 : 0);
@@ -159,6 +172,9 @@ function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void }) {
     const activity = currentActivity();
     return activity.kind === "retrying" ? activity.reason : "";
   };
+  const label = () => (isChatActive() ? activityLabel(props.said()) : "");
+  // The words leave as they came, whole: they keep what they said to the last frame of the fade.
+  const shownLabel = keepLast(() => label() || undefined, "");
 
   return (
     <View ref={(node: ViewRef) => props.anchor?.(node)} class="h-9 w-full max-w-190 select-none justify-center overflow-hidden self-center">
@@ -167,16 +183,17 @@ function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void }) {
           class="min-w-0 flex-row items-center gap-2.5 pt-1"
           style={{ opacity, transform: [{ translateY }] }}
           accessibilityState={{ busy: isChatActive() }}
+          accessibilityLabel={isChatActive() ? activityLabel(false) : undefined}
         >
           <View class="shrink-0">
             <Pip size={22} mood={pipMood()} />
           </View>
-          <If when={isChatActive()}>
-            <RollingText text={activityLabel} class="min-w-0 shrink truncate text-sm text-muted-foreground" />
+          <Presence show={label() !== ""} scaleFrom={1} duration={160} class="min-w-0 shrink flex-row items-center gap-2.5">
+            <RollingText text={() => shownLabel() ?? ""} class="min-w-0 shrink truncate text-sm text-muted-foreground" />
             <If when={reason()}>
               <Text class="min-w-0 flex-1 truncate text-xs text-subtle">{reason()}</Text>
             </If>
-          </If>
+          </Presence>
         </View>
       </If>
     </View>
@@ -604,7 +621,7 @@ type ScrollMode = "tail" | "horizon" | "horizon-held" | "free";
 
 /** Floating pill shown when the reader scrolls up past the follow threshold,
  * or when a long reply pauses at the reading horizon, offering a crisp return to the bottom. */
-function ScrollToBottomPill(props: { visible: boolean; streaming?: boolean; bottom: number; onPress: () => void }) {
+function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: () => void }) {
   const mounted = signal(false);
   const opacity = createAnimatedValue(0);
   const translateY = createAnimatedValue(8);
@@ -660,9 +677,6 @@ function ScrollToBottomPill(props: { visible: boolean; streaming?: boolean; bott
           class={`pointer-events-auto h-7 flex-row items-center gap-1.5 rounded-full px-3 ${POPUP} ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-muted/80 active:bg-muted`}
           style={GLASS_REGULAR}
         >
-          <If when={props.streaming}>
-            <View class="size-1.5 rounded-full bg-brand" />
-          </If>
           <Text class="text-xs font-medium text-foreground">{tr("Jump to latest", "回到最新")}</Text>
           <View class="rotate-180">
             <Icon name="arrowUp" size={12} tone="muted-foreground" />
@@ -818,13 +832,25 @@ export function Chat() {
       }
     }
     const watching = bottomFollowing();
+    // The actions row's seat sits under the turn's last text row — the one that
+    // can still become the reply. It never leaves before a next text row takes
+    // it (one commit: a seat lost and a seat gained is no height at all), so no
+    // seat's leaving ever pulls the rows around it.
+    let lastTextId = "";
+    for (const row of merged) if (row.kind === "text") lastTextId = row.id;
     const rows = (watching ? stable(merged) : merged).flatMap((row): ChatRow[] =>
-      row.kind !== "text" ? [row] : row.final && !row.streaming ? [...proseRows(row), replyActions(row)] : proseRows(row),
+      row.kind !== "text"
+        ? [row]
+        : row.final
+          ? [...proseRows(row), replyActions(row)]
+          : row.id === lastTextId
+            ? [...proseRows(row), heldActions(row)]
+            : proseRows(row),
     );
     // The rows a turn's fold shows, in order (commentary is a row per block, each the turn's its reply is).
     const folded = new Map<string, string>();
     for (const row of rows) {
-      const turn = processOf.get(row.id) ?? (row.kind === "prose" ? processOf.get(row.rowId) : undefined);
+      const turn = processOf.get(row.id) ?? (row.kind === "prose" || row.kind === "actions" ? processOf.get(row.rowId) : undefined);
       if (turn) folded.set(row.id, turn);
     }
     setProcessTurns(folded);
@@ -833,6 +859,23 @@ export function Chat() {
     shownKey = key;
     shown = rows;
     return rows;
+  });
+
+  /**
+   * The run has rows of its own on screen — its header, its steps, its reply — so the conversation says
+   * what it is doing and Pip's line need not. Not "a row is live": the answer once known, no row is, yet
+   * the run is not settled, and words would pop in under a finished reply for the frames in between.
+   * Before the run's first row the last thing said is still the reader's own message.
+   */
+  const liveRowShown = computed(() => {
+    const rows = displayRows();
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      if (row.kind !== "user") return true;
+      // Messages waiting in the queue trail the end; they are not what the run is answering.
+      if (!row.queued) return false;
+    }
+    return false;
   });
 
   /**
@@ -1556,6 +1599,7 @@ export function Chat() {
                     accessibilityLabel={tr("Conversation", "对话")}
                     footer={
                       <ActivityLine
+                        said={liveRowShown}
                         anchor={(node) => {
                           if (node) ending = mountedEnding = node;
                           else if (ending === mountedEnding) ending = undefined;
@@ -1571,7 +1615,6 @@ export function Chat() {
           </View>
           <ScrollToBottomPill
             visible={!bottomFollowing() && distanceFromEnd() > FOLLOW_THRESHOLD}
-            streaming={isChatActive()}
             bottom={foot().end}
             onPress={jumpToLatest}
           />

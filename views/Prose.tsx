@@ -33,6 +33,7 @@ import {
   settleVeil,
   sliceChunks,
   veilEnd,
+  waveDelay,
   type RowVeil,
   type VeilChunk,
 } from "../lib/veil";
@@ -249,12 +250,19 @@ function runVeilClock(until: number) {
   }
 }
 
-/** Current opacity (0..1) of `chunk` inside `chunks`, subscribing to `veilClock` only while active. */
-function activeChunkAlpha(chunks: VeilChunk[], chunk: VeilChunk): number {
+/** When the last word under the veil is lit (ms epoch; in the past once nothing fades). */
+export function proseVeilUntil(): number {
+  return veilUntil;
+}
+
+/** Current opacity (0..1) of `chunk` inside `chunks` at `offset` characters past the chunk's start,
+ * subscribing to `veilClock` only while active. */
+function activeChunkAlpha(chunks: VeilChunk[], chunk: VeilChunk, offset?: number): number {
   const now = Date.now();
-  if (now - chunk.startedAt >= chunk.durationMs) return 1;
+  const delay = offset === undefined ? 0 : waveDelay(chunk, offset);
+  if (now - chunk.startedAt - delay >= chunk.durationMs) return 1;
   veilClock();
-  return chunkAlpha(chunks, chunk, Date.now());
+  return chunkAlpha(chunks, chunk, Date.now(), offset);
 }
 
 function decorationLine(run: InlineRun): TextStyle["textDecorationLine"] {
@@ -266,11 +274,11 @@ function decorationLine(run: InlineRun): TextStyle["textDecorationLine"] {
 
 /** Builds a paint-only `TextStyle` for `run` with foreground, inline background wash, and
  * underline/strikethrough colors all multiplied by the chunk's veil `alpha` (matching `apply_veil`). */
-function runVeiledStyle(run: InlineRun, chunks: VeilChunk[] | undefined, hit: VeilChunk | undefined): TextStyle {
+function runVeiledStyle(run: InlineRun, chunks: VeilChunk[] | undefined, hit: VeilChunk | undefined, offset?: number): TextStyle {
   const fgHex = resolvedToneHex(run.tone);
   const bgHex = run.bg ? resolvedBgHex(run.bg) : undefined;
   const decLine = decorationLine(run);
-  const alpha = chunks && hit ? activeChunkAlpha(chunks, hit) : 1;
+  const alpha = chunks && hit ? activeChunkAlpha(chunks, hit, offset) : 1;
 
   if (alpha >= 1) {
     return {
@@ -287,6 +295,26 @@ function runVeiledStyle(run: InlineRun, chunks: VeilChunk[] | undefined, hit: Ve
     textDecorationLine: decLine,
     textDecorationColor: decLine ? veiledFg : undefined,
   };
+}
+
+/**
+ * Where a run of `length` characters starting at `runStart` in its element is cut into spans: at the
+ * edges of what is fading (`local`, in the run's own offsets), and at each word inside it — a span is
+ * one color, and the fade travels word by word (`waveOf`). Text at rest is one span, as before.
+ */
+function veilCuts(local: readonly { start: number; end: number; chunk: VeilChunk }[], runStart: number, length: number): number[] {
+  const cuts = new Set<number>([0, length]);
+  for (const c of local) {
+    if (c.start > 0 && c.start < length) cuts.add(c.start);
+    if (c.end > 0 && c.end < length) cuts.add(c.end);
+    const wave = c.chunk.wave;
+    if (!wave) continue;
+    for (const word of wave.at.keys()) {
+      const at = c.chunk.start + word - runStart;
+      if (at > c.start && at < c.end) cuts.add(at);
+    }
+  }
+  return [...cuts].sort((a, b) => a - b);
 }
 
 /** Renders an array of `TextViewInline` nodes with per-chunk opacity veil spans (zero width shift). */
@@ -317,13 +345,7 @@ function renderVeiledInlines(content: readonly TextViewInline[], chunks: VeilChu
       continue;
     }
 
-    const cuts = [0];
-    for (const c of local) {
-      if (c.start > 0 && c.start < run.text.length) cuts.push(c.start);
-      if (c.end > 0 && c.end < run.text.length) cuts.push(c.end);
-    }
-    cuts.push(run.text.length);
-    cuts.sort((a, b) => a - b);
+    const cuts = veilCuts(local, start, run.text.length);
 
     for (let i = 0; i + 1 < cuts.length; i++) {
       const a = cuts[i];
@@ -333,7 +355,7 @@ function renderVeiledInlines(content: readonly TextViewInline[], chunks: VeilChu
       out.push(
         <Text
           class={cls}
-          style={runVeiledStyle(run, chunks, hit?.chunk)}
+          style={runVeiledStyle(run, chunks, hit?.chunk, hit ? start + a - hit.chunk.start : undefined)}
           onPress={clickableUrl ? () => void openUrl(clickableUrl) : undefined}
         >
           {run.text.slice(a, b)}
@@ -433,20 +455,14 @@ function StreamingCodeCard(props: { code: string; chunks: VeilChunk[] }) {
     if (local.length === 0) {
       return [<Text class="font-mono text-xs leading-relaxed" style={{ color: hex }}>{text}</Text>];
     }
-    const cuts = [0];
-    for (const c of local) {
-      if (c.start > 0 && c.start < text.length) cuts.push(c.start);
-      if (c.end > 0 && c.end < text.length) cuts.push(c.end);
-    }
-    cuts.push(text.length);
-    cuts.sort((a, b) => a - b);
+    const cuts = veilCuts(local, 0, text.length);
     const out: JSX.Element[] = [];
     for (let i = 0; i + 1 < cuts.length; i++) {
       const a = cuts[i];
       const b = cuts[i + 1];
       if (a >= b) continue;
       const hit = local.find((c) => a >= c.start && a < c.end);
-      const alpha = hit ? activeChunkAlpha(props.chunks, hit.chunk) : 1;
+      const alpha = hit ? activeChunkAlpha(props.chunks, hit.chunk, a - hit.chunk.start) : 1;
       out.push(
         <Text
           class="font-mono text-xs leading-relaxed"
@@ -671,6 +687,7 @@ export function clearProseState() {
   proseEntries.clear();
   clearPacers();
   clearVeils();
+  veilUntil = 0;
 }
 
 /** Reference link or footnote definitions (`[label]: url` / `[^1]: note`) act at a distance across blocks. */

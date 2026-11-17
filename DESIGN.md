@@ -81,7 +81,7 @@ never does.
 |---|---|---|---|
 | `idle` | coat eyes (slit or round) | breathes (`scaleY`, 3.6s), tail wags (`0.12` rad, 3.6s), blinks every ~2.6–5.8s | Ready |
 | `think` | round, up and toward the tail | floats and tilts (`-2.5°`, 2.2s), blinks every 2s | Model is reasoning |
-| `work` | coat eyes (cats widen pupils) | bobs (`translateY`) and wags tail (`0.35` rad, 0.62s) | A tool runs |
+| `work` | coat eyes (cats widen pupils) | bobs (`translateY`) and wags tail (`0.35` rad, half a breath — `BREATH_MS` × 0.5) | A tool runs |
 | `write` | round, looking down | quick small bob and brisk tail wag (`0.18` rad, 0.3s) | Reply streams |
 | `happy` | upward arcs | one squash-and-jump (0.62s) with two quick tail wags | A run ended well |
 | `error` | crosses | one `headShake` (dogs hide smile/tongue) | A run failed |
@@ -104,7 +104,7 @@ never does.
 |---|---|---|
 | App icon (`icon.png`) | 620 of 1024 | idle (`ghost`) |
 | Welcome / waking / failure stage (`views/Chat.tsx`) | 96 (welcome) / 80 (waking, failure) | from `pipMood` |
-| Activity line under the transcript (`views/Chat.tsx`) | 22 | from `pipMood` |
+| Activity line under the transcript (`views/Chat.tsx`) | 22 | from `pipMood`; alone once the run has rows of its own, with words only for what no row says |
 | Running session, draft, child session, or collapsed running project in the sidebar (`views/Sidebar.tsx`) | 16 | work |
 | Empty single-folder sidebar (`views/Sidebar.tsx`) | 40, still | sleep |
 | Update card (`views/UpdateCard.tsx`) | 22 | `idle` / `work` / `happy` along the track |
@@ -342,11 +342,16 @@ composer's glass, not underlined words: words do not stand on a picture.
 | Wallpaper veil: composer in the middle ↔ docked ↔ conversation | 200ms | opacity only, under the pane |
 | Composer: the middle of the pane ↔ its dock | ~480ms | a spring with no bounce (`DOCK_SPRING`), played as keyframes; the stage it leaves fades where it stood in 140ms |
 | Waiting on a session change | after 600ms, 480ms in | `PATIENCE_MS`; a change that lands sooner never shows it |
-| "Working", "Thinking" and activity labels | gentle breathing + 160ms vertical morph | `useBreathingOpacity` + `RollingText` (`StatusMorph`, honors reduced motion) |
-| Streamed text pacer & veil | 16ms cadence + 100–240ms fade | opacity only, zero offset (`StreamPacer` + `RowVeil`) |
+| "Working", "Thinking" and activity labels | one shared breath (`BREATH_MS`, 1600ms) + 160ms vertical morph | `useBreathingOpacity` + `RollingText` (`StatusMorph`, honors reduced motion) |
+| Update card, size unknown | the drift's two breaths (3200ms) | `BREATH_MS × 2` ping-pong, Pip riding |
+| Streamed text pacer & veil | 16ms cadence, cut at word edges + 100–240ms fade, travelling word by word within 36ms | opacity only, zero offset (`StreamPacer` + `RowVeil`) |
 
-Motion explains a change; nothing loops except Pip, a spinner, the active
-breathing label, and the input caret.
+Motion explains a change; nothing loops except Pip, a spinner, the shared
+breath of the live labels, the input caret, and the update track's drift.
+The breath is one clock (`ui/motion.ts`): every label still working binds the
+same value, so a header and the step under it inhale together, the cue hands
+from row to row mid-breath, and the last one settling eases the words home —
+a dimmed word never snaps back to full ink.
 Dynamic rows, sections, and status marks never pop in or vanish in one frame:
 vertical stack items use `Reveal` (`ui/Reveal.tsx`, scoped `Collapsible reveal`
 spring + opacity/glide so virtualized `List`s elsewhere never reflow; pass
@@ -384,7 +389,19 @@ Streaming never animates layout: bursty deltas are smoothed through a 16ms
 positional shift and newly arrived characters dissolve in through an opacity
 veil of at most 240ms (`lib/veil.ts`, `duration = clamp(gap-EMA × 3, 100, 240)`
 — no positional offset, each chunk fades once, text already on screen when a row
-attaches never fades). Scrolling follows Natural Reading Physics (`ScrollMode` in
+attaches never fades). What arrives is cut at the edge of a word, never inside
+one, and within what arrived the fade travels word by word: a word is the unit
+that is read, so it is the unit that appears — half a word fading in after the
+other half, or a line lit whole on one frame, is the machine showing through.
+A run is said once, where it happens: the turn's header, the step under way,
+the reply itself. Pip stands under them and feels it; its line says words only
+for what no row says (a wait, a compaction, a retry, the moment before the
+first row), a step is said only once it can be said whole, and the turn ends
+on the seconds its timer counted. A reply's actions take their seat while it
+is written (`heldActions` in `views/Rows.tsx`): the Copy line's height is
+already there under the streaming text, so the reply's end fills a seat
+instead of adding one — a reader at its foot is not pushed a line. Scrolling
+follows Natural Reading Physics (`ScrollMode` in
 `views/Chat.tsx`): a newly sent prompt rides growth upward naturally until it
 reaches the reading horizon below the title bar (`horizon` → `horizon-held`),
 never injects dead runway or yanks back on settle; any upward scroll immediately

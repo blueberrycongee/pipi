@@ -303,7 +303,12 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     }
 
     /** A longer run, as agents work: prose between steps, several tool calls at a time, then the answer. */
-    async function runSteps(user: AgentMessage, step: (record: object) => Promise<void>, update: (event: object) => Promise<void>) {
+    async function runSteps(
+      user: AgentMessage,
+      prompt: string,
+      step: (record: object, pauseMs?: number) => Promise<void>,
+      update: (event: object, pauseMs?: number) => Promise<void>,
+    ) {
       isStreaming = true;
       const pieces = (text: string) => text.match(/[\s\S]{1,24}/g) ?? [];
       const before = messages;
@@ -326,8 +331,15 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         file(steered);
       };
       /** One assistant message: optional thinking, prose, then its tool calls, which run after it ends. */
-      const message = async (parts: { thinking?: string; text?: string; tools?: { name: string; args: Record<string, unknown>; out: string }[] }) => {
+      const message = async (parts: {
+        thinking?: string;
+        text?: string;
+        tools?: { name: string; args: Record<string, unknown>; out: string }[];
+        /** The last word and the message's end land inside one fade, as a fast stream's do. */
+        tight?: boolean;
+      }) => {
         await steer();
+        const end = parts.tight ? 0 : undefined;
         const content: Record<string, unknown>[] = [];
         const tools = (parts.tools ?? []).map((tool) => ({ ...tool, id: `call_s${++calls}` }));
         const base = { role: "assistant", provider: "anthropic", model: "claude-sonnet-4-5", usage, timestamp: Date.now() };
@@ -343,8 +355,11 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           const at = content.length;
           content.push({ type: "text", text: parts.text });
           await update({ type: "text_start", contentIndex: at });
-          for (const piece of pieces(parts.text)) await update({ type: "text_delta", contentIndex: at, delta: piece });
-          await update({ type: "text_end", contentIndex: at, content: parts.text });
+          const deltas = pieces(parts.text);
+          for (let i = 0; i < deltas.length; i++) {
+            await update({ type: "text_delta", contentIndex: at, delta: deltas[i] }, parts.tight && i === deltas.length - 1 ? 0 : undefined);
+          }
+          await update({ type: "text_end", contentIndex: at, content: parts.text }, end);
         }
         for (const tool of tools) {
           const at = content.length;
@@ -355,7 +370,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           await update({ type: "toolcall_end", contentIndex: at, toolCall });
         }
         const done = { ...base, content, stopReason: tools.length ? "toolUse" : "stop" } as unknown as AgentMessage;
-        await step({ type: "message_end", message: done });
+        await step({ type: "message_end", message: done }, end);
         file(done);
         for (const tool of tools) {
           await step({ type: "tool_execution_start", toolCallId: tool.id, toolName: tool.name, args: tool.args });
@@ -365,7 +380,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           await step({ type: "message_end", message: result });
           file(result);
         }
-        await step({ type: "turn_end" });
+        await step({ type: "turn_end" }, end);
       };
       await step({ type: "agent_start" });
       await step({ type: "turn_start" });
@@ -392,7 +407,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           { name: "bash", args: { command: "nsh check ." }, out: "ok" },
         ],
       });
-      await message({ thinking: options.reply ? "The user asked a follow-up; let me write the answer in full." : undefined, text: options.reply ?? STEPS_REPLY });
+      await message({ thinking: options.reply ? "The user asked a follow-up; let me write the answer in full." : undefined, text: options.reply ?? STEPS_REPLY, tight: prompt.includes("tight") });
       emit({ type: "agent_end", willRetry: false });
       await drainQueuedTurns(step, update, file);
       isStreaming = false;
@@ -555,12 +570,12 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       const pace = options.pace ?? 0;
       const needsConfirm = prompt.includes("confirm");
       const bashCmd = 'ls -la thirdparty/ 2>/dev/null && echo "---"';
-      const step = async (record: object) => {
+      const step = async (record: object, pauseMs = pace) => {
         if (aborted) return;
         emit(record);
-        if (pace) await later(pace);
+        if (pauseMs) await later(pauseMs);
       };
-      const update = (event: object) => step({ type: "message_update", usage, assistantMessageEvent: event });
+      const update = (event: object, pauseMs = pace) => step({ type: "message_update", usage, assistantMessageEvent: event }, pauseMs);
       const user: AgentMessage = { role: "user", content: [{ type: "text", text: prompt }, ...(images ?? [])], timestamp: Date.now() };
       const toolName = needsConfirm ? "bash" : "read";
       const toolArgs = needsConfirm ? { command: bashCmd } : { path: "package.json" };
@@ -579,7 +594,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       };
       let approved = true;
       const reply = options.reply ?? (prompt.includes("long") ? LONG_REPLY : REPLY);
-      if (prompt.includes("steps")) return runSteps(user, step, update);
+      if (prompt.includes("steps")) return runSteps(user, prompt, step, update);
       if (prompt.includes("acp")) return runAcp(user, prompt, step, update);
       isStreaming = true;
       // Pi writes the session file as soon as the run starts, so a session can be found again.

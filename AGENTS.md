@@ -102,6 +102,10 @@ multi-agent orchestration, and settings.
 - `nsh test Recover.test.tsx` — an agent process lost at rest, under a run,
   or again and again (`harness.dies`, or a prompt containing "crash"): what
   stays on screen, what is said, and when the app stops starting it again
+- `nsh test Flow.test.tsx` — a run as the conversation says it, every 16ms on a
+  manual clock: said once (Pip's line never restates the row above it), each
+  step said whole (no placeholder line a delta rewrites), and the turn ending on
+  the seconds its timer counted
 - `nsh test Fold.test.tsx` — what folds and who says so, on a manual clock: a
   turn that is over is folded however it ended (answered, stopped, failed, a
   message sent into the run) and however the reader came to it, and what they
@@ -298,10 +302,27 @@ that is taken, set `PORT`.
   or a message sent into the run took the end from it. Only the turn the run
   is on is open by default (`running` in `buildDisplayRows`: the last one,
   unanswered, not closed — `turnMs`), so a turn that is over is folded
-  however it ended and however the reader came to it. The fold is made before
-  a reader who is following; one reading elsewhere keeps the process, and the
-  fold is owed — made when they follow again, gone when they leave
-  (`turnDefault`, `foldOwedTurns` in `views/Rows.tsx`), never held for good.
+  however it ended and however the reader came to it. The fold is the turn's
+  own end, made wherever the reader is then (`turnDefault` in
+  `views/Rows.tsx`): it is not owed to a reader who scrolled away and made on
+  their return — one reading elsewhere never got it back. And it leaves once
+  the reply's last word is lit (`scheduleAutoFold` waits on
+  `proseVeilUntil`): one that leaves sooner pulls the floor from under a word
+  still arriving.
+- A run is said once, where it happens (`activityLabel`, `liveRowShown` in
+  `views/Chat.tsx`): the turn's header ("Working 12s"), the step under way
+  ("Reading package.json"), the reply as it is written. Pip's line under them
+  does not restate the row above it — once the run has rows of its own it
+  keeps to Pip (`pipMood`), and speaks only for what no row says: a wait on
+  the reader or on other sessions, a compaction, a retry, and the moment
+  before the run's first row. A step is said whole or not yet: a call the
+  model has only begun to write (`isUnnamedCall` in `pi/turns.ts`: its name
+  known, no argument yet) gets no line — "Reading file" rewritten "Reading
+  package.json" a frame later is a line that changes its mind — and the line
+  before it stands meanwhile. What is counted is what is concluded: the
+  header's timer turns over on the turn's own seconds and the figure it ends
+  on is the same count (`elapsedSeconds`), never "12s" then "14 seconds".
+  `nsh test Flow.test.tsx` films a run every 16ms and holds all three.
 - Past that the folds are the reader's (`choices` in `views/Rows.tsx`): a press
   is the only thing that writes one, and it holds through the run and its end,
   the next message, a session change and back. A press on the working turn is
@@ -324,7 +345,13 @@ that is taken, set `PORT`.
 - Streamed text paces and fades behind a veil (`lib/stream-pacer.ts`, `lib/veil.ts`,
   `views/Prose.tsx`): bursty deltas drain on 16ms ticks (`markPacersSeeded` on
   landing), alpha per appended chunk, recolored per frame from JS. A span nested
-  in a `<Text>` takes no animated color (it renders black).
+  in a `<Text>` takes no animated color (it renders black). The pacer's cut is
+  the veil's fade boundary, so it lands on a word's edge (`snapToWord`: back
+  first, then forward; CJK cuts freely) — a word cut in two fades in as two
+  halves. Within a chunk the fade travels word by word (`waveOf`, the last
+  word `VEIL_WAVE_MS` after the first): a chunk lit whole on one frame is a
+  slab that pops. A chunk is done when its last word is (`peak` is the tail's
+  progress), and a span is cut per word only while it is fading (`veilCuts`).
 - Following the reply uses Natural Reading Physics (`ScrollMode`: `tail` /
   `horizon` / `horizon-held` / `free` in `views/Chat.tsx`): `maintainVisibleContentPosition`
   is active only in `tail`/`horizon` (`bottomFollowing`), while any upward scroll

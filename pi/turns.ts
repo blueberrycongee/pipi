@@ -92,6 +92,15 @@ export type DisplayRow = Exclude<Row, ToolRow> | ActivityRow | TurnHeaderRow;
 
 const isToolActive = (status: ToolRow["status"]) => status === "call" || status === "queued" || status === "running";
 
+/**
+ * A call the model has only begun to write: its name is known, nothing of what
+ * it is for. Said now, its line would be a placeholder ("Reading file") that
+ * the next delta rewrites ("Reading package.json") — a line that changes its
+ * mind a frame after it appears. It is not said until it can be said whole:
+ * the row before it stands meanwhile.
+ */
+const isUnnamedCall = (step: ProcessStep) => step.kind === "tool" && step.status === "call" && Object.keys(step.args ?? {}).length === 0;
+
 /** Normalizes tool names across Pi, Claude Code, Codex, Devin, OpenCode, Cursor, Gemini & ACP servers. */
 export function classifyTool(rawName: string): { category: ToolCategory; subkind?: "find" | "fetch"; icon: IconName } {
   const lower = rawName
@@ -618,7 +627,9 @@ function segmentLine(key: SegmentKey, tools: ToolRow[], zh: boolean): string {
 }
 
 /** The step a running group is on: the newest call still running, reasoning under way, or the last call. */
-function currentLine(steps: readonly ProcessStep[], zh: boolean): string {
+function currentLine(all: readonly ProcessStep[], zh: boolean): string {
+  // A call not named yet says nothing: the line stays on the step before it.
+  const steps = all.filter((step) => !isUnnamedCall(step));
   for (let i = steps.length - 1; i >= 0; i--) {
     const step = steps[i];
     if (step.kind === "tool" && isToolActive(step.status)) return toolLine(step, true, zh);
@@ -675,9 +686,13 @@ export function describeTurn(row: TurnHeaderRow, lang: Lang): string {
   return zh ? `用时 ${spokenDuration(row.durationMs, zh)}` : `Finished in ${spokenDuration(row.durationMs, zh)}`;
 }
 
-/** A turn's length in words, as the header says it: "48 seconds", "1 minute 57 seconds", "1 小时 3 分". */
+/**
+ * A turn's length in words, as the header says it: "48 seconds", "1 minute 57 seconds", "1 小时 3 分".
+ * Whole seconds gone, as the live timer counts them (`elapsedSeconds`): a turn
+ * that read "Working 13s" ends "Finished in 13 seconds", never a second more.
+ */
 export function spokenDuration(ms: number, zh: boolean): string {
-  const total = Math.max(1, Math.round(ms / 1000));
+  const total = Math.max(1, elapsedSeconds(ms));
   const hours = Math.floor(total / 3600);
   const minutes = Math.floor((total % 3600) / 60);
   const seconds = total % 60;
@@ -687,6 +702,9 @@ export function spokenDuration(ms: number, zh: boolean): string {
     : [minutes > 0 ? unit(minutes, "minute", "分") : "", seconds > 0 || minutes === 0 ? unit(seconds, "second", "秒") : ""];
   return parts.filter(Boolean).join(" ");
 }
+
+/** How many whole seconds `ms` is: what the live timer shows, and what the turn's final figure is counted in. */
+export const elapsedSeconds = (ms: number) => Math.floor(Math.max(0, ms) / 1000);
 
 /** The step a folded running turn is on, in a line. */
 export function describeActiveStep(step: NonNullable<TurnHeaderRow["activeStep"]>, lang: Lang): string {
@@ -764,7 +782,8 @@ export function buildDisplayRows(
     let totalTurnMs = first.turnMs;
     let tailClosed = first.turnMs !== undefined;
     const flushSteps = () => {
-      if (steps.length) process.push(activityOf(steps));
+      // A run of steps that is only a call not named yet has nothing to say: its row waits for the name.
+      if (steps.length && !steps.every(isUnnamedCall)) process.push(activityOf(steps));
       steps = [];
     };
     for (; i < rows.length; i++) {
@@ -783,7 +802,7 @@ export function buildDisplayRows(
       }
       if (cur.kind === "tool" || cur.kind === "thinking") {
         steps.push(cur);
-        activeStep = cur;
+        if (!isUnnamedCall(cur)) activeStep = cur;
         if (cur.kind === "tool") {
           turnTools.push(cur);
           if (cur.background && isToolActive(cur.status)) backgroundStep = cur;

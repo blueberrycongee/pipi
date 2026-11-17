@@ -11,6 +11,9 @@ import {
   veilBoost,
   veilDurationMs,
   veilEmaNext,
+  veilEnd,
+  waveDelay,
+  waveOf,
   veilOpacity,
   type RowVeil,
 } from "./veil";
@@ -179,4 +182,33 @@ test("closeHangingInline mends hanging inline edge cases", () => {
   // Closed code fence with blank lines inside does not confuse trailing inline mending
   const withFence = "```ts\nconst a = 1;\n\nconst b = 2;\n```\n**trailing bold ";
   expect(mendStreamingMarkdown(withFence).source).toBe("```ts\nconst a = 1;\n\nconst b = 2;\n```\n**trailing bold** ");
+});
+
+test("a chunk's fade travels word by word: the head leads, each word takes its turn, all settled together", () => {
+  const v = seeded(fresh());
+  const chunks = advanceVeil(v, "one two three four", 1000);
+  expect(chunks).toHaveLength(1);
+  const chunk = chunks[0];
+  // Four words: the first starts on arrival, the last at the end of the wave.
+  expect([...waveOf("one two three four").at]).toEqual([[0, 0], [4, 12], [8, 24], [14, 36]]);
+  expect(waveDelay(chunk, 0)).toBe(0);
+  expect(waveDelay(chunk, 8)).toBe(24); // "three" is the third word
+  expect(waveDelay(chunk, 14)).toBe(36);
+  // The head is the furthest along; a word inside holds back by its delay.
+  // An EMA of 90ms gives the longest fade (240ms), and the wave is 36ms: well inside it by 120ms.
+  const head = chunkAlpha(chunks, chunk, 1120);
+  const fourth = chunkAlpha(chunks, chunk, 1120, 14);
+  expect(chunkAlpha(chunks, chunk, 1120, 0)).toBeGreaterThan(fourth);
+  expect(head).toBeGreaterThanOrEqual(fourth);
+  // Nothing is never beyond the head, and no word goes backwards.
+  let last = 0;
+  for (let at = 1000; at < 1400; at += 8) {
+    const alpha = chunkAlpha(chunks, chunk, at, 14);
+    expect(alpha).toBeGreaterThanOrEqual(last);
+    last = alpha;
+  }
+  // The chunk is done only once its last word is: the wave is counted, not cut off.
+  expect(veilEnd([chunk])).toBe(1000 + chunk.durationMs + 36);
+  expect(chunkAlpha(chunks, chunk, 1000 + chunk.durationMs + 40)).toBe(1);
+  expect(chunks).toHaveLength(0);
 });

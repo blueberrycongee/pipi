@@ -602,7 +602,7 @@ test("displays the sent user bubble before any thinking or writing indicator on 
 
     const statusLabels = ["正在思考", "正在回复", "正在处理"];
     let sawThinking = false;
-    let sawWriting = false;
+    let sawWorking = false;
     for (let elapsed = 0; elapsed < 25_000; elapsed += 50) {
       expect(app.count(`label:对话 >> text:${promptText}`)).toBeGreaterThan(0);
       const allTexts = app.texts();
@@ -616,15 +616,17 @@ test("displays the sent user bubble before any thinking or writing indicator on 
         const statusAt = findPhrase(chatTexts, label);
         if (statusAt >= 0) {
           if (label === "正在思考") sawThinking = true;
-          if (label === "正在回复") sawWriting = true;
+          if (label === "正在处理") sawWorking = true;
           expect(userAt).toBeLessThan(statusAt);
         }
       }
       if (elapsed > 200 && app.shows("label:发送")) break;
       await app.wait(50);
     }
+    // Before the run has a row Pip's line says it is thinking; from its first row on the turn's
+    // header says the work, and the line keeps to Pip (no "正在回复" under a reply being written).
     expect(sawThinking).toBe(true);
-    expect(sawWriting).toBe(true);
+    expect(sawWorking).toBe(true);
     await app.waitFor("label:发送");
   };
 

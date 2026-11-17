@@ -21,6 +21,16 @@ const VEIL_GAP_CLAMP_MS = 1000;
 /** First-seen text longer than this indicates re-attaching mid-reply: seed baseline. */
 export const VEIL_ATTACH_SEED_CHARS = 240;
 
+/**
+ * How long the fade takes to travel the whole of one appended chunk (ms). A
+ * chunk is what arrived between two frames: at a fast stream that is a couple
+ * of words, at a burst a whole line. Lit on one frame it is a slab that pops;
+ * travelling word by word it reads as the reply being written. Bounded, so a
+ * long chunk is a sweep and not a crawl, and so no chunk outlives its fade by
+ * more than this.
+ */
+export const VEIL_WAVE_MS = 36;
+
 /** Text alpha for fade progress `p` (0..1): `1 - (1 - p)^1.6`. */
 export function veilOpacity(p: number): number {
   const q = Math.min(1, Math.max(0, p));
@@ -63,7 +73,11 @@ export interface VeilChunk {
   startedAt: number;
   /** Fade duration (ms) fixed at arrival from the cadence EMA. */
   durationMs: number;
-  /** Highest normalized progress reached so retiring earlier chunks never regresses alpha. */
+  /** Where each word of the chunk starts fading, by its offset in the chunk, in ms from `startedAt`:
+   * the fade travels through the chunk word by word instead of lighting all of it on one frame. */
+  wave?: { last: number; at: Map<number, number> };
+  /** Highest normalized progress its last word reached (below 0 until the wave gets there), so
+   * retiring earlier chunks never regresses alpha. The chunk is done when its last word is. */
   peak?: number;
 }
 
@@ -137,6 +151,45 @@ export function finishVeilPass(v: RowVeil): void {
   v.seeding = false;
 }
 
+/**
+ * Where each word of an appended `piece` starts fading, by its offset in the
+ * chunk, in ms from the chunk's arrival: every word takes its turn, the first
+ * at once and the last `VEIL_WAVE_MS` later. A cut inside a word (a span
+ * boundary in the renderer) reads the word it is in.
+ */
+export function waveOf(piece: string): { last: number; at: Map<number, number> } {
+  const words: number[] = [];
+  let at = 0;
+  while (at < piece.length) {
+    // A word runs to the space after it, so a word and the gap before the next fade as one.
+    const next = piece.slice(at).search(/\s/);
+    const stop = next === -1 ? piece.length : at + next;
+    if (stop > at) words.push(at);
+    at = stop + 1;
+  }
+  const turns = Math.max(1, words.length - 1);
+  const map = new Map<number, number>();
+  words.forEach((word, i) => map.set(word, Math.round((VEIL_WAVE_MS * i) / turns * 10) / 10));
+  return { last: words.length > 1 ? map.get(words[words.length - 1])! : 0, at: map };
+}
+
+/** The delay (ms) a word `offset` characters into `chunk` waits for: the turn of the word it is in. */
+export function waveDelay(chunk: VeilChunk, offset: number): number {
+  const wave = chunk.wave;
+  if (!wave) return 0;
+  // The last word start at or before `offset`: its turn is the one this character waits for.
+  let turn = 0;
+  let found = false;
+  for (const [at, waits] of wave.at) {
+    if (at > offset) continue;
+    if (!found || at >= turn) {
+      turn = at;
+      found = true;
+    }
+  }
+  return found ? wave.at.get(turn)! : wave.last;
+}
+
 /** Advances a single element (`elemKey`) inside `v` to `text` at `now` (ms).
  * Idempotent when `text` is unchanged; returns active fading chunks for this element. */
 export function advanceElemVeil(v: RowVeil, elemKey: string, text: string, now: number): VeilChunk[] {
@@ -161,7 +214,13 @@ export function advanceElemVeil(v: RowVeil, elemKey: string, text: string, now: 
         el.emaMs = veilEmaNext(el.emaMs, Math.max(0, now - el.lastAppend));
       }
       el.lastAppend = now;
-      el.chunks.push({ start: p, end: text.length, startedAt: now, durationMs: veilDurationMs(el.emaMs) });
+      el.chunks.push({
+        start: p,
+        end: text.length,
+        startedAt: now,
+        durationMs: veilDurationMs(el.emaMs),
+        wave: waveOf(text.slice(p)),
+      });
     }
     el.prev = text;
   }
@@ -184,7 +243,7 @@ export function pruneSettledChunks(chunks: VeilChunk[], now: number): number {
   let write = 0;
   for (let i = 0; i < chunks.length; i++) {
     const c = chunks[i];
-    const p = Math.max(c.peak ?? 0, ((now - c.startedAt) * initialBoost) / c.durationMs);
+    const p = Math.max(c.peak ?? Number.NEGATIVE_INFINITY, progressOf(c, now, initialBoost));
     c.peak = p;
     if (p < 1) {
       chunks[write++] = c;
@@ -194,25 +253,36 @@ export function pruneSettledChunks(chunks: VeilChunk[], now: number): number {
   return veilBoost(chunks.length);
 }
 
+/** How far the fade of `c`'s last word has got at `now`: the wave reaches it `wave.last` after arrival. */
+function progressOf(c: VeilChunk, now: number, boost: number): number {
+  const spent = now - c.startedAt;
+  if (!c.wave) return (spent * boost) / c.durationMs;
+  return ((spent - c.wave.last) * boost) / c.durationMs;
+}
+
 /** The text alpha (0..1) of `chunk` at `now`, one of the element's `chunks`: a
  * backed-up stream (3+ fading at once) runs its fades faster. 1 once settled. */
-export function chunkAlpha(chunks: VeilChunk[], chunk: VeilChunk, now: number): number {
+export function chunkAlpha(chunks: VeilChunk[], chunk: VeilChunk, now: number, offset?: number): number {
   const boost = pruneSettledChunks(chunks, now);
   if (!chunks.includes(chunk)) return 1;
-  const p = Math.max(chunk.peak ?? 0, ((now - chunk.startedAt) * boost) / chunk.durationMs);
-  chunk.peak = p;
-  if (p >= 1) {
+  // The last word's progress is the chunk's: what it has done, never undone by a later frame.
+  const tail = Math.max(chunk.peak ?? Number.NEGATIVE_INFINITY, progressOf(chunk, now, boost));
+  chunk.peak = tail;
+  if (tail >= 1) {
     const idx = chunks.indexOf(chunk);
     if (idx >= 0) chunks.splice(idx, 1);
     return 1;
   }
-  return veilOpacity(p);
+  if (offset === undefined || !chunk.wave) return veilOpacity(tail);
+  // A word is ahead of the last one by the turns between them: the wave's head leads, its tail follows.
+  const ahead = ((chunk.wave.last - waveDelay(chunk, offset)) * boost) / chunk.durationMs;
+  return veilOpacity(tail + ahead);
 }
 
-/** Upper bound on when the last of `chunks` finishes fading (0 when empty). */
+/** Upper bound on when the last of `chunks` finishes fading — its last word, counted (0 when empty). */
 export function veilEnd(chunks: readonly VeilChunk[]): number {
   let end = 0;
-  for (const c of chunks) end = Math.max(end, c.startedAt + c.durationMs);
+  for (const c of chunks) end = Math.max(end, c.startedAt + c.durationMs + (c.wave?.last ?? 0));
   return end;
 }
 

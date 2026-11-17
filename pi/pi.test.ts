@@ -4,7 +4,7 @@ import { PiClient, type Transport } from "./client";
 import { DaemonClient } from "./daemon";
 import { createLineSplitter } from "./jsonl";
 import { firstVisualRowDiff, type Row, sameVisualRows, Transcript, toolSummary, withoutHandoff, withoutImageNotes } from "./transcript";
-import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, describeToolsSummary, displayRowIds, stableDisplayRows, type TurnHeaderRow } from "./turns";
+import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, describeToolsSummary, displayRowIds, elapsedSeconds, spokenDuration, stableDisplayRows, type TurnHeaderRow } from "./turns";
 
 test("splits records on LF only, across chunks, keeping U+2028", () => {
   const lines: string[] = [];
@@ -151,6 +151,9 @@ test("a turn's process folds once, when its answer is known, and prose never cha
   expect(shown()).toEqual(["user", "turn", "text"]);
   update({ type: "toolcall_start", contentIndex: 1, id: "c1", toolName: "read" });
   update({ type: "toolcall_start", contentIndex: 2, id: "c2", toolName: "bash" });
+  // Calls the model has only begun to write have nothing to say yet: their row waits for what they are for.
+  expect(shown()).toEqual(["user", "turn", "text"]);
+  update({ type: "toolcall_delta", contentIndex: 1, delta: '{"path":"a.ts"}' });
   expect(shown()).toEqual(["user", "turn", "text", "activity"]);
   const calls = [
     { type: "toolCall", id: "c1", name: "read", arguments: {} },
@@ -351,6 +354,7 @@ test("groups interleaved reasoning and tool calls between commentary boundaries 
   // Commentary prose flushes the accumulated process group
   update({ type: "text_delta", contentIndex: 1, delta: "Checking TranscriptRow next." });
   update({ type: "toolcall_start", contentIndex: 2, id: "c4", toolName: "Read file" });
+  update({ type: "toolcall_delta", contentIndex: 2, delta: '{"path":"Rows.tsx"}' });
   midRows = buildDisplayRows(t.rows(), true);
   expect(midRows.map((r) => r.kind)).toEqual(["user", "turn", "text", "activity", "text", "activity"]);
 
@@ -451,6 +455,44 @@ test("the turn the run is on shows its process; one a run left closed is not it,
   expect(again.durationMs).toBeUndefined();
 });
 
+test("a call is not said until it can be said whole: no placeholder line that the next delta rewrites", () => {
+  const t = new Transcript();
+  const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
+  const rows = () => buildDisplayRows(t.rows(), true);
+  const acts = () => rows().filter((row) => row.kind === "activity") as ActivityRow[];
+  t.apply({ type: "message_start", message: asked("go") });
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+
+  // The call's name alone would read "Reading file": it gets no row, and the header alone is live.
+  update({ type: "toolcall_start", contentIndex: 0, id: "c1", toolName: "read" });
+  expect(acts()).toHaveLength(0);
+  expect(turnsOf(rows())[0]).toMatchObject({ running: true, live: true });
+  // Named, it is said as it is.
+  update({ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"src/package.json"}' });
+  expect(acts().map((row) => describeActivity(row, "en"))).toEqual(["Reading package.json"]);
+  t.apply({ type: "tool_execution_end", toolCallId: "c1", toolName: "read", result: { content: [] }, isError: false });
+  expect(acts().map((row) => describeActivity(row, "en"))).toEqual(["Read package.json"]);
+
+  // The next call joins the same row; until it is named the row keeps saying what it last said.
+  update({ type: "toolcall_start", contentIndex: 1, id: "c2", toolName: "read" });
+  expect(acts().map((row) => describeActivity(row, "en"))).toEqual(["Read package.json"]);
+  update({ type: "toolcall_delta", contentIndex: 1, delta: '{"path":"views/Chat.tsx"}' });
+  expect(acts().map((row) => describeActivity(row, "en"))).toEqual(["Reading Chat.tsx"]);
+
+  // A folded working turn's header names the step it is on the same way.
+  update({ type: "toolcall_start", contentIndex: 2, id: "c3", toolName: "grep" });
+  const folded = turnsOf(buildDisplayRows(t.rows(), true, { chosen: () => false }))[0];
+  expect(folded.activeStep).toMatchObject({ kind: "tool", name: "read" });
+});
+
+test("a turn's length is said in the whole seconds its timer counted", () => {
+  expect(elapsedSeconds(13_900)).toBe(13);
+  expect(spokenDuration(13_900, false)).toBe("13 seconds");
+  expect(spokenDuration(1_999, false)).toBe("1 second");
+  expect(spokenDuration(119_900, false)).toBe("1 minute 59 seconds");
+  expect(spokenDuration(13_900, true)).toBe("13 秒");
+});
+
 test("only the newest row still working is live: one looping status cue at a time", () => {
   const t = new Transcript();
   const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
@@ -458,8 +500,10 @@ test("only the newest row still working is live: one looping status cue at a tim
   t.apply({ type: "message_start", message: asked("go") });
   t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
   update({ type: "toolcall_start", contentIndex: 0, id: "c1", toolName: "read" });
+  update({ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"a.ts"}' });
   update({ type: "text_delta", contentIndex: 1, delta: "Looking." });
   update({ type: "toolcall_start", contentIndex: 2, id: "c2", toolName: "bash" });
+  update({ type: "toolcall_delta", contentIndex: 2, delta: '{"command":"ls"}' });
 
   // Two runs of work still going: the later one is live, the header and the earlier one stand still.
   let rows = buildDisplayRows(t.rows(), true);

@@ -2390,8 +2390,9 @@ function onEvent(event: SessionEvent) {
       // how the session is found again, should its agent go away under the run.
       if (event.message.role === "user" && !state()?.sessionFile) void refreshState().catch(() => undefined);
       break;
+    // A turn starting is the model taking up the work again. A turn ending says nothing of what is
+    // next — the run may be over: "Thinking" there would be said of a reply just finished, on its way out.
     case "turn_start":
-    case "turn_end":
       if (running() && activity().kind !== "retrying" && publishActivity({ kind: "thinking" })) return;
       break;
     case "queue_update":

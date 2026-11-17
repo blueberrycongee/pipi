@@ -2,7 +2,7 @@ import { cleanup, createAnimatedValue, effect, reduceMotion, Scroll, signal, Tex
 import type { JSX, ViewRef } from "nsh";
 import { Collapsible, TextView } from "nsh/base";
 import { Menu } from "nsh/desktop";
-import { clip, duration } from "../lib/format";
+import { clip } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
 import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
 import { type Row, type ToolRow, withoutHandoff, withoutImageNotes } from "../pi/transcript";
@@ -13,6 +13,7 @@ import {
   describeToolCall,
   describeToolsSummary,
   describeTurn,
+  elapsedSeconds,
   classifyTool,
   type DiffStats,
   type DisplayRow,
@@ -26,7 +27,7 @@ import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from 
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { clearProseState, PROSE, ProseBlock, type ProseRow } from "./Prose";
+import { clearProseState, PROSE, ProseBlock, proseVeilUntil, type ProseRow } from "./Prose";
 
 /**
  * The rows of the chat. `List` recycles its cells, so every row reads its
@@ -182,18 +183,29 @@ function clearTurnTimers(id: string) {
 function scheduleAutoFold(id: string) {
   clearTurnTimers(id);
   pendingAutoClose.add(id);
-  // Let the settle commit lay out the finished reply and its Copy row at rest
-  // first, then collapse the process rows in their own scoped pass one frame later.
-  const tCollapse = setTimeout(() => {
+  // The settle commit lays out the finished reply in a Copy seat that is
+  // already taken; the process rows then collapse in their own scoped pass —
+  // but only once the reply's last word is lit: a fold that leaves earlier
+  // pulls the floor from under a word still arriving.
+  const collapse = () => {
     pendingAutoClose.delete(id);
     closingTurns.update((all) => ({ ...all, [id]: "collapsing" }));
+    const tDone = setTimeout(() => {
+      clearTurnTimers(id);
+      closingTurns.update(({ [id]: _, ...rest }) => rest);
+      foldSettled();
+    }, FOLD_SETTLE_MS);
+    foldTimers.set(id, [tDone]);
+  };
+  const tCollapse = setTimeout(() => {
+    const wait = proseVeilUntil() - Date.now();
+    if (wait <= 0) {
+      collapse();
+      return;
+    }
+    foldTimers.set(id, [setTimeout(collapse, wait)]);
   }, 16);
-  const tDone = setTimeout(() => {
-    clearTurnTimers(id);
-    closingTurns.update(({ [id]: _, ...rest }) => rest);
-    foldSettled();
-  }, 16 + FOLD_SETTLE_MS);
-  foldTimers.set(id, [tCollapse, tDone]);
+  foldTimers.set(id, [tCollapse]);
 }
 
 /**
@@ -428,6 +440,7 @@ export function enterConversation(key: number) {
   }
 
   replyActionRows.clear();
+  heldActionRows.clear();
   clearProseState();
 }
 
@@ -644,9 +657,13 @@ export interface ReplyActionsRow {
   /** The reply (transcript row) it acts on. */
   rowId: string;
   text: string;
+  /** Set while the reply is still written: the row takes the Copy line's height
+   * already, so the reply's end fills a seat instead of adding one. */
+  held?: boolean;
 }
 
 const replyActionRows = new Map<string, ReplyActionsRow>();
+const heldActionRows = new Map<string, ReplyActionsRow>();
 
 /** The actions row of a finished reply: the same object while the reply does not change, so the list leaves it alone. */
 export function replyActions(row: { id: string; text: string }): ReplyActionsRow {
@@ -657,10 +674,26 @@ export function replyActions(row: { id: string; text: string }): ReplyActionsRow
   return made;
 }
 
+/**
+ * The actions row's seat under a reply still being written: the same row id and
+ * height it will keep, nothing in it yet. When the reply ends the seat fills
+ * where it stood — the reader at its foot is not pushed a line.
+ */
+export function heldActions(row: { id: string }): ReplyActionsRow {
+  let held = heldActionRows.get(row.id);
+  if (!held) {
+    held = { kind: "actions", id: `${row.id}#actions`, rowId: row.id, text: "", held: true };
+    heldActionRows.set(row.id, held);
+  }
+  return held;
+}
+
 function ReplyActionsView(props: { row: ReplyActionsRow }) {
   return (
     <View class="h-6 select-none flex-row items-center">
-      <CopyButton id={props.row.id} text={props.row.text} label={tr("Copy reply", "复制回复")} class="-ml-1" />
+      <Presence show={!props.row.held} scaleFrom={1} class="-ml-1">
+        <CopyButton id={props.row.id} text={props.row.text} label={tr("Copy reply", "复制回复")} />
+      </Presence>
     </View>
   );
 }
@@ -806,7 +839,7 @@ function DiffBadge(props: { stats?: DiffStats }) {
 }
 
 function ThinkingRow(props: { row: Extract<Row, { kind: "thinking" }>; defaultOpen?: boolean; compact?: boolean }) {
-  const pulseOpacity = useBreathingOpacity(() => props.row.streaming, 0.68, 1500);
+  const breathOpacity = useBreathingOpacity(() => props.row.streaming);
   const fallback = () => Boolean(props.defaultOpen);
   const open = () => isOpen(props.row.id, fallback());
   const label = () => thinkingLabel(props.row, activeLanguage());
@@ -828,7 +861,7 @@ function ThinkingRow(props: { row: Extract<Row, { kind: "thinking" }>; defaultOp
   return (
     <Collapsible open={open() && hasBody()} reveal content={<ReasoningBody text={props.row.text} />}>
       <ProcessLine open={open() && hasBody()} onPress={hasBody() ? () => toggle(props.row.id, fallback()) : undefined}>
-        <RollingText id={() => props.row.id} text={label} class={text()} style={{ opacity: pulseOpacity }} />
+        <RollingText id={() => props.row.id} text={label} class={text()} style={{ opacity: breathOpacity }} />
       </ProcessLine>
     </Collapsible>
   );
@@ -980,7 +1013,7 @@ function ToolCallRow(props: { row: ToolRow; compact?: boolean }) {
 function ActivityView(props: { row: ActivityRow }) {
   const open = () => isOpen(props.row.id, false);
   const title = () => describeActivity(props.row, activeLanguage());
-  const pulseOpacity = useBreathingOpacity(() => props.row.live === true, 0.68, 1300);
+  const breathOpacity = useBreathingOpacity(() => props.row.live === true);
   const only = () => (props.row.steps.length === 1 ? props.row.steps[0] : undefined);
   const onlySession = () => {
     const step = only();
@@ -1023,7 +1056,7 @@ function ActivityView(props: { row: ActivityRow }) {
     >
       <View class="flex-row items-center gap-1">
         <ProcessLine open={open() && hasBody()} onPress={hasBody() ? () => toggle(props.row.id, false) : undefined}>
-          <RollingText id={() => props.row.id} text={title} class="min-w-0 shrink truncate text-md text-subtle" style={{ opacity: pulseOpacity }} />
+          <RollingText id={() => props.row.id} text={title} class="min-w-0 shrink truncate text-md text-subtle" style={{ opacity: breathOpacity }} />
         </ProcessLine>
         <If when={onlySession()}>
           {(sid) => (
@@ -1045,15 +1078,32 @@ function ActivityView(props: { row: ActivityRow }) {
  * while it runs, how long it took after. It folds the turn's process rows,
  * which the list shows or leaves out; the header itself never changes height.
  */
-function TurnHeaderView(props: { row: TurnHeaderRow }) {
-  const pulseOpacity = useBreathingOpacity(() => props.row.live === true, 0.68, 1300);
+/** A working turn's time so far, in whole seconds gone: "7s", "1m 4s". */
+function runningFor(ms: number): string {
+  const total = elapsedSeconds(ms);
+  return total < 60 ? `${total}s` : `${Math.floor(total / 60)}m ${total % 60}s`;
+}
 
+function TurnHeaderView(props: { row: TurnHeaderRow }) {
+  const breathOpacity = useBreathingOpacity(() => props.row.live === true);
+
+  // The timer turns over as each second of the turn completes, not a second
+  // after the header happened to mount: an interval of its own phase reads up
+  // to a second behind, and the figure the turn ends on ("Finished in 13
+  // seconds") would jump ahead of the one it was counting ("Working 12s").
   const now = signal(Date.now());
   effect(() => {
     if (!props.row.running) return;
-    now.set(Date.now());
-    const timer = setInterval(() => now.set(Date.now()), 1000);
-    cleanup(() => clearInterval(timer));
+    const startedAt = props.row.startedAt;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = () => {
+      const at = Date.now();
+      now.set(at);
+      const into = startedAt === undefined ? 0 : Math.max(0, at - startedAt) % 1000;
+      timer = setTimeout(tick, 1000 - into + 4);
+    };
+    tick();
+    cleanup(() => clearTimeout(timer));
   });
   const elapsed = () => (props.row.running && props.row.startedAt !== undefined ? Math.max(0, now() - props.row.startedAt) : undefined);
   const preview = () => {
@@ -1076,10 +1126,10 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
           id={() => props.row.id}
           text={() => describeTurn(props.row, activeLanguage())}
           class="shrink-0 text-md text-subtle"
-          style={{ opacity: pulseOpacity }}
+          style={{ opacity: breathOpacity }}
         />
         <If when={elapsed() !== undefined && (elapsed() ?? 0) >= 1000}>
-          <Text class="shrink-0 text-md tabular-nums text-subtle">{(elapsed() ?? 0) < 60_000 ? `${Math.floor((elapsed() ?? 0) / 1000)}s` : duration(elapsed() ?? 0)}</Text>
+          <Text class="shrink-0 text-md tabular-nums text-subtle">{runningFor(elapsed() ?? 0)}</Text>
         </If>
         <Presence show={Boolean(preview())} scaleFrom={0.97} class="min-w-0 shrink flex-row items-center gap-1.5">
           <If when={!props.row.running}>

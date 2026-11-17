@@ -1,6 +1,7 @@
 import { Canvas, cleanup, createAnimatedValue, createMotion, effect, reduceMotion, signal, token, View } from "nsh";
 import type { CanvasRenderingContext2D } from "nsh";
 import { pipCoat } from "../store/prefs";
+import { BREATH_MS } from "../ui/motion";
 import { BOUNDS, GRID, LINE_PAINT, pip, silhouette, tailPivot, type CoatId, type Mood, type Paint, type Path, type Shape } from "./geometry";
 
 export type { CoatId, Mood } from "./geometry";
@@ -61,9 +62,10 @@ export function Pip(props: { size: number; mood?: Mood; coat?: CoatId; still?: b
         body.play({ duration: 2200, iterations: "infinite", easing: "easeInOut", keyframes: { translateY: [0, -size * 0.045, 0], rotate: [0, -2.5, 0] } });
         break;
       case "work":
-        // A ghost does not walk: it bobs, and the tail keeps time.
-        wag(0.35, 620);
-        body.play({ duration: 620, iterations: "infinite", easing: "easeInOut", keyframes: { translateY: [0, -size * 0.05, 0] } });
+        // A ghost does not walk: it bobs, and the tail keeps time — two bobs
+        // to the working labels' shared breath, so every alive cue keeps one clock.
+        wag(0.35, BREATH_MS / 2);
+        body.play({ duration: BREATH_MS / 2, iterations: "infinite", easing: "easeInOut", keyframes: { translateY: [0, -size * 0.05, 0] } });
         break;
       case "write":
         wag(0.18, 300);

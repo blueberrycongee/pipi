@@ -6,7 +6,7 @@ import { Pip } from "../mascot/Pip";
 import { appUpdate, appUpdateVisible, beginAppUpdate, dismissAppUpdate, installAppUpdate } from "../store/update";
 import { Button, IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
-import { EASING, Presence, SPRING } from "../ui/motion";
+import { BREATH_MS, EASING, Presence, SPRING } from "../ui/motion";
 import { POPUP } from "../ui/styles";
 import { PROSE } from "./Prose";
 
@@ -182,8 +182,9 @@ export function UpdateCard() {
           pipPos.set((TAIL_LO + TAIL_HI) / 2);
         } else {
           blobRunning = true;
-          void blob.keyframes([0, 1, 0], { duration: 2600, easing: "easeInOut", iterations: "infinite" });
-          void pipPos.keyframes([TAIL_LO, TAIL_HI, TAIL_LO], { duration: 2600, easing: "easeInOut", iterations: "infinite" });
+          // Two breaths a drift: the wait here keeps the working labels' tempo.
+          void blob.keyframes([0, 1, 0], { duration: BREATH_MS * 2, easing: "easeInOut", iterations: "infinite" });
+          void pipPos.keyframes([TAIL_LO, TAIL_HI, TAIL_LO], { duration: BREATH_MS * 2, easing: "easeInOut", iterations: "infinite" });
         }
       }
     });
