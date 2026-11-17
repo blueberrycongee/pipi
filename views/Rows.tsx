@@ -1,5 +1,5 @@
 import { cleanup, createAnimatedValue, effect, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
-import type { JSX } from "nsh";
+import type { JSX, ViewRef } from "nsh";
 import { Collapsible, TextView } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { clip, duration } from "../lib/format";
@@ -104,6 +104,62 @@ const openingTurns = signal<Record<string, "arming" | "expanding">>({});
 const pendingAutoClose = new Set<string>();
 const foldTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
 
+const horizonPromptId = signal<string | undefined>(undefined);
+let horizonPromptNodeCallback: (node: ViewRef | undefined) => void = () => {};
+let currentHorizon: { id: string; node: ViewRef } | undefined;
+
+function reportHorizon(id: string, node: ViewRef | undefined) {
+  if (node) {
+    if (currentHorizon?.id === id && currentHorizon?.node === node) return;
+    currentHorizon = { id, node };
+    horizonPromptNodeCallback(node);
+  } else if (currentHorizon?.id === id) {
+    currentHorizon = undefined;
+    horizonPromptNodeCallback(undefined);
+  }
+}
+
+/** Registers the active sent user bubble id so the chat can measure when it reaches the reading horizon. */
+export function setHorizonPrompt(id: string | undefined, onNode: (node: ViewRef | undefined) => void) {
+  horizonPromptNodeCallback = onNode;
+  if (!id) currentHorizon = undefined;
+  horizonPromptId.set(id);
+}
+
+const RECALL_MS = 210;
+const recallingUsers = signal<Record<string, { row: Extract<Row, { kind: "user" }>; prevId?: string }>>({});
+const recallTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Read inside `displayRows` so a recalled queued bubble stays mounted while collapsing out. */
+export function trackRecallingUsers() {
+  recallingUsers();
+}
+
+export function recallingUserSnapshots(): Readonly<Record<string, { row: Extract<Row, { kind: "user" }>; prevId?: string }>> {
+  return untracked(recallingUsers);
+}
+
+function recallQueuedRow(row: Extract<Row, { kind: "user" }>, edit: boolean) {
+  if (untracked(reduceMotion)) {
+    void takeQueued(row.id, edit);
+    return;
+  }
+  const list = untracked(transcriptRows);
+  const idx = list.findIndex((item) => item.id === row.id);
+  const prevId = idx > 0 ? list[idx - 1].id : undefined;
+  const existing = recallTimers.get(row.id);
+  if (existing) clearTimeout(existing);
+  recallingUsers.update((all) => ({ ...all, [row.id]: { row, prevId } }));
+  recallTimers.set(
+    row.id,
+    setTimeout(() => {
+      recallTimers.delete(row.id);
+      recallingUsers.update(({ [row.id]: _, ...rest }) => rest);
+    }, RECALL_MS),
+  );
+  void takeQueued(row.id, edit);
+}
+
 /** Read inside `displayRows` so projection re-runs when a turn finishes collapsing. */
 export function trackFoldState() {
   closingTurns();
@@ -152,14 +208,16 @@ function scheduleAutoFold(id: string) {
  */
 function toggleTurn(id: string, open: boolean, running: boolean) {
   anchorFold();
+  const wasPendingClose = !running && pendingAutoClose.has(id);
   clearTurnTimers(id);
   // The turn is the reader's from here on: no fold of its own is left to make.
   watched.seen.delete(id);
   const work = running ? workOf(id) : undefined;
-  if (reduceMotion()) {
+  if (reduceMotion() || wasPendingClose) {
     closingTurns.update(({ [id]: _, ...rest }) => rest);
     openingTurns.update(({ [id]: _, ...rest }) => rest);
-    choose(id, !open, work);
+    choose(id, wasPendingClose ? true : !open, work);
+    if (wasPendingClose) foldSettled();
     return;
   }
   if (!open) {
@@ -215,7 +273,8 @@ function useProcessFold(id: () => string) {
   let currentOpen = true;
   let rearmSeq = 0;
 
-  const desiredState = (rowId: string): { open: boolean; phase: "steady" | "arming" | "expanding" | "collapsing"; at: number } => {
+  const desiredState = (rowId: string): { open: boolean; phase: "steady" | "arming" | "expanding" | "collapsing"; at: number; recall?: boolean } => {
+    if (recallingUsers()[rowId]) return { open: false, phase: "collapsing", at: 0, recall: true };
     const place = processTurns.get(rowId);
     if (!place) return { open: true, phase: "steady", at: 0 };
     if (closingTurns()[place.turn] === "collapsing") return { open: false, phase: "collapsing", at: place.at };
@@ -227,10 +286,11 @@ function useProcessFold(id: () => string) {
 
   effect(() => {
     const rowId = id();
+    recallingUsers();
     closingTurns();
     openingTurns();
     untracked(() => {
-      const { open: nextOpen, phase, at } = desiredState(rowId);
+      const { open: nextOpen, phase, at, recall } = desiredState(rowId);
       const rebound = rowId !== trackedId;
       trackedId = rowId;
 
@@ -239,7 +299,7 @@ function useProcessFold(id: () => string) {
         void opacity.stop();
         void translateY.stop();
         opacity.set(nextOpen ? 1 : 0);
-        translateY.set(nextOpen ? 0 : -6);
+        translateY.set(nextOpen ? 0 : recall ? 6 : -6);
         if (nextOpen !== currentOpen) {
           currentOpen = nextOpen;
           reveal.set(false);
@@ -271,7 +331,7 @@ function useProcessFold(id: () => string) {
         void translateY.timing(0, { duration: 240, delay, easing: EASING.signature });
       } else {
         void opacity.timing(0, { duration: 150, easing: EASING.exit });
-        void translateY.timing(-4, { duration: 180, easing: EASING.exit });
+        void translateY.timing(recall ? 6 : -4, { duration: 180, easing: EASING.exit });
       }
     });
   });
@@ -286,6 +346,7 @@ function useProcessFold(id: () => string) {
     open: cellOpen,
     reveal,
     isFolding: () => {
+      if (recallingUsers()[id()]) return true;
       const place = processTurns.get(id());
       if (!place) return false;
       return closingTurns()[place.turn] !== undefined || openingTurns()[place.turn] !== undefined;
@@ -345,6 +406,10 @@ let shownKeys: number[] = [];
  */
 export function enterConversation(key: number) {
   for (const id of [...foldTimers.keys()]) clearTurnTimers(id);
+  for (const timer of recallTimers.values()) clearTimeout(timer);
+  recallTimers.clear();
+  recallingUsers.set({});
+  currentHorizon = undefined;
   pendingAutoClose.clear();
   closingTurns.set({});
   openingTurns.set({});
@@ -396,10 +461,49 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
     const q = messageQueue();
     return q.followUp.some((wire) => said(wire) === props.row.text) && !q.steering.some((wire) => said(wire) === props.row.text);
   };
+  const bubbleOpacity = createAnimatedValue(untracked(queued) ? 0.6 : 1);
+  let trackedBubbleId = untracked(() => props.row.id);
+  let wasQueued = untracked(queued);
+  effect(() => {
+    const id = props.row.id;
+    const isQueued = queued();
+    const reduced = reduceMotion();
+    untracked(() => {
+      if (id !== trackedBubbleId) {
+        trackedBubbleId = id;
+        wasQueued = isQueued;
+        void bubbleOpacity.stop();
+        bubbleOpacity.set(isQueued ? 0.6 : 1);
+        return;
+      }
+      if (isQueued === wasQueued) return;
+      wasQueued = isQueued;
+      void bubbleOpacity.stop();
+      if (reduced) {
+        bubbleOpacity.set(isQueued ? 0.6 : 1);
+      } else {
+        void bubbleOpacity.timing(isQueued ? 0.6 : 1, { duration: 180, easing: EASING.entrance });
+      }
+    });
+  });
+  cleanup(() => void bubbleOpacity.stop());
+
+  const hostNode = signal<ViewRef | undefined>(undefined);
+  effect(() => {
+    const rowId = props.row.id;
+    const target = horizonPromptId();
+    const node = hostNode();
+    if (target === rowId && node) {
+      untracked(() => reportHorizon(rowId, node));
+      cleanup(() => reportHorizon(rowId, undefined));
+    }
+  });
+
   return (
-    <View class="group items-end">
+    <View ref={(node: ViewRef) => hostNode.set(node)} class="group items-end">
       <View
-        class={`max-w-[70%] gap-1.5 rounded-2xl rounded-br-md corner-squircle bg-secondary px-3.5 py-2.5 ${queued() ? "opacity-60" : ""}`}
+        class="max-w-[70%] gap-1.5 rounded-2xl rounded-br-md corner-squircle bg-secondary px-3.5 py-2.5"
+        style={{ opacity: bubbleOpacity }}
         selectable
         onContextMenu={(e) =>
           Menu.popup(
@@ -408,8 +512,8 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
               // There is nothing in the session to fork at until the agent takes the message.
               ...(queued()
                 ? [
-                    { label: tr("Edit", "编辑"), onSelect: () => void takeQueued(props.row.id, true) },
-                    { label: tr("Remove From Queue", "从队列中移除"), onSelect: () => void takeQueued(props.row.id, false) },
+                    { label: tr("Edit", "编辑"), onSelect: () => recallQueuedRow(props.row, true) },
+                    { label: tr("Remove From Queue", "从队列中移除"), onSelect: () => recallQueuedRow(props.row, false) },
                   ]
                 : [{ label: tr("Fork From Here", "从此处创建分支"), onSelect: () => void forkFrom(ordinal()) }]),
             ],
@@ -481,7 +585,7 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
             size="sm"
             tipPlacement="bottom"
             label={tr("Edit queued message", "编辑排队消息")}
-            onPress={() => void takeQueued(props.row.id, true)}
+            onPress={() => recallQueuedRow(props.row, true)}
           />
           <IconButton
             icon="x"
@@ -489,7 +593,7 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
             size="sm"
             tipPlacement="bottom"
             label={tr("Remove from queue", "从队列中移除")}
-            onPress={() => void takeQueued(props.row.id, false)}
+            onPress={() => recallQueuedRow(props.row, false)}
           />
         </If>
         <If when={props.row.text}>
@@ -702,7 +806,7 @@ function DiffBadge(props: { stats?: DiffStats }) {
 }
 
 function ThinkingRow(props: { row: Extract<Row, { kind: "thinking" }>; defaultOpen?: boolean; compact?: boolean }) {
-  const pulseOpacity = useBreathingOpacity(() => props.row.streaming, 0.48, 1500);
+  const pulseOpacity = useBreathingOpacity(() => props.row.streaming, 0.68, 1500);
   const fallback = () => Boolean(props.defaultOpen);
   const open = () => isOpen(props.row.id, fallback());
   const label = () => thinkingLabel(props.row, activeLanguage());
@@ -876,7 +980,7 @@ function ToolCallRow(props: { row: ToolRow; compact?: boolean }) {
 function ActivityView(props: { row: ActivityRow }) {
   const open = () => isOpen(props.row.id, false);
   const title = () => describeActivity(props.row, activeLanguage());
-  const pulseOpacity = useBreathingOpacity(() => props.row.live === true, 0.55, 1300);
+  const pulseOpacity = useBreathingOpacity(() => props.row.live === true, 0.68, 1300);
   const only = () => (props.row.steps.length === 1 ? props.row.steps[0] : undefined);
   const onlySession = () => {
     const step = only();
@@ -942,31 +1046,7 @@ function ActivityView(props: { row: ActivityRow }) {
  * which the list shows or leaves out; the header itself never changes height.
  */
 function TurnHeaderView(props: { row: TurnHeaderRow }) {
-  const pulseOpacity = useBreathingOpacity(() => props.row.live === true, 0.55, 1300);
-  const settleOpacity = createAnimatedValue(1);
-  let trackedId = "";
-  let wasRunning = false;
-  effect(() => {
-    const id = props.row.id;
-    const running = props.row.running;
-    untracked(() => {
-      if (id !== trackedId) {
-        trackedId = id;
-        wasRunning = running;
-        void settleOpacity.stop();
-        settleOpacity.set(1);
-        return;
-      }
-      if (wasRunning && !running && !reduceMotion()) {
-        wasRunning = false;
-        settleOpacity.set(0.45);
-        void settleOpacity.timing(1, { duration: 180, easing: EASING.entrance });
-      } else {
-        wasRunning = running;
-      }
-    });
-  });
-  cleanup(() => void settleOpacity.stop());
+  const pulseOpacity = useBreathingOpacity(() => props.row.live === true, 0.68, 1300);
 
   const now = signal(Date.now());
   effect(() => {
@@ -992,14 +1072,12 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
         open={props.row.open}
         onPress={props.row.hasDetails ? () => toggleTurn(props.row.id, props.row.open, props.row.running) : undefined}
       >
-        <View style={{ opacity: settleOpacity }}>
-          <RollingText
-            id={() => props.row.id}
-            text={() => describeTurn(props.row, activeLanguage())}
-            class="shrink-0 text-md text-subtle"
-            style={{ opacity: pulseOpacity }}
-          />
-        </View>
+        <RollingText
+          id={() => props.row.id}
+          text={() => describeTurn(props.row, activeLanguage())}
+          class="shrink-0 text-md text-subtle"
+          style={{ opacity: pulseOpacity }}
+        />
         <If when={elapsed() !== undefined && (elapsed() ?? 0) >= 1000}>
           <Text class="shrink-0 text-md tabular-nums text-subtle">{(elapsed() ?? 0) < 60_000 ? `${Math.floor((elapsed() ?? 0) / 1000)}s` : duration(elapsed() ?? 0)}</Text>
         </If>

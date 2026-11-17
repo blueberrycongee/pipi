@@ -10,10 +10,10 @@
 //   switching back to a session or recycling a `List` cell.
 
 /** EMA seed for the inter-append gap (`VEIL_EMA_SEED_MS`). */
-export const VEIL_EMA_SEED_MS = 160;
+export const VEIL_EMA_SEED_MS = 90;
 /** Duration clamp (`VEIL_MIN_FADE_MS` / `VEIL_MAX_FADE_MS`). */
-export const VEIL_MIN_FADE_MS = 120;
-export const VEIL_MAX_FADE_MS = 400;
+export const VEIL_MIN_FADE_MS = 100;
+export const VEIL_MAX_FADE_MS = 240;
 /** Dissolve exponent (`1 - (1 - p)^1.6`). */
 export const VEIL_CURVE_POW = 1.6;
 /** Gap clamp feeding the EMA (`min(gap, 1000)`). */
@@ -63,6 +63,8 @@ export interface VeilChunk {
   startedAt: number;
   /** Fade duration (ms) fixed at arrival from the cadence EMA. */
   durationMs: number;
+  /** Highest normalized progress reached so retiring earlier chunks never regresses alpha. */
+  peak?: number;
 }
 
 /** Per-element chunk tracker (`ElemVeil`). */
@@ -182,7 +184,9 @@ export function pruneSettledChunks(chunks: VeilChunk[], now: number): number {
   let write = 0;
   for (let i = 0; i < chunks.length; i++) {
     const c = chunks[i];
-    if ((now - c.startedAt) * initialBoost < c.durationMs) {
+    const p = Math.max(c.peak ?? 0, ((now - c.startedAt) * initialBoost) / c.durationMs);
+    c.peak = p;
+    if (p < 1) {
       chunks[write++] = c;
     }
   }
@@ -195,7 +199,14 @@ export function pruneSettledChunks(chunks: VeilChunk[], now: number): number {
 export function chunkAlpha(chunks: VeilChunk[], chunk: VeilChunk, now: number): number {
   const boost = pruneSettledChunks(chunks, now);
   if (!chunks.includes(chunk)) return 1;
-  return veilOpacity(((now - chunk.startedAt) * boost) / chunk.durationMs);
+  const p = Math.max(chunk.peak ?? 0, ((now - chunk.startedAt) * boost) / chunk.durationMs);
+  chunk.peak = p;
+  if (p >= 1) {
+    const idx = chunks.indexOf(chunk);
+    if (idx >= 0) chunks.splice(idx, 1);
+    return 1;
+  }
+  return veilOpacity(p);
 }
 
 /** Upper bound on when the last of `chunks` finishes fading (0 when empty). */

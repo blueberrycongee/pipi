@@ -20,9 +20,9 @@ const fresh = (): RowVeil => ({ elems: new Map(), seeding: false, initialized: f
 const seeded = (v: RowVeil): RowVeil => { v.initialized = true; return v; };
 
 test("veil constants and cadence math", () => {
-  // duration = clamp(ema*3, 120, 400); seed 160 -> max, fast stream -> floor.
-  expect(veilDurationMs(160)).toBe(400);
-  expect(veilDurationMs(30)).toBe(120);
+  // duration = clamp(ema*3, 100, 240); seed 90 -> max, fast stream -> floor.
+  expect(veilDurationMs(90)).toBe(240);
+  expect(veilDurationMs(30)).toBe(100);
   expect(veilDurationMs(60)).toBe(180);
   // ema = ema*0.7 + min(gap,1000)*0.3.
   expect(veilEmaNext(160, 100)).toBe(160 * 0.7 + 100 * 0.3);
@@ -65,8 +65,8 @@ test("row veil: first-seen text is the baseline, only appends fade, chunks settl
   expect(chunks).toHaveLength(1);
   expect(chunks[0].start).toBe(17);
   expect(chunks[0].end).toBe(22);
-  // Settled after its duration (400ms max): never fades again.
-  expect(advanceVeil(v, "already on screen plus", 1000 + 410)).toHaveLength(0);
+  // Settled after its duration (240ms max): never fades again.
+  expect(advanceVeil(v, "already on screen plus", 1000 + 250)).toHaveLength(0);
   // A later append veils only the new suffix.
   const next = advanceVeil(v, "already on screen plus more", 1600);
   expect(next).toHaveLength(1);

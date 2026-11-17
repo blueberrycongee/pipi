@@ -1,10 +1,11 @@
 import { Animated, cleanup, computed, createAnimatedValue, effect, List, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
-import type { JSX, ListRef, MouseEvent, ScrollEvent, ViewRef } from "nsh";
+import type { JSX, ListRef, MouseEvent, ScrollEvent, ViewRef, WheelEvent } from "nsh";
 import { Button as BaseButton, Popover } from "nsh/base";
 import { edgeStep, edgeTarget } from "../lib/edge-scroll";
 import { topBarHeight } from "../lib/layout";
 import { basename, tildePath } from "../lib/format";
 import { tr } from "../lib/i18n";
+import { markPacersSeeded } from "../lib/stream-pacer";
 import { markVeilsSeeded } from "../lib/veil";
 import type { Mood } from "../mascot/geometry";
 import { Pip } from "../mascot/Pip";
@@ -57,9 +58,12 @@ import {
   isTurnClosing,
   onFoldSettled,
   onFoldToggle,
+  recallingUserSnapshots,
   replyActions,
+  setHorizonPrompt,
   setProcessTurns,
   trackFoldState,
+  trackRecallingUsers,
   TranscriptRow,
   turnChoice,
   turnDefault,
@@ -487,15 +491,7 @@ function Failure(props: { title: string; detail: string }) {
 /** How near the end of the conversation (pt) counts as at it: the list follows from within it, and a released
  * reader who scrolls back down re-attaches from within it too — a moving end can never be landed on exactly,
  * and the pill would hide at this distance anyway. */
-const FOLLOW_THRESHOLD = 72;
-
-/**
- * How far the live end must stand below the view before the way back is offered
- * while a send still holds the prompt: a turn still growing into the room
- * under it is not out of reach, and the pill must not stand over a blank that
- * is simply the room the reply is growing into.
- */
-const JUMP_THRESHOLD = 200;
+const FOLLOW_THRESHOLD = 48;
 
 /** How long (ms) after a scroll gesture of the reader's begins its scroll events are read as theirs. */
 const INPUT_WINDOW_MS = 1500;
@@ -503,16 +499,11 @@ const INPUT_WINDOW_MS = 1500;
 /** After the reader releases the view, how long (ms) a move towards the end is not read as theirs: the list settles its layout once as it is released. */
 const RELEASE_SETTLE_MS = 300;
 
-/** How far under the title bar's band a sent prompt rests once its send anchors it there (zeron's own-send inset: the chrome plus the first row's air). */
-const OWN_SEND_TOP_GAP = 96;
-/** How long (ms) a send's entry glide gets to land before the hold re-asserts the prompt's place absolutely. */
-const OWN_SEND_GLIDE_MS = 320;
-/** How quiet (ms) the offset must be after the glide's window to call the flight landed: re-asking sooner — animated or not — restarts or snaps the stretch still arriving. */
-const OWN_SEND_QUIET_MS = 50;
-/** The longest (ms) the landing wait runs before the pin takes over wherever the flight got to. */
-const OWN_SEND_LAND_MS = 900;
-/** The longest (ms) a settled hold's glide back to the end may take before the reservation is dropped anyway — a list that reports no passes lands the same way, only later. */
-const OWN_SEND_RETURN_MS = 900;
+/** After an upward wheel/trackpad gesture, how long (ms) bottom re-attachment is suppressed so trackpad bounce never snaps back. */
+const UPWARD_GUARD_MS = 350;
+
+/** Reading horizon below the title bar: where a newly sent prompt pauses gently when a long reply pushes it there. */
+const HORIZON_GAP = 28;
 
 /** How long (ms) a selection drag that has left the pane goes on scrolling after the selection last grew: the button going up out there is not heard. */
 const EDGE_BEAT_MS = 250;
@@ -584,7 +575,7 @@ const HERO = { head: 136, foot: 20, rise: 9, sink: 11 } as const;
 
 /** How the composer travels between the middle of the pane and its foot: as a spring with no bounce in it
  * moves, a little softer than a panel's — it goes a third of the window, and has all but landed in ~550ms. */
-const DOCK_SPRING = { stiffness: 220, damping: 30, mass: 1 } as const;
+const DOCK_SPRING = { stiffness: 260, damping: 32, mass: 0.96 } as const;
 const DOCK_FPS = 60;
 /** How near its end the travel is over, as a share of the way: a point in some three hundred. */
 const DOCK_REST = 1 / 300;
@@ -609,10 +600,11 @@ function dockFrames() {
 }
 
 type Screen = "starting" | "failed" | "connect" | "welcome" | "transcript";
+type ScrollMode = "tail" | "horizon" | "horizon-held" | "free";
 
 /** Floating pill shown when the reader scrolls up past the follow threshold,
- * offering a crisp native spring return to the bottom of the conversation. */
-function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: () => void }) {
+ * or when a long reply pauses at the reading horizon, offering a crisp return to the bottom. */
+function ScrollToBottomPill(props: { visible: boolean; streaming?: boolean; bottom: number; onPress: () => void }) {
   const mounted = signal(false);
   const opacity = createAnimatedValue(0);
   const translateY = createAnimatedValue(8);
@@ -668,6 +660,9 @@ function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: 
           class={`pointer-events-auto h-7 flex-row items-center gap-1.5 rounded-full px-3 ${POPUP} ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-muted/80 active:bg-muted`}
           style={GLASS_REGULAR}
         >
+          <If when={props.streaming}>
+            <View class="size-1.5 rounded-full bg-brand" />
+          </If>
           <Text class="text-xs font-medium text-foreground">{tr("Jump to latest", "回到最新")}</Text>
           <View class="rotate-180">
             <Icon name="arrowUp" size={12} tone="muted-foreground" />
@@ -727,35 +722,21 @@ function PromptJumpPill(props: {
 export function Chat() {
   let list: ListRef | undefined;
   /**
-   * Whether the view follows the reply as it grows.
-   *
-   * While it does, the list keeps itself at the end
-   * (`maintainVisibleContentPosition`): the offset moves in the same layout
-   * as the content, so no frame shows the reply behind its end, and nothing
-   * here scrolls per delta. For that the list must be handed only what
-   * changed: rows that did not change stay the same objects (`stable`), and a
-   * reply is a row per block, so a delta changes the last row alone.
-   *
-   * The reader takes over by input: a scroll of theirs that
-   * moves up at all releases the view at once, and it then holds where they
-   * left it however the reply grows. Scrolling back down to the end, the jump
-   * pill or sending follows again. Nothing else changes it, so it cannot flap.
-   *
-   * Releasing takes two things, both found by measuring the list: the prop
-   * off, and the rows handed over anew (not `stable`) while released. With
-   * only its last row changed, the list goes on pulling to the end it was
-   * last told to keep.
+   * Natural Reading Physics (`ScrollMode`):
+   * - `"tail"`: pins cleanly to the end via `maintainVisibleContentPosition`.
+   * - `"horizon"`: active after sending a fresh prompt; rides growth from the
+   *   bottom until the sent prompt reaches `horizonInset()`, then pauses cleanly
+   *   in `"horizon-held"` so long replies are read from the top without yanking.
+   * - `"horizon-held"`: pauses at the reading horizon while the reply continues
+   *   growing below; never yanks to the end when the run settles.
+   * - `"free"`: user scrolled or toggled a fold; user intent always wins
+   *   immediately with zero tug-of-war or snap-back jitter.
    */
-  const following = signal(true);
+  const scrollMode = signal<ScrollMode>("tail");
+  const bottomFollowing = computed(() => scrollMode() === "tail" || scrollMode() === "horizon");
   const distanceFromEnd = signal(0);
-  /** The rows at the viewport's top and bottom: the range the prompt bubble
-   * reads the last prompt against. `onViewableItemsChange` feeds both where the
-   * platform reports; the scroll passes measure the top (`measureTop`), which
-   * every platform answers, and the bottom follows from the last reported span —
-   * without a span only the top is certain and the below-view case stays dark. */
   const topRow = signal(-1);
   const bottomRow = signal(-1);
-  /** Rows a screen held at the last full viewable report: `measureTop`'s estimate of the bottom when only the top is measured. */
   let viewSpan = -1;
   let measuringTop = false;
   const measureTop = () => {
@@ -771,38 +752,26 @@ export function Chat() {
       }
     });
   };
-  /** When the reader last began a scroll gesture. */
   let inputAt = 0;
   let releasedAt = 0;
+  let lastUpwardInputAt = 0;
+  let isDragging = false;
   let lastY: number | undefined;
-  /** When the offset last actually moved: the send's anchor reads it to know its glide has landed before pinning. */
-  let lastMoveAt = 0;
   let lastDistance = 0;
-  let lastViewportH = 0;
-  /**
-   * A send's own-turn anchor (zeron's send): its bubble glides to the top of the
-   * view and the view holds it there while the reply grows into the runway
-   * reserved under it — the bubble never rides a folding turn or a growing
-   * stream. A scroll gesture of the reader's releases the hold; the reservation
-   * stays theirs to scroll through, and the view returns to the end only when
-   * the run settles (or when they ask for it).
-   */
-  /**
-   * `glideUntil`: the entry glide's retarget window. `seatBy`: how long its last
-   * flight may take to land before the pin takes over anyway; `seated`: it has.
-   * `askedIx`: the index the flying retarget was aimed at — only a new one is
-   * worth restarting the flight.
-   */
-  let ownSend: { id: string; glideUntil: number; seatBy: number; seated: boolean; askedIx?: number } | undefined;
-  /**
-   * Scrollable room reserved under the anchored prompt (extra bottom pad): what
-   * lets it reach the top. It is the blank the reply grows into, and stays part
-   * of the content while the reader scrolls — it is dropped only where it cannot
-   * be seen, or once a return glide has landed below it.
-   */
-  const runway = signal(0);
-  /** Set while the anchor owns the view: the end-pin, the jump pill and the end-settle stay out of its way. */
-  const ownHold = signal(false);
+  let lastScrollDir = 0;
+  const activePromptId = signal<string | undefined>(undefined);
+  let horizonNode: ViewRef | undefined;
+  let checkingHorizon = false;
+  effect(() => {
+    const id = activePromptId();
+    untracked(() => {
+      setHorizonPrompt(id, (node) => {
+        horizonNode = node;
+      });
+    });
+  });
+  cleanup(() => setHorizonPrompt(undefined, () => {}));
+
   let held: Screen = "starting";
   const screen = computed<Screen>(() => {
     const phase = sidecarPhase().name;
@@ -821,6 +790,7 @@ export function Chat() {
     if (isLeavingSession() && shown.length > 0) return shown;
     const key = conversationKey();
     trackFoldState();
+    trackRecallingUsers();
     const processOf = new Map<string, string>();
     const projected = buildDisplayRows(
       transcriptRows(),
@@ -833,10 +803,22 @@ export function Chat() {
       },
       processOf,
     );
-    // The send's hold counts as watching the end: the reader is shown the turn they
-    // sent from, so a turn that ends under it folds before them as it would were they following.
-    const watching = following() || ownHold();
-    const rows = (watching ? stable(projected) : projected).flatMap((row): ChatRow[] =>
+    let merged = projected;
+    const snapEntries = Object.entries(recallingUserSnapshots());
+    if (snapEntries.length > 0) {
+      const existingIds = new Set(merged.map((row) => row.id));
+      const missing = snapEntries.filter(([id]) => !existingIds.has(id));
+      if (missing.length > 0) {
+        merged = [...merged];
+        for (const [, snap] of missing) {
+          const afterIdx = snap.prevId ? merged.findIndex((row) => row.id === snap.prevId) : -1;
+          if (afterIdx >= 0) merged.splice(afterIdx + 1, 0, snap.row);
+          else merged.push(snap.row);
+        }
+      }
+    }
+    const watching = bottomFollowing();
+    const rows = (watching ? stable(merged) : merged).flatMap((row): ChatRow[] =>
       row.kind !== "text" ? [row] : row.final && !row.streaming ? [...proseRows(row), replyActions(row)] : proseRows(row),
     );
     // The rows a turn's fold shows, in order (commentary is a row per block, each the turn's its reply is).
@@ -856,23 +838,18 @@ export function Chat() {
   /**
    * The last prompt sent, while it is out of view — the bubble's only subject.
    * Above the viewport's top while its reply is being read, or below the bottom
-   * while older history is being read (`below`): either way the reader's own
-   * question has scrolled off and the bubble offers the way back to it. Prompts
-   * passed on the way are never named. The send's anchor is already that prompt
-   * pinned at the top, so while it holds the bubble is out of the way.
+   * while older history is being read (`below`).
    */
   const promptAway = computed(() => {
-    if (ownHold()) return undefined;
-    // A reserve standing under a view already following is the anchor still
-    // settling, not the reader having scrolled off: nothing to offer the way
-    // back from.
-    if (following() && runway() > 0) return undefined;
     const top = topRow();
     if (top < 0) return undefined;
+    const mode = scrollMode();
+    const activeId = activePromptId();
     const rows = displayRows();
     for (let i = rows.length - 1; i >= 0; i--) {
       const row = rows[i];
       if (row.kind !== "user") continue;
+      if (mode === "horizon-held" && row.id === activeId) return undefined;
       if (i < top) return { index: i, text: row.text, images: row.images, below: false };
       const bottom = bottomRow();
       // Below is only real where the scroll says the view left the end: a stale
@@ -884,15 +861,15 @@ export function Chat() {
     return undefined;
   });
 
-  /** Back to that prompt: it lands where a sent prompt rests, just under the title bar. */
+  const horizonInset = () => untracked(topBarHeight) + HORIZON_GAP;
+
+  /** Back to that prompt: it lands just under the title bar's reading horizon. */
   const jumpToPrompt = () => {
     const target = untracked(promptAway);
     if (!target) return;
-    releaseOwnSend();
+    disengageFollow(false);
     inputAt = Date.now();
-    releasedAt = Date.now();
-    following.set(false);
-    list?.scrollToIndex({ index: target.index, viewPosition: 0, viewOffset: ownSendInset(), animated: !untracked(reduceMotion) });
+    list?.scrollToIndex({ index: target.index, viewPosition: 0, viewOffset: horizonInset(), animated: !untracked(reduceMotion) });
   };
 
   const failure = () => {
@@ -991,227 +968,127 @@ export function Chat() {
     void stageFade.stop();
   });
 
-  /** Where the anchored prompt rests: just under the title bar's band, like zeron's `OWN_SEND_TOP_INSET_PX`. */
-  const ownSendInset = () => untracked(topBarHeight) + OWN_SEND_TOP_GAP;
-
-  /**
-   * A return glide to the end the content keeps once the reservation goes: from
-   * the offset it started at and where it is heading, so the flight is known to
-   * have landed from either side. The reservation is what let the held offset
-   * stand there, so it stays until the glide lands — dropped first, the list
-   * would clamp the held offset at once and the prompt would snap back instead
-   * of settling.
-   */
-  let runwayLanding: { from: number; target: number; ready: boolean } | undefined;
-
-  /** The anchor's pin ends: the hold is lifted but the reservation stays — it is the reader's to scroll through now. */
-  const releasePin = () => {
-    ownSend = undefined;
-    ownHold.set(false);
+  const disengageFollow = (upward = false) => {
+    endSettleEpoch++;
+    endSettlePasses = 0;
+    releasedAt = Date.now();
+    if (upward) lastUpwardInputAt = releasedAt;
+    if (untracked(scrollMode) !== "free") scrollMode.set("free");
   };
 
-  /** The anchor ends: pin, hold and reservation gone at once — only where no view stands on the reservation (a conversation change remounts the list whole). */
-  const dropOwnSend = () => {
-    releasePin();
-    runway.set(0);
-    runwayLanding = undefined;
-  };
-
-  /**
-   * The reservation under the view is never taken from it: removing scrollable
-   * space under the offset clamps the list and snaps every row down. It goes
-   * only where the view cannot see it (`onScroll`), or once a return glide has
-   * carried the view to the end the content keeps without it (`runwayLanding`).
-   */
-
-  /** A scroll gesture of the reader's, or their press into what they were reading: the anchor's word is spent — the reservation stays, theirs to scroll through. */
-  const releaseOwnSend = () => {
-    if (!ownSend && !runwayLanding) return;
-    releasePin();
-    runwayLanding = undefined;
-    // A native flight can still be in the air — the glide's or the return's:
-    // an unanimated ask where the view already is takes the scroll back from it.
-    if (lastY !== undefined) list?.scrollTo({ y: lastY, animated: false });
-  };
-
-  /**
-   * One layout pass of the anchor's pin, fed by the list's own scroll reports.
-   *
-   * The entry glide is re-asked only when the prompt's index has moved (a fold
-   * taking rows away above it): every animated re-ask starts the native flight
-   * over, so asking per report kept it restarting and arriving after the
-   * window — the pin then snapped its last stretch into a jump. Untouched, one
-   * flight lands it whole. After the window the last flight is given a beat of
-   * quiet to land (`seatBy` the cap), and only then does the pin assert the
-   * prompt's place absolutely (`scrollToIndex` resolves the row wherever folds
-   * and growth move it).
-   */
-  const ownSendStep = () => {
-    const o = ownSend;
-    if (!o) return;
-    const ix = untracked(displayRows).findIndex((row) => row.id === o.id);
-    if (ix < 0) return settleOwnSend();
-    const now = Date.now();
-    if (now < o.glideUntil) {
-      if (ix !== o.askedIx) {
-        o.askedIx = ix;
-        list?.scrollToIndex({ index: ix, viewPosition: 0, viewOffset: ownSendInset(), animated: true });
+  const checkHorizon = () => {
+    if (checkingHorizon || untracked(scrollMode) !== "horizon" || !untracked(isRunning)) return;
+    if (isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS || Date.now() - lastUpwardInputAt <= UPWARD_GUARD_MS) return;
+    const targetList = list;
+    const targetNode = horizonNode;
+    if (!targetList || !targetNode) return;
+    checkingHorizon = true;
+    void Promise.all([targetList.measure(), targetNode.measure(), ending?.measure()]).then(([frame, pBox, end]) => {
+      checkingHorizon = false;
+      if (list !== targetList || horizonNode !== targetNode) return;
+      if (untracked(scrollMode) !== "horizon" || !untracked(isRunning)) return;
+      if (isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS || Date.now() - lastUpwardInputAt <= UPWARD_GUARD_MS) return;
+      if (!frame || !pBox || frame.bounds.size.height <= 0) return;
+      const pad = untracked(foot).end;
+      const frameBottom = frame.pagePosition.y + frame.bounds.size.height;
+      if (end && end.pagePosition.y + end.bounds.size.height + pad < frameBottom - 24) return;
+      const hTop = frame.pagePosition.y + horizonInset();
+      const readableBottom = frameBottom - pad;
+      const readableH = Math.max(120, readableBottom - hTop);
+      const pTop = pBox.pagePosition.y;
+      const pBottom = pTop + pBox.bounds.size.height;
+      const reached = pBox.bounds.size.height <= readableH * 0.4 ? pTop <= hTop + 24 : pBottom <= hTop + readableH * 0.32;
+      if (reached) {
+        endSettleEpoch++;
+        endSettlePasses = 0;
+        scrollMode.set("horizon-held");
+        if (pTop < frame.pagePosition.y + untracked(topBarHeight) + 4) {
+          const promptId = untracked(activePromptId);
+          const promptIdx = promptId ? untracked(displayRows).findIndex((r) => r.id === promptId) : -1;
+          if (promptIdx >= 0) {
+            targetList.scrollToIndex({ index: promptIdx, viewPosition: 0, viewOffset: horizonInset(), animated: false });
+          }
+        }
+        measureEnd();
+        measureTop();
       }
+    });
+  };
+
+  const onWheel = (e: WheelEvent) => {
+    inputAt = Date.now();
+    if (e.delta.y < -0.1) {
+      disengageFollow(true);
       return;
     }
-    if (!o.seated) {
-      if (now - lastMoveAt < OWN_SEND_QUIET_MS && now < o.seatBy) return;
-      o.seated = true;
+    if (e.delta.y > 0.1 && untracked(scrollMode) === "horizon-held") {
+      scrollMode.set("free");
     }
-    list?.scrollToIndex({ index: ix, viewPosition: 0, viewOffset: ownSendInset(), animated: false });
   };
 
-  /**
-   * Carry the view to the end the content keeps once the reservation goes, then
-   * drop it. The reservation is what lets the offset stand where it is: dropped
-   * first, the list clamps and every row falls; dropped after the glide lands,
-   * it takes away room the view has already left.
-   *
-   * Returns true while a flight is in the air — the landing is reported by
-   * `onScroll` (a list that reports no passes lands it on the timer).
-   */
-  const landRealEnd = (animated: boolean): boolean => {
-    const room = untracked(runway);
-    if (room <= 0) return false;
-    if (!list) {
-      runway.set(0);
-      return false;
-    }
-    const from = lastY ?? 0;
-    const targetList = list;
-    // The end is measured, never taken from the last scroll report: a held
-    // view is not told how the reply grew under it, so its max offset is stale.
-    // The landing is asked at once, and only aimed once the measure lands.
-    const landing: { from: number; target: number; ready: boolean } = (runwayLanding = { from, target: from, ready: false });
-    void Promise.all([targetList.measure(), ending?.measure()]).then(([frame, end]) => {
-      if (runwayLanding !== landing) return;
-      const pad = untracked(foot).end;
-      // The view can have moved while the measure was on its way (a live reply
-      // growing under a view already following again): aim from where it is now.
-      const origin = lastY ?? from;
-      let target: number;
-      if (frame && end) {
-        const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
-        target = Math.max(0, origin + gap);
-      } else {
-        target = Math.max(0, lastMax - room);
-      }
-      landing.from = origin;
-      landing.target = target;
-      landing.ready = true;
-      if (!animated || untracked(reduceMotion)) {
-        targetList.scrollTo({ y: target, animated: false });
-        runwayLanding = undefined;
-        runway.set(0);
-        following.set(true);
-        scheduleEndSettle(2);
-        return;
-      }
-      targetList.scrollTo({ y: target, animated: true });
-      setTimeout(() => {
-        if (runwayLanding !== landing) return;
-        runwayLanding = undefined;
-        runway.set(0);
-        following.set(true);
-        scheduleEndSettle(1);
-      }, OWN_SEND_RETURN_MS);
-    });
-    return true;
+  const onDragStart = () => {
+    isDragging = true;
+    inputAt = Date.now();
+    endSettleEpoch++;
+    endSettlePasses = 0;
   };
 
-  /**
-   * The anchor's natural end. The reservation stays until the view has glided
-   * to the end the content keeps without it: a hold ending with the reservation
-   * still standing leaves the prompt somewhere the content cannot keep, and the
-   * view settles there rather than snapping back.
-   */
-  const settleOwnSend = () => {
-    releasePin();
-    following.set(true);
-    if (!landRealEnd(true)) {
-      runwayLanding = undefined;
-      scheduleEndSettle(2);
+  const onDragEnd = () => {
+    isDragging = false;
+    inputAt = Date.now();
+    const now = Date.now();
+    const reattachThreshold = isChatActive() ? 24 : FOLLOW_THRESHOLD;
+    if (
+      !untracked(bottomFollowing) &&
+      lastScrollDir > 0 &&
+      lastDistance <= reattachThreshold &&
+      now - lastUpwardInputAt > UPWARD_GUARD_MS &&
+      now - releasedAt > RELEASE_SETTLE_MS
+    ) {
+      scrollMode.set("tail");
     }
   };
 
   const onScroll = (e: ScrollEvent) => {
     const y = e.offset.y;
-    const distance = e.contentSize.height - (y + e.size.height);
-    // The reservation this report was measured against: dropping it below does
-    // not change where the real end is, only how far it can be scrolled to.
-    const roomBefore = untracked(runway);
+    const distance = Math.max(0, e.contentSize.height - (y + e.size.height));
+    const now = Date.now();
 
-    // The return glide has landed where the end will be: the reservation goes
-    // now, taking away room the view has already left. A flight down and one up
-    // land from opposite sides.
-    const landing = runwayLanding;
-    if (landing?.ready) {
-      const arrived = landing.target >= landing.from ? y >= landing.target - 0.5 : y <= landing.target + 0.5;
-      if (arrived) {
-        runwayLanding = undefined;
-        runway.set(0);
-        following.set(true);
-        scheduleEndSettle(1);
+    if (now - inputAt < INPUT_WINDOW_MS) {
+      if (lastY !== undefined && Math.abs(y - lastY) > 0.5) {
+        lastScrollDir = y < lastY ? -1 : 1;
       }
-    }
-
-    if (ownSend) {
-      // A scroll of the reader's inside the input window ends the hold (theirs wins);
-      // the layout's own passes — the glide's, the fold's, the reply's — feed its step.
-      if (lastY !== undefined && Date.now() - inputAt < INPUT_WINDOW_MS && Math.abs(y - lastY) > 0.5) {
-        releaseOwnSend();
-      } else {
-        ownSendStep();
-      }
-    }
-
-    // The list reports its own layout passes too (a row measured, the fold
-    // closing): only a move within a gesture of the reader's is theirs. Up and
-    // away from the end releases; back down to within the threshold follows again.
-    // The end that counts is the real one: the reservation is dead room below it.
-    const toRealEnd = distance - roomBefore;
-    if (lastY !== undefined && Date.now() - inputAt < INPUT_WINDOW_MS) {
-      if (following() && y < lastY - 0.5 && distance > Math.max(lastDistance, 0) + 0.5) {
-        following.set(false);
-        releasedAt = Date.now();
-      } else if (!following() && y > lastY + 0.5) {
-        // A reservation still standing below the view is not something to
-        // reattach through: a downward move inside it is the reader's own,
-        // and following would carry them past it. Only the real end follows.
-        if (roomBefore <= 0 && toRealEnd >= -2 && toRealEnd <= FOLLOW_THRESHOLD && Date.now() - releasedAt > RELEASE_SETTLE_MS) {
-          follow(!reduceMotion() && !isChatActive());
+      if (
+        untracked(bottomFollowing) &&
+        ((lastY !== undefined && y < lastY - 0.5 && distance > Math.max(lastDistance, 0) + 0.5) ||
+          (isDragging && distance > 12))
+      ) {
+        disengageFollow(true);
+      } else if (untracked(scrollMode) === "horizon-held" && lastY !== undefined && Math.abs(y - lastY) > 0.5) {
+        releasedAt = now;
+        if (y < lastY - 0.5) lastUpwardInputAt = now;
+        scrollMode.set("free");
+      } else if (!untracked(bottomFollowing) && lastY !== undefined && y > lastY + 0.5) {
+        const reattachThreshold = isChatActive() ? 24 : 40;
+        if (
+          distance <= reattachThreshold &&
+          now - lastUpwardInputAt > UPWARD_GUARD_MS &&
+          now - releasedAt > RELEASE_SETTLE_MS
+        ) {
+          scrollMode.set("tail");
         }
       }
     }
-    if (lastY === undefined || Math.abs(y - lastY) > 0.5) lastMoveAt = Date.now();
     lastY = y;
     lastDistance = distance;
-    lastViewportH = e.size.height;
     lastMax = e.contentSize.height - e.size.height;
+    distanceFromEnd.set(distance);
 
-    // The reservation is never dropped while the view can see it — removing
-    // scrollable room under the offset clamps the list and snaps every row
-    // down. Off the bottom of the view it goes whole, taking nothing with it.
-    if (roomBefore > 0 && !ownSend && !runwayLanding && distance >= roomBefore - 0.5) {
-      runway.set(0);
-    }
+    if (untracked(scrollMode) === "horizon") checkHorizon();
 
-    // The distance named to the pills never counts the reservation: nothing
-    // real stands where the pad does. Dropping it here does not change that
-    // distance — the same room simply stops being scrollable.
-    distanceFromEnd.set(Math.max(0, distance - roomBefore));
-
-    // A scroll asked while its commit settled is re-asked as the list reports
-    // its passes — each lands on the end the layout now says. A gesture of the
-    // reader's ends it: theirs wins.
     if (endSettlePasses > 0) {
       endSettlePasses--;
-      if (following() && Date.now() - inputAt > INPUT_WINDOW_MS && Math.abs(distance) > 1) {
+      if (untracked(bottomFollowing) && !isDragging && now - inputAt > INPUT_WINDOW_MS && Math.abs(distance) > 1) {
         list?.scrollTo({ y: Math.max(0, e.contentSize.height - e.size.height), animated: false });
       }
     }
@@ -1219,8 +1096,6 @@ export function Chat() {
   };
   const onInput = () => {
     inputAt = Date.now();
-    // A gesture beginning is the reader's say on the view: the hold ends where it is.
-    releaseOwnSend();
   };
 
   /**
@@ -1324,16 +1199,15 @@ export function Chat() {
   // went: the activity line's foot plus the pad under it, from the list's own.
   let ending: ViewRef | undefined;
   const measureEnd = () => {
-    if (untracked(following)) return;
-    // The reserve is dead room, not anything to read: the pad stops at the foot.
+    if (untracked(bottomFollowing)) return;
     const pad = untracked(foot).end;
     void Promise.all([list?.measure(), ending?.measure()]).then(([frame, end]) => {
       // Rows far from the end are not mounted: the distance the scroll reported stands.
-      if (!frame || !end || untracked(following)) return;
+      if (!frame || !end || untracked(bottomFollowing)) return;
       const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
       // The list is not told how content grew under a held offset; keep the max
       // offset it would have from the measure, so a return knows where to go.
-      lastMax = Math.max(0, (lastY ?? 0) + gap + untracked(runway));
+      lastMax = Math.max(0, (lastY ?? 0) + gap);
       distanceFromEnd.set(Math.max(0, gap));
     });
   };
@@ -1341,6 +1215,7 @@ export function Chat() {
     displayRows();
     foot();
     untracked(() => {
+      if (scrollMode() === "horizon") checkHorizon();
       measureEnd();
       // Rows can change what the top row is without a scroll (a fold closing
       // above a held view, history landing): measure keeps the bubble aimed.
@@ -1348,13 +1223,19 @@ export function Chat() {
     });
   });
 
-  // The run a send anchored is over — nothing more fills the room the pin
-  // reserved: the hold hands the view back to the end. A timed cap once did
-  // this instead, cutting live runs short and snapping the prompt back.
+  // When a run finishes, a short reply stays in tail mode; a long reply held at the reading horizon
+  // transitions cleanly to free mode without yanking the reader down to the bottom.
   effect(() => {
     const running = isRunning();
     untracked(() => {
-      if (!running && ownSend) settleOwnSend();
+      if (running) return;
+      const mode = scrollMode();
+      if (mode === "horizon") {
+        scrollMode.set("tail");
+      } else if (mode === "horizon-held") {
+        scrollMode.set("free");
+        measureEnd();
+      }
     });
   });
 
@@ -1375,9 +1256,9 @@ export function Chat() {
     endSettlePasses = passes;
     void Promise.all([targetList.measure(), ending?.measure()]).then(([frame, end]) => {
       if (epoch !== endSettleEpoch) return;
-      if (!untracked(following) || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
+      if (!untracked(bottomFollowing) || isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
       if (!frame || list !== targetList || listKey !== expectedKey || !listReady) return;
-      const pad = untracked(foot).end + untracked(runway);
+      const pad = untracked(foot).end;
       if (end && frame.bounds.size.height > 0) {
         const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
         if (Math.abs(gap) <= 1 || (gap < 0 && (lastY === undefined || lastY <= 0.5))) {
@@ -1395,12 +1276,10 @@ export function Chat() {
   };
 
   const follow = (animated: boolean) => {
-    releaseOwnSend();
     inputAt = 0;
-    following.set(true);
-    // A reservation still standing is left by the same glide a settled send
-    // takes: the view travels to the end the content keeps, then the pad goes.
-    if (landRealEnd(animated)) return;
+    lastUpwardInputAt = 0;
+    isDragging = false;
+    scrollMode.set("tail");
     if (animated) list?.scrollToEnd({ animated: true });
     else scheduleEndSettle(2);
   };
@@ -1408,11 +1287,7 @@ export function Chat() {
   // A fold the reader presses grows or shrinks the rows under it, not those above: let go of the end.
   onFoldToggle(() => {
     pokeRepaint();
-    // Pressing into a turn is the reader elsewhere: the send's anchor is spent too.
-    releaseOwnSend();
-    if (!untracked(following)) return;
-    following.set(false);
-    releasedAt = Date.now();
+    disengageFollow(false);
   });
   onFoldSettled(() => {
     pokeRepaint();
@@ -1424,15 +1299,35 @@ export function Chat() {
   const jumpToLatest = () => follow(!reduceMotion());
 
   effect(() => {
+    const cue = sendAnchorTick();
+    untracked(() => {
+      if (!cue) return;
+      const rows = untracked(transcriptRows);
+      const promptPos = rows.findIndex((row) => row.id === cue.rowId);
+      const hasHistoryAbove = promptPos > 0 || (promptPos < 0 && rows.length > 0);
+      activePromptId.set(hasHistoryAbove ? cue.rowId : undefined);
+      inputAt = 0;
+      lastUpwardInputAt = 0;
+      isDragging = false;
+      scrollMode.set(hasHistoryAbove ? "horizon" : "tail");
+      if (list && listKey === conversationKey() && listReady && untracked(distanceFromEnd) > FOLLOW_THRESHOLD) {
+        scheduleEndSettle(2);
+      }
+    });
+  });
+
+  effect(() => {
     scrollToEndTick();
     if (!scrollArmed) {
       scrollArmed = true;
       return;
     }
     untracked(() => {
-      if (ownHold()) return;
+      if (scrollMode() === "horizon") return;
+      if (isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
       inputAt = 0;
-      following.set(true);
+      lastUpwardInputAt = 0;
+      scrollMode.set("tail");
       // A conversation mounting a fresh `<List>` in this turn opens at its end natively via
       // `initialScrollAtEnd` (before its first frame, following while rows measure); calling
       // `scrollTo` during that synchronous swap would hit the outgoing list or cancel the pass.
@@ -1441,50 +1336,7 @@ export function Chat() {
       }
     });
   });
-  // A send that begins a fresh run anchors on its bubble instead of riding the
-  // end: the prompt glides under the title bar's edge and holds there while the
-  // reply grows into the runway reserved below it — the zeron send. What the
-  // reader sent never slides under a folding turn or a stream's own growth.
-  let pendingAnchor: string | undefined;
-  const tryInstallAnchor = () => {
-    const id = pendingAnchor;
-    if (!id || !list || !listReady || untracked(screen) !== "transcript") return;
-    // A run already over holds nothing: the bubble rests where it landed.
-    if (!untracked(isRunning)) {
-      pendingAnchor = undefined;
-      return;
-    }
-    const ix = untracked(displayRows).findIndex((row) => row.id === id);
-    if (ix < 0) return;
-    pendingAnchor = undefined;
-    inputAt = 0;
-    const reduced = untracked(reduceMotion);
-    const glideUntil = Date.now() + (reduced ? 0 : OWN_SEND_GLIDE_MS);
-    ownSend = { id, glideUntil, seatBy: glideUntil + OWN_SEND_LAND_MS, seated: reduced, askedIx: ix };
-    // A return still in the air belonged to the send before this one: its
-    // landing must not take the room this send needs.
-    runwayLanding = undefined;
-    lastMoveAt = Date.now();
-    ownHold.set(true);
-    following.set(false);
-    // The runway is the room the prompt needs to reach the top: a viewport of
-    // scrollable space under it that the reply grows into. The view stays where
-    // it is while that happens; the room is dropped only once it cannot be seen.
-    runway.set(lastViewportH || untracked(viewHeight) || 600);
-    list.scrollToIndex({ index: ix, viewPosition: 0, viewOffset: ownSendInset(), animated: !reduced });
-  };
-  effect(() => {
-    const cue = sendAnchorTick();
-    untracked(() => {
-      if (!cue) return;
-      pendingAnchor = cue.rowId;
-      // The cue lands the same turn the bubble does — a welcome send's list is
-      // still mounting, so the install retries over the next passes too.
-      tryInstallAnchor();
-      setTimeout(tryInstallAnchor, 0);
-      setTimeout(tryInstallAnchor, 80);
-    });
-  });
+
   // That reaches a list on screen only. A conversation can land while none is —
   // the empty chat held, dimmed, until its successor is whole — and the list
   // made for it then would open at its start, with the scroll to the end already
@@ -1497,20 +1349,21 @@ export function Chat() {
     if (!listed || was) return;
     untracked(() => {
       inputAt = 0;
+      lastUpwardInputAt = 0;
+      isDragging = false;
       lastY = undefined;
-      following.set(true);
+      if (scrollMode() !== "horizon") scrollMode.set("tail");
     });
   });
   // The foot rising moves the end up with it — attachments, a draft growing, an inline prompt — and the list
   // does not go along by itself (it loses its place, and paints blank): a view that follows is sent to the end again,
-  // at once while the reply can move the end too, gliding under a prompt, which holds it. Sinking, the list clamps
-  // itself; an offset asked for then, before the shorter content is laid out, is past the end.
+  // while one held at the reading horizon or released stays steady.
   let footEnd = untracked(foot).end;
   effect(() => {
     const end = foot().end;
     const rose = end > footEnd;
     footEnd = end;
-    if (!rose || !untracked(following)) return;
+    if (!rose || !untracked(bottomFollowing) || isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
     if (untracked(hasInlinePrompt) && !untracked(reduceMotion)) list?.scrollToEnd({ animated: true });
     else scheduleEndSettle(2);
   });
@@ -1552,7 +1405,7 @@ export function Chat() {
     }
     untracked(() => {
       pokeRepaint();
-      if (following() && list && listKey === conversationKey() && listReady) {
+      if (bottomFollowing() && !isDragging && Date.now() - inputAt > INPUT_WINDOW_MS && list && listKey === conversationKey() && listReady) {
         scheduleEndSettle(2);
       }
     });
@@ -1612,14 +1465,18 @@ export function Chat() {
     const key = conversationKey();
     untracked(() => {
       inputAt = 0;
+      lastUpwardInputAt = 0;
+      isDragging = false;
       lastY = undefined;
+      lastScrollDir = 0;
       selected = "";
       endSettleEpoch++;
       endSettlePasses = 0;
       endSelecting();
-      pendingAnchor = undefined;
-      dropOwnSend();
-      following.set(true);
+      activePromptId.set(undefined);
+      horizonNode = undefined;
+      checkingHorizon = false;
+      scrollMode.set("tail");
       distanceFromEnd.set(0);
       topRow.set(-1);
       bottomRow.set(-1);
@@ -1627,6 +1484,7 @@ export function Chat() {
       enterConversation(key);
       const seenIds = displayRowIds(transcriptRows());
       markRowsSeen(seenIds);
+      markPacersSeeded(seenIds);
       markVeilsSeeded(seenIds);
       pokeRepaint();
     });
@@ -1676,9 +1534,10 @@ export function Chat() {
                     keyExtractor={(row) => row.id}
                     onScroll={onScroll}
                     scrollEventThrottle={16}
-                    onScrollDragStart={onInput}
+                    onScrollDragStart={onDragStart}
+                    onScrollDragEnd={onDragEnd}
                     onMomentumStart={onInput}
-                    onWheel={onInput}
+                    onWheel={onWheel}
                     onViewableItemsChange={(info) => {
                       const items = info.viewableItems;
                       const first = items[0]?.index ?? -1;
@@ -1687,12 +1546,12 @@ export function Chat() {
                       bottomRow.set(last);
                       if (first >= 0 && last >= first) viewSpan = last - first;
                     }}
-                    maintainVisibleContentPosition={following() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
+                    maintainVisibleContentPosition={bottomFollowing() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
                     class="flex-1"
                     contentStyle={{
                       paddingHorizontal: 24,
                       paddingTop: topBarHeight() + (wallpaper() && !HEADER_BAND ? HEAD_FADE : 12),
-                      paddingBottom: foot().end + runway(),
+                      paddingBottom: foot().end,
                     }}
                     accessibilityLabel={tr("Conversation", "对话")}
                     footer={
@@ -1711,11 +1570,12 @@ export function Chat() {
             </Each>
           </View>
           <ScrollToBottomPill
-            visible={!following() && (distanceFromEnd() > JUMP_THRESHOLD || (!ownHold() && distanceFromEnd() > FOLLOW_THRESHOLD))}
+            visible={!bottomFollowing() && distanceFromEnd() > FOLLOW_THRESHOLD}
+            streaming={isChatActive()}
             bottom={foot().end}
             onPress={jumpToLatest}
           />
-          <PromptJumpPill visible={promptAway() !== undefined} prompt={promptAway} top={ownSendInset()} onPress={jumpToPrompt} />
+          <PromptJumpPill visible={promptAway() !== undefined} prompt={promptAway} top={horizonInset()} onPress={jumpToPrompt} />
         </If>
         <If when={screen() === "connect"}>
           <Connect />

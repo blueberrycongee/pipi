@@ -321,13 +321,17 @@ that is taken, set `PORT`.
 - Hand the list only what changed: rows that did not change must stay the
   same objects (`stableDisplayRows`, the block cache). A changed row that is
   not the last one sends the list through a pass on estimated sizes.
-- Streamed text fades behind a veil (`lib/veil.ts`, `views/Prose.tsx`):
-  in layout at once, alpha per appended chunk, recolored per frame from JS. A
-  span nested in a `<Text>` takes no animated color (it renders black).
-- Following the reply is the list's own (`maintainVisibleContentPosition`),
-  on only while following; `views/Chat.tsx` says how the reader releases it
-  and why the rows are handed over anew while released. Do not scroll per
-  delta: `scrollToEnd` passes through offset 0 on its way.
+- Streamed text paces and fades behind a veil (`lib/stream-pacer.ts`, `lib/veil.ts`,
+  `views/Prose.tsx`): bursty deltas drain on 16ms ticks (`markPacersSeeded` on
+  landing), alpha per appended chunk, recolored per frame from JS. A span nested
+  in a `<Text>` takes no animated color (it renders black).
+- Following the reply uses Natural Reading Physics (`ScrollMode`: `tail` /
+  `horizon` / `horizon-held` / `free` in `views/Chat.tsx`): `maintainVisibleContentPosition`
+  is active only in `tail`/`horizon` (`bottomFollowing`), while any upward scroll
+  immediately enters `free` with zero tug-of-war or snap-back jitter; long replies
+  pause cleanly once the sent prompt reaches `horizonInset()` (`horizon-held`)
+  without injecting fake runway or yanking to the end on settle. Do not scroll
+  per delta: `scrollToEnd` passes through offset 0 on its way.
 - The conversation's foot is measured from the composer's figure (`footOf`,
   `figure` in `views/Chat.tsx`), never a constant: whatever stands on the
   composer — attachments, a long draft, an inline prompt —

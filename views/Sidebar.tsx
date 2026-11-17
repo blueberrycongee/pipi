@@ -2125,7 +2125,7 @@ export function Sidebar() {
         </If>
       </View>
       <SidebarTree />
-      <View class="border-t border-sidebar-border p-2">
+      <View class="border-t border-sidebar-border px-2 py-1">
         <View class="flex-row items-center justify-between pl-1.5 pr-0.5">
           <IconButton
             icon="gear"

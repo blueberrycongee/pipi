@@ -170,7 +170,7 @@ a group), 12–16 (inside a container), 24 (between groups), 28 (between turns).
 The sidebar's vertical rhythm is a named ladder on that grid, smallest to
 largest: rows of one parent touch (0, hover fills stack as one column), a
 boundary between project folders gets 4, a caption hugs its list (6), the
-footer pads the hairline (8, matched by the scroll's end pad), the primary
+footer pads the hairline (4, under the scroll's end pad of 8), the primary
 action and the first caption sit 12 apart, and functional groups split at
 24. An empty tree centers its sleep Pip in the visible region, never a fixed
 offset.
@@ -340,10 +340,10 @@ composer's glass, not underlined words: words do not stand on a picture.
 | Toast entrance | 220ms | fade up |
 | Session change: the chat left / landing | 120ms out / 200ms in | opacity only, the pane as one |
 | Wallpaper veil: composer in the middle ↔ docked ↔ conversation | 200ms | opacity only, under the pane |
-| Composer: the middle of the pane ↔ its dock | ~550ms | a spring with no bounce (`DOCK_SPRING`), played as keyframes; the stage it leaves fades where it stood in 140ms |
+| Composer: the middle of the pane ↔ its dock | ~480ms | a spring with no bounce (`DOCK_SPRING`), played as keyframes; the stage it leaves fades where it stood in 140ms |
 | Waiting on a session change | after 600ms, 480ms in | `PATIENCE_MS`; a change that lands sooner never shows it |
-| "Working", "Thinking" and activity labels | breathing opacity | `useBreathingOpacity` (honors reduced motion) |
-| Streamed text veil | 120–400ms | opacity only, zero offset |
+| "Working", "Thinking" and activity labels | gentle breathing + 160ms vertical morph | `useBreathingOpacity` + `RollingText` (`StatusMorph`, honors reduced motion) |
+| Streamed text pacer & veil | 16ms cadence + 100–240ms fade | opacity only, zero offset (`StreamPacer` + `RowVeil`) |
 
 Motion explains a change; nothing loops except Pip, a spinner, the active
 breathing label, and the input caret.
@@ -379,13 +379,17 @@ only past patience (600ms) with Pip. No state in between passes through — no
 throughout: a message sent during the change goes where it lands. In the
 sidebar, rows that slide under a resting pointer (a draft row opening or
 closing above them) do not light up until the pointer moves.
-Streaming never animates layout: text is committed to layout as it arrives and
-newly arrived characters dissolve in through an opacity veil of at most 400ms
-(Cadence: duration = clamp(gap-EMA × 3, 120, 400) — no positional
-offset, each chunk fades once, text already on screen when a row attaches never
-fades. The list follows the end only while the reader is at it; a scroll up
-releases follow until they return to within 8pt. All motion honors reduced
-motion.
+Streaming never animates layout: bursty deltas are smoothed through a 16ms
+`StreamPacer` (`lib/stream-pacer.ts`) while text commits cleanly without
+positional shift and newly arrived characters dissolve in through an opacity
+veil of at most 240ms (`lib/veil.ts`, `duration = clamp(gap-EMA × 3, 100, 240)`
+— no positional offset, each chunk fades once, text already on screen when a row
+attaches never fades). Scrolling follows Natural Reading Physics (`ScrollMode` in
+`views/Chat.tsx`): a newly sent prompt rides growth upward naturally until it
+reaches the reading horizon below the title bar (`horizon` → `horizon-held`),
+never injects dead runway or yanks back on settle; any upward scroll immediately
+cancels auto-follow (`free`) with zero bounce-back jitter, and scrolling back to
+within 48pt resumes `tail` follow. All motion honors reduced motion.
 
 ## Components
 

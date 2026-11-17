@@ -204,22 +204,20 @@ const STREAM_FADE_SPEC: LeanSpec<"opacity" | "translateY"> = {
   easing: EASING.entrance,
 };
 
-/** Sent user bubbles arrive with refined grace: gentle fade-up paired with subtle glide.
- * The opacity ramp is carefully tuned so the bubble reads as intentional from frame one,
- * while the Y-offset provides spatial depth without overstating the motion. */
+/** Sent user bubbles rise gently from the composer: upward glide paired with crisp opacity. */
 const USER_ENTRANCE_SPEC: LeanSpec<"opacity" | "translateY"> = {
   tracks: {
     opacity: [
-      { offset: 0, value: 0.08 },
-      { offset: 0.4, value: 0.7 },
+      { offset: 0, value: 0 },
+      { offset: 0.55, value: 0.88 },
       { offset: 1, value: 1 },
     ],
     translateY: [
-      { offset: 0, value: -6 },
+      { offset: 0, value: 8 },
       { offset: 1, value: 0 },
     ],
   },
-  duration: 280,
+  duration: 210,
   easing: EASING.signature,
 };
 
@@ -267,7 +265,8 @@ export function useRowEntrance(id: () => string, streaming?: () => boolean, skip
       }
       seenRowIds.add(currentId);
       if (crisp?.()) {
-        item.values.opacity.set(0.35);
+        item.values.opacity.set(0);
+        item.values.translateY.set(8);
         item.play(USER_ENTRANCE_SPEC);
         return;
       }

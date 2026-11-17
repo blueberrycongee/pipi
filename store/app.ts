@@ -13,6 +13,7 @@ import type {
 } from "../agents/types";
 import { activeLanguage, tr } from "../lib/i18n";
 import { answersTo, type ComposerCommand, parseSlashLine } from "../lib/slash";
+import { markPacersSeeded } from "../lib/stream-pacer";
 import { markVeilsSeeded } from "../lib/veil";
 import {
   chooseRandomWallpaperCandidate,
@@ -210,7 +211,7 @@ const composerFocus = signal(0, { equals: false });
 /** Ticks when something outside the model chip (`/model`) asks for its list. */
 const modelPickerAsk = signal(0, { equals: false });
 const scrollToEnd = signal(0, { equals: false });
-/** The staged row of a send that starts a fresh run: the chat glides it to the top of the view and holds it while the reply fills in under it (zeron's own-turn anchor). */
+/** The staged row of a send that begins a fresh run: the chat's cue to track its prompt to the reading horizon. */
 const sendAnchor = signal<{ rowId: string } | undefined>(undefined, { equals: false });
 const landed = signal(0);
 const paletteOpen = signal(false);
@@ -340,7 +341,7 @@ export const composerAttachments = () => attachments();
 export const composerFocusTick = () => composerFocus();
 export const modelPickerTick = () => modelPickerAsk();
 export const scrollToEndTick = () => scrollToEnd();
-/** The staged row of a send that began a fresh run: the chat's cue to anchor it at the top of the view. */
+/** The staged row of a send that began a fresh run: the chat's cue to track its prompt to the reading horizon. */
 export const sendAnchorTick = () => sendAnchor();
 export const isPaletteOpen = () => paletteOpen();
 export const isCompareOpen = () => compareOpen();
@@ -1108,10 +1109,11 @@ function landHistory(messages: AgentMessage[]) {
   });
 }
 
-/** Marks every row the transcript can put on screen as already seen: a landing never replays row entrances or streaming veils. */
+/** Marks every row the transcript can put on screen as already seen: a landing never replays row entrances, pacers, or streaming veils. */
 function markTranscriptSeen() {
   const ids = displayRowIds(transcript.rows());
   markRowsSeen(ids);
+  markPacersSeeded(ids);
   markVeilsSeeded(ids);
 }
 
@@ -2997,8 +2999,7 @@ async function dispatchPrompt(
       running.set(true);
       runStartedAt.set(Date.now());
       activity.set({ kind: "thinking" });
-      // A fresh run anchors on its own bubble: the prompt glides to the top and
-      // stays put while the reply fills the runway under it.
+      // A fresh run starts in horizon mode: the prompt rises naturally until it reaches the reading horizon.
       if (stagedId) sendAnchor.set({ rowId: stagedId });
     }
     scrollToEnd.set(0);

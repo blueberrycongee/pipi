@@ -22,6 +22,7 @@ import { TextView } from "nsh/base";
 import type { TextViewBlock, TextViewDocument, TextViewInline, TextViewListItem } from "nsh/base";
 import { tr } from "../lib/i18n";
 import { mendStreamingMarkdown, PENDING_LINK_URL } from "../lib/mend";
+import { clearPacers, pacedStreamText } from "../lib/stream-pacer";
 import {
   advanceElemVeil,
   beginVeilPass,
@@ -665,9 +666,10 @@ interface ProseEntry {
 
 const proseEntries = new Map<string, ProseEntry>();
 
-/** Clears cached blocks and veils when switching sessions. */
+/** Clears cached blocks, pacers and veils when switching sessions. */
 export function clearProseState() {
   proseEntries.clear();
+  clearPacers();
   clearVeils();
 }
 
@@ -816,8 +818,9 @@ function advanceDocVeil(
  */
 export function proseRows(row: { id: string; text: string; streaming: boolean }): ProseRow[] {
   const reduced = reduceMotion();
+  const text = pacedStreamText(row.id, row.text, row.streaming, reduced);
   const before = proseEntries.get(row.id);
-  if (before && before.text === row.text && before.streaming === row.streaming && before.reduced === reduced) {
+  if (before && before.text === text && before.streaming === row.streaming && before.reduced === reduced) {
     return before.rows;
   }
 
@@ -827,46 +830,46 @@ export function proseRows(row: { id: string; text: string; streaming: boolean })
     before.streaming &&
     before.reduced === reduced &&
     !before.hasRefDefs &&
-    row.text.length >= before.text.length &&
-    row.text.startsWith(before.text) &&
-    !REF_DEF_RE.test(row.text.slice(Math.max(0, before.text.lastIndexOf("\n"))));
+    text.length >= before.text.length &&
+    text.startsWith(before.text) &&
+    !REF_DEF_RE.test(text.slice(Math.max(0, before.text.lastIndexOf("\n"))));
 
   let blocks: TextViewBlock[];
   let footnotes: TextViewDocument["footnotes"];
   let startIndex = 0;
   let stableOffset = 0;
   let stableCount = 0;
-  const hasRefDefs = canIncremental ? false : REF_DEF_RE.test(row.text);
+  const hasRefDefs = canIncremental ? false : REF_DEF_RE.test(text);
 
   if (canIncremental && before.stableOffset > 0 && before.stableCount > 0) {
     stableOffset = before.stableOffset;
     stableCount = before.stableCount;
     startIndex = stableCount;
-    const tailMended = mendStreamingMarkdown(row.text.slice(stableOffset)).source;
+    const tailMended = mendStreamingMarkdown(text.slice(stableOffset)).source;
     const tailDoc = TextView.parse(tailMended, { streaming: true });
     blocks = [...before.blocks.slice(0, stableCount), ...tailDoc.blocks];
     footnotes = tailDoc.footnotes;
 
     // Advance the incremental anchor forward as the reply grows past ~1200 chars beyond it
-    if (row.text.length - stableOffset > 1200) {
-      const nextBoundary = findIncrementalBoundary(row.text);
+    if (text.length - stableOffset > 1200) {
+      const nextBoundary = findIncrementalBoundary(text);
       if (nextBoundary > stableOffset) {
-        const prefixDoc = TextView.parse(row.text.slice(0, nextBoundary), { streaming: false });
+        const prefixDoc = TextView.parse(text.slice(0, nextBoundary), { streaming: false });
         stableOffset = nextBoundary;
         stableCount = prefixDoc.blocks.length;
       }
     }
   } else {
     const doc = row.streaming
-      ? TextView.parse(mendStreamingMarkdown(row.text).source, { streaming: true })
-      : TextView.parse(row.text, { streaming: false });
+      ? TextView.parse(mendStreamingMarkdown(text).source, { streaming: true })
+      : TextView.parse(text, { streaming: false });
     blocks = doc.blocks;
     footnotes = doc.footnotes;
 
-    if (row.streaming && !hasRefDefs && row.text.length > 1200) {
-      const nextBoundary = findIncrementalBoundary(row.text);
+    if (row.streaming && !hasRefDefs && text.length > 1200) {
+      const nextBoundary = findIncrementalBoundary(text);
       if (nextBoundary > 0) {
-        const prefixDoc = TextView.parse(row.text.slice(0, nextBoundary), { streaming: false });
+        const prefixDoc = TextView.parse(text.slice(0, nextBoundary), { streaming: false });
         stableOffset = nextBoundary;
         stableCount = prefixDoc.blocks.length;
       }
@@ -895,12 +898,14 @@ export function proseRows(row: { id: string; text: string; streaming: boolean })
       rows[index] = old;
       continue;
     }
-    // The tail block gets a transient id: when it stops being the tail (a
-    // new block starts, or the reply settles) its key changes, so the list
-    // re-measures it instead of keeping the streaming height.
+    // Block identity is structural, not a stream-phase identity. Replacing a
+    // tail key at the exact moment a reply settles makes a virtualized list
+    // delete and insert the same paragraph, which is the source of the final
+    // one-frame jump. The row keeps its key; its measured height is allowed to
+    // settle in place.
     rows[index] = {
       kind: "prose",
-      id: `${row.id}#${index}${tail ? "~tail" : ""}`,
+      id: `${row.id}#${index}`,
       rowId: row.id,
       index,
       block,
@@ -921,7 +926,7 @@ export function proseRows(row: { id: string; text: string; streaming: boolean })
   }
 
   proseEntries.set(row.id, {
-    text: row.text,
+    text,
     streaming: row.streaming,
     reduced,
     rows,
