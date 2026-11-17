@@ -141,7 +141,7 @@ import { Icon, type IconName } from "../ui/Icon";
 import { animateNextLayout, delayedFade, FloatingLayer, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, ViewDeck } from "../ui/motion";
 import { FOCUS_RING, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { CroppedWallpaperSurface, WallpaperAdjustDialog } from "./Wallpaper";
+import { CroppedWallpaperSurface, openWallpaperAdjust } from "./Wallpaper";
 
 const SECTIONS: { id: SettingsSection; label: () => string; icon: IconName }[] = [
   { id: "general", label: () => tr("General", "常规"), icon: "sliders" },
@@ -1033,7 +1033,6 @@ function wallpaperPauseModeLabel(mode: WallpaperPauseMode) {
 
 /** App-wide preferences only: the model, thinking and run knobs belong to a session and its harness. */
 function General() {
-  const adjustOpen = signal(false);
   return (
     <Page title={tr("General", "常规")}>
       <SettingGroup title={tr("Appearance", "外观")}>
@@ -1079,7 +1078,7 @@ function General() {
               {(wp) => (
                 <>
                   <BaseButton
-                    onPress={() => adjustOpen.set(true)}
+                    onPress={openWallpaperAdjust}
                     accessibilityLabel={tr("Preview and adjust wallpaper", "预览并调整壁纸")}
                     class={`relative h-9 w-15 overflow-hidden rounded-md corner-squircle border border-border bg-sunken ${PRESS} ${FOCUS_RING}`}
                   >
@@ -1106,7 +1105,7 @@ function General() {
                   <Button
                     label={tr("Adjust", "调整")}
                     size="sm"
-                    onPress={() => adjustOpen.set(true)}
+                    onPress={openWallpaperAdjust}
                   />
                   <Button
                     label={DYNAMIC_WALLPAPER_ENABLED ? tr("Replace", "更换") : tr("Replace image", "更换图片")}
@@ -1301,7 +1300,6 @@ function General() {
           </View>
         </Reveal>
       </SettingGroup>
-      <WallpaperAdjustDialog open={adjustOpen()} onClose={() => adjustOpen.set(false)} />
       <SettingGroup title="pipi">
         <View class="gap-3 px-3 py-3">
           {(["cat", "dog"] as const).map((species) => (

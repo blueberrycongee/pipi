@@ -135,6 +135,10 @@ multi-agent orchestration, and settings.
 - `nsh test UserFold.test.tsx` — a sent message laid out past six lines folds
   to a fading preview; the chevron at the bubble's foot opens and closes it
   (`--target macos` films `.nsh/shots/userfold-*.png`)
+- `nsh test Zoom.test.tsx` — a table's hover expand button opens it in the
+  zoom layer (`ui/Zoom.tsx`, the one preview surface — a `TextView` image
+  press lands there too); Escape or its close button leaves it
+  (`--target macos` films `.nsh/shots/zoom-*.png`)
 - `nsh test WallpaperLook.test.tsx --target macos` — the app under a wallpaper,
   every surface it reaches, in `.nsh/shots/wallpaper-*.png` (`harness.wallpaper`
   lays one; name any image in the test's `PICTURE`)
@@ -259,8 +263,10 @@ that is taken, set `PORT`.
   failures toast as `warning`. A `phase: "failed"` blocking screen keeps
   its full-screen state AND fires an error toast. Transcript rows and
   `transcript.note` carry conversation/agent content only — app errors are
-  never reported inline, in banners, or in dialogs. The same toast again
-  stays in place and its time starts over; it is never removed and re-added.
+  never reported inline, in banners, or in dialogs. A toast is one line:
+  its whitespace collapses and its text never runs past 120 chars. The
+  same toast again stays in place and its time starts over; it is never
+  removed and re-added.
 - A run's error is said once, and only when it stands (`#failure` in
   `pi/transcript.ts`): a failed assistant message is held back until the run
   settles or the conversation moves on, and a retry (`auto_retry_start`, an

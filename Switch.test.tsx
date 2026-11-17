@@ -221,3 +221,55 @@ test("switching project from the welcome project popover keeps the draft and set
   expect(app.texts()).toContain("Pi · ~/code/nsh");
   expect(app.value("label:Message")).toBe("package a new build");
 });
+
+test("opening an uncached agent's empty task session flushes the outgoing conversation and lands on welcome without flashing No model", async () => {
+  const now = Date.now();
+  const emptyTask = {
+    id: "s_task_empty",
+    title: "Gemini CLI · Fresh audit task",
+    titleLocked: true,
+    cwd: "/Users/pip",
+    agentId: "gemini",
+    agentName: "Gemini CLI",
+    driver: "acp",
+    initiator: "user",
+    runtimeMode: "full-access",
+    status: "failed",
+    unread: false,
+    loaded: false,
+    depth: 0,
+    createdAt: now - 2_000,
+    lastActive: now - 2_000,
+  };
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: {
+      "harness.scenario": "welcome",
+      "harness.startDelay": String(DELAY),
+      "harness.distinct": "1",
+      "harness.daemonSessions": JSON.stringify([emptyTask]),
+    },
+  });
+  await app.waitFor("text:What are we building?");
+  await app.press(row(REFACTOR));
+  await app.waitUntil(() => shows(app, REFACTOR));
+  await app.wait(DELAY + 200);
+
+  // `gemini` is uncached in `agentHasModel`, so `headFor` exercises the `leaving` -> `landHistory([])`
+  // path: once settled, `REFACTOR` must be gone and Welcome must stand without flashing `No model`.
+  await app.press(row("Gemini CLI · Fresh audit task"));
+  const seen = await frames(app, () => ({
+    old: shows(app, REFACTOR),
+    welcome: app.texts().includes("What are we building?"),
+    noModel: app.texts().includes("Connect a model to begin") || app.texts().includes("No model"),
+  }));
+  expect(seen.some((f) => f.noModel)).toBe(false);
+  expect(seen.at(-1)?.old).toBe(false);
+  expect(seen.at(-1)?.welcome).toBe(true);
+  // And the named task keeps its own highlighted row in Recent rather than collapsing into an untitled draft.
+  expect(app.count("id:sidebar-recents >> text:Gemini CLI · Fresh audit task")).toBe(1);
+});

@@ -22,6 +22,8 @@ export interface FakeOptions {
   sessions?: SessionSummary[];
   /** Per-workspace saved sessions for multi-project sidebar testing. */
   workspaceSessions?: Record<string, SessionSummary[]>;
+  /** Initial daemon session records to seed before connect (e.g. failed or interrupted background sessions). */
+  daemonSessions?: DaemonSession[];
   /** Folder path returned when `pickFolder` is called. */
   pickedFolder?: string;
   /** Image path returned when `pickImage` is called. */
@@ -884,7 +886,9 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     pendingDialogs?: Map<string, Record<string, unknown>>;
   }
 
-  const daemonSessions = new Map<string, FakeDaemonSession>();
+  const daemonSessions = new Map<string, FakeDaemonSession>(
+    (options.daemonSessions ?? []).map((seed) => [seed.id, { ...seed }]),
+  );
   let daemonCallbacks: DaemonCallbacks | undefined;
 
   const daemonInfo = (s: FakeDaemonSession): DaemonSession => {
@@ -893,6 +897,22 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   };
 
   const pushDaemon = (s: FakeDaemonSession) => daemonCallbacks?.onSession(daemonInfo(s));
+
+  const removeFakeDaemon = (s: FakeDaemonSession) => {
+    if (!daemonSessions.has(s.id)) return;
+    s.inner?.kill();
+    daemonSessions.delete(s.id);
+    daemonCallbacks?.onSessionRemoved?.(s.id);
+  };
+
+  const reapEmptyFakeDraft = (s: FakeDaemonSession) => {
+    if (s.viewers) return;
+    if (s.parentId || s.worktree || s.titleLocked || s.initiator === "external") return;
+    if (s.title && s.title !== "New session") return;
+    if (s.status !== "idle" || s.unread || s.file) return;
+    if (daemonTree(s.id).length > 0) return;
+    removeFakeDaemon(s);
+  };
 
   /**
    * Watches a session's process records the way the real daemon does: run
@@ -974,8 +994,9 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       s.loaded = false;
       s.pendingQueue = { steering: [], followUp: [] };
       s.pendingDialogs?.clear();
-      s.status = s.status === "working" || s.status === "blocked" ? "failed" : "interrupted";
-      pushDaemon(s);
+      if (s.status === "working" || s.status === "blocked") s.status = "failed";
+      if (!s.viewers && s.status === "idle") reapEmptyFakeDraft(s);
+      if (daemonSessions.has(s.id)) pushDaemon(s);
       for (const h of s.viewers?.exit ?? []) h({ code: e.code ?? null, signal: e.signal ?? undefined });
     });
   };
@@ -1130,6 +1151,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             if (ended) return;
             ended = true;
             if (s.viewers === viewers) s.viewers = undefined;
+            reapEmptyFakeDraft(s);
             for (const h of viewers.exit.splice(0)) h({ code: 0 });
           };
           const virtual = {
@@ -1157,6 +1179,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
                 } else if (record?.type === "new_session") {
                   s.file = undefined;
                   s.title = "New session";
+                  s.titleLocked = false;
                   s.pendingQueue = { steering: [], followUp: [] };
                   s.pendingDialogs?.clear();
                   pushDaemon(s);
@@ -1198,6 +1221,12 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         async killSession(sessionId: string) {
           const s = daemonSessions.get(sessionId);
           s?.inner?.kill();
+        },
+        async removeSession(sessionId: string) {
+          const own = daemonSessions.get(sessionId);
+          if (!own) return;
+          const targets = [own, ...daemonTree(sessionId).filter((d) => !d.file)];
+          for (const target of targets) removeFakeDaemon(target);
         },
         async stopTree(sessionId: string) {
           const own = daemonSessions.get(sessionId);
@@ -1245,6 +1274,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           const s: FakeDaemonSession = {
             id: `s_fake_${++daemonSeq}`,
             title: input.title || "New session",
+            ...(input.title ? { titleLocked: true } : {}),
             cwd: wt?.path ?? input.cwd,
             agentId: input.agentId,
             agentName: agentNameOf(input.agentId),
@@ -1253,7 +1283,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             initiator: "user",
             runtimeMode: input.runtimeMode ?? "full-access",
             worktree: wt ?? fakeWorktrees.find((w) => input.cwd === w.path),
-            status: "idle",
+            status: input.message ? "working" : "idle",
             unread: false,
             loaded: false,
             depth: parent ? parent.depth + 1 : 0,

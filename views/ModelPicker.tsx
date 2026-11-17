@@ -68,7 +68,7 @@ export function ModelList(props: { onChosen: () => void; class?: string }) {
 }
 
 /** The composer's model chip: shows the model in use, opens the list to change it. */
-export function ModelPicker() {
+export function ModelPicker(props: { onOpen?: () => void }) {
   const open = signal(false);
   let held = "";
   const label = () => {
@@ -91,7 +91,10 @@ export function ModelPicker() {
   return (
     <Popover
       open={open()}
-      onOpenChange={(e) => open.set(e.open)}
+      onOpenChange={(e) => {
+        if (e.open) props.onOpen?.();
+        open.set(e.open);
+      }}
       placement="top"
       align="start"
       offset={8}
@@ -108,7 +111,7 @@ export function ModelPicker() {
 }
 
 /** The composer's thinking chip, shown for models that reason. */
-export function ThinkingPicker() {
+export function ThinkingPicker(props: { onOpen?: () => void }) {
   const open = signal(false);
   let held: ThinkingLevel | undefined;
   const level = () => {
@@ -121,7 +124,10 @@ export function ThinkingPicker() {
     <Presence show={thinkingLevels().length > 1} scaleFrom={0.92}>
       <Popover
         open={open()}
-        onOpenChange={(e) => open.set(e.open)}
+        onOpenChange={(e) => {
+          if (e.open) props.onOpen?.();
+          open.set(e.open);
+        }}
         placement="top"
         align="start"
         offset={8}

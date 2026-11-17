@@ -59,6 +59,7 @@ import {
 } from "../store/prefs";
 import { EASING } from "../ui/motion";
 import { SIDEBAR_GLASS, WALLPAPER_FROST } from "../ui/styles";
+import { isZoomOpen, ZoomLayer } from "../ui/Zoom";
 import { CompareDialog } from "./AgentPicker";
 import { Chat } from "./Chat";
 import { ExtensionDialog, hasInlinePrompt } from "./ExtensionDialog";
@@ -69,9 +70,11 @@ import { TitleBar } from "./TitleBar";
 import { Toasts } from "./Toasts";
 import { UpdateCard } from "./UpdateCard";
 import {
+  isWallpaperAdjustOpen,
   notifyWallpaperClick,
   notifyWallpaperPointerLeave,
   notifyWallpaperPointerMove,
+  WallpaperAdjustDialog,
   WallpaperUnderlay,
 } from "./Wallpaper";
 
@@ -106,7 +109,7 @@ const toggleSettings = () => (currentView().name === "settings" ? showChat() : s
 
 /** Escape leaves what is on top: a dialog or inline prompt closes itself; then settings or sub-agent inspection; then the run stops. */
 function escape() {
-  if (isPaletteOpen() || isCompareOpen()) return;
+  if (isPaletteOpen() || isCompareOpen() || isZoomOpen() || isWallpaperAdjustOpen()) return;
   if (pendingDialog()) {
     if (hasInlinePrompt()) cancelPendingDialog();
     return;
@@ -589,7 +592,8 @@ export function Shell() {
                 currentView().name === "chat" &&
                 !isPaletteOpen() &&
                 !isCompareOpen() &&
-                !pendingDialog()
+                !pendingDialog() &&
+                !isWallpaperAdjustOpen()
               ) {
                 notifyWallpaperClick(e.pagePosition.x, e.pagePosition.y);
               }
@@ -604,6 +608,8 @@ export function Shell() {
       <Palette />
       <CompareDialog />
       <Settings />
+      <WallpaperAdjustDialog />
+      <ZoomLayer />
       <ExtensionDialog />
       <UpdateCard />
       <Toasts />

@@ -16,10 +16,10 @@
 //    chunk is fading (`veilClock`). A span inside a `<Text>` is a run of its
 //    attributed string, not a view, so it takes no native animated color.
 
-import { createAnimatedValue, openUrl, reduceMotion, Scroll, signal, Text, token, View } from "nsh";
+import { createAnimatedValue, Image, openUrl, reduceMotion, Scroll, signal, Text, token, View } from "nsh";
 import type { AnimatedValue, JSX, TextStyle } from "nsh";
-import { TextView } from "nsh/base";
-import type { TextViewBlock, TextViewDocument, TextViewInline, TextViewListItem } from "nsh/base";
+import { Button as BaseButton, TextView } from "nsh/base";
+import type { TextViewBlock, TextViewDocument, TextViewImage, TextViewInline, TextViewListItem } from "nsh/base";
 import { tr } from "../lib/i18n";
 import { mendStreamingMarkdown, PENDING_LINK_URL } from "../lib/mend";
 import { clearPacers, pacedStreamText } from "../lib/stream-pacer";
@@ -39,6 +39,9 @@ import {
 } from "../lib/veil";
 import { Icon } from "../ui/Icon";
 import { EASING } from "../ui/motion";
+import { FOCUS_RING, HOVER_REVEAL, PRESS } from "../ui/styles";
+import { tip } from "../ui/Tip";
+import { openZoom } from "../ui/Zoom";
 
 /** Shared typography classes for `TextView` fallback blocks (alerts, math, settled code). */
 export const PROSE = {
@@ -63,6 +66,42 @@ export const PROSE = {
 
 /** Gentle opacity entrance for newly created structural blocks (tables, rules, code cards). */
 const BLOCK_FADE_MS = 220;
+
+/** The table's typography inside the zoom layer: the same recipe, a step roomier. */
+const ZOOM_TABLE_PROSE = {
+  ...PROSE,
+  tableCell: "px-3.5 py-2 text-base",
+  tableHeaderCell: "text-sm font-semibold text-muted-foreground",
+} as const;
+
+/** Opens a table in the window's zoom layer: a snapshot rendered through `TextView`, wide tables scroll inside it. */
+function zoomTable(block: Extract<TextViewBlock, { type: "table" }>) {
+  openZoom({
+    render: () => <TextView document={{ blocks: [block] }} classes={ZOOM_TABLE_PROSE} selectable links="open" />,
+  });
+}
+
+/** Opens an image in the same zoom layer (`TextView`'s `onImagePress`). */
+function zoomImage(image: TextViewImage) {
+  openZoom({
+    title: image.title || image.alt,
+    render: () => <Image src={image.src} class="max-w-full" style={{ objectFit: "contain" }} accessibilityLabel={image.alt} />,
+  });
+}
+
+/** A block's hover-revealed expand button: a floating chip at its top-right corner that opens it in the zoom layer. */
+function ExpandButton(props: { onPress: () => void }) {
+  return (
+    <BaseButton
+      onPress={props.onPress}
+      accessibilityLabel={tr("Expand", "放大")}
+      tooltip={tip(tr("Expand", "放大"))}
+      class={`absolute right-1 top-1 size-6 items-center justify-center rounded-full border-[0.5px] border-hairline-hover bg-popover shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-secondary ${HOVER_REVEAL}`}
+    >
+      <Icon name="expand" size={13} tone="foreground" />
+    </BaseButton>
+  );
+}
 
 /* ── Inline Tree Inspection & Flattening ─────────────────────────────────── */
 
@@ -582,6 +621,7 @@ function VeiledListView(props: {
 function VeiledTableView(props: {
   block: Extract<TextViewBlock, { type: "table" }>;
   blockIdx: () => number;
+  settled: boolean;
   chunks: () => ReadonlyMap<string, VeilChunk[]>;
 }) {
   const alignClass = (col: number) => {
@@ -592,37 +632,42 @@ function VeiledTableView(props: {
   };
 
   return (
-    <View selectable class="overflow-hidden rounded-lg corner-squircle border border-border">
-      <Scroll horizontal class="w-full">
-        <View class="min-w-full">
-          <View class="flex-row border-b border-border bg-muted">
-            <Each of={props.block.head} key="index">
-              {(cell, c) => (
-                <View class="min-w-24 flex-1 px-3 py-1.5">
-                  <Text class={`text-xs font-semibold ${alignClass(c())}`}>
-                    {renderVeiledInlines(cell().content, props.chunks().get(`th:${props.blockIdx()}:${c()}`) ?? [], "muted")}
-                  </Text>
+    <View class="group relative">
+      <View selectable class="overflow-hidden rounded-lg corner-squircle border border-border">
+        <Scroll horizontal class="w-full">
+          <View class="min-w-full">
+            <View class="flex-row border-b border-border bg-muted">
+              <Each of={props.block.head} key="index">
+                {(cell, c) => (
+                  <View class="min-w-24 flex-1 px-3 py-1.5">
+                    <Text class={`text-xs font-semibold ${alignClass(c())}`}>
+                      {renderVeiledInlines(cell().content, props.chunks().get(`th:${props.blockIdx()}:${c()}`) ?? [], "muted")}
+                    </Text>
+                  </View>
+                )}
+              </Each>
+            </View>
+            <Each of={props.block.rows ?? []} key="index">
+              {(row, r) => (
+                <View class={`flex-row ${r() > 0 ? "border-t border-hairline" : ""}`}>
+                  <Each of={row()} key="index">
+                    {(cell, c) => (
+                      <View class="min-w-24 flex-1 px-3 py-1.5">
+                        <Text class={`text-sm leading-relaxed ${alignClass(c())}`}>
+                          {renderVeiledInlines(cell().content, props.chunks().get(`td:${props.blockIdx()}:${r()}:${c()}`) ?? [], "fg")}
+                        </Text>
+                      </View>
+                    )}
+                  </Each>
                 </View>
               )}
             </Each>
           </View>
-          <Each of={props.block.rows ?? []} key="index">
-            {(row, r) => (
-              <View class={`flex-row ${r() > 0 ? "border-t border-hairline" : ""}`}>
-                <Each of={row()} key="index">
-                  {(cell, c) => (
-                    <View class="min-w-24 flex-1 px-3 py-1.5">
-                      <Text class={`text-sm leading-relaxed ${alignClass(c())}`}>
-                        {renderVeiledInlines(cell().content, props.chunks().get(`td:${props.blockIdx()}:${r()}:${c()}`) ?? [], "fg")}
-                      </Text>
-                    </View>
-                  )}
-                </Each>
-              </View>
-            )}
-          </Each>
-        </View>
-      </Scroll>
+        </Scroll>
+      </View>
+      <If when={props.settled}>
+        <ExpandButton onPress={() => zoomTable(props.block)} />
+      </If>
     </View>
   );
 }
@@ -637,6 +682,7 @@ function FallbackTextViewBlock(props: { block: TextViewBlock; settled: boolean }
       codeBlockScrollbar={false}
       tableScrollbar={false}
       codeBlockActions={props.settled ? [{ id: "copy", label: tr("Copy code", "复制代码") }] : undefined}
+      onImagePress={({ image }) => zoomImage(image)}
     />
   );
 }
@@ -989,6 +1035,11 @@ export function ProseBlock(props: { row: ProseRow }) {
     const b = item();
     return b.type === "table" && isSimpleTable(b) ? b : undefined;
   };
+  /** A table the veiled path cannot render (a colspan or a nested block) still gets its expand affordance. */
+  const asFallbackTable = () => {
+    const b = item();
+    return b.type === "table" && !isSimpleTable(b) ? b : undefined;
+  };
   // Keep `StreamingCodeCard` mounted not only while it is the tail block, but also while
   // its trailing chunks finish dissolving — once the last chunk reaches alpha 1, hand off
   // seamlessly to `TextView` syntax highlighting + Copy button without snapping mid-fade!
@@ -1027,12 +1078,26 @@ export function ProseBlock(props: { row: ProseRow }) {
                         <If
                           when={asTable()}
                           else={
-                            <If when={asStreamingCode()} else={<FallbackTextViewBlock block={item()} settled={!props.row.tail} />}>
-                              {(codeBlock) => <StreamingCodeCard code={codeBlock()?.code ?? ""} chunks={chunksOf(`code:${index()}`)} />}
+                            <If
+                              when={asFallbackTable()}
+                              else={
+                                <If when={asStreamingCode()} else={<FallbackTextViewBlock block={item()} settled={!props.row.tail} />}>
+                                  {(codeBlock) => <StreamingCodeCard code={codeBlock()?.code ?? ""} chunks={chunksOf(`code:${index()}`)} />}
+                                </If>
+                              }
+                            >
+                              {(tableBlock) => (
+                                <View class="group relative">
+                                  <FallbackTextViewBlock block={tableBlock()} settled={!props.row.tail} />
+                                  <If when={!props.row.tail}>
+                                    <ExpandButton onPress={() => zoomTable(tableBlock())} />
+                                  </If>
+                                </View>
+                              )}
                             </If>
                           }
                         >
-                          {(tableBlock) => <VeiledTableView block={tableBlock()} blockIdx={index} chunks={chunksMap} />}
+                          {(tableBlock) => <VeiledTableView block={tableBlock()} blockIdx={index} settled={!props.row.tail} chunks={chunksMap} />}
                         </If>
                       }
                     >

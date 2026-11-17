@@ -180,21 +180,37 @@ function descendantsOf(session) {
   return out;
 }
 
+const isSessionInitiator = (initiator, selfId) =>
+  Boolean(initiator && initiator !== "user" && initiator !== "external" && initiator !== selfId);
+
+function hasSavedConversation(file) {
+  if (!file) return false;
+  try {
+    const stat = fs.statSync(file);
+    return stat.isFile() && stat.size > 0;
+  } catch {
+    return false;
+  }
+}
+
 function sessionInfo(session) {
+  const initiator = session.initiator ?? session.upstreamInitiator;
   return {
     id: session.id,
     title: session.title,
+    ...(session.titleLocked ? { titleLocked: true } : {}),
     cwd: session.cwd,
     file: session.file,
     agentId: session.agentId,
     agentName: session.agentName,
     driver: session.driver,
     parentId: session.parentId,
-    initiator: session.initiator,
+    initiator,
     upstreamInitiator: session.upstreamInitiator,
     runtimeMode: session.runtimeMode,
     worktree: session.worktree,
     status: session.status,
+    ...(session.lastError && (session.status === "failed" || session.status === "interrupted") ? { error: session.lastError } : {}),
     unread: session.unread,
     loaded: session.loaded,
     depth: session.depth,
@@ -678,11 +694,59 @@ function warmPoolSoon(spec) {
   poolWarmTimer.unref?.();
 }
 
+function isAttaching(sessionId) {
+  for (const conn of controlClients) {
+    if (conn.attaching?.has(sessionId)) return true;
+  }
+  return false;
+}
+
+/**
+ * An untouched UI scratchpad — no parent, not external, no given title, idle,
+ * unread-free, childless, and with nothing saved on disk — has no identity to
+ * outlive its window: once detached, keeping it only leaks an empty row.
+ */
+function isEmptyDraft(session) {
+  if (!session || session.pooled) return false;
+  if (session.attached.size > 0 || isAttaching(session.id)) return false;
+  if (session.starting || session.waiters.length > 0 || session.deliverQueue.length > 0) return false;
+  if (session.parentId || session.worktree || session.titleLocked) return false;
+  if ((session.initiator ?? session.upstreamInitiator) === "external") return false;
+  if (session.title && session.title !== "New session") return false;
+  if (session.status !== "idle" || session.unread) return false;
+  if (descendantsOf(session).length > 0) return false;
+  if (hasSavedConversation(session.file)) return false;
+  return true;
+}
+
+function removeSessionRecord(session) {
+  if (!session || !sessions.has(session.id)) return false;
+  dropPooled(session);
+  killProcess(session);
+  if (session.file && sessionsByFile.get(session.file) === session.id) {
+    sessionsByFile.delete(session.file);
+  }
+  sessions.delete(session.id);
+  for (const conn of session.attached) {
+    conn.attachedSessions?.delete(session.id);
+  }
+  session.attached.clear();
+  persist({ type: "session_remove", id: session.id });
+  for (const conn of controlClients) send(conn, { type: "session_removed", sessionId: session.id });
+  checkWindowlessExit();
+  return true;
+}
+
+function reapEmptyDraft(session) {
+  if (!isEmptyDraft(session)) return false;
+  return removeSessionRecord(session);
+}
+
 function failSession(session, reason) {
   session.lastError = reason;
   const suppress = session.suppressStopDelivery;
   session.suppressStopDelivery = false;
-  if (session.initiator && session.initiator !== "user" && session.initiator !== session.id) {
+  if (isSessionInitiator(session.initiator, session.id)) {
     if (!suppress) deliverToInitiator(session, `${session.title} (${session.agentName}) failed: ${clip(reason, 300)}`, "failed");
   } else if (session.attached.size === 0) {
     session.unread = true;
@@ -694,7 +758,6 @@ function failSession(session, reason) {
 function onSessionExit(session, code, signal, expected) {
   dropPooled(session);
   session.loaded = false;
-  pushSession(session);
   if (session.status === "working" || session.status === "blocked") {
     const why = session.lastError || `exited (${code ?? signal ?? "?"})`;
     const suppress = session.suppressStopDelivery;
@@ -703,12 +766,12 @@ function onSessionExit(session, code, signal, expected) {
     session.initiator = undefined;
     if (expected) {
       // A stop that had to kill: the session stopped, it did not die.
-      if (initiator && initiator !== "user" && initiator !== session.id) {
+      if (isSessionInitiator(initiator, session.id)) {
         if (!suppress) deliverToInitiator(session, `${session.title} (${session.agentName}) was stopped.`, "failed", initiator);
       }
       session.status = "idle";
     } else {
-      if (initiator && initiator !== "user" && initiator !== session.id) {
+      if (isSessionInitiator(initiator, session.id)) {
         if (!suppress) deliverToInitiator(session, `${session.title} (${session.agentName}) stopped mid-run: ${clip(why, 300)}`, "failed", initiator);
       } else if (session.attached.size === 0) {
         session.unread = true;
@@ -723,15 +786,15 @@ function onSessionExit(session, code, signal, expected) {
     return;
   }
   session.suppressStopDelivery = false;
-  if (!expected && session.attached.size === 0) {
-    // An idle process that died on its own: the session survives on its file;
-    // the next message revives it.
-    session.status = "interrupted";
+  // An at-rest process going away was running nothing: its status stays `idle`
+  // (`loaded: false` says the process is gone; the next attach or message wakes
+  // it), and an untouched blank draft leaves the registry altogether.
+  if (!reapEmptyDraft(session)) {
     pushSession(session);
   }
   resolveWaiters(session);
   checkWindowlessExit();
-  if (!expected && session.deliverQueue.length > 0) void revive(session);
+  if (!expected && session.deliverQueue.length > 0 && sessions.has(session.id)) void revive(session);
 }
 
 // ── Wire-level routing ───────────────────────────────────────────────────────
@@ -997,7 +1060,7 @@ function onSettled(session, record) {
   if (aborted) {
     setStatus(session, "idle");
     // A run stopped on purpose tells the session that asked for it — unless that ancestor was stopped too.
-    if (!suppress && initiator && initiator !== "user" && initiator !== session.id) {
+    if (!suppress && isSessionInitiator(initiator, session.id)) {
       deliverToInitiator(session, `${session.title} (${session.agentName}) was stopped.`, "failed", initiator);
     }
     flushDeliveries(session);
@@ -1005,24 +1068,24 @@ function onSettled(session, record) {
   }
   if (failed) {
     setStatus(session, "failed");
-    if (initiator === "user" || initiator === undefined) {
-      if (session.attached.size === 0) {
+    if (!isSessionInitiator(initiator, session.id)) {
+      if (initiator !== session.id && session.attached.size === 0) {
         session.unread = true;
         pushSession(session);
       }
-    } else if (initiator !== session.id) {
+    } else {
       deliverToInitiator(session, answer || `${session.title} (${session.agentName}) failed.`, "failed", initiator);
     }
     flushDeliveries(session);
     return;
   }
   setStatus(session, "idle");
-  if (initiator === "user" || initiator === undefined) {
-    if (session.attached.size === 0) {
+  if (!isSessionInitiator(initiator, session.id)) {
+    if (initiator !== session.id && session.attached.size === 0) {
       session.unread = true;
       pushSession(session);
     }
-  } else if (initiator !== session.id) {
+  } else {
     deliverToInitiator(session, answer || "(finished without a reply)", "idle", initiator);
   }
   flushDeliveries(session);
@@ -1055,7 +1118,7 @@ function returnInitiatorFor(target, fromId) {
 /** Sends `from`'s finished answer back to the session (or marks unread for the user). */
 function deliverToInitiator(from, text, status, explicitTarget) {
   const targetId = explicitTarget ?? from.initiator;
-  if (!targetId || targetId === "user") {
+  if (!targetId || targetId === "user" || targetId === "external") {
     if (!explicitTarget) {
       from.unread = true;
       pushSession(from);
@@ -1267,7 +1330,7 @@ function budgetMessages(messages, maxBytes = READ_BYTE_BUDGET) {
   return { messages: picked, truncated };
 }
 
-async function callSessionTool(caller, name, args = {}) {
+async function callSessionTool(caller, name, args = {}, options = {}) {
   switch (name) {
     case "agents_list": {
       const agents = config.agents.map((agent) => ({
@@ -1413,7 +1476,7 @@ async function callSessionTool(caller, name, args = {}) {
         driver: agent.driver,
         cwd,
         parentId: detached ? undefined : caller?.id,
-        initiator: detached ? "user" : caller?.id ?? "user",
+        initiator: options.external ? "external" : detached ? "user" : caller?.id ?? "user",
         runtimeMode: mode,
         binaryPath: agent.binaryPath ?? config.overrides?.[agent.id]?.binaryPath,
         extraArgs: agent.extraArgs ?? config.overrides?.[agent.id]?.extraArgs,
@@ -1490,7 +1553,7 @@ async function stopTree(session) {
         const initiator = target.initiator;
         target.initiator = undefined;
         setStatus(target, "idle");
-        if (!suppress && initiator && initiator !== "user" && initiator !== target.id) {
+        if (!suppress && isSessionInitiator(initiator, target.id)) {
           deliverToInitiator(target, `${target.title} (${target.agentName}) was stopped.`, "failed", initiator);
         }
         return;
@@ -1685,8 +1748,15 @@ async function controlOp(conn, msg) {
       // A detach or drop that landed while the process started must not be undone:
       // the conn is gone and only says it is attached if it still is.
       if (conn.destroyed || !conn.attaching.delete(session.id)) {
+        reapEmptyDraft(session);
         respondError(conn, id, "detached before the session was ready");
         return;
+      }
+      if (session.status === "failed" || session.status === "interrupted") {
+        session.status = "idle";
+        session.lastError = "";
+        persist({ type: "session_update", id: session.id, info: sessionInfo(session) });
+        pushSession(session);
       }
       session.attached.add(conn);
       conn.attachedSessions.add(session.id);
@@ -1720,6 +1790,7 @@ async function controlOp(conn, msg) {
         session.attached.delete(conn);
         conn.attachedSessions.delete(session.id);
         send(conn, { type: "detached", sessionId: session.id });
+        reapEmptyDraft(session);
       }
       respond(conn, id, "detached", {});
       return;
@@ -1752,6 +1823,16 @@ async function controlOp(conn, msg) {
     case "kill": {
       const session = sessions.get(msg.sessionId);
       if (session) killProcess(session);
+      respond(conn, id, "ok", {});
+      return;
+    }
+    case "remove": {
+      const session = sessions.get(msg.sessionId);
+      if (session) {
+        await stopTree(session);
+        const targets = [session, ...descendantsOf(session).filter((d) => !hasSavedConversation(d.file))];
+        for (const target of targets) removeSessionRecord(target);
+      }
       respond(conn, id, "ok", {});
       return;
     }
@@ -2064,7 +2145,16 @@ async function controlConnection(conn) {
     if (dropped) return;
     dropped = true;
     for (const sessionId of conn.attachedSessions ?? []) {
-      sessions.get(sessionId)?.attached.delete(conn);
+      const held = sessions.get(sessionId);
+      if (held) {
+        held.attached.delete(conn);
+        reapEmptyDraft(held);
+      }
+    }
+    for (const sessionId of conn.attaching ?? []) {
+      conn.attaching.delete(sessionId);
+      const held = sessions.get(sessionId);
+      if (held) reapEmptyDraft(held);
     }
     conn.attaching?.clear();
     for (const entry of conn.waiters ?? []) {
@@ -2191,7 +2281,7 @@ async function mcpHandle(req, res) {
           const name = msg.params?.name;
           if (!config.allowAgentTools) throw new Error("session tools are disabled in Settings → Sessions");
           // Identity comes strictly from the bearer token, never from request arguments.
-          const result = await callSessionTool(caller.session ?? undefined, name, msg.params?.arguments ?? {});
+          const result = await callSessionTool(caller.session ?? undefined, name, msg.params?.arguments ?? {}, { external: Boolean(caller.external) });
           reply({ result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] } });
         } catch (toolError) {
           reply({
@@ -2268,6 +2358,12 @@ async function loadRegistry() {
         session.proc = undefined;
         if (session.file) sessionsByFile.set(session.file, session.id);
       }
+    } else if (record.type === "session_remove" && record.id) {
+      const gone = sessions.get(record.id);
+      if (gone) {
+        if (gone.file && sessionsByFile.get(gone.file) === gone.id) sessionsByFile.delete(gone.file);
+        sessions.delete(record.id);
+      }
     } else if (record.type === "queue" && record.to) {
       // The latest queue record is the session's pending deliveries.
       const session = sessions.get(record.to);
@@ -2287,7 +2383,7 @@ async function loadRegistry() {
       session.status = "interrupted";
       const initiator = pendingNotify ?? session.initiator;
       session.initiator = undefined;
-      if (initiator && initiator !== "user" && initiator !== session.id) {
+      if (isSessionInitiator(initiator, session.id)) {
         const target = sessions.get(initiator);
         if (target) {
           target.deliverQueue.push({
@@ -2296,6 +2392,23 @@ async function loadRegistry() {
           });
         }
       }
+    }
+  }
+  // Sweep untouched scratchpads (including legacy ones whose idle exit marked them `interrupted`).
+  for (const session of [...sessions.values()]) {
+    if (
+      !session.parentId &&
+      !session.worktree &&
+      !session.titleLocked &&
+      (session.initiator ?? session.upstreamInitiator) !== "external" &&
+      (!session.title || session.title === "New session") &&
+      !session.deliverQueue.length &&
+      descendantsOf(session).length === 0 &&
+      !hasSavedConversation(session.file) &&
+      (session.status === "idle" || session.status === "interrupted")
+    ) {
+      if (session.file && sessionsByFile.get(session.file) === session.id) sessionsByFile.delete(session.file);
+      sessions.delete(session.id);
     }
   }
   // Cancel any timer before rewriting the compacted registry snapshot at boot.
@@ -2383,7 +2496,7 @@ async function main() {
     for (const session of sessions.values()) {
       const running = session.status === "working" || session.status === "blocked";
       const interruptedInitiator =
-        running && session.initiator && session.initiator !== "user" && session.initiator !== session.id ? session.initiator : undefined;
+        running && isSessionInitiator(session.initiator, session.id) ? session.initiator : undefined;
       const info = {
         ...sessionInfo(session),
         token: session.token,

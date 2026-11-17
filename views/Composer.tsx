@@ -1,5 +1,5 @@
 import { readFile } from "fs/promises";
-import { Canvas, cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
+import { Canvas, cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, Overlay, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
 import type { InputRef, PasteEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input, Popover } from "nsh/base";
 import { money } from "../lib/format";
@@ -164,7 +164,9 @@ function useSlashMenu() {
       ),
     );
   });
-  return { rows, unmatched, selected, keyed, open, current };
+  /** Closes the menu as Escape does, the draft left as it was until a new slash. */
+  const dismiss = () => dismissed.set(untracked(input)?.kind);
+  return { rows, unmatched, selected, keyed, open, current, dismiss };
 }
 
 /**
@@ -172,8 +174,14 @@ function useSlashMenu() {
  * row says the list goes on — and the rest scroll. The mark follows the
  * pointer once it moves, so there is one marked row and never a hovered one
  * beside it; a row scrolled under a resting pointer does not take it.
+ *
+ * It is an `Overlay` anchored to the composer's column, so a press anywhere
+ * else — the transcript, the sidebar, the composer's own chips — closes it as
+ * Escape does, and still reaches what it landed on. A press inside the column
+ * (the input, the tray, the chip row) is not an outside press: the draft is
+ * still being written there.
  */
-function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (row: SlashRow) => void }) {
+function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (row: SlashRow) => void; anchor?: ViewRef; width: number }) {
   const mounted = signal(false);
   const opacity = createAnimatedValue(0);
   const translateY = createAnimatedValue(6);
@@ -250,9 +258,19 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
 
   return (
     <If when={mounted()}>
+      <If when={props.anchor}>
+        {(anchor) => (
+      <Overlay
+        anchor={anchor()}
+        placement="top"
+        align="start"
+        offset={8}
+        margin={12}
+        onPressOutside={props.menu.open() ? () => props.menu.dismiss() : undefined}
+      >
       <View
-        class={`absolute inset-x-0 bottom-full mb-2 overflow-hidden ${POPUP}${props.menu.open() ? "" : " pointer-events-none"}`}
-        style={{ ...GLASS_REGULAR, opacity, transform: [{ translateY }, { scale }] }}
+        class={`overflow-hidden ${POPUP}${props.menu.open() ? "" : " pointer-events-none"}`}
+        style={{ ...GLASS_REGULAR, width: props.width, opacity, transform: [{ translateY }, { scale }] }}
         role="menu"
         accessibilityLabel={tr("Commands", "命令")}
       >
@@ -288,6 +306,9 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
           </Each>
         </Scroll>
       </View>
+      </Overlay>
+        )}
+      </If>
     </If>
   );
 }
@@ -439,6 +460,9 @@ export function Composer() {
   let trackedDraft = untracked(composerDraft);
   const height = signal(MIN_HEIGHT);
   const slash = useSlashMenu();
+  /** The composer's column, which the slash menu stands on and whose width it takes. */
+  const column = signal<ViewRef | undefined>(undefined);
+  const columnWidth = signal(0);
   const ready = () => sidecarPhase().name === "ready";
   const canSend = () => ready() || isDraftAhead();
   const working = () => isRunning() || isBashRunning() || waitingCount() > 0;
@@ -624,9 +648,15 @@ export function Composer() {
 
   return (
     <View class="px-6 pb-5 pt-3">
-      <View class="pointer-events-auto relative w-full max-w-190 self-center">
+      <View
+        ref={(node) => {
+          if (node) column.set(node);
+        }}
+        onLayout={(e) => columnWidth.set(e.bounds.size.width)}
+        class="pointer-events-auto relative w-full max-w-190 self-center"
+      >
         <ExtensionPrompt />
-        <SlashMenu menu={slash} onChoose={choose} />
+        <SlashMenu menu={slash} onChoose={choose} anchor={column()} width={columnWidth()} />
         <AttachmentTray />
         <View class={`relative rounded-[22px] corner-squircle ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
           <ExtensionLines below={false} />
@@ -672,15 +702,15 @@ export function Composer() {
           <ExtensionLines below />
           <View class="flex-row items-end justify-between gap-2 pb-2 pl-2.5 pr-2 pt-2">
             <View class="min-w-0 flex-1 flex-row flex-wrap items-center gap-0.5">
-              <AgentPicker />
-              <ModelPicker />
-              <ThinkingPicker />
+              <AgentPicker onOpen={slash.dismiss} />
+              <ModelPicker onOpen={slash.dismiss} />
+              <ThinkingPicker onOpen={slash.dismiss} />
             </View>
             <View class="shrink-0 flex-row items-center gap-1.5">
               <If when={ready()}>
                 <ContextMeter />
               </If>
-              <PermissionPicker />
+              <PermissionPicker onOpen={slash.dismiss} />
               <View style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
                 <If
                   when={showStop()}
@@ -705,6 +735,8 @@ export function Composer() {
                             sendMenuClosedAt = 0;
                             return;
                           }
+                          // The menu is the send's: the slash menu behind it would take the press's send.
+                          slash.dismiss();
                           sendMenuOpen.update((v) => !v);
                         }}
                         disabled={!canSend()}

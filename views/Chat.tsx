@@ -832,18 +832,20 @@ export function Chat() {
       }
     }
     const watching = bottomFollowing();
-    // The actions row's seat sits under the turn's last text row — the one that
-    // can still become the reply. It never leaves before a next text row takes
-    // it (one commit: a seat lost and a seat gained is no height at all), so no
-    // seat's leaving ever pulls the rows around it.
-    let lastTextId = "";
-    for (const row of merged) if (row.kind === "text") lastTextId = row.id;
+    // The actions row's seat sits under a text row only while it trails the
+    // conversation — the one that can still become the reply. A text row with
+    // rows after it (the next step's call, a queued send) is mid-turn
+    // commentary: a seat there stands as a blank line among the steps. The seat
+    // never leaves before a next text row takes it (one commit: a seat lost and
+    // a seat gained is no height at all), so no seat's leaving ever pulls the
+    // rows around it.
+    const lastRowId = merged.at(-1)?.id;
     const rows = (watching ? stable(merged) : merged).flatMap((row): ChatRow[] =>
       row.kind !== "text"
         ? [row]
         : row.final
           ? [...proseRows(row), replyActions(row)]
-          : row.id === lastTextId
+          : row.id === lastRowId
             ? [...proseRows(row), heldActions(row)]
             : proseRows(row),
     );

@@ -435,6 +435,10 @@ async function openControl(homeDir, envOverrides) {
       sessions.set(msg.session.id, msg.session);
       return;
     }
+    if (msg.type === "session_removed" && msg.sessionId) {
+      sessions.delete(msg.sessionId);
+      return;
+    }
     if (msg.id && pending.has(msg.id)) {
       const { resolve, reject } = pending.get(msg.id);
       pending.delete(msg.id);
@@ -1385,4 +1389,66 @@ test("a fresh attach adopts the standby the last attach warmed — invisibly, an
   const read3 = await ctrl.readMessages(sid3);
   const env3 = JSON.parse(read3.messages.at(-1).text);
   assert.ok(!boots3.includes(env3.pid), "an expired standby is not adopted — a fresh process took it");
+});
+
+test("untouched blank drafts reap on detach, idle exits stay idle, attach clears failed/interrupted, and remove retires fileless sessions", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-lifecycle-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+
+  const ctrl = await openControl(homeDir, { HOME: tmp, PIPI_DAEMON_POOL: "0" });
+  t.after(async () => {
+    ctrl.client.close();
+    try {
+      const inst = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+      process.kill(inst.pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+
+  // 1. Detaching from an untouched blank UI draft reaps it cleanly (`session_removed`).
+  const blank = await ctrl.call("attach", {
+    session: { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" },
+  });
+  const blankId = blank.session.id;
+  assert.equal(ctrl.sessions.has(blankId), true);
+  await ctrl.call("detach", { sessionId: blankId });
+  await ctrl.waitUntil(() => !ctrl.sessions.has(blankId));
+
+  // 2. A session that saved a conversation stays `idle` (never `interrupted`) if its idle process exits on its own.
+  const saved = await ctrl.call("attach", {
+    session: { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" },
+  });
+  const savedId = saved.session.id;
+  ctrl.client.send({ type: "in", sessionId: savedId, line: JSON.stringify({ id: "m1", type: "prompt", message: "inspect-env" }) });
+  await ctrl.waitUntil(() => ctrl.sessions.get(savedId)?.status === "idle" && ctrl.sessions.get(savedId)?.title === "inspect-env");
+  const readEnv = JSON.parse((await ctrl.readMessages(savedId)).messages.at(-1).text);
+  await ctrl.call("detach", { sessionId: savedId });
+  process.kill(readEnv.pid, "SIGKILL");
+  await ctrl.waitUntil(() => ctrl.sessions.get(savedId)?.loaded === false);
+  assert.equal(ctrl.sessions.get(savedId)?.status, "idle", "an unexpected exit while idle must not mark the session interrupted");
+
+  // 3. Attaching to a failed session spawns a fresh process and clears its failed status back to `idle`.
+  const failedJob = await ctrl.call("start_session", {
+    input: { title: "Crashy Job", agentId: "pi", cwd: workDir, message: "die:150" },
+  });
+  const failedId = failedJob.session.id;
+  await ctrl.waitUntil(() => ctrl.sessions.get(failedId)?.status === "failed");
+  const reattached = await ctrl.call("attach", {
+    session: { id: failedId, cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi" },
+  });
+  assert.equal(reattached.session.status, "idle");
+  assert.equal(ctrl.sessions.get(failedId)?.status, "idle");
+  await ctrl.call("detach", { sessionId: failedId });
+
+  // 4. `remove` retires a fileless failed daemon session from the registry altogether.
+  const brokenSpawn = await ctrl.call("start_session", {
+    input: { title: "Broken Worktree", agentId: "pi", cwd: workDir, worktree: true, message: "echo:nope" },
+  });
+  const brokenId = brokenSpawn.session.id;
+  await ctrl.waitUntil(() => ctrl.sessions.get(brokenId)?.status === "failed" && !ctrl.sessions.get(brokenId)?.file);
+  await ctrl.call("remove", { sessionId: brokenId });
+  await ctrl.waitUntil(() => !ctrl.sessions.has(brokenId));
 });

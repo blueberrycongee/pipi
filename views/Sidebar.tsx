@@ -45,7 +45,9 @@ import {
   daemonSessionByFile,
   daemonSessionOfId,
   daemonSessions,
+  daemonSessionTitle,
   daemonTreePlace,
+  isDaemonTaskSession,
   isDraftAhead,
   isRunning,
   isSessionRunning,
@@ -57,6 +59,7 @@ import {
   openWorkspace,
   pendingSession,
   projectCwdOf,
+  removeDaemonSession,
   removeSession,
   savedSessions,
   sessionsReady,
@@ -156,9 +159,11 @@ const openDaemon = () => {
  * stays until the saved row takes its place, never leaving a gap between them.
  * While a session change is under way, its destination decides instead.
  */
+const openDaemonId = () => pendingSession()?.daemonId ?? currentDaemonId();
+
 const isDraftSession = () => {
   const ds = openDaemon();
-  if (ds && (ds.parentId || ds.initiator === "external")) return false;
+  if (isDaemonTaskSession(ds)) return false;
   const pending = pendingSession();
   if (pending) return !pending.file;
   const current = sessionState();
@@ -181,7 +186,9 @@ const singleEmpty = computed(
     projects().length === 1 &&
     savedSessions().length === 0 &&
     archivedSessionItems().length === 0 &&
-    !daemonSessions().some((ds) => ds.parentId || ds.initiator === "external") &&
+    !daemonSessions().some(
+      (ds) => !(ds.id === openDaemonId() && isDraftSession()) && (Boolean(ds.parentId) || daemonRootEarnsRow(ds)),
+    ) &&
     sessionsReady() &&
     listSteady(),
 );
@@ -1021,7 +1028,7 @@ const allRecents = computed<RecentItem[]>(() => {
     if (isSessionArchived(ds.file)) continue;
     const { claimed, top } = daemonTreePlace(ds, listed);
     if (claimed || top.id !== ds.id) continue;
-    if (ds.id === currentDaemonId() && isDraftSession()) continue;
+    if (ds.id === openDaemonId() && isDraftSession()) continue;
     if (!open.has(projectCwdOf(ds.cwd, ds))) continue;
     const earns =
       daemonRootEarnsRow(ds) ||
@@ -1102,10 +1109,11 @@ function daemonRowInWorkspaces(ds: DaemonSession): boolean {
   }
   const { claimed, top } = daemonTreePlace(ds, files);
   if (claimed) return true;
-  if (top.id === currentDaemonId() && isDraftSession()) return true;
+  if (top.id === openDaemonId() && isDraftSession()) return true;
   return (
     daemonRootEarnsRow(top) &&
-    !top.file &&
+    (!top.file || !files.has(top.file)) &&
+    !isSessionArchived(top.file) &&
     projects().some((cwd) => !isWorkspaceCollapsed(cwd) && projectCwdOf(top.cwd, top) === cwd)
   );
 }
@@ -1154,6 +1162,22 @@ async function confirmDelete(session: SessionSummary, cwd: string) {
   if (action === "delete") {
     animateSidebarList();
     await removeSession(session.path, cwd);
+  }
+}
+
+async function confirmDeleteDaemon(session: DaemonSession) {
+  const name = daemonSessionTitle(session);
+  const { action } = await AlertDialog.show({
+    title: tr("Delete this session?", "删除此会话？"),
+    description: tr(`“${name}” will be removed from this Mac. This cannot be undone.`, `“${name}”将从此设备移除，该操作无法撤销。`),
+    actions: [
+      { label: tr("Cancel", "取消"), role: "cancel", id: "cancel" },
+      { label: tr("Delete", "删除"), role: "destructive", id: "delete" },
+    ],
+  });
+  if (action === "delete") {
+    animateSidebarList();
+    await removeDaemonSession(session.id);
   }
 }
 
@@ -1642,9 +1666,8 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
   const home = backend().home();
   const session = () => props.session;
   const file = () => session().file;
-  const openId = () => pendingSession()?.daemonId ?? currentDaemonId();
   const active = () =>
-    session().id === openId() || (file() !== undefined && file() === openFile() && !isDraftSession());
+    session().id === openDaemonId() || (file() !== undefined && file() === openFile() && !isDraftSession());
   const engine = () => engineOf(session().agentId);
   const working = () => (active() && isRunning()) || session().status === "working" || session().status === "blocked";
   const blocked = () => !active() && session().status === "blocked";
@@ -1660,8 +1683,8 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
     if (!nested()) return 0;
     return props.group === "recents" ? Math.max(0, session().depth - 1) : Math.max(1, session().depth);
   };
-  /** Its transcript is what the archive keeps: a session that has none yet has nothing to put there. */
-  const archivable = () => file() !== undefined;
+  /** Any settled/failed/interrupted daemon row (or one with a transcript file) can be archived out of the list. */
+  const archivable = () => file() !== undefined || !working();
   /** Only 最近's root rows drag: a nested row's place is its tree's, a 工作区 row's is the daemon's order. */
   const dropList = () => (props.group === "recents" && !nested() ? "recents" : undefined);
   const content = (
@@ -1669,9 +1692,14 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
       <BaseButton
         selected={selected()}
         onPress={() => {
-          const key = `daemon:${session().id}`;
+          const s = session();
+          const key = `daemon:${s.id}`;
           if (chosenGroups()[key] !== props.group) chosenGroups.update((all) => ({ ...all, [key]: props.group }));
-          openDaemonSession(session().id);
+          if (!isDaemonTaskSession(s) && !s.file) {
+            explicitDraftGroup = props.group;
+            draftGroup.set(props.group);
+          }
+          openDaemonSession(s.id);
         }}
         onPressDown={() => dropList() && armMouseDrag({ list: dropList()!, id: `daemon:${session().id}` })}
         onPressUp={endMouseDrag}
@@ -1693,7 +1721,7 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
         )}
       >
         <EngineMark id={engine().id} available={engine().available} />
-        <Text class={sessionTitleClass(selected())}>{session().title}</Text>
+        <Text class={sessionTitleClass(selected())}>{daemonSessionTitle(session())}</Text>
       </BaseButton>
       <View class={working() || !archivable() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`}>
         <Presence
@@ -1779,22 +1807,29 @@ function statusLabel(status: DaemonSession["status"]) {
   }
 }
 
-/** A nested session's right-click: open it, stop it outright, or archive it out of its tree. */
+/** A daemon session's right-click: open it, stop it outright, archive it, or delete it. */
 function childMenuItems(session: DaemonSession): MenuItem[] {
+  const working = session.status === "working" || session.status === "blocked";
   return [
     { label: tr("Open", "打开"), onSelect: () => openDaemonSession(session.id) },
     {
       label: tr("Stop session", "停止会话"),
-      disabled: session.status !== "working" && session.status !== "blocked",
+      disabled: !working,
       onSelect: () => void stopDaemonSession(session.id),
     },
     {
       label: tr("Archive", "归档"),
-      disabled: !session.file,
+      disabled: !session.file && working,
       onSelect: () => {
         animateSidebarList();
         void archiveDaemonSession(session.id);
       },
+    },
+    { type: "separator" },
+    {
+      label: tr("Delete…", "删除…"),
+      disabled: working,
+      onSelect: () => void confirmDeleteDaemon(session),
     },
   ];
 }
@@ -1812,11 +1847,13 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; c
   const items = computed<FolderItem[]>(() => {
     if (props.collapsed()) return lastItems;
     const rows: FolderItem[] = [];
+    const listed = new Set(folderSessions().map((s) => s.path));
     for (const ds of daemonSessions()) {
-      if (ds.parentId || ds.file) continue;
+      if (ds.parentId || (ds.file && listed.has(ds.file))) continue;
+      if (isSessionArchived(ds.file)) continue;
       if (projectCwdOf(ds.cwd, ds) !== props.cwd) continue;
       if (!daemonRootEarnsRow(ds)) continue;
-      if (ds.id === currentDaemonId() && isDraftSession()) continue;
+      if (ds.id === openDaemonId() && isDraftSession()) continue;
       rows.push({ id: `child:${ds.id}`, child: ds });
       for (const child of childSessionsOfDaemon(ds.id)) rows.push({ id: `child:${child.id}`, child });
     }

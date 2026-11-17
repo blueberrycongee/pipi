@@ -3,7 +3,6 @@ import {
   colorScheme,
   computed,
   createAnimatedValue,
-  createMotion,
   effect,
   Image,
   lifecycle,
@@ -21,7 +20,7 @@ import {
   type VideoRef,
   type ViewStyle,
 } from "nsh";
-import { Button as BaseButton, Dialog } from "nsh/base";
+import { Button as BaseButton } from "nsh/base";
 import { tr } from "../lib/i18n";
 import {
   clampAdjustment,
@@ -60,8 +59,8 @@ import {
   wallpaperVideoClickAction,
 } from "../store/app";
 import { Button, IconButton } from "../ui/Button";
-import { DIALOG_RISE, EASING } from "../ui/motion";
-import { GLASS_REGULAR, HEADER_GLASS, PAGE_GLASS, POPUP, SCRIM, WALLPAPER_FROST } from "../ui/styles";
+import { EASING, FloatingLayer } from "../ui/motion";
+import { GLASS_REGULAR, HEADER_GLASS, PAGE_GLASS, WALLPAPER_FROST } from "../ui/styles";
 
 // ---------------------------------------------------------------------------
 // Global interactive wallpaper state (cursor parallax, shader ripples, video surge)
@@ -669,10 +668,16 @@ const ZOOM_STEP = 0.25;
  * Supports drag-to-pan with a rule-of-thirds composition grid overlay while dragging,
  * zoom slider / step buttons (`100%`–`400%`), Reset, Cancel, and Apply.
  */
-export function WallpaperAdjustDialog(props: {
-  open: boolean;
-  onClose: () => void;
-}) {
+/** Whether the wallpaper adjuster is up — a floating layer like every other, mounted at the shell's root so it covers the whole window, Settings included. */
+const wallpaperAdjustOpen = signal(false);
+export const isWallpaperAdjustOpen = () => wallpaperAdjustOpen();
+/** Opens the adjuster (Settings → General → Wallpaper → Adjust); the layer itself lives at the shell's root. */
+export function openWallpaperAdjust() {
+  wallpaperAdjustOpen.set(true);
+}
+const closeWallpaperAdjust = () => wallpaperAdjustOpen.set(false);
+
+export function WallpaperAdjustDialog() {
   const draft = signal<WallpaperAdjustment>({ ...DEFAULT_WALLPAPER_ADJUSTMENT });
   const dragging = signal(false);
   const frameSize = signal({ width: PREVIEW_WIDTH, height: PREVIEW_HEIGHT });
@@ -681,13 +686,13 @@ export function WallpaperAdjustDialog(props: {
   let wasOpen = false;
 
   const ensureSynced = () => {
-    if (props.open && !wasOpen) {
+    if (wallpaperAdjustOpen() && !wasOpen) {
       wasOpen = true;
       const wp = wallpaper();
       draft.set(clampAdjustment(wp?.adjustment ?? DEFAULT_WALLPAPER_ADJUSTMENT));
       dragging.set(false);
       lastPointer = null;
-    } else if (!props.open && wasOpen) {
+    } else if (!wallpaperAdjustOpen() && wasOpen) {
       wasOpen = false;
     }
   };
@@ -715,19 +720,13 @@ export function WallpaperAdjustDialog(props: {
   );
 
   return (
-    <Dialog
-      open={(ensureSynced(), props.open && Boolean(wallpaper()))}
-      animation="fade"
-      onOpenChange={({ open }) => {
-        if (!open) props.onClose();
-      }}
-      backdropClass={SCRIM}
-      class="mx-auto my-auto w-full max-w-130 px-4"
+    <FloatingLayer
+      open={(ensureSynced(), wallpaperAdjustOpen() && Boolean(wallpaper()))}
+      onClose={closeWallpaperAdjust}
+      closeLabel={tr("Close", "关闭")}
+      panelClass="w-full max-w-130"
     >
-      <View
-        class={`gap-4 overflow-hidden p-5 ${POPUP}`}
-        style={{ ...GLASS_REGULAR, ...createMotion({ enter: DIALOG_RISE }).style }}
-      >
+      <View class="gap-4 p-5">
         {/* Header */}
         <View class="flex-row items-start justify-between gap-3">
           <View class="min-w-0 flex-1 gap-1">
@@ -744,7 +743,7 @@ export function WallpaperAdjustDialog(props: {
           <IconButton
             icon="x"
             label={tr("Close", "关闭")}
-            onPress={props.onClose}
+            onPress={closeWallpaperAdjust}
           />
         </View>
 
@@ -882,7 +881,7 @@ export function WallpaperAdjustDialog(props: {
               label={tr("Cancel", "取消")}
               variant="secondary"
               size="md"
-              onPress={props.onClose}
+              onPress={closeWallpaperAdjust}
             />
             <Button
               label={tr("Apply", "应用")}
@@ -890,12 +889,12 @@ export function WallpaperAdjustDialog(props: {
               size="md"
               onPress={() => {
                 updateWallpaperAdjustment(draft());
-                props.onClose();
+                closeWallpaperAdjust();
               }}
             />
           </View>
         </View>
       </View>
-    </Dialog>
+    </FloatingLayer>
   );
 }

@@ -1,5 +1,5 @@
-import { computed, createMotion, Text, View } from "nsh";
-import { Command, type CommandItem, Dialog } from "nsh/base";
+import { computed, Text, View } from "nsh";
+import { Command, type CommandItem } from "nsh/base";
 import { runtimeModeRank } from "../agents/catalog";
 import type { RuntimeMode } from "../agents/types";
 import { basename, tildePath } from "../lib/format";
@@ -57,9 +57,9 @@ import {
 import { backend } from "../store/backend";
 import { recentWorkspaces } from "../store/prefs";
 import { Icon, type IconName } from "../ui/Icon";
-import { DIALOG_RISE } from "../ui/motion";
+import { FloatingLayer } from "../ui/motion";
 import { runtimeModeIcon, runtimeModeText, thinkingText, tr } from "../lib/i18n";
-import { GLASS_REGULAR, POPUP, PRESS, SCRIM } from "../ui/styles";
+import { PRESS } from "../ui/styles";
 
 interface Action extends CommandItem {
   icon: IconName;
@@ -272,43 +272,41 @@ export function Palette() {
   const byId = computed(() => new Map(actions().map((action) => [action.id, action])));
   const close = () => setPaletteOpen(false);
   return (
-    <Dialog
+    <FloatingLayer
       open={isPaletteOpen()}
-      animation="fade"
-      onOpenChange={({ open }) => setPaletteOpen(open)}
-      backdropClass={SCRIM}
-      class="mx-auto mt-28 w-full max-w-150 px-4"
+      onClose={close}
+      closeLabel={tr("Close command palette", "关闭命令面板")}
+      frameClass="items-center px-4 pb-6 pt-28"
+      panelClass="w-full max-w-150"
     >
-      <View class={`overflow-hidden ${POPUP}`} style={{ ...GLASS_REGULAR, ...createMotion({ enter: DIALOG_RISE }).style }}>
-        <Command
-          items={actions()}
-          placeholder={tr("Search actions, sessions and models", "搜索操作、会话和模型")}
-          accessibilityLabel={tr("Commands", "命令面板")}
-          autoFocus
-          onCancel={close}
-          onSelect={({ id }) => {
-            close();
-            byId().get(id)?.run();
-          }}
-          class="overflow-hidden"
-          searchBarClass="h-12 flex-row items-center gap-2.5 border-b border-border px-4"
-          searchPrefix={<Icon name="search" tone="subtle" />}
-          searchClass="flex-1 text-md text-foreground caret-brand placeholder:text-subtle"
-          listClass="max-h-96 p-1.5"
-          groupClass="px-2.5 pb-1 pt-2.5 text-xs font-medium text-subtle"
-          separatorClass="mx-1 my-1 h-px bg-border"
-          itemClass={`group h-9 flex-row items-center rounded-lg corner-squircle px-2.5 ${PRESS} focus:bg-accent`}
-          empty={<Text class="py-10 text-center text-sm text-muted-foreground">{tr("Nothing matches.", "无匹配结果。")}</Text>}
-          renderItem={(entry) => (
-            <View class="flex-1 flex-row items-center gap-2.5">
-              <Icon name={byId().get(entry.id)?.icon ?? "dot"} tone="muted-foreground" />
-              <Text class="flex-1 truncate text-base text-foreground">{entry.label}</Text>
-              {entry.checked ? <Icon name="check" size={14} tone="brand-text" /> : null}
-              {entry.shortcutLabel ? <Text class="text-xs text-subtle">{entry.shortcutLabel}</Text> : null}
-            </View>
-          )}
-        />
-      </View>
-    </Dialog>
+      <Command
+        items={actions()}
+        placeholder={tr("Search actions, sessions and models", "搜索操作、会话和模型")}
+        accessibilityLabel={tr("Commands", "命令面板")}
+        autoFocus
+        onCancel={close}
+        onSelect={({ id }) => {
+          close();
+          byId().get(id)?.run();
+        }}
+        class="overflow-hidden"
+        searchBarClass="h-12 flex-row items-center gap-2.5 border-b border-border px-4"
+        searchPrefix={<Icon name="search" tone="subtle" />}
+        searchClass="flex-1 text-md text-foreground caret-brand placeholder:text-subtle"
+        listClass="max-h-96 p-1.5"
+        groupClass="px-2.5 pb-1 pt-2.5 text-xs font-medium text-subtle"
+        separatorClass="mx-1 my-1 h-px bg-border"
+        itemClass={`group h-9 flex-row items-center rounded-lg corner-squircle px-2.5 ${PRESS} focus:bg-accent`}
+        empty={<Text class="py-10 text-center text-sm text-muted-foreground">{tr("Nothing matches.", "无匹配结果。")}</Text>}
+        renderItem={(entry) => (
+          <View class="flex-1 flex-row items-center gap-2.5">
+            <Icon name={byId().get(entry.id)?.icon ?? "dot"} tone="muted-foreground" />
+            <Text class="flex-1 truncate text-base text-foreground">{entry.label}</Text>
+            {entry.checked ? <Icon name="check" size={14} tone="brand-text" /> : null}
+            {entry.shortcutLabel ? <Text class="text-xs text-subtle">{entry.shortcutLabel}</Text> : null}
+          </View>
+        )}
+      />
+    </FloatingLayer>
   );
 }

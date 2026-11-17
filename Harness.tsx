@@ -107,6 +107,7 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       history: scenario === "history" ? sampleHistory() : [],
       sessions: scenario === "connect" || scenario === "failed" ? [] : sessions,
       workspaceSessions: scenario === "multi" || scenario === "multi-slow" ? workspaceSessions : undefined,
+      daemonSessions: JSON.parse((await Storage.getItem("harness.daemonSessions")) ?? "null") ?? undefined,
       pickedFolder: (await Storage.getItem("harness.pickedFolder")) ?? "/Users/pip/code/new-app",
       pickedImage: (await Storage.getItem("harness.pickedImage")) ?? undefined,
       pace: scenario === "slow" ? 400 : scenario === "stream" || scenario === "multi-slow" ? 150 : 0,
