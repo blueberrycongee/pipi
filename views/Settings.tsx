@@ -141,7 +141,7 @@ import { Icon, type IconName } from "../ui/Icon";
 import { animateNextLayout, delayedFade, FloatingLayer, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, ViewDeck } from "../ui/motion";
 import { FOCUS_RING, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { CroppedWallpaperSurface, WallpaperAdjustDialog } from "./Wallpaper";
+import { CroppedWallpaperSurface, openWallpaperAdjust } from "./Wallpaper";
 
 const SECTIONS: { id: SettingsSection; label: () => string; icon: IconName }[] = [
   { id: "general", label: () => tr("General", "常规"), icon: "sliders" },
@@ -1033,7 +1033,6 @@ function wallpaperPauseModeLabel(mode: WallpaperPauseMode) {
 
 /** App-wide preferences only: the model, thinking and run knobs belong to a session and its harness. */
 function General() {
-  const adjustOpen = signal(false);
   return (
     <Page title={tr("General", "常规")}>
       <SettingGroup title={tr("Appearance", "外观")}>
@@ -1079,7 +1078,7 @@ function General() {
               {(wp) => (
                 <>
                   <BaseButton
-                    onPress={() => adjustOpen.set(true)}
+                    onPress={openWallpaperAdjust}
                     accessibilityLabel={tr("Preview and adjust wallpaper", "预览并调整壁纸")}
                     class={`relative h-9 w-15 overflow-hidden rounded-md corner-squircle border border-border bg-sunken ${PRESS} ${FOCUS_RING}`}
                   >
@@ -1106,7 +1105,7 @@ function General() {
                   <Button
                     label={tr("Adjust", "调整")}
                     size="sm"
-                    onPress={() => adjustOpen.set(true)}
+                    onPress={openWallpaperAdjust}
                   />
                   <Button
                     label={DYNAMIC_WALLPAPER_ENABLED ? tr("Replace", "更换") : tr("Replace image", "更换图片")}
@@ -1301,7 +1300,6 @@ function General() {
           </View>
         </Reveal>
       </SettingGroup>
-      <WallpaperAdjustDialog open={adjustOpen()} onClose={() => adjustOpen.set(false)} />
       <SettingGroup title="pipi">
         <View class="gap-3 px-3 py-3">
           {(["cat", "dog"] as const).map((species) => (
@@ -1731,13 +1729,14 @@ function Usage() {
               <Value text={money(totals().cost)} />
             </SettingRow>
             <Rule />
-            <SettingRow title={tr("Sessions", "会话")}>
-              <Value
-                text={tr(
-                  `${totals().sessions} sessions · ${totals().userMessages + totals().assistantMessages} messages · ${totals().toolCalls} tool calls`,
-                  `${totals().sessions} 个会话 · ${totals().userMessages + totals().assistantMessages} 条消息 · ${totals().toolCalls} 次工具调用`,
-                )}
-              />
+            <SettingRow
+              title={tr("Sessions", "会话")}
+              description={tr(
+                `${totals().userMessages + totals().assistantMessages} messages · ${totals().toolCalls} tool calls`,
+                `${totals().userMessages + totals().assistantMessages} 条消息 · ${totals().toolCalls} 次工具调用`,
+              )}
+            >
+              <Value text={String(totals().sessions)} />
             </SettingRow>
           </SettingGroup>
           <SettingGroup title={tr("Last 30 days", "近 30 天")}>
@@ -1891,8 +1890,39 @@ function ShortcutsPage() {
           }
         />
       </SettingGroup>
+      <SettingGroup title={tr("Documents", "文档")}>
+        <ShortcutRow title={tr("New document", "新建文档")} caps={<Kbd keys="mod+shift+n" />} />
+        <Rule />
+        <ShortcutRow
+          title={tr("Continue a draft in a document", "在文档中继续写")}
+          description={tr("Moves what the composer holds into a document.", "把输入框里写到一半的内容搬进文档。")}
+          caps={<Kbd keys="mod+e" />}
+        />
+        <Rule />
+        <ShortcutRow
+          title={tr("Add to chat", "添加到会话")}
+          description={tr("In a document: attaches it, or the passage selected, to the message.", "在文档中：把整篇或选中的内容附到消息上。")}
+          caps={<Kbd keys="mod+enter" />}
+        />
+        <Rule />
+        <ShortcutRow
+          title={tr("Blocks", "插入块")}
+          description={tr("In a document: headings, lists, quotes, code, tables.", "在文档中：标题、列表、引用、代码、表格。")}
+          caps={<Kbd text="/" />}
+        />
+      </SettingGroup>
       <SettingGroup title={tr("App", "应用")}>
         <ShortcutRow title={tr("Command palette", "命令面板")} caps={<Kbd keys="mod+k" />} />
+        <Rule />
+        <ShortcutRow
+          title={tr("Next and previous tab", "下一个与上一个标签页")}
+          caps={
+            <>
+              <Kbd keys="mod+shift+]" />
+              <Kbd keys="mod+shift+[" />
+            </>
+          }
+        />
         <Rule />
         <ShortcutRow title={tr("Settings", "设置")} caps={<Kbd keys="mod+," />} />
         <Rule />
@@ -1900,7 +1930,11 @@ function ShortcutsPage() {
         <Rule />
         <ShortcutRow title={tr("Random wallpaper", "随机切换壁纸")} caps={<Kbd keys="mod+u" />} />
         <Rule />
-        <ShortcutRow title={tr("Close window", "关闭窗口")} caps={<Kbd keys="mod+w" />} />
+        <ShortcutRow
+          title={tr("Close tab", "关闭标签页")}
+          description={tr("The window, when only one tab is open.", "只剩一个标签页时关闭窗口。")}
+          caps={<Kbd keys="mod+w" />}
+        />
         <Rule />
         <ShortcutRow title={tr("Quit pipi", "退出 pipi")} caps={<Kbd keys="mod+q" />} />
         <Rule />

@@ -1,0 +1,165 @@
+/**
+ * A document on its way to an agent, and read back out of what was sent.
+ *
+ * A document rides on a message the way an image does: it is attached, not
+ * pasted. What the agent gets is the person's words first — they title the
+ * session, and they are what a folded bubble shows — then each document in a
+ * block that names its file, so an agent with file tools can change the
+ * document where it lives:
+ *
+ *     Tighten the second paragraph
+ *
+ *     <document path="/…/docs/note-2026-11-18.md">
+ *     # Why I do not like …
+ *     </document>
+ *
+ * A message with no words of its own *is* the document: one written to be
+ * sent (a brief, a prompt) goes as its text and nothing else.
+ *
+ * No part of the app strips these blocks from a message: the transcript, the
+ * queue and the session's title all keep the wire text, and only the bubble
+ * (`views/Rows.tsx`) reads the blocks back as cards.
+ */
+
+export interface DocPart {
+  /** The document's file. */
+  path: string;
+  /** Its Markdown — or the selected passage's text. */
+  text: string;
+  /** A passage selected in the document rather than all of it. */
+  excerpt?: boolean;
+}
+
+const tagOf = (part: DocPart) => (part.excerpt ? "selection" : "document");
+const attr = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+const unattr = (value: string) => value.replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+
+function block(part: DocPart) {
+  const tag = tagOf(part);
+  return `<${tag} path="${attr(part.path)}">\n${part.text.trim()}\n</${tag}>`;
+}
+
+/**
+ * The message a send makes of what was typed and the documents attached.
+ * Alone and unremarked, a document goes as its own text — unless that text
+ * would read as a command (`/name`, `!cmd`), which a document never is.
+ */
+export function composeDocMessage(said: string, parts: readonly DocPart[]): string {
+  const words = said.trim();
+  if (!parts.length) return words;
+  if (!words && parts.length === 1) {
+    const text = parts[0].text.trim();
+    if (text && !/^[/!]/.test(text) && !OPENING.test(text)) return text;
+  }
+  return [words, ...parts.map(block)].filter(Boolean).join("\n\n");
+}
+
+const OPENING = /^<(document|selection) path="([^"\n]*)">\n/;
+const FOLLOWING = /^\n\n<(?:document|selection) path="[^"\n]*">\n/;
+
+/** The blocks `tail` is made of and nothing else, or `undefined` when it is not only blocks. */
+function blocksOf(tail: string): DocPart[] | undefined {
+  const parts: DocPart[] = [];
+  let rest = tail;
+  while (rest) {
+    const open = OPENING.exec(rest);
+    if (!open) return undefined;
+    const close = `\n</${open[1]}>`;
+    // An empty document's opening line ends where its closing one begins.
+    let at = rest.indexOf(close, open[0].length - 1);
+    // A document may quote a closing tag: its block ends where the message does, or where the next block starts.
+    for (; at >= 0; at = rest.indexOf(close, at + 1)) {
+      const after = rest.slice(at + close.length);
+      if (!after || FOLLOWING.test(after)) break;
+    }
+    if (at < 0) return undefined;
+    parts.push({
+      path: unattr(open[2]),
+      text: rest.slice(open[0].length, Math.max(open[0].length, at)),
+      ...(open[1] === "selection" ? { excerpt: true } : {}),
+    });
+    rest = rest.slice(at + close.length).replace(/^\n\n/, "");
+  }
+  return parts.length ? parts : undefined;
+}
+
+/** A sent message read back: the words typed, and the documents that rode on them. */
+export function splitDocMessage(text: string): { said: string; docs: DocPart[] } {
+  const opening = /(^|\n\n)<(?:document|selection) path="[^"\n]*">\n/g;
+  for (let found = opening.exec(text); found; found = opening.exec(text)) {
+    const docs = blocksOf(text.slice(found.index + found[1].length));
+    if (docs) return { said: text.slice(0, found.index), docs };
+  }
+  return { said: text, docs: [] };
+}
+
+/**
+ * The words a message is titled by: what was typed, or — when the message
+ * was only documents — what the first one says. Read loosely, so a text
+ * already clipped or run onto one line is too (`titleWords` in
+ * `sidecar/session-index.mjs` is the same reading on the Node side).
+ */
+export function titleWords(text: string): string {
+  if (!text.includes(' path="')) return text;
+  const said = text.replace(/(?:^|\s)<(?:document|selection) path="[^"]*">[\s\S]*$/, "").trim();
+  if (said) return said;
+  return text.replace(/^\s*<(?:document|selection) path="[^"]*">\s*/, "").replace(/\s*<\/(?:document|selection)>[\s\S]*$/, "");
+}
+
+/** A line that opens or closes a fenced code block: its marker, or `undefined`. */
+const fenceOf = (line: string) => /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+
+/**
+ * Markdown as an agent should read it: the escapes a serializer adds so that
+ * the text parses back to the same document — `foo\_bar`, `\<task>`, `\~/dev`
+ * — are noise to a model and wrong inside a path or a name, so they come off.
+ * Structure stays (headings, lists, emphasis), and so does everything in code,
+ * where a backslash is the writer's own. A hard break's trailing backslash
+ * goes too: the line break it stood for is still there.
+ */
+export function plainMarkdown(markdown: string): string {
+  const out: string[] = [];
+  let fence: string | undefined;
+  /** The backtick run an inline code span opened with; it may close on a later line of its paragraph. */
+  let span = 0;
+  for (const line of markdown.split("\n")) {
+    const marker = fenceOf(line);
+    if (fence) {
+      if (marker && marker[0] === fence[0] && marker.length >= fence.length && !line.trim().slice(marker.length).trim()) fence = undefined;
+      out.push(line);
+      continue;
+    }
+    if (marker && !span) {
+      fence = marker;
+      out.push(line);
+      continue;
+    }
+    if (!line.trim()) span = 0;
+    let text = "";
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === "`") {
+        let run = 1;
+        while (line[i + run] === "`") run++;
+        if (!span) span = run;
+        else if (span === run) span = 0;
+        text += line.slice(i, i + run);
+        i += run - 1;
+        continue;
+      }
+      if (ch === "\\" && !span) {
+        const next = line[i + 1];
+        // The line's last character: a hard break, which the newline after it already says.
+        if (next === undefined) continue;
+        if (/[!-/:-@[-`{-~]/.test(next)) {
+          text += next;
+          i++;
+          continue;
+        }
+      }
+      text += ch;
+    }
+    out.push(text);
+  }
+  return out.join("\n");
+}

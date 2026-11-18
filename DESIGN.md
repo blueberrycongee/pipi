@@ -232,6 +232,47 @@ edge is measured, not assumed: a tray, a longer draft or an inline prompt
 raises it and all three with it, so nothing the composer grows by covers the
 end of a reply.
 
+## Documents
+
+A document is a page of the person's own words — a brief the composer is too
+small for, a draft the agents help with — and the page is the writing and
+nothing else: no toolbar, no title field (its first line names it), no status
+bar. Formatting comes to the caret: `/` lists the blocks, a selection raises
+the marks. The column is the conversation's, a step narrower (720): prose
+being written, not replies being read.
+
+The editor lays blocks out as a flow with no gap of its own, so the rhythm is
+each block's margins (`EDITOR_CLASSES`, `views/DocEditor.tsx`): paragraphs
+stand 12 apart; a heading opens a section with more above it than below
+(24 over an h1 or h2, 20 over an h3, 4–8 under); a list's items sit 4 apart,
+as close as lines of one thought; what is boxed — code, a table, a quote —
+keeps 10, and a rule 20. Two paragraphs that cannot be told apart are one
+paragraph to the reader.
+
+Under the page, one 44pt line on the column's own edges. Left, in `text-xs`
+`subtle`: how much is written and that it is kept ("328 字 · 自动保存"). That
+is a property, not a state — nothing here or on the tab blinks with each
+pause in typing; a save that fails is a toast. Right: the page's one action,
+"Add to Chat" with its key (⌘↵), a quiet secondary button — the brand stays
+on the composer's send, where a message actually leaves. It names what will
+go ("Add Selection to Chat" while a passage is selected) and is disabled on
+an empty page.
+
+A document rides on a message the way an image does: attached, not pasted.
+On the composer it is a card in the tray, ahead of the images (56 high, 208
+wide: a file tile, its name, "Document" or "Selection"); a press goes back
+to the document, ✕ on hover removes it, and the field's hint says the rule —
+words are what to do with it, none sends it as it is. In the sent bubble it
+is named, not printed: a `text-xs` line with the file mark under the words,
+like the images line, and a press opens it.
+
+The composer's own door to a document is an `expand` mark at the field's top
+right, there from the draft's third line on (⌘E): a draft that long is
+offered room. The field's right margin (36) is that mark's seat always, so
+its arrival never re-wraps what is written. In the sidebar, 新文档 stands
+under 新会话, and a document's row in 最近 leads with the `file` mark where a
+session's has its engine — no trailing mark: a document has no run to report.
+
 ## Elevation
 
 Flat by default: regions are separated by background steps and hairlines.
@@ -244,6 +285,7 @@ both, never adds color. The toast's is the same family drawn tight — toasts
 stack, and a wide shadow would fall on the card below. Toasts alone drop
 the translucent glass fill for an opaque `bg-popover`: they float over the
 scrolling transcript, and translucency lets the rows behind ghost through.
+On Linux, which draws no backdrop filters, every popup uses opaque `bg-popover`.
 
 A floating layer — Settings, the command palette, the orchestration sheet,
 the wallpaper adjuster, an extension's dialog — stands over one backdrop,

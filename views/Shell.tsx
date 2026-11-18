@@ -32,6 +32,7 @@ import {
   isPaletteOpen,
   isRenaming,
   isRunning,
+  leaveSettings,
   newSession,
   pendingDialog,
   randomWallpaper,
@@ -57,21 +58,27 @@ import {
   sidebarOpen,
   sidebarWidth,
 } from "../store/prefs";
+import { flushDocs, refreshNotes, syncDocs } from "../store/docs";
+import { activeTabId, closeTab, cycleTab, draftToDoc, newDocTab, openTabs, pickDocTab } from "../store/tabs";
 import { EASING } from "../ui/motion";
 import { SIDEBAR_GLASS, WALLPAPER_FROST } from "../ui/styles";
+import { isZoomOpen, ZoomLayer } from "../ui/Zoom";
 import { CompareDialog } from "./AgentPicker";
 import { Chat } from "./Chat";
+import { DocDeck } from "./DocEditor";
 import { ExtensionDialog, hasInlinePrompt } from "./ExtensionDialog";
 import { Palette } from "./Palette";
 import { Settings } from "./Settings";
 import { Sidebar } from "./Sidebar";
-import { TitleBar } from "./TitleBar";
+import { TabBar } from "./TabBar";
 import { Toasts } from "./Toasts";
 import { UpdateCard } from "./UpdateCard";
 import {
+  isWallpaperAdjustOpen,
   notifyWallpaperClick,
   notifyWallpaperPointerLeave,
   notifyWallpaperPointerMove,
+  WallpaperAdjustDialog,
   WallpaperUnderlay,
 } from "./Wallpaper";
 
@@ -102,18 +109,18 @@ const effectiveSidebarMinWidth = () =>
   Math.max(SIDEBAR_MIN_WIDTH, Math.ceil((titleBar().left || 0) + SIDEBAR_HEADER_RIGHT_CLEARANCE));
 
 const toggleSidebar = () => setSidebarOpen(!sidebarOpen());
-const toggleSettings = () => (currentView().name === "settings" ? showChat() : showSettings());
+const toggleSettings = () => (currentView().name === "settings" ? leaveSettings() : showSettings());
 
 /** Escape leaves what is on top: a dialog or inline prompt closes itself; then settings or sub-agent inspection; then the run stops. */
 function escape() {
-  if (isPaletteOpen() || isCompareOpen()) return;
+  if (isPaletteOpen() || isCompareOpen() || isZoomOpen() || isWallpaperAdjustOpen()) return;
   if (pendingDialog()) {
     if (hasInlinePrompt()) cancelPendingDialog();
     return;
   }
   if (isRenaming()) return cancelRenaming();
-  if (currentView().name === "settings") return showChat();
-  if (isRunning() || isBashRunning() || waitingCount() > 0) void stop();
+  if (currentView().name === "settings") return leaveSettings();
+  if (currentView().name === "chat" && (isRunning() || isBashRunning() || waitingCount() > 0)) void stop();
 }
 
 const needsCloseConfirm = () => !runInBackground() && activeDaemonSessionCount() > 0;
@@ -123,6 +130,7 @@ async function confirmExit(how: "quit" | "close") {
   if (exitPrompting) return;
   const count = activeDaemonSessionCount();
   if (runInBackground() || count === 0) {
+    await flushDocs();
     if (how === "quit") Application.quit();
     else Window.get("main")?.close();
     return;
@@ -151,6 +159,7 @@ async function confirmExit(how: "quit" | "close") {
     } else {
       return;
     }
+    await flushDocs();
     if (how === "quit") Application.quit();
     else Window.get("main")?.close();
   } finally {
@@ -158,9 +167,17 @@ async function confirmExit(how: "quit" | "close") {
   }
 }
 
+/** ⌘W's target: the front tab while there are several, the window when the strip holds only one. */
+function closeTabOrWindow() {
+  const id = activeTabId();
+  if (id && openTabs().length > 1) void closeTab(id);
+  else void confirmExit("close");
+}
+
 /** The application menu: every command has a place in it, and its shortcut lives here. */
 function applicationMenu() {
   const interceptExit = needsCloseConfirm();
+  const severalTabs = openTabs().length > 1 && activeTabId() !== undefined;
   Menu.setApplicationMenu([
     {
       label: "pipi",
@@ -182,13 +199,23 @@ function applicationMenu() {
       label: tr("File", "文件"),
       submenu: [
         { label: tr("New Session", "新建会话"), shortcut: "mod+n", onSelect: () => void newSession() },
+        { label: tr("New Document", "新建文档"), shortcut: "mod+shift+n", onSelect: () => void newDocTab() },
+        {
+          label: tr("Continue Draft in a Document", "在文档中继续写"),
+          shortcut: "mod+e",
+          disabled: currentView().name !== "chat",
+          onSelect: () => void draftToDoc(),
+        },
+        { label: tr("Open Markdown File…", "打开 Markdown 文件…"), onSelect: () => void pickDocTab() },
         { label: tr("Add Project Folder…", "添加项目文件夹…"), shortcut: "mod+o", onSelect: () => void chooseWorkspace() },
         { type: "separator" },
         { label: tr("Export as HTML", "导出为 HTML"), onSelect: () => void exportHtml() },
         { type: "separator" },
-        interceptExit
-          ? { label: tr("Close Window", "关闭窗口"), shortcut: "mod+w", onSelect: () => void confirmExit("close") }
-          : { role: "close" },
+        severalTabs
+          ? { label: tr("Close Tab", "关闭标签页"), shortcut: "mod+w", onSelect: () => void closeTabOrWindow() }
+          : interceptExit
+            ? { label: tr("Close Window", "关闭窗口"), shortcut: "mod+w", onSelect: () => void confirmExit("close") }
+            : { role: "close" },
       ],
     },
     {
@@ -201,6 +228,9 @@ function applicationMenu() {
         { label: tr("Command Palette…", "命令面板…"), shortcut: "mod+k", onSelect: () => setPaletteOpen(!isPaletteOpen()) },
         { label: sidebarOpen() ? tr("Hide Sidebar", "隐藏侧边栏") : tr("Show Sidebar", "显示侧边栏"), shortcut: "mod+b", onSelect: toggleSidebar },
         { label: tr("Random Wallpaper", "随机壁纸"), shortcut: "mod+u", onSelect: () => void randomWallpaper() },
+        { type: "separator" },
+        { label: tr("Next Tab", "下一个标签页"), shortcut: "mod+shift+]", disabled: openTabs().length < 2, onSelect: () => cycleTab(1) },
+        { label: tr("Previous Tab", "上一个标签页"), shortcut: "mod+shift+[", disabled: openTabs().length < 2, onSelect: () => cycleTab(-1) },
         { type: "separator" },
         { role: "toggleFullScreen" },
       ],
@@ -545,15 +575,26 @@ export function Shell() {
     // In an effect, the menu follows what it reads: the sidebar's label, whether Stop applies.
     effect(applicationMenu);
     const win = currentWindow();
-    effect(() => {
-      win.set({ closeOnPress: !needsCloseConfirm() });
-    });
-    win.on("closePress", () => {
-      if (needsCloseConfirm()) void confirmExit("close");
+    // The close button always routes through `confirmExit` — it fast-paths
+    // when nothing runs, and it is the last chance to land document saves.
+    win.set({ closeOnPress: false });
+    win.on("closePress", () => void confirmExit("close"));
+    // Back from another app: a document open here may have been written there, and the notes folder too.
+    win.on("focusChange", ({ focused }) => {
+      if (!focused) return;
+      void syncDocs();
+      void refreshNotes();
     });
   } else {
     keymap.bind({
       "mod+n": () => void newSession(),
+      "mod+shift+n": () => void newDocTab(),
+      "mod+e": () => {
+        if (currentView().name === "chat") void draftToDoc();
+      },
+      "mod+w": () => void closeTabOrWindow(),
+      "mod+shift+]": () => cycleTab(1),
+      "mod+shift+[": () => cycleTab(-1),
       "mod+o": () => void chooseWorkspace(),
       "mod+,": toggleSettings,
       "mod+k": () => setPaletteOpen(!isPaletteOpen()),
@@ -589,7 +630,8 @@ export function Shell() {
                 currentView().name === "chat" &&
                 !isPaletteOpen() &&
                 !isCompareOpen() &&
-                !pendingDialog()
+                !pendingDialog() &&
+                !isWallpaperAdjustOpen()
               ) {
                 notifyWallpaperClick(e.pagePosition.x, e.pagePosition.y);
               }
@@ -599,11 +641,14 @@ export function Shell() {
     >
       <SidebarSplit>
         <Chat />
-        <TitleBar />
+        <DocDeck />
+        <TabBar />
       </SidebarSplit>
       <Palette />
       <CompareDialog />
       <Settings />
+      <WallpaperAdjustDialog />
+      <ZoomLayer />
       <ExtensionDialog />
       <UpdateCard />
       <Toasts />

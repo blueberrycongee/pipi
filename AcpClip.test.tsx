@@ -1,7 +1,6 @@
 // Repro + regression: an ACP harness's answer (Devin's) clipped and ghosted as
-// the run settles — `LayoutAnimation.configureNext` keyed to run state animated
-// the settle layout pass, and the list's cells were left at interpolated frames
-// (see AGENTS.md "Never key it to run state").
+// the run settles. Both a global LayoutAnimation and an automatic Collapsible
+// reveal can interpolate sibling list cells during the settle layout pass.
 //
 //   nsh test AcpClip.test.tsx --target macos
 //
@@ -14,8 +13,6 @@
 //     paragraph must draw two full text lines.
 import { expect, open, test } from "nsh/test";
 import { decodeLumGrid, type Grid, lum, pixelDiff } from "./dev/frames";
-
-const OUT = "/tmp/pipi-acp-frames";
 
 const REPLY = `有，三处未提交的改动：
 
@@ -68,15 +65,11 @@ test("an ACP answer settles in place", async () => {
   await app.type("label:消息", "acp: anything uncommitted?");
   await app.submit("label:消息");
   await app.waitFor("label:复制回复", { timeout: 60000 });
-  const first = decodeLumGrid(await app.screenshot(`${OUT}/settle.png`), 2);
+  const first = decodeLumGrid(await app.screenshot(), 2);
   await app.wait(250);
-  const second = decodeLumGrid(await app.screenshot(`${OUT}/settle+250.png`), 2);
+  const second = decodeLumGrid(await app.screenshot(), 2);
   await app.wait(1000);
-  const last = decodeLumGrid(await app.screenshot(`${OUT}/settled.png`), 2);
-  for (let i = 0; i < 12; i++) {
-    await app.screenshot(`${OUT}/f${String(i).padStart(2, "0")}.png`);
-    await app.wait(100);
-  }
+  const last = decodeLumGrid(await app.screenshot(), 2);
   expect(app.shows("label:复制回复")).toBe(true);
 
   // The transcript region (right of the sidebar, above the composer).
@@ -101,6 +94,8 @@ test("an ACP answer settles in place", async () => {
   expect(para).toBeDefined();
   // Two real lines of this paragraph: adjacent starts and full height.
   expect(paraTail.s - para.s).toBeLessThanOrEqual(30);
-  expect(paraTail.e - paraTail.s).toBeGreaterThanOrEqual(7);
-  expect(para.e - para.s).toBeGreaterThanOrEqual(7);
+  // A full CJK glyph is 12–13px high at this scale: every other scanline
+  // yields six or seven rows depending on baseline alignment, not always seven.
+  expect(paraTail.e - paraTail.s).toBeGreaterThanOrEqual(6);
+  expect(para.e - para.s).toBeGreaterThanOrEqual(6);
 }, 180000);

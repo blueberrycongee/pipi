@@ -12,6 +12,7 @@ import { createLineSplitter } from "./jsonl";
 export interface DaemonSession {
   id: string;
   title: string;
+  titleLocked?: boolean;
   cwd: string;
   file?: string;
   agentId: string;
@@ -22,6 +23,7 @@ export interface DaemonSession {
   runtimeMode: RuntimeMode;
   worktree?: WorktreeInfo;
   status: "idle" | "working" | "blocked" | "failed" | "interrupted";
+  error?: string;
   unread: boolean;
   loaded: boolean;
   depth: number;
@@ -45,6 +47,7 @@ export interface DaemonAttachSpec {
 
 export interface DaemonCallbacks {
   onSession(session: DaemonSession): void;
+  onSessionRemoved?(sessionId: string): void;
   onExit?(): void;
 }
 
@@ -141,6 +144,12 @@ export class DaemonClient {
         const session = msg.session as DaemonSession;
         this.sessions.set(session.id, session);
         this.callbacks.onSession(session);
+        return;
+      }
+      case "session_removed": {
+        const sessionId = String(msg.sessionId);
+        this.sessions.delete(sessionId);
+        this.callbacks.onSessionRemoved?.(sessionId);
         return;
       }
       case "out": {
@@ -353,6 +362,11 @@ export class DaemonClient {
   /** Ends the session's process (the record survives; the next attach revives it). */
   async killSession(sessionId: string): Promise<void> {
     await this.call("kill", { sessionId });
+  }
+
+  /** Retires a daemon session (and any fileless children) from the registry altogether. */
+  async removeSession(sessionId: string): Promise<void> {
+    await this.call("remove", { sessionId });
   }
 
   /** Aborts the session's current turn and every run under it. */

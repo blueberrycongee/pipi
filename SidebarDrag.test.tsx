@@ -148,3 +148,42 @@ test("dragging a session reorders its folder's sessions only", async () => {
     "Release notes for 0.1",
   ]);
 });
+
+test("a document stands in Recent among the sessions, and drags as one of them", async () => {
+  const dir = `/tmp/pipi-sidebardrag-${Date.now()}`;
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: {
+      "harness.scenario": "welcome",
+      "harness.dataDir": dir,
+      "harness.files": JSON.stringify({ [`${dir}/docs/note-brief.md`]: "# Launch brief\n\nWhat ships on Friday.\n" }),
+      "pipi.prefs.v1": "{}",
+    },
+  });
+  await app.waitFor("text:What are we building?");
+  await app.waitFor("id:sidebar-recents >> text:Launch brief");
+  const titles = ["Launch brief", "Look around and tell me what this project is", "Refactor the transcript reducer"];
+  // Written just now: it leads the sessions of the last minute and hours.
+  expect(recentOrder(app, titles)).toEqual(titles);
+
+  await app.dragAndHold("id:sidebar-recents >> text:Launch brief", { x: 30, y: 40 });
+  expect(app.count("id:sidebar-drag-lift")).toBe(1);
+  expect(app.count("id:sidebar-drop-line")).toBe(1);
+  await app.drop();
+  await app.wait(100);
+  expect(recentOrder(app, titles)).toEqual(["Look around and tell me what this project is", "Launch brief", "Refactor the transcript reducer"]);
+
+  // A session dragged past it lands on the other side of it.
+  await app.dragAndHold("id:sidebar-recents >> text:Refactor the transcript reducer", { x: 30, y: -40 });
+  await app.drop();
+  await app.wait(100);
+  expect(recentOrder(app, titles)).toEqual(["Look around and tell me what this project is", "Refactor the transcript reducer", "Launch brief"]);
+
+  // A press that never travels still looks at the document.
+  await app.press("id:sidebar-recents >> text:Launch brief");
+  await app.waitFor("id:doc-editor");
+});

@@ -1,13 +1,13 @@
-import { createMotion, effect, Scroll, signal, Text, View } from "nsh";
-import { Button as BaseButton, Dialog, Input } from "nsh/base";
+import { effect, Scroll, signal, Text, View } from "nsh";
+import { Button as BaseButton, Input } from "nsh/base";
 import { clip } from "../lib/format";
 import { tr } from "../lib/i18n";
 import { answerDialog, cancelPendingDialog, currentView, pendingDialog, pendingDialogCount } from "../store/app";
 import { Button } from "../ui/Button";
 import { TextField } from "../ui/Controls";
 import { Icon, type IconName } from "../ui/Icon";
-import { DIALOG_RISE, keepLast, Reveal } from "../ui/motion";
-import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, SCRIM } from "../ui/styles";
+import { FloatingLayer, keepLast, Reveal } from "../ui/motion";
+import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, POPUP, PRESS } from "../ui/styles";
 
 const TOOL_ICONS: Record<string, IconName> = {
   bash: "terminal",
@@ -354,8 +354,8 @@ export function ExtensionDialog() {
     return dialog?.method === method ? (dialog as Extract<typeof dialog, { method: M }>) : undefined;
   };
   return (
-    <Dialog open={modalOpen()} animation="fade" onOpenChange={({ open }) => !open && cancelPendingDialog()} backdropClass={SCRIM} class="m-auto w-full max-w-110 px-4">
-      <View class={`gap-4 p-5 ${POPUP}`} style={{ ...GLASS_REGULAR, ...createMotion({ enter: DIALOG_RISE }).style }}>
+    <FloatingLayer open={modalOpen()} onClose={cancelPendingDialog} closeLabel={tr("Close", "关闭")} panelClass="w-full max-w-110">
+      <View class="gap-4 p-5">
         <If when={of("confirm")}>
           {(dialog) => {
             const info = () => describeConfirm(dialog().title, dialog().message);
@@ -440,6 +440,6 @@ export function ExtensionDialog() {
           )}
         </If>
       </View>
-    </Dialog>
+    </FloatingLayer>
   );
 }

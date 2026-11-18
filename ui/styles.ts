@@ -27,8 +27,8 @@ export const GLASS_CLEAR: ViewStyle = {
 export const SCRIM = "bg-scrim";
 
 /** The anchored-surface family: popovers, menus, the palette, toasts —
- * translucent popover fill over native Liquid Glass. */
-export const POPUP = "rounded-xl corner-squircle border-[0.5px] border-hairline bg-popover/72 shadow-popover dark:bg-popover/68";
+ * translucent over glass, solid on Linux where backdrop filters are not drawn. */
+export const POPUP = `rounded-xl corner-squircle border-[0.5px] border-hairline shadow-popover ${platform.os === "linux" ? "bg-popover" : "bg-popover/72 dark:bg-popover/68"}`;
 
 /** Toasts stack over the scrolling transcript, unlike other popups: an opaque
  * surface — translucent glass would let rows ghost through — and a tight
@@ -59,7 +59,7 @@ export const FIELD_SURFACE =
 
 /** Modern hairline + Liquid Glass + multi-layer photographic ambient shadow for the floating composer. */
 export const COMPOSER_SURFACE =
-  "border-[0.5px] border-hairline bg-card/65 shadow-composer transition-all duration-250 ease-out-quint hover:border-hairline-hover focus-within:border-hairline-focus focus-within:bg-card/78 focus-within:shadow-composer-focus dark:bg-card/58 dark:shadow-composer-dark dark:hover:border-hairline-hover dark:focus-within:border-hairline-focus dark:focus-within:bg-card/72 dark:focus-within:shadow-composer-dark-focus motion-reduce:transition-none";
+  "border-[0.5px] border-hairline bg-card/65 shadow-composer transition-all duration-220 ease-out-quint hover:border-hairline-hover focus-within:border-hairline-focus focus-within:bg-card/78 focus-within:shadow-composer-focus dark:bg-card/58 dark:shadow-composer-dark dark:hover:border-hairline-hover dark:focus-within:border-hairline-focus dark:focus-within:bg-card/72 dark:focus-within:shadow-composer-dark-focus motion-reduce:transition-none";
 
 /** Where the wallpaper laid under the whole window can be frosted — everywhere
  * but Linux, which draws no backdrop filter: there the sidebar keeps its solid

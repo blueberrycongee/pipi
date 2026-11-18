@@ -37,12 +37,24 @@ function withoutImageNotes(text) {
   return text.slice(0, at);
 }
 
+// A document that rode on a prompt comes after the person's words, in a block that names its
+// file (`lib/doc-wire.ts`). A title is the words; a prompt that was only documents is titled by
+// what the first one says. Read loosely, so a text already clipped or run onto one line is too.
+const DOC_BLOCK = /(?:^|\s)<(?:document|selection) path="[^"]*">[\s\S]*$/;
+
+export function titleWords(text) {
+  if (typeof text !== "string" || !text.includes(' path="')) return text;
+  const said = text.replace(DOC_BLOCK, "").trim();
+  if (said) return said;
+  return text.replace(/^\s*<(?:document|selection) path="[^"]*">\s*/, "").replace(/\s*<\/(?:document|selection)>[\s\S]*$/, "");
+}
+
 function messageText(message) {
   const content = message?.content;
-  if (typeof content === "string") return content;
+  if (typeof content === "string") return titleWords(content);
   if (Array.isArray(content)) {
     for (const block of content) {
-      if (block?.type === "text" && typeof block.text === "string") return withoutImageNotes(block.text);
+      if (block?.type === "text" && typeof block.text === "string") return titleWords(withoutImageNotes(block.text));
     }
   }
   return "";

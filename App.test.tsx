@@ -1,5 +1,7 @@
 import { expect, open, test } from "nsh/test";
 import type { OpenOptions } from "nsh/test";
+import { resolve } from "path";
+import { pathToFileURL } from "url";
 
 /** Opens the app on the scripted Pi (Harness.tsx) as a desktop window. */
 const launch = (scenario = "welcome", options: OpenOptions = {}) =>
@@ -51,28 +53,26 @@ test("a turn's process unfolds to its prose and grouped tool calls, and a call t
 });
 
 test("pastes a screenshot and copied files as attachments, not paths", async () => {
-  const pngBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
-  // Copied local files are `file:` URLs the app reads itself: the read is stubbed.
-  const app = await launch("welcome", {
-    modules: { "fs/promises": { readFile: (path: string) => (path.endsWith(".png") ? pngBytes : new Uint8Array([104, 101, 108, 108, 111])) } },
-  });
+  const imagePath = resolve("icon.png");
+  const textPath = resolve("AGENTS.md");
+  const app = await launch();
   await app.waitFor("text:What are we building?");
 
   // A screenshot paste brings its bytes: a thumbnail in the tray, nothing in the text.
   await app.paste("label:Message", { files: ["icon.png"] });
-  await app.waitFor("label:icon.png");
+  await app.waitFor("label:Remove image");
   expect(app.value("label:Message") ?? "").toBe("");
 
   // An image copied in a file manager arrives as a file: URL — it attaches too,
   // rather than turning into a path in the input.
   await app.press("label:Remove image");
-  await app.paste("label:Message", { uris: ["file:///Users/pip/shot.png"], text: "/Users/pip/shot.png" });
-  await app.waitFor("label:shot.png");
+  await app.paste("label:Message", { uris: [pathToFileURL(imagePath).href], text: imagePath });
+  await app.waitFor("label:icon.png");
   expect(app.value("label:Message") ?? "").toBe("");
 
   // A copied non-image file goes in as its path: a reference the agent reads with tools.
-  await app.paste("label:Message", { uris: ["file:///Users/pip/notes.txt"], text: "file:///Users/pip/notes.txt" });
-  await app.waitUntil(() => app.value("label:Message") === "/Users/pip/notes.txt");
+  await app.paste("label:Message", { uris: [pathToFileURL(textPath).href], text: pathToFileURL(textPath).href });
+  await app.waitUntil(() => app.value("label:Message") === textPath);
 
   // Plain text still pastes as text.
   await app.clear("label:Message");
@@ -113,6 +113,9 @@ test("Usage shows what each agent reported: a cost only where one was named, no 
   expect(texts.some((text) => text.endsWith(" · $3.11"))).toBe(true);
   expect(texts.some((text) => text.includes("$0.00"))).toBe(false);
   expect(texts.some((text) => text.includes("tokens came with no cost from their agent"))).toBe(true);
+  // The session count is the row's value; its messages and tool calls read in full below the title.
+  expect(texts).toContain("760 messages · 1904 tool calls");
+  expect(texts).toContain("31");
   // Kimi reported nothing: named once below the list, with no row of its own.
   expect(texts.filter((text) => text.includes("Kimi"))).toEqual(["Not counted: 2 sessions from Kimi CLI. The agent reported no usage for them, or they were saved before pipi recorded it."]);
 });
@@ -287,8 +290,9 @@ test("renames from the title bar: a press outside commits, Escape cancels", asyn
   const app = await launch("history");
   await app.waitFor("text:Here is the plan.");
 
-  // Open the inline rename from the title and type a new name.
-  await app.press("id:session-title");
+  // Open the inline rename from the tab's menu and type a new name.
+  await app.rightClick("id:tab-0");
+  await app.chooseMenuItem("Rename…");
   await app.waitFor("label:Session name");
   await app.clear("label:Session name");
   await app.type("label:Session name", "Renamed session");
@@ -299,7 +303,8 @@ test("renames from the title bar: a press outside commits, Escape cancels", asyn
   expect(app.count("label:Session name")).toBe(0);
 
   // Escape drops the edit instead.
-  await app.press("id:session-title");
+  await app.rightClick("id:tab-0");
+  await app.chooseMenuItem("Rename…");
   await app.waitFor("label:Session name");
   await app.clear("label:Session name");
   await app.type("label:Session name", "Discarded name");
@@ -426,7 +431,7 @@ test("shows tool permission confirmation inline above the composer while keeping
 });
 
 test("shows what is sent during a run in the conversation alone, and takes each message back from its own bubble", async () => {
-  const app = await launch("stream");
+  const app = await launch("slow", { clock: {} });
   await app.waitFor("text:What are we building?");
   await app.type("label:Message", "make a long plan");
   await app.submit("label:Message");
@@ -442,6 +447,7 @@ test("shows what is sent during a run in the conversation alone, and takes each 
   // The bubbles show in the order sent, each once: nothing lists them a second time over the composer.
   const texts = app.texts();
   expect(texts.indexOf("also update the readme")).toBeLessThan(texts.indexOf("keep the changelog in step"));
+  expect(texts.indexOf("keep the changelog in step")).toBeLessThan(texts.indexOf("then tag the release"));
   for (const text of ["also update the readme", "keep the changelog in step", "then tag the release"]) {
     expect(texts.filter((item) => item === text).length).toBe(1);
   }
@@ -467,13 +473,21 @@ test("shows what is sent during a run in the conversation alone, and takes each 
   await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 1);
   expect(app.texts().some((text) => /^Part \d+ of the plan$/.test(text))).toBe(true);
 
-  // The one left is delivered in its turn, and only it.
-  await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 0, { timeout: 60000 });
-  await app.wait(3500);
+  // Send the edited steering message again: it waits behind the earlier follow-up on screen.
+  await app.submit("label:Message");
+  await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 2);
+  const waitingTexts = app.texts();
+  expect(waitingTexts.indexOf("then tag the release")).toBeLessThan(waitingTexts.indexOf("keep the changelog in step"));
+
+  // Advance the run through delivery: steering is answered before the follow-up, not in send order.
+  await app.waitFor("label:Send", { timeout: 120000 });
   expect(app.count("label:Conversation >> text:then tag the release")).toBe(1);
   expect(app.count("label:Conversation >> text:also update the readme")).toBe(0);
-  expect(app.count("label:Conversation >> text:keep the changelog in step")).toBe(0);
-}, 120000);
+  expect(app.count("label:Conversation >> text:keep the changelog in step")).toBe(1);
+  expect(app.count("label:Conversation >> text:Queued")).toBe(0);
+  const deliveredTexts = app.texts();
+  expect(deliveredTexts.indexOf("keep the changelog in step")).toBeLessThan(deliveredTexts.indexOf("then tag the release"));
+}, 600000);
 
 test("keeps a run going in the background when switching sessions, and resumes it", async () => {
   const app = await launch("slow");
@@ -633,7 +647,8 @@ test("displays the sent user bubble before any thinking or writing indicator on 
   // First message from the welcome stage, then an immediate follow-up while Pip is still celebrating.
   await assertChronologicalSend("第一条消息：先显示气泡再显示正在回复");
   await assertChronologicalSend("第二条消息：紧接着发送也要保持时间顺序");
-});
+  // Two bounded 25s virtual runs take up to ~5x real time on AppKit, plus launch and input.
+}, 300000);
 
 test("shows a message sent mid-run as a bubble in the conversation at once, and only once delivered", async () => {
   const app = await launch("stream");
@@ -662,6 +677,3 @@ test("shows a message sent mid-run as a bubble in the conversation at once, and 
   expect(app.count("label:Edit queued message")).toBe(0);
   expect(app.count("label:Conversation >> text:Queued")).toBe(0);
 }, 90000);
-
-
-

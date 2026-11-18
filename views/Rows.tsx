@@ -4,6 +4,7 @@ import { Collapsible, TextView } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { clip } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
+import { type DocPart, splitDocMessage } from "../lib/doc-wire";
 import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
 import { type Row, type ToolRow, withoutHandoff, withoutImageNotes } from "../pi/transcript";
 import {
@@ -21,6 +22,8 @@ import {
   type TurnHeaderRow,
 } from "../pi/turns";
 import { conversationKey, copyMessage, copyText, daemonSessionOfId, forkFrom, messageQueue, openDaemonSession, takeQueued, transcriptRows } from "../store/app";
+import { docTabTitle, titleLine } from "../store/docs";
+import { noteFromText, openDocIfThere } from "../store/tabs";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
@@ -93,16 +96,15 @@ export function setProcessTurns(rows: ReadonlyMap<string, string>) {
 }
 
 /**
- * Per-turn scoped fold lifecycle (both auto-fold on answer arrival and manual
- * toggle on `TurnHeaderView`). Uses `Collapsible`'s scoped native spring
- * (`Spring::new(180)`, ~265ms critically damped) per process row instead of
- * global `LayoutAnimation.configureNext`, so the virtualized `List` never
- * cross-fades or clips sibling/recycled cells.
+ * Automatic folds commit once the reply is lit. Only reader-initiated folds
+ * use a scoped spring: even a scoped layout animation moves the virtualized
+ * list's sibling cells, leaving the finished reply shifted while it settles.
  */
 const FOLD_SETTLE_MS = 275;
 const closingTurns = signal<Record<string, "arming" | "collapsing">>({});
 const openingTurns = signal<Record<string, "arming" | "expanding">>({});
 const pendingAutoClose = new Set<string>();
+const autoFoldCommit = signal(0);
 const foldTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
 
 const horizonPromptId = signal<string | undefined>(undefined);
@@ -164,6 +166,7 @@ function recallQueuedRow(row: Extract<Row, { kind: "user" }>, edit: boolean) {
 /** Read inside `displayRows` so projection re-runs when a turn finishes collapsing. */
 export function trackFoldState() {
   closingTurns();
+  autoFoldCommit();
 }
 
 /** Whether `id`'s process rows stay mounted in `displayRows` while collapsing to 0pt. */
@@ -183,19 +186,12 @@ function clearTurnTimers(id: string) {
 function scheduleAutoFold(id: string) {
   clearTurnTimers(id);
   pendingAutoClose.add(id);
-  // The settle commit lays out the finished reply in a Copy seat that is
-  // already taken; the process rows then collapse in their own scoped pass —
-  // but only once the reply's last word is lit: a fold that leaves earlier
-  // pulls the floor from under a word still arriving.
+  // Wait for the last word, then remove the process in one layout pass.
+  // A Collapsible reveal here interpolates sibling list cells at run settle.
   const collapse = () => {
-    pendingAutoClose.delete(id);
-    closingTurns.update((all) => ({ ...all, [id]: "collapsing" }));
-    const tDone = setTimeout(() => {
-      clearTurnTimers(id);
-      closingTurns.update(({ [id]: _, ...rest }) => rest);
-      foldSettled();
-    }, FOLD_SETTLE_MS);
-    foldTimers.set(id, [tDone]);
+    clearTurnTimers(id);
+    autoFoldCommit.update((n) => n + 1);
+    foldSettled();
   };
   const tCollapse = setTimeout(() => {
     const wait = proseVeilUntil() - Date.now();
@@ -459,10 +455,22 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
       .filter((row) => row.kind === "user")
       .findIndex((row) => row.id === props.row.id);
   const open = () => isOpen(props.row.id, false);
+  /** The message as its words and the documents that rode on them (`lib/doc-wire.ts`); read again only when the text is another. */
+  let readText: string | undefined;
+  let read: { said: string; docs: DocPart[] } = { said: "", docs: [] };
+  const parts = () => {
+    const text = props.row.text;
+    if (text !== readText) {
+      readText = text;
+      read = splitDocMessage(text);
+    }
+    return read;
+  };
+  const said = () => parts().said;
   const foldable = () => {
     const measured = userLineCounts()[props.row.id];
     if (measured !== undefined) return measured > USER_FOLD_LINES;
-    return hardBreakLines(props.row.text) > USER_FOLD_LINES || roughUserLines(props.row.text) >= USER_PREFOLD_LINES;
+    return hardBreakLines(said()) > USER_FOLD_LINES || roughUserLines(said()) >= USER_PREFOLD_LINES;
   };
   const folded = () => foldable() && !open();
   const fold = () => toggle(props.row.id, false);
@@ -534,7 +542,7 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
           )
         }
       >
-        <If when={props.row.text}>
+        <If when={said()}>
           {/* While folded the whole message takes the press; while open it is plain selectable text again. */}
           <View
             role={folded() ? "button" : undefined}
@@ -547,15 +555,33 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
               onTextLayout={(e) => {
                 const n = e.lines.length;
                 // Fewer lines than the text's own breaks (or a zero-height headless stub box) is not a real layout pass.
-                if (n < hardBreakLines(props.row.text) || (n === 1 && (e.lines[0]?.bounds.size.height ?? 0) === 0)) return;
+                if (n < hardBreakLines(said()) || (n === 1 && (e.lines[0]?.bounds.size.height ?? 0) === 0)) return;
                 if (folded() && n >= USER_FOLD_LINES) return;
                 if (n !== userLineCounts()[props.row.id]) userLineCounts.update((all) => ({ ...all, [props.row.id]: n }));
               }}
             >
-              {props.row.text}
+              {said()}
             </Text>
           </View>
         </If>
+        {/* A document that rode on the message is named, not printed: its words are in the document, a press away. */}
+        <Each of={parts().docs} key="index">
+          {(doc) => (
+            <View
+              testID="message-doc"
+              role="button"
+              onPress={() => void openDocIfThere(doc().path)}
+              tooltip={tip(tr("Open the document", "打开文档"))}
+              class={`-mx-1 select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle px-1 py-0.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
+            >
+              <Icon name="file" size={14} tone="muted-foreground" />
+              <Text class="shrink truncate text-xs text-muted-foreground">
+                {(doc().excerpt ? "" : titleLine(doc().text, true)) || docTabTitle(doc().path)}
+                {doc().excerpt ? tr(" · selection", " · 选中的内容") : ""}
+              </Text>
+            </View>
+          )}
+        </Each>
         <If when={props.row.images > 0}>
           <View class="select-none flex-row items-center gap-1.5">
             <Icon name="image" size={14} tone="muted-foreground" />
@@ -692,7 +718,19 @@ function ReplyActionsView(props: { row: ReplyActionsRow }) {
   return (
     <View class="h-6 select-none flex-row items-center">
       <Presence show={!props.row.held} scaleFrom={1} class="-ml-1">
-        <CopyButton id={props.row.id} text={props.row.text} label={tr("Copy reply", "复制回复")} />
+        <View class="flex-row items-center">
+          <CopyButton id={props.row.id} text={props.row.text} label={tr("Copy reply", "复制回复")} />
+          {/* The reply kept as a document: something to edit, and to take to another session. */}
+          <IconButton
+            testID="reply-to-note"
+            icon="fileEdit"
+            size="sm"
+            tone="subtle"
+            tipPlacement="bottom"
+            label={tr("Save as Document", "存为文档")}
+            onPress={() => void noteFromText(props.row.text)}
+          />
+        </View>
       </Presence>
     </View>
   );

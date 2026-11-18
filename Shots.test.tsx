@@ -1,8 +1,8 @@
 // Screenshots of every state, for design review, from the scripted Pi:
 //
-//   nsh test Shots.test.tsx --target macos      # writes .nsh/shots/*.png
+//   mkdir -p .nsh/shots && nsh test Shots.test.tsx --target macos
 //
-// Only a real platform draws the app, so headless runs skip.
+// Only a real platform draws the app; headless runs still exercise every state.
 import { open, test } from "nsh/test";
 import type { App } from "nsh/test";
 
@@ -16,7 +16,8 @@ async function shot(app: App, name: string) {
   await app.wait(500);
   try {
     await app.screenshot(`.nsh/shots/${name}.png`);
-  } catch {
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "a screenshot needs a real platform, which draws the app: run the test with `--target`") throw error;
     drawn = false;
   }
 }
@@ -26,12 +27,11 @@ test("states", async () => {
     let app = await launch("welcome", scheme);
     await app.waitFor("text:What are we building?");
     await shot(app, `welcome-${scheme}`);
-    if (!drawn) return;
     await app.press("text:Claude Sonnet 4.5");
     await shot(app, `models-${scheme}`);
-    await app.press("label:Message");
+    await app.keyboard.press("escape");
     await app.paste("label:Message", { files: ["icon.png", "icon.png"] });
-    await app.waitFor("label:icon.png");
+    await app.waitFor("label:Attachments");
     await shot(app, `attachments-${scheme}`);
 
     app = await launch("multi", scheme);

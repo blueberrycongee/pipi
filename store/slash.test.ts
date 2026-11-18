@@ -59,9 +59,14 @@ test("an engine's command reaches it as written, a shell-owned name never does, 
   store.setDraft("/rename Audit");
   await store.send();
   await until(() => store.sessionState()?.sessionName === "Audit", "the rename");
+  const auditDaemonId = store.currentDaemonId();
   store.setDraft("/clear");
   await store.send();
-  await until(() => store.transcriptRows().length === 0, "the new session");
+  await until(() => store.transcriptRows().length === 0 && store.currentDaemonId() !== auditDaemonId, "the new session");
+  expect(store.sessionState()?.sessionName).toBeUndefined();
+  const auditSession = store.daemonSessions().find((s) => s.id === auditDaemonId);
+  expect(auditSession).toBeDefined();
+  expect(auditSession?.title).not.toBe("New session");
+  expect(store.daemonSessionTitle(auditSession!)).toBe("Audit");
   expect(prompts().length).toBe(sent);
-  expect(backend.sent.some((command) => command.type === "new_session")).toBe(true);
 });

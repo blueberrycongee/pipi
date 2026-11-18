@@ -1,4 +1,5 @@
 import fs from "fs/promises";
+import { titleWords } from "../lib/doc-wire";
 import { runHelper } from "./sidecar";
 export { parseSessionSnapshot, readSessionSnapshot, type SessionSnapshot, type SessionSnapshotOptions } from "./session-file";
 
@@ -46,6 +47,7 @@ export async function deleteSession(path: string) {
 
 /** What a session is called in lists and the title bar. */
 export function sessionTitle(session: { name?: string; firstMessage?: string }, fallback = "New session") {
-  const text = (session.name || session.firstMessage || "").replace(/\s+/g, " ").trim();
+  // A first message is titled by its words, not by the documents that rode on it; one that is a document opens on a heading's words, not its marks.
+  const text = (session.name || titleWords(session.firstMessage ?? "").replace(/^\s*#{1,6}\s+/, "")).replace(/\s+/g, " ").trim();
   return text || fallback;
 }

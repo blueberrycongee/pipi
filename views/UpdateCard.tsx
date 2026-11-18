@@ -285,17 +285,14 @@ export function UpdateCard() {
           style={enter.style}
           role="alert"
         >
-          {/* Head: the version line, and the ways to put the card off while it may wait. */}
+          {/* Head: the version line, and the way to put the card off while it may wait. */}
           <View class="flex-row items-start justify-between gap-2">
             <View class="min-w-0 flex-1 gap-0.5">
               <Text class="shrink text-sm font-medium text-foreground">{title()}</Text>
               <Text class="text-xs text-muted-foreground">{subtitle()}</Text>
             </View>
             <If when={dismissable()}>
-              <View class="flex-row items-center gap-0.5">
-                <Button label={tr("Later", "稍后")} variant="ghost" size="sm" onPress={dismissAppUpdate} />
-                <IconButton icon="x" size="sm" label={tr("Dismiss", "关闭")} onPress={dismissAppUpdate} />
-              </View>
+              <IconButton icon="x" size="sm" label={tr("Dismiss", "关闭")} onPress={dismissAppUpdate} />
             </If>
           </View>
 

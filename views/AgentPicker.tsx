@@ -1,5 +1,5 @@
-import { computed, createMotion, Scroll, signal, Text, View } from "nsh";
-import { Button as BaseButton, Dialog, Input, Popover } from "nsh/base";
+import { computed, Scroll, signal, Text, View } from "nsh";
+import { Button as BaseButton, Input, Popover } from "nsh/base";
 import { runtimeModeRank } from "../agents/catalog";
 import type { RuntimeMode, WorkspaceIsolation } from "../agents/types";
 import { formatAgentMeta, runtimeModeIcon, runtimeModeText, tr } from "../lib/i18n";
@@ -25,8 +25,8 @@ import { AgentLogo } from "../ui/AgentLogo";
 import { Button, Chip, IconButton } from "../ui/Button";
 import { Switch } from "../ui/Controls";
 import { Icon } from "../ui/Icon";
-import { DIALOG_RISE, popupHiddenStyle, popupLeavingStyle, popupStyle } from "../ui/motion";
-import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, SCRIM } from "../ui/styles";
+import { FloatingLayer, popupHiddenStyle, popupLeavingStyle, popupStyle } from "../ui/motion";
+import { FIELD_SURFACE, POPUP, PRESS } from "../ui/styles";
 
 const RUNTIME_MODES: readonly RuntimeMode[] = ["approval-required", "auto-accept-edits", "full-access"];
 
@@ -34,7 +34,7 @@ const RUNTIME_MODES: readonly RuntimeMode[] = ["approval-required", "auto-accept
  * The composer's Agent Harness chip (`Pi`, `Claude Code`, `Codex`, `OpenCode`, `Cursor`, or custom ACP).
  * Switching mid-conversation automatically prepares a Portable Context Handoff!
  */
-export function AgentPicker() {
+export function AgentPicker(props: { onOpen?: () => void }) {
   const open = signal(false);
   const current = () => activeAgent();
   const pickerAgents = computed(() => {
@@ -50,7 +50,10 @@ export function AgentPicker() {
   return (
     <Popover
       open={open()}
-      onOpenChange={(e) => open.set(e.open)}
+      onOpenChange={(e) => {
+        if (e.open) props.onOpen?.();
+        open.set(e.open);
+      }}
       placement="top"
       align="start"
       offset={8}
@@ -95,7 +98,7 @@ export function AgentPicker() {
 }
 
 /** The composer's Runtime Permission Mode chip (`Supervised` / `Auto-edit` / `Full access`). */
-export function PermissionPicker() {
+export function PermissionPicker(props: { onOpen?: () => void }) {
   const open = signal(false);
   const mode = () => runtimeMode();
   const ceiling = () => currentRuntimeCeiling();
@@ -103,7 +106,10 @@ export function PermissionPicker() {
   return (
     <Popover
       open={open()}
-      onOpenChange={(e) => open.set(e.open)}
+      onOpenChange={(e) => {
+        if (e.open) props.onOpen?.();
+        open.set(e.open);
+      }}
       placement="top"
       align="end"
       offset={8}
@@ -186,14 +192,14 @@ export function CompareDialog() {
   };
 
   return (
-    <Dialog
+    <FloatingLayer
       open={isCompareOpen()}
-      animation="fade"
-      onOpenChange={({ open }) => setCompareOpen(open)}
-      backdropClass={SCRIM}
-      class="mx-auto mt-20 w-full max-w-150 px-4"
+      onClose={close}
+      closeLabel={tr("Close", "关闭")}
+      frameClass="items-center px-4 pb-6 pt-20"
+      panelClass="w-full max-w-150"
     >
-      <View class={`gap-4 p-5 ${POPUP}`} style={{ ...GLASS_REGULAR, ...createMotion({ enter: DIALOG_RISE }).style }}>
+      <View class="gap-4 p-5">
         <View class="flex-row items-start justify-between gap-3">
           <View class="min-w-0 flex-1 gap-0.5">
             <Text class="text-lg font-semibold text-foreground" role="header">
@@ -269,6 +275,6 @@ export function CompareDialog() {
           <Button label={tr("Launch Comparison", "开始并行对比")} variant="primary" size="lg" icon="agents" disabled={!effectiveTask()} onPress={() => void run()} />
         </View>
       </View>
-    </Dialog>
+    </FloatingLayer>
   );
 }

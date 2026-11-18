@@ -58,6 +58,8 @@ export interface Backend {
   pickFolder(prompt: string): Promise<string | undefined>;
   /** Shows the system's image file picker; resolves with the selected image path, or `undefined` when cancelled. Throws `NoPickerError` when no picker tool exists. */
   pickImage?(prompt: string): Promise<string | undefined>;
+  /** Shows the system's file picker limited to `extensions` (without dots); resolves with the picked path, or `undefined` when cancelled. Throws `NoPickerError` when no picker tool exists. */
+  pickFile?(prompt: string, extensions?: string[]): Promise<string | undefined>;
   /** Asks the app's update source (`nsh.json` → `updater`) for a newer version; `null` when up to date or updates don't apply here. */
   checkAppUpdate?(): Promise<AppUpdate | null>;
   /** Downloads the update the last check found; rejects when there is none or it cannot install here. */
@@ -220,6 +222,44 @@ const system: Backend = {
         const out = await runDesktopPicker([
           ["zenity", ["--file-selection", `--title=${prompt}`, `--file-filter=${label} | ${patterns}`, "--file-filter=All files | *"]],
           ["kdialog", ["--getopenfilename", ".", `${patterns}|${label}`, "--title", prompt]],
+        ]);
+        return out || undefined;
+      }
+      return undefined;
+    } catch (error) {
+      if (error instanceof NoPickerError) throw error;
+      return undefined;
+    }
+  },
+  async pickFile(prompt, extensions = []) {
+    try {
+      if (process.platform === "macos") {
+        const types = extensions.map((t) => JSON.stringify(t)).join(", ");
+        const script = types
+          ? `POSIX path of (choose file of type {${types}} with prompt ${JSON.stringify(prompt)})`
+          : `POSIX path of (choose file with prompt ${JSON.stringify(prompt)})`;
+        const { code, stdout } = await process.run("osascript", ["-e", script], { timeoutMs: 600_000 });
+        const path = stdout.trim();
+        return code === 0 && path ? path : undefined;
+      }
+      if (process.platform === "windows") {
+        const patterns = extensions.map((ext) => `*.${ext}`).join(";") || "*.*";
+        const script = [
+          "Add-Type -AssemblyName System.Windows.Forms",
+          `$d = New-Object System.Windows.Forms.OpenFileDialog`,
+          `$d.Title = ${JSON.stringify(prompt)}`,
+          `$d.Filter = 'Files|${patterns}|All files|*.*'`,
+          `if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }`,
+        ].join("; ");
+        const { code, stdout } = await process.run("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-Command", script], { timeoutMs: 600_000 });
+        const path = stdout.trim().split(/\r?\n/).pop()?.trim() ?? "";
+        return code === 0 && path ? path : undefined;
+      }
+      if (process.platform === "linux") {
+        const patterns = extensions.map((ext) => `*.${ext}`).join(" ");
+        const out = await runDesktopPicker([
+          ["zenity", ["--file-selection", `--title=${prompt}`, ...(patterns ? [`--file-filter=Files | ${patterns}`, "--file-filter=All files | *"] : [])]],
+          ["kdialog", ["--getopenfilename", ".", `${patterns || "*"}|Files`, "--title", prompt]],
         ]);
         return out || undefined;
       }

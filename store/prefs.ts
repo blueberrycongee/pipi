@@ -49,6 +49,17 @@ export interface ArchivedSessionMeta {
   gone?: true;
 }
 
+/** A surface the top tab strip held: a chat session, or a markdown document. */
+export interface StoredOpenTab {
+  kind: "chat" | "doc";
+  /** chat: the conversation's session file ("daemon:<id>" while file-less, "" for an unstarted draft); doc: the file's path. */
+  ref: string;
+  /** chat with a `"daemon:"` ref only: the `.jsonl` it resolved to once, for reopening after a daemon restart. */
+  file?: string;
+  /** Only looked at so far (the strip's preview seat). */
+  preview?: boolean;
+}
+
 /** What the user last picked on one agent's pickers; every fresh session on that agent restores it. */
 export interface AgentSessionChoice {
   /** Model as `{provider, id}` (the same key the model list uses). */
@@ -79,6 +90,8 @@ interface Prefs {
   archivedSessions: Record<string, ArchivedSessionMeta>;
   /** Days without activity before an inactive conversation is archived automatically; `0` turns it off. */
   autoArchiveDays: AutoArchiveDays;
+  /** The top tab strip's surfaces, left to right, restored on the next launch. */
+  openTabs: StoredOpenTab[];
   /** The last active project folder. */
   activeWorkspace?: string;
   appearance: Appearance;
@@ -157,6 +170,7 @@ const DEFAULTS: Prefs = {
   collapsedGroups: ["archived"],
   archivedSessions: {},
   autoArchiveDays: 0,
+  openTabs: [],
   appearance: "system",
   pipCoat: "ghost",
   language: "system",
@@ -264,6 +278,25 @@ function normalizeRankMap(raw: unknown): Record<string, Record<string, number>> 
   return out;
 }
 
+function normalizeOpenTabs(raw: unknown): StoredOpenTab[] {
+  if (!Array.isArray(raw)) return [];
+  const out: StoredOpenTab[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const t = item as Partial<StoredOpenTab>;
+    if (t.kind !== "chat" && t.kind !== "doc") continue;
+    if (typeof t.ref !== "string") continue;
+    if (t.kind === "doc" && !t.ref) continue;
+    out.push({
+      kind: t.kind,
+      ref: t.ref,
+      ...(typeof t.file === "string" && t.file ? { file: t.file } : {}),
+      ...(t.preview === true ? { preview: true } : {}),
+    });
+  }
+  return out;
+}
+
 function normalizeSessionChoices(raw: unknown): Record<string, AgentSessionChoice> {
   if (!raw || typeof raw !== "object") return {};
   const out: Record<string, AgentSessionChoice> = {};
@@ -284,6 +317,9 @@ function normalizeSessionChoices(raw: unknown): Record<string, AgentSessionChoic
 }
 
 const prefs = signal<Prefs>(DEFAULTS);
+/** `loadPrefs` finished: late readers (the tab strip's restore) wait on it, since views mount before it resolves. */
+const loaded = signal(false);
+export const prefsReady = () => loaded();
 
 /** Reads the stored preferences; call once, before the first screen. */
 export async function loadPrefs() {
@@ -308,6 +344,7 @@ export async function loadPrefs() {
         sessionRanks: normalizeRankMap(parsed.sessionRanks),
         collapsedGroups,
         archivedSessions: normalizeArchivedSessions(parsed.archivedSessions),
+        openTabs: normalizeOpenTabs(parsed.openTabs),
         autoArchiveDays: AUTO_ARCHIVE_DAYS.includes(parsed.autoArchiveDays as AutoArchiveDays)
           ? (parsed.autoArchiveDays as AutoArchiveDays)
           : 0,
@@ -353,6 +390,7 @@ export async function loadPrefs() {
   }
   applyAppearance(prefs().appearance);
   applyWallpaperTheme();
+  loaded.set(true);
 }
 
 function change(patch: Partial<Prefs>) {
@@ -389,6 +427,13 @@ export const archivedSessions = () => prefs().archivedSessions;
 export const isSessionArchived = (path: string | undefined) =>
   !!path && Object.prototype.hasOwnProperty.call(prefs().archivedSessions, path);
 export const autoArchiveDays = () => prefs().autoArchiveDays;
+export const storedOpenTabs = () => prefs().openTabs;
+
+/** Remembers the tab strip's surfaces between launches; the order is the strip's. */
+export function setOpenTabs(tabs: StoredOpenTab[]) {
+  change({ openTabs: tabs });
+}
+
 export const appearance = () => prefs().appearance;
 export const pipCoat = (): CoatId => (isCoat(prefs().pipCoat) ? prefs().pipCoat : "ghost");
 export const language = () => prefs().language;

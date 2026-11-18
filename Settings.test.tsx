@@ -209,6 +209,9 @@ test("dynamic wallpaper entry points show in Settings and Command Palette, and s
 
   await app.keyboard.press("mod+k");
   await app.waitFor("text:Random Wallpaper");
+  // The list draws the rows in view: asked for by name, the wallpaper's are among them wherever they stand in it.
+  await app.type("label:Commands", "wallpaper");
+  await app.waitUntil(() => app.texts().some((t) => t.includes("Live Wallpaper")));
   const paletteTexts = app.texts();
   expect(paletteTexts.some((t) => t.includes("Live Wallpaper"))).toBe(true);
   expect(paletteTexts).toContain("Resume Dynamic Wallpaper");

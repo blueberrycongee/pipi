@@ -248,6 +248,13 @@ async function runSingleTurn(promptText) {
     const target = promptText.split("pingpong-start:")[1].trim();
     await callMcp("session_send", { session: target, message: "pingpong-mode first" });
     reply = "started-pingpong";
+  } else if (promptText.startsWith("watch:")) {
+    const clearMs = Number(promptText.slice(6)) || 0;
+    emit({ type: "pipi_background_watch", active: true });
+    if (clearMs > 0) {
+      setTimeout(() => emit({ type: "pipi_background_watch", active: false }), clearMs).unref?.();
+    }
+    reply = \`watch:\${clearMs}\`;
   }
 
   const asst = { role: "assistant", content: [{ type: "text", text: reply }], stopReason: "stop", timestamp: Date.now() };
@@ -433,6 +440,10 @@ async function openControl(homeDir, envOverrides) {
     }
     if (msg.type === "session" && msg.session && !msg.id) {
       sessions.set(msg.session.id, msg.session);
+      return;
+    }
+    if (msg.type === "session_removed" && msg.sessionId) {
+      sessions.delete(msg.sessionId);
       return;
     }
     if (msg.id && pending.has(msg.id)) {
@@ -1385,4 +1396,184 @@ test("a fresh attach adopts the standby the last attach warmed — invisibly, an
   const read3 = await ctrl.readMessages(sid3);
   const env3 = JSON.parse(read3.messages.at(-1).text);
   assert.ok(!boots3.includes(env3.pid), "an expired standby is not adopted — a fresh process took it");
+});
+
+test("untouched blank drafts reap on detach, idle exits stay idle, attach clears failed/interrupted, and remove retires fileless sessions", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-lifecycle-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+
+  const ctrl = await openControl(homeDir, { HOME: tmp, PIPI_DAEMON_POOL: "0" });
+  t.after(async () => {
+    ctrl.client.close();
+    try {
+      const inst = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+      process.kill(inst.pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+
+  // 1. Detaching from an untouched blank UI draft reaps it cleanly (`session_removed`).
+  const blank = await ctrl.call("attach", {
+    session: { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" },
+  });
+  const blankId = blank.session.id;
+  assert.equal(ctrl.sessions.has(blankId), true);
+  await ctrl.call("detach", { sessionId: blankId });
+  await ctrl.waitUntil(() => !ctrl.sessions.has(blankId));
+
+  // 2. A session that saved a conversation stays `idle` (never `interrupted`) if its idle process exits on its own.
+  const saved = await ctrl.call("attach", {
+    session: { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" },
+  });
+  const savedId = saved.session.id;
+  ctrl.client.send({ type: "in", sessionId: savedId, line: JSON.stringify({ id: "m1", type: "prompt", message: "inspect-env" }) });
+  await ctrl.waitUntil(() => ctrl.sessions.get(savedId)?.status === "idle" && ctrl.sessions.get(savedId)?.title === "inspect-env");
+  const readEnv = JSON.parse((await ctrl.readMessages(savedId)).messages.at(-1).text);
+  await ctrl.call("detach", { sessionId: savedId });
+  process.kill(readEnv.pid, "SIGKILL");
+  await ctrl.waitUntil(() => ctrl.sessions.get(savedId)?.loaded === false);
+  assert.equal(ctrl.sessions.get(savedId)?.status, "idle", "an unexpected exit while idle must not mark the session interrupted");
+
+  // 3. Attaching to a failed session spawns a fresh process and clears its failed status back to `idle`.
+  const failedJob = await ctrl.call("start_session", {
+    input: { title: "Crashy Job", agentId: "pi", cwd: workDir, message: "die:150" },
+  });
+  const failedId = failedJob.session.id;
+  await ctrl.waitUntil(() => ctrl.sessions.get(failedId)?.status === "failed");
+  const reattached = await ctrl.call("attach", {
+    session: { id: failedId, cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi" },
+  });
+  assert.equal(reattached.session.status, "idle");
+  assert.equal(ctrl.sessions.get(failedId)?.status, "idle");
+  await ctrl.call("detach", { sessionId: failedId });
+
+  // 4. `remove` retires a fileless failed daemon session from the registry altogether.
+  const brokenSpawn = await ctrl.call("start_session", {
+    input: { title: "Broken Worktree", agentId: "pi", cwd: workDir, worktree: true, message: "echo:nope" },
+  });
+  const brokenId = brokenSpawn.session.id;
+  await ctrl.waitUntil(() => ctrl.sessions.get(brokenId)?.status === "failed" && !ctrl.sessions.get(brokenId)?.file);
+  await ctrl.call("remove", { sessionId: brokenId });
+  await ctrl.waitUntil(() => !ctrl.sessions.has(brokenId));
+});
+
+test("attaching a saved session file never adopts a blank pooled standby without switching into the file", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-pool-file-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+  const bootlog = path.join(tmp, "boot.log");
+
+  const savedFile = path.join(workDir, "saved.jsonl");
+  fs.writeFileSync(
+    savedFile,
+    [
+      JSON.stringify({ type: "message", message: { role: "user", content: "saved prompt", timestamp: 1 } }),
+      JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "saved reply" }], stopReason: "stop", timestamp: 2 } }),
+    ].join("\n") + "\n",
+  );
+
+  const ctrl = await openControl(homeDir, { HOME: tmp, PIPI_MOCK_BOOTLOG: bootlog, PIPI_DAEMON_POOL_DELAY_MS: "10" });
+  t.after(async () => {
+    ctrl.client.close();
+    try {
+      const inst = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+      process.kill(inst.pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+
+  const spec = { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" };
+  const first = await ctrl.call("attach", { session: spec });
+  const sid1 = first.session.id;
+
+  // Wait for the background standby to boot.
+  const boots = await ctrl.waitUntil(() => {
+    try {
+      const lines = fs.readFileSync(bootlog, "utf8").trim().split("\n").filter(Boolean).map(Number);
+      return lines.length >= 2 ? lines : undefined;
+    } catch {
+      return undefined;
+    }
+  });
+  ctrl.client.send({ type: "in", sessionId: sid1, line: JSON.stringify({ id: "p0", type: "prompt", message: "inspect-env" }) });
+  await ctrl.waitUntil(() => ctrl.events.some((e) => e.type === "out" && e.line?.includes("agent_settled")));
+  const env1 = JSON.parse((await ctrl.readMessages(sid1)).messages.at(-1).text);
+  const standbyPid = boots.find((pid) => pid !== env1.pid);
+  assert.ok(standbyPid, "the standby is the second booted process");
+
+  // Attaching to a saved file must NOT take the blank standby without switch_session.
+  const reopened = await ctrl.call("attach", { session: { ...spec, file: savedFile } });
+  const sidSaved = reopened.session.id;
+  assert.equal(reopened.session.file, savedFile);
+  assert.equal(reopened.session.title, "saved prompt");
+  ctrl.client.send({ type: "in", sessionId: sidSaved, line: JSON.stringify({ id: "gm1", type: "get_messages" }) });
+  const gmOut = await ctrl.waitUntil(() =>
+    ctrl.events.find((e) => e.type === "out" && e.sessionId === sidSaved && e.line?.includes('"id":"gm1"')),
+  );
+  const gmRecord = JSON.parse(gmOut.line);
+  assert.equal(gmRecord.data.messages.length, 2);
+  assert.equal(gmRecord.data.messages[0].content, "saved prompt");
+
+  // And the blank standby is still intact for the next fresh session.
+  ctrl.events.length = 0;
+  const fresh = await ctrl.call("attach", { session: spec });
+  ctrl.client.send({ type: "in", sessionId: fresh.session.id, line: JSON.stringify({ id: "p2", type: "prompt", message: "inspect-env" }) });
+  await ctrl.waitUntil(() => ctrl.events.some((e) => e.type === "out" && e.sessionId === fresh.session.id && e.line?.includes("agent_settled")));
+  const envFresh = JSON.parse((await ctrl.readMessages(fresh.session.id)).messages.at(-1).text);
+  assert.equal(envFresh.pid, standbyPid, "saved-file attach left the blank standby for the next fresh session");
+});
+
+test("pipi_background_watch stays hidden from UI clients and keeps daemon alive across windowless idle until cleared", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-watch-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+
+  const ctrl = await openControl(homeDir, { HOME: tmp, PIPI_DAEMON_POOL: "0", PIPI_DAEMON_IDLE_EXIT_MS: "250" });
+  const daemonPid = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid;
+  t.after(() => {
+    ctrl.client.close();
+    try {
+      process.kill(daemonPid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+  await ctrl.call("config", { linger: false });
+
+  const attached = await ctrl.call("attach", {
+    session: { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" },
+  });
+  const sid = attached.session.id;
+
+  ctrl.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "w1", type: "prompt", message: "watch:700" }) });
+  await ctrl.waitUntil(() => ctrl.events.some((e) => e.type === "out" && e.sessionId === sid && e.line?.includes("agent_settled")));
+  assert.equal(
+    ctrl.events.some((e) => e.type === "out" && e.line?.includes("pipi_background_watch")),
+    false,
+    "pipi_background_watch is internal to daemon and never forwarded to clients",
+  );
+
+  // Close the UI client while the background watch is active (~700ms window):
+  // the daemon must stay alive past WINDOWLESS_EXIT_MS (250ms), then exit once cleared.
+  ctrl.client.close();
+  await new Promise((r) => setTimeout(r, 400));
+  assert.doesNotThrow(() => process.kill(daemonPid, 0), "daemon stays alive while backgroundWatch is active");
+
+  const deadline = Date.now() + 5000;
+  let alive = true;
+  while (Date.now() < deadline && alive) {
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      process.kill(daemonPid, 0);
+    } catch {
+      alive = false;
+    }
+  }
+  assert.equal(alive, false, "daemon exits once backgroundWatch clears");
 });

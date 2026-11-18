@@ -463,3 +463,187 @@ test("a child session archives from its row in the tree, and comes back when res
   expect(app.count(`id:sidebar-recents >> text:${title}`)).toBe(1);
   expect(app.count(saved)).toBe(0);
 }, 60000);
+
+test("a failed fileless daemon session localizes its title, opens cleanly without bleeding another session, and does not return", async () => {
+  const now = Date.now();
+  const zombie = {
+    id: "s_zombie_1",
+    title: "New session",
+    cwd: "/Users/pip",
+    agentId: "claude",
+    agentName: "Claude Code",
+    driver: "claude",
+    initiator: "user",
+    runtimeMode: "full-access",
+    status: "interrupted",
+    unread: false,
+    loaded: false,
+    depth: 0,
+    createdAt: now - 10_000,
+    lastActive: now - 10_000,
+  };
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "zh-CN",
+    clock: {},
+    storage: {
+      "harness.scenario": "welcome",
+      "harness.startDelay": String(DELAY),
+      "harness.distinct": "1",
+      "harness.daemonSessions": JSON.stringify([zombie]),
+    },
+  });
+  await app.waitFor("text:今天要构建什么？");
+
+  // Open an existing saved session first so the chat holds another conversation's messages.
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitUntil(() => app.count("label:对话 >> text:Refactor the transcript reducer") > 0);
+  await app.wait(DELAY + 200);
+
+  // In zh-CN, the untitled failed daemon row says "新会话" (never raw English "New session") and carries the alert mark.
+  expect(app.texts()).not.toContain("New session");
+  expect(app.count("id:sidebar-recents >> id:sidebar-child-failed")).toBe(1);
+
+  // Clicking the failed "新会话" row must never bleed or morph into "Refactor the transcript reducer".
+  await app.press("id:sidebar-recents >> text:新会话");
+  const seen = await frames(app, () => ({
+    leaked: app.count("label:对话 >> text:Refactor the transcript reducer") > 0,
+    welcome: app.texts().includes("今天要构建什么？"),
+    failedMarks: app.count("id:sidebar-recents >> id:sidebar-child-failed"),
+  }));
+  expect(seen.some((f) => f.leaked)).toBe(false);
+  expect(seen.at(-1)?.welcome).toBe(true);
+  expect(seen.every((f) => f.failedMarks === 0)).toBe(true);
+
+  // Leaving it untouched for another session retires the recovered zombie instead of bringing the alert row back.
+  await app.press("id:sidebar-recents >> text:Release notes for 0.1");
+  await app.waitUntil(() => app.count("label:对话 >> text:Release notes for 0.1") > 0);
+  await app.wait(DELAY + 200);
+  expect(app.count("id:sidebar-recents >> id:sidebar-child-failed")).toBe(0);
+  expect(app.count("id:sidebar-workspaces >> id:sidebar-child-failed")).toBe(0);
+});
+
+test("failed fileless daemon sessions (root and child) expose Archive and retire cleanly when archived", async () => {
+  const now = Date.now();
+  const seeded = [
+    {
+      id: "s_failed_root",
+      title: "New session",
+      cwd: "/Users/pip",
+      agentId: "claude",
+      agentName: "Claude Code",
+      driver: "claude",
+      initiator: "user",
+      runtimeMode: "full-access",
+      status: "failed",
+      unread: false,
+      loaded: false,
+      depth: 0,
+      createdAt: now - 5_000,
+      lastActive: now - 5_000,
+    },
+    {
+      id: "s_parent_saved",
+      title: "Refactor the transcript reducer",
+      cwd: "/Users/pip",
+      file: "/sessions/two.jsonl",
+      agentId: "pi",
+      agentName: "Pi",
+      driver: "pi",
+      initiator: "user",
+      runtimeMode: "full-access",
+      status: "idle",
+      unread: false,
+      loaded: false,
+      depth: 0,
+      createdAt: now - 20_000,
+      lastActive: now - 20_000,
+    },
+    {
+      id: "s_failed_child",
+      title: "Codex · Broken worktree setup",
+      titleLocked: true,
+      cwd: "/Users/pip",
+      parentId: "s_parent_saved",
+      agentId: "codex",
+      agentName: "Codex",
+      driver: "codex",
+      initiator: "user",
+      runtimeMode: "full-access",
+      status: "failed",
+      unread: false,
+      loaded: false,
+      depth: 1,
+      createdAt: now - 3_000,
+      lastActive: now - 3_000,
+    },
+  ];
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "zh-CN",
+    reducedMotion: true,
+    storage: {
+      "harness.scenario": "welcome",
+      "harness.daemonSessions": JSON.stringify(seeded),
+    },
+  });
+  await app.waitFor("text:今天要构建什么？");
+  // Move onto a saved session so there is no open draft row sharing the "新会话" label.
+  await app.press("id:sidebar-recents >> text:Look around and tell me what this project is");
+  await app.waitFor("text:Here is the plan.");
+
+  expect(app.count("id:sidebar-recents >> id:sidebar-child-failed")).toBe(2);
+  expect(app.count("id:sidebar-workspaces >> id:sidebar-child-failed")).toBe(2);
+
+  // Archive the failed fileless root row from Recent.
+  await app.hover("id:sidebar-recents >> text:新会话");
+  await app.press("id:sidebar-recents >> label:归档 >> nth=0");
+  await app.waitUntil(() => app.count("id:sidebar-recents >> text:新会话") === 0);
+  expect(app.count("id:sidebar-workspaces >> text:新会话")).toBe(0);
+  expect(app.texts()).toContain("「新会话」已归档。");
+
+  // Archive the failed fileless child row from Recent too.
+  await app.hover("id:sidebar-recents >> text:Codex · Broken worktree setup");
+  const childIdx = app
+    .texts()
+    .slice(app.texts().indexOf("最近") + 1)
+    .filter((t) => ["Look around and tell me what this project is", "Refactor the transcript reducer", "Codex · Broken worktree setup"].includes(t))
+    .indexOf("Codex · Broken worktree setup");
+  await app.press(`id:sidebar-recents >> label:归档 >> nth=${childIdx}`);
+  await app.waitUntil(() => app.count("id:sidebar-recents >> text:Codex · Broken worktree setup") === 0);
+  expect(app.count("id:sidebar-workspaces >> text:Codex · Broken worktree setup")).toBe(0);
+  // Fileless failed sessions have no saved transcript on disk, so they retire cleanly rather than leaving ghosts in Archived.
+  expect(app.count("text:已归档")).toBe(0);
+});
+
+test("starting a new session from a saved session detaches onto a fresh draft without mutating or duplicating the saved row", async () => {
+  const app = await launch("welcome");
+  await app.waitFor("text:What are we building?");
+
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+
+  // Pressing New session must detach into a fresh draft instead of resetting the saved session to "New session".
+  await app.press("id:sidebar-new-session");
+  await app.waitFor("text:What are we building?");
+
+  expect(app.count("id:sidebar-recents >> text:Refactor the transcript reducer")).toBe(1);
+  expect(app.count("id:sidebar-workspaces >> text:Refactor the transcript reducer")).toBe(1);
+  expect(app.count("id:sidebar-recents >> text:New session")).toBe(1);
+  expect(app.count("id:sidebar-workspaces >> text:New session")).toBe(1);
+
+  // Sending in the new draft never replaces or duplicates the saved session.
+  await app.type("label:Message", "unrelated fresh draft");
+  await app.submit("label:Message");
+  await app.waitUntil(() => app.count("id:sidebar-recents >> text:unrelated fresh draft") === 1);
+  expect(app.count("id:sidebar-recents >> text:Refactor the transcript reducer")).toBe(1);
+  expect(app.count("id:sidebar-workspaces >> text:Refactor the transcript reducer")).toBe(1);
+
+  // Opening the saved session again still shows its intact conversation.
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+});

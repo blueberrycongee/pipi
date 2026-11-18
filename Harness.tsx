@@ -11,7 +11,8 @@
 // `harness.distinct` gives each saved session a history of its own, so a switch shows.
 // `harness.long` ends each saved session's history on a reply longer than the window, so where it lands shows.
 // `harness.cut` opens each saved session's history on turns that got no answer (steered, stopped, failed).
-// `harness.then` (`"<ms>:<session file>"`, `"<ms>:<file>@<folder>"` or `"<ms>:new"`, `;`-separated) changes session on
+// `harness.then` (`"<ms>:<session file>"`, `"<ms>:<file>@<folder>"`, `"<ms>:new"`, `"<ms>:tab:<n>"` or
+// `"<ms>:closetab:<n>"` — the strip's nth tab shown or closed — `;`-separated) changes session on
 // its own that long after boot: a test films the change from its first frame, which a
 // `press` (it resolves once the app is quiet) hides.
 // `harness.dies` (`"<ms>"` or `"<ms>x<count>"`) makes the first agent process (or the first `count`) go away on its
@@ -20,14 +21,18 @@
 // `harness.wallpaper` (JSON: `{}`, or `{ "path": "<absolute path>", "width": …, "height": …,
 // "kind": "video"|"shader", "preset": "jelly" }`) lays a wallpaper:
 // the repository's own picture, or any image on disk — a wallpaper is a file, and a test cannot name one here.
-// `harness.pickedImage` / `harness.pickedFolder` answer the app's file pickers, for wallpaper flows.
+// `harness.pickedImage` / `harness.pickedFolder` / `harness.pickedFile` answer the app's file pickers, for wallpaper and document flows.
+// `harness.dataDir` names the app's data folder (notes are files in its `docs/`): a real one, for the tests that save.
+// `harness.files` (JSON `{path: content}`) puts real files on disk before boot: documents and notes a test names.
 // `harness.update` (JSON of FakeOptions.update) has the update checker find a new version: the card, its
 // track and its sparkles.
+import * as fs from "fs/promises";
 import { mount, Storage } from "nsh";
 import wallpaperPicture from "./assets/brand/dmg-background@2x.png";
 import { fakeBackend, sampleHistory } from "./dev/fake-pi";
 import { boot, newSession, openSession, send, setDraft, showSettings, type SettingsSection } from "./store/app";
 import { useBackend } from "./store/backend";
+import { closeTab, openTabs, selectTab, tabId } from "./store/tabs";
 import { Shell } from "./views/Shell";
 
 const now = Date.now();
@@ -58,18 +63,20 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
   const dies = diesAfter ? { after: Number(diesAfter), times: Number(diesTimes ?? 1) } : undefined;
   const startsAllowed = await Storage.getItem("harness.starts");
   if (scenario === "multi" || scenario === "multi-slow") {
-    const existing = await Storage.getItem("pipi.prefs.v1");
-    if (!existing) {
-      await Storage.setItem(
-        "pipi.prefs.v1",
-        JSON.stringify({
-          workspaces: ["/Users/pip/code/pipi", "/Users/pip/code/nsh", "/Users/pip/code/pi-docs"],
-          activeWorkspace: "/Users/pip/code/pipi",
-          collapsedWorkspaces: [],
-          sidebarOpen: true,
-        }),
-      );
-    }
+    // Merge over whatever an earlier app in this run persisted: an `existing`
+    // check alone lets leftover prefs starve the sidebar of its workspaces.
+    const stored = JSON.parse((await Storage.getItem("pipi.prefs.v1")) ?? "{}") as Record<string, unknown>;
+    delete stored.openTabs;
+    await Storage.setItem(
+      "pipi.prefs.v1",
+      JSON.stringify({
+        ...stored,
+        workspaces: ["/Users/pip/code/pipi", "/Users/pip/code/nsh", "/Users/pip/code/pi-docs"],
+        activeWorkspace: "/Users/pip/code/pipi",
+        collapsedWorkspaces: [],
+        sidebarOpen: true,
+      }),
+    );
   }
   const wallpaperChoice = await Storage.getItem("harness.wallpaper");
   if (wallpaperChoice) {
@@ -100,6 +107,11 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       }),
     );
   }
+  const files = JSON.parse((await Storage.getItem("harness.files")) ?? "{}") as Record<string, string>;
+  for (const [path, content] of Object.entries(files)) {
+    await fs.mkdir(path.split("/").slice(0, -1).join("/"), { recursive: true }).catch(() => undefined);
+    await fs.writeFile(path, content).catch(() => undefined);
+  }
   useBackend(
     fakeBackend({
       noModels: scenario === "connect",
@@ -107,8 +119,11 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       history: scenario === "history" ? sampleHistory() : [],
       sessions: scenario === "connect" || scenario === "failed" ? [] : sessions,
       workspaceSessions: scenario === "multi" || scenario === "multi-slow" ? workspaceSessions : undefined,
+      daemonSessions: JSON.parse((await Storage.getItem("harness.daemonSessions")) ?? "null") ?? undefined,
       pickedFolder: (await Storage.getItem("harness.pickedFolder")) ?? "/Users/pip/code/new-app",
       pickedImage: (await Storage.getItem("harness.pickedImage")) ?? undefined,
+      pickedFile: (await Storage.getItem("harness.pickedFile")) ?? undefined,
+      dataDir: (await Storage.getItem("harness.dataDir")) ?? undefined,
       pace: scenario === "slow" ? 400 : scenario === "stream" || scenario === "multi-slow" ? 150 : 0,
       startDelay,
       distinctHistories,
@@ -126,6 +141,8 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
     const target = step.slice(at + 1);
     setTimeout(() => {
       if (target === "new") void newSession();
+      else if (target.startsWith("tab:")) selectTab(openTabs()[Number(target.slice(4))]);
+      else if (target.startsWith("closetab:")) closeTab(tabId(openTabs()[Number(target.slice(9))]));
       else if (target.startsWith("draft:")) setDraft(target.slice(6).replace(/\\n/g, "\n"));
       else if (target.startsWith("send:")) {
         if (target.length > 5) setDraft(target.slice(5).replace(/\\n/g, "\n"));

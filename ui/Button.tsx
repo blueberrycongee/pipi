@@ -33,9 +33,11 @@ export function Button(props: {
   shortcut?: string;
   disabled?: boolean;
   class?: string;
+  testID?: string;
 }) {
   return (
     <BaseButton
+      testID={props.testID}
       onPress={props.onPress}
       disabled={props.disabled}
       class={`shrink-0 flex-row items-center justify-center ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} disabled:opacity-40 ${SIZE[props.size ?? "md"]} ${VARIANT[props.variant ?? "secondary"]} ${props.class ?? ""}`}

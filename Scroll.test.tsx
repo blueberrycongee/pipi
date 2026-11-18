@@ -79,3 +79,16 @@ test("scrolling back down to the end follows again", async () => {
     expect(app.shows(PILL)).toBe(false);
   }
 }, 60000);
+
+test("spring-back at the streaming end keeps following", async () => {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const app = await launch();
+    await streamTo(app, 8);
+    await app.scroll("label:Conversation", -400);
+    await app.waitFor(PILL, { timeout: 2000 });
+    await app.wait(400);
+    await app.scroll("label:Conversation", 4000);
+    await app.wait(1800);
+    expect(app.shows(PILL)).toBe(false);
+  }
+}, 180000);

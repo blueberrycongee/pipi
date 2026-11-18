@@ -1,5 +1,5 @@
-import { computed, createMotion, Text, View } from "nsh";
-import { Command, type CommandItem, Dialog } from "nsh/base";
+import { computed, Text, View } from "nsh";
+import { Command, type CommandItem } from "nsh/base";
 import { runtimeModeRank } from "../agents/catalog";
 import type { RuntimeMode } from "../agents/types";
 import { basename, tildePath } from "../lib/format";
@@ -22,6 +22,7 @@ import {
   copyLastReply,
   createAndOpenWorktree,
   currentDaemonId,
+  currentView,
   currentRuntimeCeiling,
   daemonSessions,
   duplicateSession,
@@ -55,11 +56,13 @@ import {
   workspaceSessions,
 } from "../store/app";
 import { backend } from "../store/backend";
+import { docTabTitle, notes } from "../store/docs";
 import { recentWorkspaces } from "../store/prefs";
+import { newDocTab, openDocTab } from "../store/tabs";
 import { Icon, type IconName } from "../ui/Icon";
-import { DIALOG_RISE } from "../ui/motion";
+import { FloatingLayer } from "../ui/motion";
 import { runtimeModeIcon, runtimeModeText, thinkingText, tr } from "../lib/i18n";
-import { GLASS_REGULAR, POPUP, PRESS, SCRIM } from "../ui/styles";
+import { PRESS } from "../ui/styles";
 
 interface Action extends CommandItem {
   icon: IconName;
@@ -77,6 +80,7 @@ export function Palette() {
     const permissionModes: RuntimeMode[] = ["approval-required", "auto-accept-edits", "full-access"];
     return [
       { id: "new", label: tr("New Session", "新建会话"), group: sessionGroup, keywords: ["new session"], shortcut: "mod+n", icon: "pencil", run: () => void newSession() },
+      { id: "new-doc", label: tr("New Document", "新建文档"), group: sessionGroup, keywords: ["new document", "note", "write", "文档", "笔记"], shortcut: "mod+shift+n", icon: "filePlus", run: () => void newDocTab() },
       { id: "rename", label: tr("Rename Session…", "重命名会话…"), group: sessionGroup, keywords: ["rename session"], icon: "pencil", run: startRenaming },
       { id: "duplicate", label: tr("Duplicate Session", "复制会话"), group: sessionGroup, keywords: ["duplicate session"], icon: "copy", run: () => void duplicateSession() },
       ...(canArchiveCurrentSession()
@@ -232,6 +236,19 @@ export function Palette() {
             run: () => void openSession(session.path, cwd),
           };
         }),
+      // Every document the app keeps: one that has sunk in 最近 is found by what it is called.
+      ...notes().map((note): Action => {
+        const title = docTabTitle(note.path);
+        return {
+          id: `doc:${note.path}`,
+          label: title,
+          group: tr("Documents", "文档"),
+          keywords: [title, "document", "note", "文档", "笔记"],
+          icon: "file",
+          checked: currentView().name === "doc" && (currentView() as { docId?: string }).docId === note.path,
+          run: () => openDocTab(note.path),
+        };
+      }),
       ...daemonSessions()
         .filter((ds) => !ds.file && (ds.parentId || ds.initiator === "external"))
         .slice(0, 30)
@@ -272,43 +289,41 @@ export function Palette() {
   const byId = computed(() => new Map(actions().map((action) => [action.id, action])));
   const close = () => setPaletteOpen(false);
   return (
-    <Dialog
+    <FloatingLayer
       open={isPaletteOpen()}
-      animation="fade"
-      onOpenChange={({ open }) => setPaletteOpen(open)}
-      backdropClass={SCRIM}
-      class="mx-auto mt-28 w-full max-w-150 px-4"
+      onClose={close}
+      closeLabel={tr("Close command palette", "关闭命令面板")}
+      frameClass="items-center px-4 pb-6 pt-28"
+      panelClass="w-full max-w-150"
     >
-      <View class={`overflow-hidden ${POPUP}`} style={{ ...GLASS_REGULAR, ...createMotion({ enter: DIALOG_RISE }).style }}>
-        <Command
-          items={actions()}
-          placeholder={tr("Search actions, sessions and models", "搜索操作、会话和模型")}
-          accessibilityLabel={tr("Commands", "命令面板")}
-          autoFocus
-          onCancel={close}
-          onSelect={({ id }) => {
-            close();
-            byId().get(id)?.run();
-          }}
-          class="overflow-hidden"
-          searchBarClass="h-12 flex-row items-center gap-2.5 border-b border-border px-4"
-          searchPrefix={<Icon name="search" tone="subtle" />}
-          searchClass="flex-1 text-md text-foreground caret-brand placeholder:text-subtle"
-          listClass="max-h-96 p-1.5"
-          groupClass="px-2.5 pb-1 pt-2.5 text-xs font-medium text-subtle"
-          separatorClass="mx-1 my-1 h-px bg-border"
-          itemClass={`group h-9 flex-row items-center rounded-lg corner-squircle px-2.5 ${PRESS} focus:bg-accent`}
-          empty={<Text class="py-10 text-center text-sm text-muted-foreground">{tr("Nothing matches.", "无匹配结果。")}</Text>}
-          renderItem={(entry) => (
-            <View class="flex-1 flex-row items-center gap-2.5">
-              <Icon name={byId().get(entry.id)?.icon ?? "dot"} tone="muted-foreground" />
-              <Text class="flex-1 truncate text-base text-foreground">{entry.label}</Text>
-              {entry.checked ? <Icon name="check" size={14} tone="brand-text" /> : null}
-              {entry.shortcutLabel ? <Text class="text-xs text-subtle">{entry.shortcutLabel}</Text> : null}
-            </View>
-          )}
-        />
-      </View>
-    </Dialog>
+      <Command
+        items={actions()}
+        placeholder={tr("Search actions, sessions, documents and models", "搜索操作、会话、文档和模型")}
+        accessibilityLabel={tr("Commands", "命令面板")}
+        autoFocus
+        onCancel={close}
+        onSelect={({ id }) => {
+          close();
+          byId().get(id)?.run();
+        }}
+        class="overflow-hidden"
+        searchBarClass="h-12 flex-row items-center gap-2.5 border-b border-border px-4"
+        searchPrefix={<Icon name="search" tone="subtle" />}
+        searchClass="flex-1 text-md text-foreground caret-brand placeholder:text-subtle"
+        listClass="max-h-96 p-1.5"
+        groupClass="px-2.5 pb-1 pt-2.5 text-xs font-medium text-subtle"
+        separatorClass="mx-1 my-1 h-px bg-border"
+        itemClass={`group h-9 flex-row items-center rounded-lg corner-squircle px-2.5 ${PRESS} focus:bg-accent`}
+        empty={<Text class="py-10 text-center text-sm text-muted-foreground">{tr("Nothing matches.", "无匹配结果。")}</Text>}
+        renderItem={(entry) => (
+          <View class="flex-1 flex-row items-center gap-2.5">
+            <Icon name={byId().get(entry.id)?.icon ?? "dot"} tone="muted-foreground" />
+            <Text class="flex-1 truncate text-base text-foreground">{entry.label}</Text>
+            {entry.checked ? <Icon name="check" size={14} tone="brand-text" /> : null}
+            {entry.shortcutLabel ? <Text class="text-xs text-subtle">{entry.shortcutLabel}</Text> : null}
+          </View>
+        )}
+      />
+    </FloatingLayer>
   );
 }

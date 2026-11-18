@@ -34,6 +34,7 @@ const cases: Record<string, () => Promise<void>> = {
   "session-to-session": () => film("session-to-session", "history", ["/sessions/two.jsonl"]),
   "session-to-new": () => film("session-to-new", "history", ["new"]),
   "back-to-a-session-seen": () => film("back-to-a-session-seen", "welcome", ["/sessions/two.jsonl", "/sessions/four.jsonl", "/sessions/two.jsonl"]),
+  "back-from-empty": () => film("back-from-empty", "history", ["new", "/sessions/one.jsonl"]),
   "another-project": () => film("another-project", "multi", ["/sessions/nsh-1.jsonl@/Users/pip/code/nsh"]),
   "another-engine": () => film("another-engine", "welcome", ["/sessions/two.jsonl", "/sessions/three.jsonl"]),
 };

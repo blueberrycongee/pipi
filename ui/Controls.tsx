@@ -2,7 +2,7 @@ import { effect, signal, Text, untracked, View } from "nsh";
 import type { InputRef, JSX } from "nsh";
 import { Input, Switch as BaseSwitch, Tab, Tabs } from "nsh/base";
 import { LayerActive } from "./Reveal";
-import { FIELD_SURFACE, FOCUS_RING } from "./styles";
+import { FIELD_SURFACE, FOCUS_RING, PRESS, PRESS_SCALE } from "./styles";
 
 /** An on/off control. */
 export function Switch(props: { checked: boolean; onChange: (checked: boolean) => void; label: string; disabled?: boolean }) {
@@ -13,9 +13,9 @@ export function Switch(props: { checked: boolean; onChange: (checked: boolean) =
       accessibilityLabel={props.label}
       onChange={({ checked }) => props.onChange(checked)}
       hitSlop={6}
-      class={`shrink-0 rounded-full ${FOCUS_RING} disabled:opacity-50`}
-      trackClass="w-8 rounded-full bg-input p-0.5 transition-colors duration-150 checked:bg-primary"
-      thumbClass="size-4 rounded-full bg-foreground transition-transform duration-150 ease-out-quint checked:translate-x-3 checked:bg-primary-foreground"
+      class={`group shrink-0 rounded-full ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} disabled:opacity-50`}
+      trackClass="w-8 rounded-full bg-input p-0.5 transition-colors duration-100 checked:bg-primary enabled:group-hover:bg-foreground/15 enabled:group-active:bg-foreground/20 checked:enabled:group-hover:bg-primary/90 checked:enabled:group-active:bg-primary/80 motion-reduce:transition-none"
+      thumbClass="size-4 rounded-full bg-foreground transition-transform duration-150 ease-out-quint checked:translate-x-3 checked:bg-primary-foreground motion-reduce:transition-none"
     />
   );
 }

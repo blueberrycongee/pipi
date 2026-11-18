@@ -248,6 +248,9 @@ export function FloatingLayer(props: {
   open: boolean;
   onClose: () => void;
   closeLabel: string;
+  /** The full-window frame's classes, replacing `items-center justify-center
+   * p-6`: where the panel stands and the padding that keeps it off the edges. */
+  frameClass?: string;
   panelClass?: string;
   testID?: string;
   children: JSX.Element;
@@ -334,7 +337,7 @@ export function FloatingLayer(props: {
     <If when={mounted()}>
       <View
         testID={props.testID}
-        class={`absolute inset-0 z-40 items-center justify-center p-6${props.open ? "" : " pointer-events-none"}`}
+        class={`absolute inset-0 z-40 ${props.frameClass ?? "items-center justify-center p-6"}${props.open ? "" : " pointer-events-none"}`}
       >
         <View class={`pointer-events-none absolute inset-0 ${SCRIM}`} style={{ opacity: scrimOpacity }} />
         <If when={props.open}>

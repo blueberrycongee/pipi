@@ -13,6 +13,7 @@ const modelKey = (model: { provider: string; id: string }) => `${model.provider}
 
 /** The searchable list of the models Pi can call, grouped by provider. */
 export function ModelList(props: { onChosen: () => void; class?: string }) {
+  const query = signal("");
   const current = () => {
     const model = draftModel() ?? sessionState()?.model;
     return model ? modelKey(model) : "";
@@ -30,6 +31,8 @@ export function ModelList(props: { onChosen: () => void; class?: string }) {
   return (
     <Command
       items={items()}
+      query={query()}
+      onQueryChange={(event) => query.set(event.query)}
       placeholder={tr("Search models", "搜索模型")}
       accessibilityLabel={tr("Models", "模型")}
       autoFocus
@@ -49,10 +52,14 @@ export function ModelList(props: { onChosen: () => void; class?: string }) {
       itemClass={`group h-8 flex-row items-center rounded-md corner-squircle px-2 ${PRESS} focus:bg-accent`}
       empty={
         <View class="items-center gap-3 px-6 py-8">
-          <Text class="text-center text-sm text-muted-foreground">{tr("No models match. Connect a provider to see its models here.", "没有匹配的模型。连接服务商后即可在此查看其模型。")}</Text>
-          <BaseButton onPress={() => (props.onChosen(), showAgentSettings())} class={`h-7 justify-center rounded-md corner-squircle bg-secondary px-2.5 ${PRESS} hover:bg-secondary/80`}>
-            <Text class="text-base font-medium text-secondary-foreground">{tr(`Configure ${activeAgent().name}`, `配置 ${activeAgent().name}`)}</Text>
-          </BaseButton>
+          <Text class="text-center text-sm text-muted-foreground">{availableModels().length
+            ? tr(`No models match “${query()}”.`, `没有与“${query()}”匹配的模型。`)
+            : tr("Connect a provider to see its models here.", "连接服务商后即可在此查看其模型。")}</Text>
+          <If when={!availableModels().length}>
+            <BaseButton onPress={() => (props.onChosen(), showAgentSettings())} class={`h-7 justify-center rounded-md corner-squircle bg-secondary px-2.5 ${PRESS} hover:bg-secondary/80`}>
+              <Text class="text-base font-medium text-secondary-foreground">{tr(`Configure ${activeAgent().name}`, `配置 ${activeAgent().name}`)}</Text>
+            </BaseButton>
+          </If>
         </View>
       }
       renderItem={(entry) => (
@@ -68,7 +75,7 @@ export function ModelList(props: { onChosen: () => void; class?: string }) {
 }
 
 /** The composer's model chip: shows the model in use, opens the list to change it. */
-export function ModelPicker() {
+export function ModelPicker(props: { onOpen?: () => void }) {
   const open = signal(false);
   let held = "";
   const label = () => {
@@ -91,7 +98,10 @@ export function ModelPicker() {
   return (
     <Popover
       open={open()}
-      onOpenChange={(e) => open.set(e.open)}
+      onOpenChange={(e) => {
+        if (e.open) props.onOpen?.();
+        open.set(e.open);
+      }}
       placement="top"
       align="start"
       offset={8}
@@ -108,7 +118,7 @@ export function ModelPicker() {
 }
 
 /** The composer's thinking chip, shown for models that reason. */
-export function ThinkingPicker() {
+export function ThinkingPicker(props: { onOpen?: () => void }) {
   const open = signal(false);
   let held: ThinkingLevel | undefined;
   const level = () => {
@@ -121,7 +131,10 @@ export function ThinkingPicker() {
     <Presence show={thinkingLevels().length > 1} scaleFrom={0.92}>
       <Popover
         open={open()}
-        onOpenChange={(e) => open.set(e.open)}
+        onOpenChange={(e) => {
+          if (e.open) props.onOpen?.();
+          open.set(e.open);
+        }}
         placement="top"
         align="start"
         offset={8}

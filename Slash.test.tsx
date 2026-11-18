@@ -125,6 +125,15 @@ test("during a run, Escape closes the menu and the run goes on", async () => {
   await app.waitFor("label:Stop");
 });
 
+test("a press on a row chooses it", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  await app.type(MESSAGE, "/del");
+  await app.waitFor(MENU);
+  await app.press("text:/delegate");
+  expect(draft(app)).toBe("/delegate ");
+});
+
 test("the arrow keys go around the whole list, and the pointer moves the same mark", async () => {
   const app = await launch();
   await app.waitFor("text:What are we building?");

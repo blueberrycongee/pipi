@@ -1,5 +1,6 @@
 import {
   batch,
+  Clipboard,
   cleanup,
   computed,
   createAnimatedValue,
@@ -45,11 +46,14 @@ import {
   daemonSessionByFile,
   daemonSessionOfId,
   daemonSessions,
+  daemonSessionTitle,
   daemonTreePlace,
+  isDaemonTaskSession,
   isDraftAhead,
   isRunning,
   isSessionRunning,
   isSessionUnread,
+  leaveSettings,
   newSession,
   newSessionInWorkspace,
   openDaemonSession,
@@ -57,6 +61,7 @@ import {
   openWorkspace,
   pendingSession,
   projectCwdOf,
+  removeDaemonSession,
   removeSession,
   savedSessions,
   sessionsReady,
@@ -70,6 +75,8 @@ import {
   workspaceSessions,
 } from "../store/app";
 import { backend } from "../store/backend";
+import { type NoteSummary, notes } from "../store/docs";
+import { addNoteToChat, deleteNote, docTabTitle, newDocTab, openDocTab } from "../store/tabs";
 import {
   isGroupCollapsed,
   isSessionArchived,
@@ -96,8 +103,8 @@ type FolderItem = { id: string; session?: SessionSummary; child?: DaemonSession 
 
 type GroupId = "workspaces" | "recents" | "archived";
 
-/** A row in 最近: a saved session, or a daemon session of a tree with no saved row to hang under. */
-type RecentItem = { id: string; session?: SessionSummary; child?: DaemonSession; cwd?: string };
+/** A row in 最近: a saved session, a daemon session of a tree with no saved row to hang under, or a document the app keeps. */
+type RecentItem = { id: string; session?: SessionSummary; child?: DaemonSession; cwd?: string; note?: NoteSummary };
 
 /** How many sessions 最近 lists before its footer offers to show the rest. */
 const RECENT_LIMIT = 100;
@@ -156,9 +163,11 @@ const openDaemon = () => {
  * stays until the saved row takes its place, never leaving a gap between them.
  * While a session change is under way, its destination decides instead.
  */
+const openDaemonId = () => pendingSession()?.daemonId ?? currentDaemonId();
+
 const isDraftSession = () => {
   const ds = openDaemon();
-  if (ds && (ds.parentId || ds.initiator === "external")) return false;
+  if (isDaemonTaskSession(ds)) return false;
   const pending = pendingSession();
   if (pending) return !pending.file;
   const current = sessionState();
@@ -181,7 +190,9 @@ const singleEmpty = computed(
     projects().length === 1 &&
     savedSessions().length === 0 &&
     archivedSessionItems().length === 0 &&
-    !daemonSessions().some((ds) => ds.parentId || ds.initiator === "external") &&
+    !daemonSessions().some(
+      (ds) => !(ds.id === openDaemonId() && isDraftSession()) && (Boolean(ds.parentId) || daemonRootEarnsRow(ds)),
+    ) &&
     sessionsReady() &&
     listSteady(),
 );
@@ -703,7 +714,7 @@ function orderedIds(list: string): string[] {
   if (list === "recents") {
     return recents()
       .filter((item) => !item.id.startsWith("recent-child:"))
-      .map((item) => (item.session ? item.session.path : `daemon:${item.child!.id}`));
+      .map(recentKey);
   }
   const cwd = list.slice(3);
   return sortedFolderSessions(cwd).map((s) => s.path);
@@ -982,16 +993,27 @@ const daemonStandingOf = (session: DaemonSession) => {
 };
 /** The sessions a project folder lists, active folder or parked one. */
 const sessionsOf = (cwd: string) => (cwd === activeProjectPath() ? savedSessions() : (workspaceSessions()[cwd] ?? []));
-const standOf = (item: RecentItem) => {
-  const key = item.session ? item.session.path : `daemon:${item.child!.id}`;
-  return recentRankOverrides()[key] ?? (item.session ? standingOf(item.session) : daemonStandingOf(item.child!));
+/** A document's standing, by its file: first sight of its row, like a session's — one being written keeps its place. */
+const noteStandingOf = (note: NoteSummary) => {
+  const known = recentStanding.get(note.path);
+  if (known !== undefined) return known;
+  recentStanding.set(note.path, note.modified);
+  return note.modified;
 };
-const createdOf = (item: RecentItem) => item.session?.created ?? item.child?.createdAt ?? 0;
+/** What a root row of 最近 is ranked and dragged by: a session's or a document's file, a daemon tree's id. */
+const recentKey = (item: RecentItem) => item.note?.path ?? item.session?.path ?? `daemon:${item.child!.id}`;
+const standOf = (item: RecentItem) =>
+  recentRankOverrides()[recentKey(item)] ??
+  (item.note ? noteStandingOf(item.note) : item.session ? standingOf(item.session) : daemonStandingOf(item.child!));
+const createdOf = (item: RecentItem) => item.note?.modified ?? item.session?.created ?? item.child?.createdAt ?? 0;
 
 /**
- * Recent sessions across every open folder: the forest's roots in the place each
+ * What was worked on lately, sessions across every open folder and the
+ * documents written beside them, in one list: the forest's roots in the place each
  * first took (`recentStanding`), every root's daemon descendants nested under it
  * in tree order — the tree a session started shows here as it does in 工作区.
+ * A document is a root like a session is: found where the eye already goes,
+ * next to the session it was written for.
  * Roots are saved sessions and the daemon trees no saved row claims (external or
  * detached runs, starts still without a file); a child whose own tree hides keeps
  * a flat row rather than going missing.
@@ -1021,7 +1043,7 @@ const allRecents = computed<RecentItem[]>(() => {
     if (isSessionArchived(ds.file)) continue;
     const { claimed, top } = daemonTreePlace(ds, listed);
     if (claimed || top.id !== ds.id) continue;
-    if (ds.id === currentDaemonId() && isDraftSession()) continue;
+    if (ds.id === openDaemonId() && isDraftSession()) continue;
     if (!open.has(projectCwdOf(ds.cwd, ds))) continue;
     const earns =
       daemonRootEarnsRow(ds) ||
@@ -1041,11 +1063,13 @@ const allRecents = computed<RecentItem[]>(() => {
     roots.push({ id: `recent:${session.path}`, session, cwd });
   }
   for (const ds of tops.values()) roots.push({ id: `recent-daemon:${ds.id}`, child: ds });
+  for (const note of notes()) roots.push({ id: `recent-note:${note.path}`, note });
   roots.sort((a, b) => standOf(b) - standOf(a) || createdOf(b) - createdOf(a) || a.id.localeCompare(b.id));
 
   const out: RecentItem[] = [];
   for (const root of roots) {
     out.push(root);
+    if (root.note) continue;
     const children = root.session ? childSessionsOf(root.session.path) : childSessionsOfDaemon(root.child!.id);
     for (const child of children) out.push({ id: `recent-child:${child.id}`, child });
   }
@@ -1102,10 +1126,11 @@ function daemonRowInWorkspaces(ds: DaemonSession): boolean {
   }
   const { claimed, top } = daemonTreePlace(ds, files);
   if (claimed) return true;
-  if (top.id === currentDaemonId() && isDraftSession()) return true;
+  if (top.id === openDaemonId() && isDraftSession()) return true;
   return (
     daemonRootEarnsRow(top) &&
-    !top.file &&
+    (!top.file || !files.has(top.file)) &&
+    !isSessionArchived(top.file) &&
     projects().some((cwd) => !isWorkspaceCollapsed(cwd) && projectCwdOf(top.cwd, top) === cwd)
   );
 }
@@ -1154,6 +1179,22 @@ async function confirmDelete(session: SessionSummary, cwd: string) {
   if (action === "delete") {
     animateSidebarList();
     await removeSession(session.path, cwd);
+  }
+}
+
+async function confirmDeleteDaemon(session: DaemonSession) {
+  const name = daemonSessionTitle(session);
+  const { action } = await AlertDialog.show({
+    title: tr("Delete this session?", "删除此会话？"),
+    description: tr(`“${name}” will be removed from this Mac. This cannot be undone.`, `“${name}”将从此设备移除，该操作无法撤销。`),
+    actions: [
+      { label: tr("Cancel", "取消"), role: "cancel", id: "cancel" },
+      { label: tr("Delete", "删除"), role: "destructive", id: "delete" },
+    ],
+  });
+  if (action === "delete") {
+    animateSidebarList();
+    await removeDaemonSession(session.id);
   }
 }
 
@@ -1642,9 +1683,8 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
   const home = backend().home();
   const session = () => props.session;
   const file = () => session().file;
-  const openId = () => pendingSession()?.daemonId ?? currentDaemonId();
   const active = () =>
-    session().id === openId() || (file() !== undefined && file() === openFile() && !isDraftSession());
+    session().id === openDaemonId() || (file() !== undefined && file() === openFile() && !isDraftSession());
   const engine = () => engineOf(session().agentId);
   const working = () => (active() && isRunning()) || session().status === "working" || session().status === "blocked";
   const blocked = () => !active() && session().status === "blocked";
@@ -1660,8 +1700,8 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
     if (!nested()) return 0;
     return props.group === "recents" ? Math.max(0, session().depth - 1) : Math.max(1, session().depth);
   };
-  /** Its transcript is what the archive keeps: a session that has none yet has nothing to put there. */
-  const archivable = () => file() !== undefined;
+  /** Any settled/failed/interrupted daemon row (or one with a transcript file) can be archived out of the list. */
+  const archivable = () => file() !== undefined || !working();
   /** Only 最近's root rows drag: a nested row's place is its tree's, a 工作区 row's is the daemon's order. */
   const dropList = () => (props.group === "recents" && !nested() ? "recents" : undefined);
   const content = (
@@ -1669,9 +1709,14 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
       <BaseButton
         selected={selected()}
         onPress={() => {
-          const key = `daemon:${session().id}`;
+          const s = session();
+          const key = `daemon:${s.id}`;
           if (chosenGroups()[key] !== props.group) chosenGroups.update((all) => ({ ...all, [key]: props.group }));
-          openDaemonSession(session().id);
+          if (!isDaemonTaskSession(s) && !s.file) {
+            explicitDraftGroup = props.group;
+            draftGroup.set(props.group);
+          }
+          openDaemonSession(s.id);
         }}
         onPressDown={() => dropList() && armMouseDrag({ list: dropList()!, id: `daemon:${session().id}` })}
         onPressUp={endMouseDrag}
@@ -1693,7 +1738,7 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
         )}
       >
         <EngineMark id={engine().id} available={engine().available} />
-        <Text class={sessionTitleClass(selected())}>{session().title}</Text>
+        <Text class={sessionTitleClass(selected())}>{daemonSessionTitle(session())}</Text>
       </BaseButton>
       <View class={working() || !archivable() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`}>
         <Presence
@@ -1779,22 +1824,29 @@ function statusLabel(status: DaemonSession["status"]) {
   }
 }
 
-/** A nested session's right-click: open it, stop it outright, or archive it out of its tree. */
+/** A daemon session's right-click: open it, stop it outright, archive it, or delete it. */
 function childMenuItems(session: DaemonSession): MenuItem[] {
+  const working = session.status === "working" || session.status === "blocked";
   return [
     { label: tr("Open", "打开"), onSelect: () => openDaemonSession(session.id) },
     {
       label: tr("Stop session", "停止会话"),
-      disabled: session.status !== "working" && session.status !== "blocked",
+      disabled: !working,
       onSelect: () => void stopDaemonSession(session.id),
     },
     {
       label: tr("Archive", "归档"),
-      disabled: !session.file,
+      disabled: !session.file && working,
       onSelect: () => {
         animateSidebarList();
         void archiveDaemonSession(session.id);
       },
+    },
+    { type: "separator" },
+    {
+      label: tr("Delete…", "删除…"),
+      disabled: working,
+      onSelect: () => void confirmDeleteDaemon(session),
     },
   ];
 }
@@ -1812,11 +1864,13 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; c
   const items = computed<FolderItem[]>(() => {
     if (props.collapsed()) return lastItems;
     const rows: FolderItem[] = [];
+    const listed = new Set(folderSessions().map((s) => s.path));
     for (const ds of daemonSessions()) {
-      if (ds.parentId || ds.file) continue;
+      if (ds.parentId || (ds.file && listed.has(ds.file))) continue;
+      if (isSessionArchived(ds.file)) continue;
       if (projectCwdOf(ds.cwd, ds) !== props.cwd) continue;
       if (!daemonRootEarnsRow(ds)) continue;
-      if (ds.id === currentDaemonId() && isDraftSession()) continue;
+      if (ds.id === openDaemonId() && isDraftSession()) continue;
       rows.push({ id: `child:${ds.id}`, child: ds });
       for (const child of childSessionsOfDaemon(ds.id)) rows.push({ id: `child:${child.id}`, child });
     }
@@ -1894,7 +1948,62 @@ function toggleProject(cwd: string) {
   toggleWorkspaceCollapsed(cwd);
 }
 
-/** The scrollable tree: 工作区's project folders, 最近's sessions across them, and 已归档's tucked-away sessions. */
+async function confirmDeleteNote(note: NoteSummary) {
+  const name = docTabTitle(note.path);
+  const { action } = await AlertDialog.show({
+    title: tr("Delete this document?", "删除这篇文档？"),
+    description: tr(`“${name}” will be removed from this Mac. This cannot be undone.`, `“${name}”将从此设备移除，该操作无法撤销。`),
+    actions: [
+      { label: tr("Cancel", "取消"), role: "cancel", id: "cancel" },
+      { label: tr("Delete", "删除"), role: "destructive", id: "delete" },
+    ],
+  });
+  if (action === "delete") {
+    animateSidebarList();
+    await deleteNote(note.path);
+  }
+}
+
+/**
+ * A document in 最近: something written here, beside the sessions it was
+ * written for. A press looks at it (the strip's preview seat); writing in it
+ * keeps its tab. It drags among the sessions as one of them.
+ */
+function NoteRow(props: { note: NoteSummary }) {
+  const selected = () => {
+    const v = currentView();
+    return v.name === "doc" && v.docId === props.note.path;
+  };
+  const menu = (e: ContextMenuEvent) =>
+    Menu.popup(
+      [
+        { label: tr("Open", "打开"), onSelect: () => openDocTab(props.note.path) },
+        { label: tr("Add to Chat", "添加到会话"), onSelect: () => void addNoteToChat(props.note.path) },
+        { label: tr("Copy Path", "复制路径"), onSelect: () => void Clipboard.writeText(props.note.path) },
+        { type: "separator" },
+        { label: tr("Delete…", "删除…"), onSelect: () => void confirmDeleteNote(props.note) },
+      ],
+      e.pagePosition,
+    );
+  return (
+    <DropRow list="recents" id={props.note.path} onContextMenu={menu}>
+      <BaseButton
+        selected={selected()}
+        onPress={() => openDocTab(props.note.path, { preview: true })}
+        onPressDown={() => armMouseDrag({ list: "recents", id: props.note.path })}
+        onPressUp={endMouseDrag}
+        class={calm(sessionRowClass(false, false, false))}
+      >
+        <View class={ICON_SLOT}>
+          <Icon name="file" size={14} tone={selected() ? "foreground" : "muted-foreground"} />
+        </View>
+        <Text class={sessionTitleClass(selected())}>{docTabTitle(props.note.path)}</Text>
+      </BaseButton>
+    </DropRow>
+  );
+}
+
+/** The scrollable tree: 工作区's project folders, 最近's sessions and documents, and 已归档's tucked-away sessions. */
 function SidebarTree() {
   const recentCount = () => allRecents().length + (hasRecentDraft() ? 1 + childSessionsOfOpen().length : 0);
   const showRecents = () => recentCount() > 0;
@@ -2004,7 +2113,9 @@ function SidebarTree() {
               </Reveal>
               <Each of={recents()} key={(item) => item.id}>
                 {(item) =>
-                  item().child ? (
+                  item().note ? (
+                    <NoteRow note={item().note!} />
+                  ) : item().child ? (
                     <DaemonSessionRow session={item().child!} group="recents" nested={item().id.startsWith("recent-child:")} />
                   ) : (
                     <SessionRow session={item().session!} cwd={item().cwd!} group="recents" />
@@ -2107,7 +2218,7 @@ export function Sidebar() {
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
         </If>
       </View>
-      <View class={`shrink-0 flex-row items-center gap-1 pb-2 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
+      <View class={`shrink-0 flex-row items-center gap-1 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
         <BaseButton
           testID="sidebar-new-session"
           onPress={startNewSession}
@@ -2124,13 +2235,28 @@ export function Sidebar() {
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
         </If>
       </View>
+      {/* The other thing to start here: a page of one's own words — a brief, a draft — with the agents a key away. */}
+      <View class={`shrink-0 pb-2 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
+        <BaseButton
+          testID="sidebar-new-doc"
+          onPress={() => void newDocTab()}
+          accessibilityLabel={tr("New document", "新文档")}
+          tooltip={tip(tr("New document", "新文档"), "mod+shift+n", "right")}
+          class={`h-8 min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle px-2.5 ${ROW_PRESS}`}
+        >
+          <View class={ICON_SLOT}>
+            <Icon name="filePlus" size={14} tone="muted-foreground" />
+          </View>
+          <Text class="text-base text-sidebar-foreground">{tr("New document", "新文档")}</Text>
+        </BaseButton>
+      </View>
       <SidebarTree />
       <View class="border-t border-sidebar-border px-2 py-1">
         <View class="flex-row items-center justify-between pl-1.5 pr-0.5">
           <IconButton
             icon="gear"
             selected={settingsOpen()}
-            onPress={() => (settingsOpen() ? showChat() : showSettings())}
+            onPress={() => (settingsOpen() ? leaveSettings() : showSettings())}
             label={tr("Settings", "设置")}
             shortcut="mod+,"
             tone={settingsOpen() ? "foreground" : "muted-foreground"}

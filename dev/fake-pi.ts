@@ -1,5 +1,7 @@
+import * as fs from "fs/promises";
 import { acpDefaultModel, builtinAgentSpec, defaultAgentStatuses } from "../agents/catalog";
 import type { AgentHarnessStatus, CustomAgentConfig, RuntimeMode, WorktreeInfo } from "../agents/types";
+import { titleWords } from "../lib/doc-wire";
 import type { Exit, Transport } from "../pi/client";
 import type { DaemonAttachSpec, DaemonCallbacks, DaemonClient, DaemonSession } from "../pi/daemon";
 import type { AgentMessage, ImageContent, Model, SessionState } from "../pi/protocol";
@@ -22,10 +24,16 @@ export interface FakeOptions {
   sessions?: SessionSummary[];
   /** Per-workspace saved sessions for multi-project sidebar testing. */
   workspaceSessions?: Record<string, SessionSummary[]>;
+  /** Initial daemon session records to seed before connect (e.g. failed or interrupted background sessions). */
+  daemonSessions?: DaemonSession[];
   /** Folder path returned when `pickFolder` is called. */
   pickedFolder?: string;
   /** Image path returned when `pickImage` is called. */
   pickedImage?: string;
+  /** File path returned when `pickFile` is called. */
+  pickedFile?: string;
+  /** The app's data folder (notes live in its `docs/`): a real, writable one for the tests that save. */
+  dataDir?: string;
   /** Milliseconds between streamed records (0: all at once). */
   pace?: number;
   /** Milliseconds an agent takes to start and to load a saved session, as real CLIs do (0: at once). */
@@ -50,7 +58,7 @@ export interface FakeOptions {
    * `rate` is the download's speed in bytes per ms; `unknownSize` streams
    * progress without a total, the indeterminate track.
    */
-  update?: { version?: string; notes?: string; canInstall?: boolean; bytes?: number; rate?: number; unknownSize?: boolean };
+  update?: { version?: string; notes?: string; canInstall?: boolean; bytes?: number; rate?: number; unknownSize?: boolean; shell?: boolean };
 }
 
 const MODELS: Model[] = [
@@ -593,7 +601,19 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         timestamp: Date.now(),
       };
       let approved = true;
-      const reply = options.reply ?? (prompt.includes("long") ? LONG_REPLY : REPLY);
+      let reply = options.reply ?? (prompt.includes("long") ? LONG_REPLY : REPLY);
+      // A document rode on the prompt (`lib/doc-wire.ts`) and the words ask to "rewrite" it: the agent
+      // changes the file where it lives, as one with file tools does — every "draft" in it becomes "final".
+      const attached = /<(?:document|selection) path="([^"]+)">/.exec(prompt)?.[1];
+      if (attached && prompt.includes("rewrite")) {
+        // "slowly": the file is written a while into the run — time for the person to go on typing in it.
+        if (prompt.includes("slowly")) await later(1500);
+        const text = await fs.readFile(attached, "utf8").catch(() => undefined);
+        if (text !== undefined) await fs.writeFile(attached, text.replace(/draft/g, "final").replace(/Draft/g, "Final")).catch(() => undefined);
+      }
+      // "recite <path>": the reply is what that file holds now — how a test reads the disk.
+      const recited = /^recite (\S+)/.exec(prompt)?.[1];
+      if (recited) reply = `\`\`\`\n${await fs.readFile(recited, "utf8").catch(() => "(no file)")}\n\`\`\``;
       if (prompt.includes("steps")) return runSteps(user, prompt, step, update);
       if (prompt.includes("acp")) return runAcp(user, prompt, step, update);
       isStreaming = true;
@@ -822,7 +842,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             } catch (error) {
               emit({ id: command.id, type: "response", command: command.type, success: false, error: (error as Error).message });
             }
-          }, command.type === "switch_session" ? (options.startDelay ?? 0) : 0);
+          }, command.type === "switch_session" && !String(command.id ?? "").startsWith("d_") ? (options.startDelay ?? 0) : 0);
         }
       },
       onStdout: (handler) => void (out = handler),
@@ -884,7 +904,9 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     pendingDialogs?: Map<string, Record<string, unknown>>;
   }
 
-  const daemonSessions = new Map<string, FakeDaemonSession>();
+  const daemonSessions = new Map<string, FakeDaemonSession>(
+    (options.daemonSessions ?? []).map((seed) => [seed.id, { ...seed }]),
+  );
   let daemonCallbacks: DaemonCallbacks | undefined;
 
   const daemonInfo = (s: FakeDaemonSession): DaemonSession => {
@@ -893,6 +915,22 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   };
 
   const pushDaemon = (s: FakeDaemonSession) => daemonCallbacks?.onSession(daemonInfo(s));
+
+  const removeFakeDaemon = (s: FakeDaemonSession) => {
+    if (!daemonSessions.has(s.id)) return;
+    s.inner?.kill();
+    daemonSessions.delete(s.id);
+    daemonCallbacks?.onSessionRemoved?.(s.id);
+  };
+
+  const reapEmptyFakeDraft = (s: FakeDaemonSession) => {
+    if (s.viewers) return;
+    if (s.parentId || s.worktree || s.titleLocked || s.initiator === "external") return;
+    if (s.title && s.title !== "New session") return;
+    if (s.status !== "idle" || s.unread || s.file) return;
+    if (daemonTree(s.id).length > 0) return;
+    removeFakeDaemon(s);
+  };
 
   /**
    * Watches a session's process records the way the real daemon does: run
@@ -936,7 +974,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
               ? msg.content.filter((b): b is { type: string; text: string } => (b as { type?: string }).type === "text" && typeof (b as { text?: unknown }).text === "string").map((b) => b.text).join(" ")
               : "";
             if (text.trim() && !text.trimStart().startsWith("<pipi-message")) {
-              s.title = text.replace(/\s+/g, " ").trim().slice(0, 48);
+              s.title = titleWords(text).replace(/\s+/g, " ").trim().slice(0, 48);
               pushDaemon(s);
             }
           }
@@ -974,11 +1012,14 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       s.loaded = false;
       s.pendingQueue = { steering: [], followUp: [] };
       s.pendingDialogs?.clear();
-      s.status = s.status === "working" || s.status === "blocked" ? "failed" : "interrupted";
-      pushDaemon(s);
+      if (s.status === "working" || s.status === "blocked") s.status = "failed";
+      if (!s.viewers && s.status === "idle") reapEmptyFakeDraft(s);
+      if (daemonSessions.has(s.id)) pushDaemon(s);
       for (const h of s.viewers?.exit ?? []) h({ code: e.code ?? null, signal: e.signal ?? undefined });
     });
   };
+
+  let initialHistorySessionId: string | undefined;
 
   /** A session's process, as the daemon spawns it: `starts`/`dies`/`failStart`/`startDelay` all apply here. */
   const spawnDaemonProcess = async (s: FakeDaemonSession): Promise<Transport> => {
@@ -988,7 +1029,11 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     activeAgent = s.agentId;
     defaultModel = modelsForAgent(s.agentId, s.custom)[0] ?? UNKNOWN;
     defaultThinking = defaultModel.reasoning ? "medium" : "off";
-    const inner = transport(s.cwd, s.agentId, s.agentId === "pi" ? (options.history ?? []) : [], s.custom);
+    if (!initialHistorySessionId && s.agentId === "pi" && !s.file && (options.history?.length ?? 0) > 0) {
+      initialHistorySessionId = s.id;
+    }
+    const seedHistory = s.id === initialHistorySessionId && s.agentId === "pi" ? (options.history ?? []) : [];
+    const inner = transport(s.cwd, s.agentId, seedHistory, s.custom);
     wireDaemonSession(s, inner);
     return inner;
   };
@@ -1007,7 +1052,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   const api: Backend & { sent: Record<string, unknown>[] } = {
     sent,
     home: () => "/Users/pip",
-    dataDir: () => "/Users/pip/Library/Application Support/dev.pipi.app",
+    dataDir: () => options.dataDir ?? "/Users/pip/Library/Application Support/dev.pipi.app",
     async probeAgents(probeOpts) {
       const defaults = defaultAgentStatuses(probeOpts?.customAgents);
       return defaults.map((a): AgentHarnessStatus => {
@@ -1114,7 +1159,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             if (file) {
               // As the real daemon does: the process is on the session's file before the attach answers.
               inner.write(`${JSON.stringify({ id: `d_${++daemonCmdSeq}`, type: "switch_session", sessionPath: file })}\n`);
-              await new Promise<void>((r) => setTimeout(r, (options.startDelay ?? 0) + 1));
+              await new Promise<void>((r) => setTimeout(r, 1));
             }
           }
           if (file) s.file = file;
@@ -1130,6 +1175,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             if (ended) return;
             ended = true;
             if (s.viewers === viewers) s.viewers = undefined;
+            reapEmptyFakeDraft(s);
             for (const h of viewers.exit.splice(0)) h({ code: 0 });
           };
           const virtual = {
@@ -1157,6 +1203,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
                 } else if (record?.type === "new_session") {
                   s.file = undefined;
                   s.title = "New session";
+                  s.titleLocked = false;
                   s.pendingQueue = { steering: [], followUp: [] };
                   s.pendingDialogs?.clear();
                   pushDaemon(s);
@@ -1198,6 +1245,12 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         async killSession(sessionId: string) {
           const s = daemonSessions.get(sessionId);
           s?.inner?.kill();
+        },
+        async removeSession(sessionId: string) {
+          const own = daemonSessions.get(sessionId);
+          if (!own) return;
+          const targets = [own, ...daemonTree(sessionId).filter((d) => !d.file)];
+          for (const target of targets) removeFakeDaemon(target);
         },
         async stopTree(sessionId: string) {
           const own = daemonSessions.get(sessionId);
@@ -1245,6 +1298,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           const s: FakeDaemonSession = {
             id: `s_fake_${++daemonSeq}`,
             title: input.title || "New session",
+            ...(input.title ? { titleLocked: true } : {}),
             cwd: wt?.path ?? input.cwd,
             agentId: input.agentId,
             agentName: agentNameOf(input.agentId),
@@ -1253,7 +1307,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             initiator: "user",
             runtimeMode: input.runtimeMode ?? "full-access",
             worktree: wt ?? fakeWorktrees.find((w) => input.cwd === w.path),
-            status: "idle",
+            status: input.message ? "working" : "idle",
             unread: false,
             loaded: false,
             depth: parent ? parent.depth + 1 : 0,
@@ -1317,6 +1371,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     },
     pickFolder: async () => options.pickedFolder,
     pickImage: async () => options.pickedImage,
+    pickFile: async () => options.pickedFile,
     async checkAppUpdate() {
       const u = options.update;
       if (!u) return null;
@@ -1325,6 +1380,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         notes: u.notes ?? "A shinier coat, a steadier step, and everything a little quicker.",
         url: "https://github.com/blueberrycongee/pipi/releases",
         canInstall: u.canInstall ?? true,
+        shell: u.shell ?? false,
       };
     },
     async downloadAppUpdate(onProgress) {

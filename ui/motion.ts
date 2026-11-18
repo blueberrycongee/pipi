@@ -424,7 +424,7 @@ export function popupStyle(placement: "top" | "bottom" | "left" | "right" = "bot
     ...glass,
     transformOrigin: popupOrigin(placement, align),
     transitionProperty: "opacity, transform, filter",
-    transitionDuration: 260,
+    transitionDuration: DURATION.instant,
     transitionTimingFunction: POPUP_EASE.open,
   };
 }

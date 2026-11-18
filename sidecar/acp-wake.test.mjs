@@ -242,3 +242,60 @@ test("switching back to a saved session strips stale background flags", async (t
   assert.equal(call?.name, "job 1");
   assert.equal(call?.background, undefined);
 });
+
+test("changing sessions on Antigravity never sends session/close to tear down the worker", async (t) => {
+  const logFile = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-agy-log-"));
+  t.after(() => fs.rmSync(logFile, { recursive: true, force: true }));
+  const acpLog = path.join(logFile, "fake.jsonl");
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "60000", FAKE_ACP_LOG: acpLog });
+  await bridge.prompt("start a background job");
+  await bridge.settles(1);
+
+  await bridge.send({ type: "new_session" });
+  await bridge.send({ type: "get_available_models" });
+  await bridge.prompt("hello");
+  await bridge.settles(2);
+
+  const methods = fs
+    .readFileSync(acpLog, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line).method);
+  assert.ok(methods.filter((m) => m === "session/new").length >= 2);
+  assert.equal(methods.includes("session/close"), false, "agy session worker must not receive session/close");
+});
+
+test("new_session mid-turn settles the interrupted turn as aborted and saves the aborted record to disk", async (t) => {
+  const bridge = startBridge(t, { FAKE_ACP_TICK_MS: "40" });
+  void bridge.prompt("tick for me");
+  const deadline = Date.now() + 8000;
+  while (!bridge.records.some((r) => r.type === "message_update" && r.assistantMessageEvent?.type === "thinking_delta")) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for streaming delta");
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  const { data: stateBefore } = await bridge.send({ type: "get_state" });
+  assert.ok(stateBefore.sessionFile);
+
+  await bridge.send({ type: "new_session" });
+
+  const abortedEnd = bridge.records.find(
+    (r) => r.type === "message_end" && r.message?.role === "assistant" && r.message.stopReason === "aborted",
+  );
+  assert.ok(abortedEnd, "interrupted turn must emit message_end with stopReason=aborted");
+  const settled = bridge.records.find((r) => r.type === "agent_settled");
+  assert.equal(settled?.aborted, true, "interrupted turn must emit agent_settled(aborted=true)");
+
+  const savedMsgs = fs
+    .readFileSync(stateBefore.sessionFile, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((entry) => entry.type === "message")
+    .map((entry) => entry.message);
+  assert.ok(
+    savedMsgs.some((m) => m.role === "assistant" && m.stopReason === "aborted"),
+    "outgoing session file must persist the aborted assistant record",
+  );
+});

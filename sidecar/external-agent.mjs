@@ -31,6 +31,7 @@ import {
   ZERO_USAGE,
 } from "./agent-usage.mjs";
 import { agentAuthEnv, childEnv, ensureDir, externalSessionsDir, resolveBinary, shellForCommand, spawnBinary } from "./env-paths.mjs";
+import { titleWords } from "./session-index.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const mcpStdioScript = path.join(__dirname, "pipi-mcp-stdio.mjs");
@@ -336,7 +337,7 @@ async function saveExternalSessionNow() {
     nativeThreadId,
     cwd,
     name: sessionName,
-    firstMessage: firstText.slice(0, 240),
+    firstMessage: titleWords(firstText).slice(0, 240),
     model: currentModel,
     thinkingLevel,
     usageBaseline,
@@ -951,7 +952,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       finished = true;
       if (liveTurnStream === api) liveTurnStream = undefined;
       const counted = sessionEpoch === turnEpoch;
-      if (msgOpen || errorMessage) {
+      if (msgOpen || errorMessage || stopReason === "aborted") {
         openMsg();
         const content = blocks.map((b) => (keepOpenTools && b.type === "toolCall" && openTools.has(b.id) ? { ...b, background: true } : b));
         const assistantMsg = {
@@ -1684,19 +1685,32 @@ function clearStaleBackgroundTools(list = messages, onlyId = undefined) {
   return cleared;
 }
 
+let reportedBackgroundWatch = false;
+function syncBackgroundWatch() {
+  if (!process.env.PIPI_SESSION_ID) return;
+  const active = Boolean(acpWake || acpBackgroundTools.size > 0);
+  if (active === reportedBackgroundWatch) return;
+  reportedBackgroundWatch = active;
+  emit({ type: "pipi_background_watch", active });
+}
+
 function forgetAcpWake() {
   if (acpWake?.timer) clearTimeout(acpWake.timer);
   acpWake = undefined;
   acpWakeSleepWake?.();
   acpBackgroundTools.clear();
   clearStaleBackgroundTools();
+  syncBackgroundWatch();
 }
 
 /** Starts watching the session after a turn that ended well (`stream` is that turn's). */
 function armAcpWake(stream, acpId, epoch) {
   if (acpWake?.timer) clearTimeout(acpWake.timer);
   acpWake = undefined;
-  if (!acpLazyWake || sessionEpoch !== epoch) return;
+  if (!acpLazyWake || sessionEpoch !== epoch) {
+    syncBackgroundWatch();
+    return;
+  }
   const seen = stream.seen();
   for (const [id, info] of seen.open) acpBackgroundTools.set(String(id), info);
   const tx = agyTranscriptState(acpId);
@@ -1712,6 +1726,7 @@ function armAcpWake(stream, acpId, epoch) {
     timer: undefined,
   };
   acpWake = watch;
+  syncBackgroundWatch();
   // Read where the session stands now, as close to the answer as can be: a move past it is a wake.
   void acpUpdatedAt(acpId).then((at) => {
     if (acpWake === watch && watch.baseline === undefined) watch.baseline = at;
@@ -1725,6 +1740,7 @@ function scheduleAcpWakePoll(watch) {
   const age = Date.now() - watch.armedAt;
   if (age > ACP_WAKE_WATCH_MS && acpBackgroundTools.size === 0) {
     acpWake = undefined;
+    syncBackgroundWatch();
     return;
   }
   const delay = acpBackgroundTools.size > 0 ? ACP_WAKE_BG_MS : age < ACP_WAKE_FAST_FOR_MS ? ACP_WAKE_FAST_MS : ACP_WAKE_SLOW_MS;
@@ -1759,7 +1775,10 @@ async function acpWakePoll(watch) {
   if (acpWake !== watch) return;
   watch.timer = undefined;
   if (acpWakeStale(watch)) {
-    if (acpWake === watch) acpWake = undefined;
+    if (acpWake === watch) {
+      acpWake = undefined;
+      syncBackgroundWatch();
+    }
     return;
   }
   // A turn, a catch-up, or a handshake is the agent's business now: look again later.
@@ -1855,6 +1874,7 @@ function applyAcpWokeSlice(woke, stream, watch, wakeOpenTools = undefined) {
       }
     }
   }
+  syncBackgroundWatch();
   return hasAnswerText;
 }
 
@@ -2665,8 +2685,10 @@ async function negotiateAcpRound(bin, epoch) {
   }
   if (acpReset || !acpSessionId) {
     // Release the previous session on this peer when the agent supports it —
-    // DeepSeek Harness keeps every session resident until `session/close`.
-    if (acpReset && acpSessionId && acpSessionCaps?.close !== undefined) {
+    // DeepSeek Harness keeps every session resident until `session/close`,
+    // whereas Antigravity's `--process-per-session` tears down the whole
+    // session worker (and any live subagents) on `session/close`.
+    if (acpReset && acpSessionId && acpSessionCaps?.close !== undefined && !acpLazyWake) {
       await acpRequest("session/close", { sessionId: acpSessionId }, 5_000).catch(() => undefined);
       acpSessionId = undefined;
     }
@@ -2796,7 +2818,13 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
   // `session/cancel` only applies to a prompt already in flight — one sent
   // after the cancel starts fresh, so a turn aborted during negotiation must
   // never reach session/prompt.
-  if (sessionEpoch !== turnEpoch || abortRequested) return;
+  if (sessionEpoch !== turnEpoch || abortRequested) {
+    if (abortRequested && sessionEpoch === turnEpoch) {
+      const stream = makeTurnStreamHelper(turnEpoch);
+      stream.finish("aborted");
+    }
+    return;
+  }
   const stream = makeTurnStreamHelper(turnEpoch);
   acpStream = stream;
   try {
@@ -2871,24 +2899,39 @@ async function discoverCatalog() {
 let sessionChange = undefined;
 
 /**
- * Runs a session-changing command without waiting on the engine: the turn is
- * interrupted, a handshake in flight is left stale (`ensureAcpSession` runs it
- * again for the new session), and one still stalled after a brief window has
- * its peer dropped in the background so it never holds up the next prompt.
+ * Runs a session-changing command without waiting on the engine: any active
+ * turn settles first while `sessionEpoch` still matches so its aborted record
+ * flushes to disk and emits `agent_settled`, a handshake in flight is left
+ * stale (`ensureAcpSession` runs it again for the new session), and one still
+ * stalled after a brief window has its peer dropped in the background.
  */
 async function changeSession(apply) {
-  sessionEpoch++;
-  const changedAt = sessionEpoch;
-  queuedSteering = [];
-  queuedFollowUp = [];
-  steerInterrupt = false;
-  acpReset = true;
+  const prev = sessionChange;
   let done;
   const mine = new Promise((resolve) => {
     done = resolve;
   });
   sessionChange = mine;
   try {
+    if (prev) await prev;
+    if (queuedSteering.length > 0 || queuedFollowUp.length > 0) {
+      queuedSteering = [];
+      queuedFollowUp = [];
+      emit({ type: "queue_update", steering: [], followUp: [] });
+    }
+    steerInterrupt = false;
+    if (turnPromise) {
+      await settleActiveTurn(2500);
+    }
+    if (acpWake || acpBackgroundTools.size > 0) {
+      forgetAcpWake();
+      if (messagesDirty && sessionFile) {
+        await saveExternalSession().catch(() => undefined);
+      }
+    }
+    sessionEpoch++;
+    const changedAt = sessionEpoch;
+    acpReset = true;
     if (acpRoundEpoch !== undefined) {
       const timer = setTimeout(() => {
         if (acpRoundEpoch !== undefined && acpRoundEpoch < changedAt) dropAcpPeer("ACP negotiation cancelled for session change");
@@ -2896,7 +2939,6 @@ async function changeSession(apply) {
       timer.unref?.();
     }
     acpCatalogCooldownUntil = 0;
-    await settleActiveTurn(2500);
     isStreaming = false;
     abortRequested = false;
     await apply();
@@ -2977,6 +3019,7 @@ async function handleCommand(cmd) {
       };
     }
     case "prompt": {
+      while (sessionChange) await sessionChange;
       const text = String(cmd.message || "");
       const images = imageBlocks(cmd.images);
       if (isStreaming) {

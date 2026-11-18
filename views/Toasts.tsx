@@ -55,7 +55,7 @@ function ToastCard(props: { toast: Toast; leaving: boolean }) {
           <View class="shrink-0">
             <Icon name={icon()} tone={LOOK[props.toast.tone].tone} />
           </View>
-          <Text class="min-w-0 shrink text-sm text-popover-foreground">{props.toast.text}</Text>
+          <Text class="min-w-0 shrink truncate text-sm text-popover-foreground">{props.toast.text}</Text>
           <If when={props.toast.action}>
             {(act) => (
               <BaseButton

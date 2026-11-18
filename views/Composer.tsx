@@ -1,5 +1,5 @@
 import { readFile } from "fs/promises";
-import { Canvas, cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
+import { Canvas, cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, Overlay, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
 import type { InputRef, PasteEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input, Popover } from "nsh/base";
 import { money } from "../lib/format";
@@ -10,8 +10,12 @@ import {
   activeAgent,
   addAttachment,
   composerAttachments,
+  composerDocs,
   composerDraft,
   composerFocusTick,
+  currentView,
+  detachDoc,
+  type DocRef,
   extensionStatuses,
   extensionWidgets,
   focusComposer,
@@ -32,7 +36,9 @@ import {
   transcriptRows,
   waitingCount,
 } from "../store/app";
+import { docAt } from "../store/docs";
 import { SEND_MODES, sendMode, setSendMode, type SendMode } from "../store/prefs";
+import { draftToDoc, openDocTab } from "../store/tabs";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, enter, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, SPRING } from "../ui/motion";
@@ -44,6 +50,8 @@ import { ModelPicker, ThinkingPicker } from "./ModelPicker";
 
 const MIN_HEIGHT = 32;
 const MAX_HEIGHT = 220;
+/** The field's height from its third line on: a draft that long is offered a document to go on in. */
+const LONG_DRAFT_HEIGHT = 66;
 
 /** The image types Pi's providers take; past its bound a paste stays a path instead. */
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"]);
@@ -164,7 +172,9 @@ function useSlashMenu() {
       ),
     );
   });
-  return { rows, unmatched, selected, keyed, open, current };
+  /** Closes the menu as Escape does, the draft left as it was until a new slash. */
+  const dismiss = () => dismissed.set(untracked(input)?.kind);
+  return { rows, unmatched, selected, keyed, open, current, dismiss };
 }
 
 /**
@@ -172,8 +182,14 @@ function useSlashMenu() {
  * row says the list goes on — and the rest scroll. The mark follows the
  * pointer once it moves, so there is one marked row and never a hovered one
  * beside it; a row scrolled under a resting pointer does not take it.
+ *
+ * It is an `Overlay` anchored to the composer's column, so a press anywhere
+ * else — the transcript, the sidebar, the composer's own chips — closes it as
+ * Escape does, and still reaches what it landed on. A press inside the column
+ * (the input, the tray, the chip row) is not an outside press: the draft is
+ * still being written there.
  */
-function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (row: SlashRow) => void }) {
+function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (row: SlashRow) => void; anchor?: ViewRef; width: number }) {
   const mounted = signal(false);
   const opacity = createAnimatedValue(0);
   const translateY = createAnimatedValue(6);
@@ -250,9 +266,19 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
 
   return (
     <If when={mounted()}>
+      <If when={props.anchor}>
+        {(anchor) => (
+      <Overlay
+        anchor={anchor()}
+        placement="top"
+        align="start"
+        offset={8}
+        margin={12}
+        onPressOutside={props.menu.open() ? () => props.menu.dismiss() : undefined}
+      >
       <View
-        class={`absolute inset-x-0 bottom-full mb-2 overflow-hidden ${POPUP}${props.menu.open() ? "" : " pointer-events-none"}`}
-        style={{ ...GLASS_REGULAR, opacity, transform: [{ translateY }, { scale }] }}
+        class={`overflow-hidden ${POPUP}${props.menu.open() ? "" : " pointer-events-none"}`}
+        style={{ ...GLASS_REGULAR, width: props.width, opacity, transform: [{ translateY }, { scale }] }}
         role="menu"
         accessibilityLabel={tr("Commands", "命令")}
       >
@@ -288,29 +314,72 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
           </Each>
         </Scroll>
       </View>
+      </Overlay>
+        )}
+      </If>
     </If>
   );
 }
 
 /**
- * Pasted images wait in a tray that rises from behind the composer's top edge:
- * a little narrower than the composer, its lower edge
- * tucked under it, so adding one never changes the input's own size. The
- * thumbnail is the card; its remove button shows on hover or focus.
+ * A document riding on the message: a card naming it, and whether all of it
+ * goes or a passage. A press goes back to the document — the words are still
+ * written there, not here.
+ */
+function DocCard(props: { doc: DocRef }) {
+  const title = () => docAt(props.doc.path)?.title() ?? props.doc.title;
+  return (
+    <View testID="composer-doc" class="group relative h-14 w-52 shrink-0" style={enter("zoomIn")}>
+      <BaseButton
+        onPress={() => openDocTab(props.doc.path)}
+        accessibilityLabel={title()}
+        tooltip={tip(tr("Back to the document", "回到文档"))}
+        class={`size-full flex-row items-center gap-2.5 rounded-lg corner-squircle border-[0.5px] border-hairline-hover bg-background/70 pl-2 pr-3 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
+      >
+        <View class="size-9 shrink-0 items-center justify-center rounded-md corner-squircle bg-muted">
+          <Icon name="file" size={16} tone="muted-foreground" />
+        </View>
+        <View class="min-w-0 flex-1">
+          <Text class="truncate text-sm font-medium text-foreground">{title()}</Text>
+          <Text class="truncate text-xs text-subtle">{props.doc.excerpt ? tr("Selection", "选中的内容") : tr("Document", "文档")}</Text>
+        </View>
+      </BaseButton>
+      <BaseButton
+        onPress={() => detachDoc(props.doc.path)}
+        accessibilityLabel={tr("Remove document", "移除文档")}
+        tooltip={tip(tr("Remove document", "移除文档"))}
+        class={`absolute right-1 top-1 size-5 items-center justify-center rounded-full border-[0.5px] border-hairline-hover bg-popover shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-secondary ${HOVER_REVEAL}`}
+      >
+        <Icon name="x" size={12} tone="foreground" />
+      </BaseButton>
+    </View>
+  );
+}
+
+/**
+ * What rides on the message waits in a tray that rises from behind the
+ * composer's top edge: a little narrower than the composer, its lower edge
+ * tucked under it, so adding to it never changes the input's own size.
+ * Documents come first, then pasted images — a thumbnail is its own card.
+ * Each one's remove button shows on hover or focus.
  */
 function AttachmentTray() {
-  const shown = keepLast(() => {
-    const list = composerAttachments();
-    return list.length > 0 ? list : undefined;
-  }, composerAttachments());
+  const held = () => composerAttachments().length > 0 || composerDocs().length > 0;
+  const shown = keepLast(() => (held() ? { docs: composerDocs(), images: composerAttachments() } : undefined), {
+    docs: composerDocs(),
+    images: composerAttachments(),
+  });
   return (
-    <Reveal open={composerAttachments().length > 0} offset={6}>
+    <Reveal open={held()} offset={6}>
       <View
         class="relative mx-4 -mb-2 overflow-hidden rounded-t-2xl corner-squircle border-[0.5px] border-b-0 border-hairline bg-card/85 pb-2 dark:bg-card/75"
         accessibilityLabel={tr("Attachments", "附件")}
       >
         <Scroll horizontal contentClass="flex-row gap-2 p-2">
-          <Each of={shown() ?? []} key="index">
+          <Each of={shown()?.docs ?? []} key={(doc) => doc.path}>
+            {(doc) => <DocCard doc={doc()} />}
+          </Each>
+          <Each of={shown()?.images ?? []} key="index">
             {(image, index) => (
               <View class="group relative size-14 shrink-0 overflow-hidden rounded-lg corner-squircle bg-muted" style={enter("zoomIn")}>
                 <Image
@@ -439,10 +508,13 @@ export function Composer() {
   let trackedDraft = untracked(composerDraft);
   const height = signal(MIN_HEIGHT);
   const slash = useSlashMenu();
+  /** The composer's column, which the slash menu stands on and whose width it takes. */
+  const column = signal<ViewRef | undefined>(undefined);
+  const columnWidth = signal(0);
   const ready = () => sidecarPhase().name === "ready";
   const canSend = () => ready() || isDraftAhead();
   const working = () => isRunning() || isBashRunning() || waitingCount() > 0;
-  const hasText = () => composerDraft().trim().length > 0 || composerAttachments().length > 0;
+  const hasText = () => composerDraft().trim().length > 0 || composerAttachments().length > 0 || composerDocs().length > 0;
   /** An input method's marked text shows in the field while `composerDraft` is still empty; the hint stays away for it. */
   const composing = signal(false);
   const showPlaceholder = computed(() => composerDraft().length === 0 && !composing());
@@ -487,7 +559,10 @@ export function Composer() {
 
   effect(() => {
     composerFocusTick();
-    input?.focus();
+    // The keyboard is the composer's only while the chat is in front: under a
+    // document it would take the document's typing, and open its menus over it.
+    if (currentView().name === "chat") input?.focus();
+    else input?.blur();
   });
 
   const sendMenuOpen = signal(false);
@@ -618,15 +693,23 @@ export function Composer() {
     // While the agent starts (a session switch), the field keeps its usual words rather than passing through others.
     if (sidecarPhase().name === "failed") return tr(`${name} is not running`, `${name} 未运行`);
     if (ready() && !hasModel()) return tr("Connect a model provider to start", "连接模型服务商以开始使用");
+    // A document rides on the message: words are what to do with it, and none sends it as it is.
+    if (composerDocs().length) return tr("Say what to do with it, or just send", "说说要怎么处理，或直接发送");
     if (isRunning()) return tr(`Steer ${name}…`, `引导 ${name}…`);
     return tr(`Ask ${name}…`, `问问 ${name}…`);
   };
 
   return (
     <View class="px-6 pb-5 pt-3">
-      <View class="pointer-events-auto relative w-full max-w-190 self-center">
+      <View
+        ref={(node) => {
+          if (node) column.set(node);
+        }}
+        onLayout={(e) => columnWidth.set(e.bounds.size.width)}
+        class="pointer-events-auto relative w-full max-w-190 self-center"
+      >
         <ExtensionPrompt />
-        <SlashMenu menu={slash} onChoose={choose} />
+        <SlashMenu menu={slash} onChoose={choose} anchor={column()} width={columnWidth()} />
         <AttachmentTray />
         <View class={`relative rounded-[22px] corner-squircle ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
           <ExtensionLines below={false} />
@@ -659,28 +742,43 @@ export function Composer() {
             autoCorrect={false}
             disabled={sidecarPhase().name === "failed"}
             accessibilityLabel={tr("Message", "消息")}
-            class="mx-4 mt-4 text-md text-foreground caret-brand"
+            class="ml-4 mr-9 mt-4 text-md text-foreground caret-brand"
             style={{ height: height() }}
           />
+          {/* A draft past its second line is offered room: it goes on as a document, where Return is
+              a new line and every word is kept. The field's right margin is the button's seat always,
+              so its arrival never re-wraps what is written. */}
+          <Presence show={height() >= LONG_DRAFT_HEIGHT} scaleFrom={0.85} class="absolute right-2 top-2.5">
+            <IconButton
+              testID="composer-to-doc"
+              icon="expand"
+              size="sm"
+              tone="subtle"
+              label={tr("Continue in a document", "在文档中继续写")}
+              shortcut="mod+e"
+              tipPlacement="top"
+              onPress={() => void draftToDoc()}
+            />
+          </Presence>
           {/* The hint is app-drawn, not the host's placeholder: host text re-rasterizes at
               integer offsets under the dock's transform and visibly steps a frame late. */}
           <If when={showPlaceholder()}>
-            <View class="pointer-events-none absolute left-4 right-4 top-4">
+            <View class="pointer-events-none absolute left-4 right-9 top-4">
               <Text class="truncate text-md text-subtle">{placeholder()}</Text>
             </View>
           </If>
           <ExtensionLines below />
           <View class="flex-row items-end justify-between gap-2 pb-2 pl-2.5 pr-2 pt-2">
             <View class="min-w-0 flex-1 flex-row flex-wrap items-center gap-0.5">
-              <AgentPicker />
-              <ModelPicker />
-              <ThinkingPicker />
+              <AgentPicker onOpen={slash.dismiss} />
+              <ModelPicker onOpen={slash.dismiss} />
+              <ThinkingPicker onOpen={slash.dismiss} />
             </View>
             <View class="shrink-0 flex-row items-center gap-1.5">
               <If when={ready()}>
                 <ContextMeter />
               </If>
-              <PermissionPicker />
+              <PermissionPicker onOpen={slash.dismiss} />
               <View style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
                 <If
                   when={showStop()}
@@ -705,6 +803,8 @@ export function Composer() {
                             sendMenuClosedAt = 0;
                             return;
                           }
+                          // The menu is the send's: the slash menu behind it would take the press's send.
+                          slash.dismiss();
                           sendMenuOpen.update((v) => !v);
                         }}
                         disabled={!canSend()}

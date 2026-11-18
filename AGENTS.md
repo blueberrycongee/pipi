@@ -49,6 +49,57 @@ multi-agent orchestration, and settings.
   said. The dead-agent screen is for a process that dies while starting,
   or will not stay up. An exit the store asked for is never routed: let go
   of a client (`closeActive`, `removeParked`) before closing it.
+- The sidebar is the shelf and the strip is the desk. The shelf
+  (`views/Sidebar.tsx`) lists every session and note there is, by project
+  and by age — a press there *looks* at one. The strip
+  (`views/TabBar.tsx`, state in `store/tabs.ts`) holds the few surfaces in
+  hand: chat sessions and Markdown documents, a press apart. So that
+  looking does not litter the desk, what was only looked at sits in the
+  strip's one **preview** seat — its name in italics — and the next thing
+  looked at takes that seat over; a tab is *kept* once it is worked on (a
+  message sent in its session, a document written in or taken to one) or the reader says
+  so (a double press, a drag, Keep Open). Closing a tab puts the thing
+  back on the shelf; it deletes nothing and stops nothing.
+- Documents are the strip's other surface (`store/docs.ts`,
+  `views/DocEditor.tsx`): a page of the person's own words — a brief the
+  composer is too small and too quick to send for, a draft the agents help
+  with — and the one reason it is here is that the agents are a key away.
+  A real Markdown file behind one live `RichEditorSession` per open tab,
+  saved on a debounce and flushed on close. Notes are the documents the
+  app keeps itself under `<dataDir>/docs/`, named by their first line:
+  they stand in the sidebar's 最近 among the sessions, from the press
+  that made them (a note whose tab is closed is put away, not lost; one
+  nobody wrote in leaves nothing behind), and the palette finds the ones
+  that have sunk. The ways in are where the need is: 新文档 under 新会话
+  (⌘⇧N), the composer's own door once a draft passes its second line (⌘E
+  moves the draft into a document — `draftToDoc`), a reply's "Save as
+  Document". The way out is one (`addDocToChat`): ⌘↵ attaches the
+  document — the passage selected, else all of it — to the composer's
+  message as a card (`DocRef` in `store/app.ts`) and brings the chat
+  forward. Nothing is pasted and nothing is sent: the words stay in the
+  document, the card goes wherever the composer's message goes, and a
+  whole document is sent as it reads when sent. Sent without a word the
+  message *is* the document's text; with one, the document rides behind
+  the words in a block naming its file (`lib/doc-wire.ts`), so an agent
+  with file tools changes it where it lives. No part of the app strips
+  those blocks: the bubble reads them back as cards (`views/Rows.tsx`),
+  and a title is the words (`titleWords`, twinned in
+  `sidecar/session-index.mjs`). What goes to an agent is `plainMarkdown`
+  — the serializer's escapes (`foo\_bar`, `\<tag>`) taken off.
+- A document's file is not the editor's alone, and the editor never writes
+  over what it has not read (`reconcile` in `store/docs.ts`): what an
+  agent or another editor wrote comes into the open document first, as one
+  change undo takes back, said once with the way back; where the person
+  typed meanwhile the two are merged by paragraph (`lib/merge3.ts`), theirs
+  standing where both changed the same lines. It looks at the disk when a
+  document comes forward, when the window does, and while agents work
+  (`syncDocs`), and a document on its way to a session is on disk before
+  the agent looks for it (`flushDoc`). A file from elsewhere keeps its
+  front matter as written, outside the editor; one holding what the editor
+  cannot keep (raw HTML, footnotes, link definitions, math) opens
+  read-only — shown, never rewritten. The editor lays blocks out as a
+  flow with no gap of its own: the page's rhythm is each block's margins
+  (`EDITOR_CLASSES`).
 - Nothing is bundled: `agents/catalog.ts` lists the built-in harnesses
   and the user's custom ACP configs, `sidecar/probe-agents.mjs` finds
   them on PATH (never triggering OAuth popups or project hooks), and each
@@ -116,6 +167,25 @@ multi-agent orchestration, and settings.
   shown with the click, and that nothing passes through while the agent loads;
   `nsh test SwitchFilm.test.tsx --target macos` films the changes into
   `.nsh/shots/switch-*.png` (compare frames: the fades do not show in `texts()`)
+- `nsh test Tabs.test.tsx` — the strip: shelf-looks sharing the one preview
+  seat, what keeps a tab, neighbours on a close, ⌘⇧]/⌘⇧[, the drag's reorder
+  and its Escape, a dropped `.md`, a typed heading renaming its tab
+- `nsh test Docs.test.tsx` — the document from end to end: `/` listing
+  blocks and Enter picking (`、` under a Chinese input method opens it
+  too), a new document in 最近 from the press that made it, ⌘↵ attaching
+  it (or the passage selected) to the message and what that message is
+  sent as, a long draft going on as a document (⌘E), what an agent writes
+  to the file landing in the open document and merging with what was
+  typed meanwhile (the scripted Pi rewrites a document handed to it when
+  asked to "rewrite", and "recite <path>" prints a file), front matter
+  kept, a lossy file read-only; `nsh test DocLook.test.tsx --target macos`
+  shoots each of those into `.nsh/shots/doc-*.png`; `nsh test
+  lib/doc-wire.test.ts` / `lib/merge3.test.ts` — the message's wire form
+  and the three-way merge
+- `nsh test TabsFilm.test.tsx --target macos` — films a document coming
+  forward over the chat and a tab closing (the pills flow to their new
+  slots) into `.nsh/shots/tabs-*.png`, via `harness.then`'s `tab:` /
+  `closetab:` steps
 - `nsh test Settings.test.tsx` — Settings switches sections and subpages
   without remounting visited panes or flashing `Usage`'s empty state;
   `--target macos` checks pixel stability right after section switches
@@ -135,6 +205,10 @@ multi-agent orchestration, and settings.
 - `nsh test UserFold.test.tsx` — a sent message laid out past six lines folds
   to a fading preview; the chevron at the bubble's foot opens and closes it
   (`--target macos` films `.nsh/shots/userfold-*.png`)
+- `nsh test Zoom.test.tsx` — a table's hover expand button opens it in the
+  zoom layer (`ui/Zoom.tsx`, the one preview surface — a `TextView` image
+  press lands there too); Escape or its close button leaves it
+  (`--target macos` films `.nsh/shots/zoom-*.png`)
 - `nsh test WallpaperLook.test.tsx --target macos` — the app under a wallpaper,
   every surface it reaches, in `.nsh/shots/wallpaper-*.png` (`harness.wallpaper`
   lays one; name any image in the test's `PICTURE`)
@@ -209,7 +283,9 @@ that is taken, set `PORT`.
   (`auth.json`), `providers.ts`
 - `store/` — `app.ts` (all state and actions; signals are private),
   `backend.ts` (everything that touches the machine, swappable in tests),
-  `prefs.ts`, `update.ts` (the app's own update checks and the card's state)
+  `prefs.ts`, `tabs.ts` (the strip: which surfaces are open, the preview
+  seat, doc⇄chat), `docs.ts` (open Markdown documents, their files kept
+  in step with the disk, and the notes listed in 最近), `update.ts` (the app's own update checks and the card's state)
 - `views/` — screens; `ui/` — the component kit; `mascot/` — Pip
 - `sidecar/` — Node helpers run as children: `probe-agents.mjs` (PATH
   discovery), `launch-pi.mjs`, `external-agent.mjs` (the universal
@@ -259,8 +335,10 @@ that is taken, set `PORT`.
   failures toast as `warning`. A `phase: "failed"` blocking screen keeps
   its full-screen state AND fires an error toast. Transcript rows and
   `transcript.note` carry conversation/agent content only — app errors are
-  never reported inline, in banners, or in dialogs. The same toast again
-  stays in place and its time starts over; it is never removed and re-added.
+  never reported inline, in banners, or in dialogs. A toast is one line:
+  its whitespace collapses and its text never runs past 120 chars. The
+  same toast again stays in place and its time starts over; it is never
+  removed and re-added.
 - A run's error is said once, and only when it stands (`#failure` in
   `pi/transcript.ts`): a failed assistant message is held back until the run
   settles or the conversation moves on, and a retry (`auto_retry_start`, an

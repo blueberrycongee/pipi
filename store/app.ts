@@ -12,6 +12,7 @@ import type {
   WorktreeInfo,
 } from "../agents/types";
 import { activeLanguage, tr } from "../lib/i18n";
+import { composeDocMessage } from "../lib/doc-wire";
 import { answersTo, type ComposerCommand, parseSlashLine } from "../lib/slash";
 import { markPacersSeeded } from "../lib/stream-pacer";
 import { markVeilsSeeded } from "../lib/veil";
@@ -167,8 +168,8 @@ export interface Attachment extends ImageContent {
   name: string;
 }
 
-/** Settings on `section`; `agent` names the agent whose configuration is open inside Agents. */
-export type View = { name: "chat" } | { name: "settings"; section: SettingsSection; agent?: string };
+/** Settings on `section`; `agent` names the agent whose configuration is open inside Agents. A `doc` names the open document's file. */
+export type View = { name: "chat" } | { name: "doc"; docId: string } | { name: "settings"; section: SettingsSection; agent?: string };
 export type SettingsSection = "general" | "agents" | "sessions" | "archive" | "usage" | "shortcuts" | "about";
 
 const phase = signal<Phase>({ name: "starting" });
@@ -207,6 +208,7 @@ const credentials = signal<Record<string, CredentialKind>>({});
 const view = signal<View>({ name: "chat" });
 const draft = signal("");
 const attachments = signal<Attachment[]>([]);
+const docRefs = signal<DocRef[]>([]);
 const composerFocus = signal(0, { equals: false });
 /** Ticks when something outside the model chip (`/model`) asks for its list. */
 const modelPickerAsk = signal(0, { equals: false });
@@ -297,13 +299,14 @@ export const archivedSessionItems = computed<ArchivedSessionItem[]>(() => {
     const meta = held.file ? map[held.file] : undefined;
     if (!held.file || !meta || meta.gone || seen.has(held.file)) continue;
     seen.add(held.file);
+    const named = held.title && held.title !== "New session" ? held.title : "";
     out.push({
       id: `archived:${held.file}`,
       session: {
         path: held.file,
         id: held.id,
-        name: held.title,
-        firstMessage: held.title,
+        name: named || undefined,
+        firstMessage: named,
         messageCount: 0,
         created: held.createdAt,
         modified: held.lastActive,
@@ -338,6 +341,7 @@ export const storedProviders = () => credentials();
 export const currentView = () => view();
 export const composerDraft = () => draft();
 export const composerAttachments = () => attachments();
+export const composerDocs = () => docRefs();
 export const composerFocusTick = () => composerFocus();
 export const modelPickerTick = () => modelPickerAsk();
 export const scrollToEndTick = () => scrollToEnd();
@@ -379,7 +383,9 @@ const modelsByAgent = new Map<string, Model[]>();
 function agentHasModel(agentId: string): boolean {
   if (agentId === currentAgentId() && hasModel()) return true;
   const cached = modelsByAgent.get(agentId);
-  return Boolean(cached && cached.length > 0);
+  if (cached && cached.length > 0) return true;
+  const spec = agents().find((a) => a.id === agentId);
+  return Boolean(spec && spec.available && spec.models.length > 0);
 }
 
 /**
@@ -398,11 +404,17 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
     // switch in flight already put on screen. Only a cold boot is not warm —
     // its "starting" stage stands until the first agent answers.
     const warm = phase().name === "ready" || isDraftAhead() || ahead !== undefined || transcript.rows().length > 0;
-    const welcome = !goal.file && !goal.daemonId && warm && agentHasModel(goal.agentId ?? currentAgentId());
-    stashTranscript();
     const seenFile = goal.file ?? (goal.daemonId ? daemonSessionOfId(goal.daemonId)?.file : undefined);
     const seenDaemonId = goal.daemonId ?? (goal.file ? daemonSessionByFile(goal.file)?.id : undefined);
     const seenDaemon = seenDaemonId ? daemonSessionOfId(seenDaemonId) : undefined;
+    const emptyDaemon =
+      Boolean(goal.daemonId) &&
+      !seenFile &&
+      seenDaemon !== undefined &&
+      seenDaemon.status !== "working" &&
+      seenDaemon.status !== "blocked";
+    const welcome = !goal.file && (!goal.daemonId || emptyDaemon) && warm && agentHasModel(goal.agentId ?? currentAgentId());
+    stashTranscript();
     const seen = (seenFile ? visited.get(seenFile) : undefined) ?? (seenDaemonId ? visitedByDaemon.get(seenDaemonId) : undefined);
     if (seen) {
       if (seenFile) visited.delete(seenFile);
@@ -589,9 +601,14 @@ export function daemonTreePlace(session: DaemonSession, files: ReadonlySet<strin
   return { top: cur };
 }
 
-/** Whether a tree root earns a sidebar row of its own: work, a wait, an unread answer, or an outside caller. */
+/** Whether `session` is an explicit daemon task (child, external caller, or named job) rather than an untitled UI scratchpad. */
+export function isDaemonTaskSession(session: DaemonSession | undefined): boolean {
+  return Boolean(session && (session.parentId || session.initiator === "external" || session.titleLocked));
+}
+
+/** Whether a tree root earns a sidebar row of its own: work, a wait, an unread answer, a named job, or an outside caller. */
 export function daemonRootEarnsRow(session: DaemonSession): boolean {
-  return session.initiator === "external" || session.status !== "idle" || session.unread;
+  return session.initiator === "external" || Boolean(session.titleLocked) || session.status !== "idle" || session.unread;
 }
 
 /** Sessions started under the session whose file is `path`, nested in the sidebar under it. */
@@ -800,10 +817,15 @@ export const hasModel = computed(() => {
 /** Optimistic model for a fresh draft session shown ahead of the agent (`isDraftAhead`). */
 export const draftModel = computed<Model | undefined>(() => {
   if (!isDraftAhead()) return undefined;
-  const wanted = storedSessionChoice(currentAgentId())?.model;
-  if (!wanted) return undefined;
-  const list = models().length ? models() : (modelsByAgent.get(currentAgentId()) ?? []);
-  return list.find((m) => m.id === wanted.id && m.provider === wanted.provider) ?? list.find((m) => m.id === wanted.id);
+  const id = currentAgentId();
+  const cached = modelsByAgent.get(id);
+  const list = cached && cached.length ? cached : (agents().find((a) => a.id === id)?.models ?? models());
+  const wanted = storedSessionChoice(id)?.model;
+  if (wanted) {
+    const picked = list.find((m) => m.id === wanted.id && m.provider === wanted.provider) ?? list.find((m) => m.id === wanted.id);
+    if (picked) return picked;
+  }
+  return list[0];
 });
 
 /** Optimistic thinking depth for a fresh draft session shown ahead of the agent (`isDraftAhead`). */
@@ -832,8 +854,8 @@ export const currentTitle = computed(() => {
     return sessionTitle({ firstMessage: first.text }, tr("New session", "新会话"));
   }
   const ds = currentDaemonSession();
-  if (ds && (ds.parentId || ds.initiator === "external") && ds.title) {
-    return ds.title;
+  if (isDaemonTaskSession(ds)) {
+    return daemonSessionTitle(ds!);
   }
   return tr("New session", "新会话");
 });
@@ -1071,7 +1093,16 @@ function landHistory(messages: AgentMessage[]) {
     if (file) visited.delete(file);
     if (did) visitedByDaemon.delete(did);
   }
-  if (messages.length === 0 && transcript.rows().length === 0 && !before) {
+  if (
+    messages.length === 0 &&
+    transcript.rows().length === 0 &&
+    rows().length === 0 &&
+    shownVersion === transcript.version &&
+    !leaving() &&
+    !before &&
+    !queue().steering.length &&
+    !queue().followUp.length
+  ) {
     return;
   }
   const countUsers = (list: readonly Row[]) => list.reduce((n, r) => (r.kind === "user" ? n + 1 : n), 0);
@@ -1104,6 +1135,10 @@ function landHistory(messages: AgentMessage[]) {
   markTranscriptSeen();
   batch(() => {
     flush();
+    if (leaving()) {
+      leaving.set(false);
+      arrived.update((n) => n + 1);
+    }
     landed.update((n) => n + 1);
     if (!shown) scrollToEnd.set(0);
   });
@@ -1189,13 +1224,39 @@ function request<C extends CommandType>(
 
 /** Daemon sessions the store itself ended — their pushes are expected, not news. */
 const quietSessions = new Set<string>();
+/** Fileless daemon sessions the user archived/dismissed (kept so an older un-restarted daemon cannot push them back). */
+const dismissedDaemonIds = new Set<string>();
+/** Untitled fileless daemon sessions that were opened from a failed/interrupted state (retired if left untouched). */
+const recoveredZombieIds = new Set<string>();
 
-/** What a daemon session is called on screen: its file's listing name/first message when there is one. */
-function daemonSessionTitle(session: DaemonSession): string {
-  const summary =
-    (session.cwd === workspace() ? sessions() : (sessionsByWorkspace()[session.cwd] ?? [])).find((s) => s.path === session.file) ??
-    sessions().find((s) => s.path === session.file);
-  return summary ? sessionTitle(summary, session.title) : session.title;
+/** What a daemon session is called on screen: localized when untitled, synced with its saved file when renamed. */
+export function daemonSessionTitle(session: DaemonSession, fallback = tr("New session", "新会话")): string {
+  const summary = session.file
+    ? ((session.cwd === workspace() ? sessions() : (sessionsByWorkspace()[session.cwd] ?? [])).find((s) => s.path === session.file) ??
+       sessions().find((s) => s.path === session.file))
+    : undefined;
+  if (session.titleLocked && session.title && session.title !== "New session") {
+    return session.title;
+  }
+  if (summary?.name) return sessionTitle(summary, fallback);
+  if (session.title && session.title !== "New session") return session.title;
+  if (summary) return sessionTitle(summary, fallback);
+  return fallback;
+}
+
+function removeDaemonSessionLocal(sessionId: string) {
+  daemonSessionList.update((list) => (list.some((s) => s.id === sessionId) ? list.filter((s) => s.id !== sessionId) : list));
+  visitedByDaemon.delete(sessionId);
+  recoveredZombieIds.delete(sessionId);
+}
+
+function retireDaemonSession(sessionId: string) {
+  dismissedDaemonIds.add(sessionId);
+  quietSessions.add(sessionId);
+  removeDaemonSessionLocal(sessionId);
+  if (daemonClient) {
+    void daemonClient.removeSession(sessionId).catch(() => daemonClient?.killSession(sessionId).catch(() => undefined));
+  }
 }
 
 /**
@@ -1204,6 +1265,8 @@ function daemonSessionTitle(session: DaemonSession): string {
  * workspace list (a file first appearing is how a fresh session gets a row at all).
  */
 function upsertDaemonSession(session: DaemonSession) {
+  if (dismissedDaemonIds.has(session.id)) return;
+  if (session.file || (session.title && session.title !== "New session")) recoveredZombieIds.delete(session.id);
   const prev = daemonSessionList().find((known) => known.id === session.id);
   daemonSessionList.update((list) => {
     const at = list.findIndex((known) => known.id === session.id);
@@ -1268,6 +1331,7 @@ async function ensureDaemon(): Promise<DaemonClient | undefined> {
         if (!connect) return undefined;
         const started = await connect({
           onSession: upsertDaemonSession,
+          onSessionRemoved: removeDaemonSessionLocal,
           onExit: () => {
             daemonClient = undefined;
           },
@@ -1338,6 +1402,8 @@ function teardownStore() {
   for (const started of clientDaemonId.keys()) started.close(0);
   clientDaemonId.clear();
   clientSendHolds.clear();
+  dismissedDaemonIds.clear();
+  recoveredZombieIds.clear();
   visited.clear();
   visitedByDaemon.clear();
   active?.close(0);
@@ -1489,10 +1555,40 @@ async function launch(
     const retry = autoRetryChoice();
     if (retry !== undefined) request("set_auto_retry", { enabled: retry }).catch(() => undefined);
     if ((reopen || daemonId) && !preserveRows) {
+      // The daemon already put the process on `reopen`'s session file before answering the attach.
+      const [, history] = await Promise.all([
+        refreshState(),
+        withStartupTimeout(request("get_messages"), agentLabel),
+      ]);
+      if (mine !== generation) return;
+      const current = state() ?? first;
+      const heldStatus = currentDaemonSession()?.status;
+      const activeRun = Boolean(current.isStreaming) || heldStatus === "working" || heldStatus === "blocked";
+      if (history.messages.length === 0 && !activeRun && !ahead) {
+        // An empty at-rest session lands on Welcome rather than a transcript: resolve
+        // models and user choices before publishing `"ready"`, as `finishFreshLaunch` does.
+        await Promise.all([refreshModels(effectiveAgentId), refreshLevels()]);
+        if (mine !== generation) return;
+        const base = state() ?? first;
+        const chosen = await applySessionChoices(base, false);
+        if (mine !== generation) return;
+        const resolved = await applyThinkingChoice(chosen, false);
+        if (mine !== generation) return;
+        batch(() => {
+          state.set(resolved ?? base);
+          running.set(false);
+          activity.set({ kind: "idle" });
+          phase.set({ name: "ready" });
+          landHistory(history.messages);
+        });
+        if ((resolved ?? base)?.sessionFile) reportSessionFile();
+        const listCwd = projectCwdOf(cwd, currentDaemonSession());
+        void Promise.all([refreshCommands(), refreshSessions(listCwd), refreshCredentials(), refreshGitWorkspace(cwd), refreshStats()]).catch(failLaunch);
+        return;
+      }
       batch(() => {
-        state.set(first);
-        const heldStatus = currentDaemonSession()?.status;
-        if (first.isStreaming || heldStatus === "working" || heldStatus === "blocked") {
+        if (!state()) state.set(first);
+        if (activeRun) {
           if (!running()) runStartedAt.set(Date.now());
           running.set(true);
           if (activity().kind === "idle") activity.set({ kind: "thinking" });
@@ -1502,13 +1598,7 @@ async function launch(
         }
         phase.set({ name: "ready" });
       });
-      if (first.sessionFile) reportSessionFile();
-      // The daemon already put the process on `reopen`'s session file before answering the attach.
-      const [, history] = await Promise.all([
-        refreshState(),
-        withStartupTimeout(request("get_messages"), agentLabel),
-      ]);
-      if (mine !== generation) return;
+      if ((state() ?? first).sessionFile) reportSessionFile();
       landHistory(history.messages);
       // The conversation is on screen: the session change is over, its pickers fill in behind it.
       void finishLaunch().catch(failLaunch);
@@ -1598,8 +1688,17 @@ async function connect(cwd: string, agentId: string, mine: number, reopen?: stri
        (sessionsByWorkspace()[rootCwd] ?? []).find((s) => s.path === reopen) ??
        (sessionsByWorkspace()[cwd] ?? []).find((s) => s.path === reopen))
     : undefined;
+  const targetId = daemonId ?? daemonSessionByFile(reopen)?.id;
+  const priorHeld = targetId ? daemonSessionOfId(targetId) : undefined;
+  const wasFailedUntitledZombie = Boolean(
+    priorHeld &&
+      !priorHeld.file &&
+      !isDaemonTaskSession(priorHeld) &&
+      (!priorHeld.title || priorHeld.title === "New session") &&
+      (priorHeld.status === "failed" || priorHeld.status === "interrupted"),
+  );
   const { transport, session } = await daemon.attach({
-    id: daemonId ?? daemonSessionByFile(reopen)?.id,
+    id: targetId,
     file: reopen,
     title: known ? sessionTitle(known, "") : undefined,
     cwd,
@@ -1616,6 +1715,11 @@ async function connect(cwd: string, agentId: string, mine: number, reopen?: stri
     transport.kill();
     return undefined;
   }
+  if (wasFailedUntitledZombie) recoveredZombieIds.add(session.id);
+  const settledSession =
+    session.status === "failed" || session.status === "interrupted"
+      ? { ...session, status: "idle" as const, error: undefined }
+      : session;
   let started: PiClient | undefined;
   started = new PiClient(transport, {
     onEvent: (event) => routeEvent(started, event),
@@ -1623,11 +1727,12 @@ async function connect(cwd: string, agentId: string, mine: number, reopen?: stri
     onExit: (exit, stderr) => routeExit(started, exit, stderr, agentLabel),
   });
   client = started;
-  clientDaemonId.set(started, session.id);
+  clientDaemonId.set(started, settledSession.id);
   batch(() => {
-    openDaemonId.set(session.id);
-    currentRuntimeMode.set(session.runtimeMode);
-    if (session.agentId && session.agentId !== currentAgentId()) currentAgentId.set(session.agentId);
+    if (settledSession !== session) upsertDaemonSession(settledSession);
+    openDaemonId.set(settledSession.id);
+    currentRuntimeMode.set(settledSession.runtimeMode);
+    if (settledSession.agentId && settledSession.agentId !== currentAgentId()) currentAgentId.set(settledSession.agentId);
   });
   return started;
 }
@@ -1759,7 +1864,6 @@ export async function switchAgentHarness(nextAgentId: string) {
     return;
   }
 
-  await settle();
   const prevName = activeAgent().name;
   setPreferredAgentId(nextAgentId);
 
@@ -1868,7 +1972,7 @@ export async function openWorkspace(path: string, sessionPath?: string, sessionA
   if (path === workspace() && phase().name === "ready" && !isSwitching()) {
     rememberWorkspace(projectCwd);
     if (sessionPath) {
-      await openSession(sessionPath);
+      await openSession(sessionPath, undefined, sessionAgentId);
     } else {
       view.set({ name: "chat" });
       focusComposer();
@@ -1877,8 +1981,9 @@ export async function openWorkspace(path: string, sessionPath?: string, sessionA
   }
   pendingHandoff.set(undefined);
   view.set({ name: "chat" });
-  if (mustDetachOnSwitch()) return switchInto(path, sessionPath, sessionAgentId ?? currentAgentId(), held?.id);
-  await start(path, sessionPath, sessionAgentId ?? currentAgentId(), undefined, held?.id);
+  const resolvedAgentId = sessionAgentId ?? held?.agentId ?? findKnownSessionSummary(sessionPath)?.agentId ?? currentAgentId();
+  if (mustDetachOnSwitch()) return switchInto(path, sessionPath, resolvedAgentId, held?.id);
+  await start(path, sessionPath, resolvedAgentId, undefined, held?.id);
 }
 
 /** Starts a fresh session in `cwd`, switching to that project first when needed. */
@@ -2563,6 +2668,9 @@ export function cancelPendingDialog() {
 
 // ── Toasts ──────────────────────────────────────────────────────────────────
 
+/** A toast says its piece on one line — however long the title or the error it carries. */
+const TOAST_MAX_CHARS = 120;
+
 /** How long a toast stays: longer for an error or one that offers an action, and for one that takes longer to read. */
 function toastLifetime(tone: Toast["tone"], text: string, hasAction: boolean) {
   const base = tone === "error" || hasAction ? 6000 : 4000;
@@ -2616,8 +2724,10 @@ export function toast(
   text: string,
   options?: { icon?: IconName; action?: ToastAction; durationMs?: number },
 ) {
-  const ttl = options?.durationMs ?? toastLifetime(tone, text, !!options?.action);
-  const same = toasts().find((item) => item.tone === tone && item.text === text);
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  const shown = oneLine.length > TOAST_MAX_CHARS ? `${oneLine.slice(0, TOAST_MAX_CHARS - 1)}…` : oneLine;
+  const ttl = options?.durationMs ?? toastLifetime(tone, shown, !!options?.action);
+  const same = toasts().find((item) => item.tone === tone && item.text === shown);
   if (same) {
     if (options?.icon || options?.action) {
       toasts.update((list) => list.map((item) => (item.id === same.id ? { ...item, icon: options.icon ?? item.icon, action: options.action ?? item.action } : item)));
@@ -2633,7 +2743,7 @@ export function toast(
     toastTimers.delete(gone.id);
     heldToasts.delete(gone.id);
   }
-  toasts.update((list) => [...list.slice(-2), { id, tone, text, icon: options?.icon, action: options?.action }]);
+  toasts.update((list) => [...list.slice(-2), { id, tone, text: shown, icon: options?.icon, action: options?.action }]);
   expireToast(id, ttl);
 }
 
@@ -2670,6 +2780,62 @@ export function addAttachment(image: Attachment) {
 
 export function removeAttachment(index: number) {
   attachments.update((list) => list.filter((_, i) => i !== index));
+}
+
+/**
+ * A document riding on the message being written: all of it, or a passage
+ * selected in it. It is attached, not pasted — the words stay in the
+ * document, where they are written — and it goes wherever the composer's
+ * next message goes, whichever session that is by then.
+ */
+export interface DocRef {
+  /** The document's file. */
+  path: string;
+  /** Its name when it was attached. */
+  title: string;
+  /** The text as attached. The whole document goes as it reads when sent (`docRefText`), a passage as it was selected. */
+  text: string;
+  /** A passage selected in the document rather than all of it. */
+  excerpt?: boolean;
+}
+
+/** What an attached document says now; `store/tabs` answers with the open document's text, so words written after attaching are sent too. */
+export const docRefText: { read: (ref: DocRef) => string } = { read: (ref) => ref.text };
+
+/** Attaches a document to the composer's message; attached again it is the same card, as it reads now. */
+export function attachDoc(ref: DocRef) {
+  docRefs.update((list) => (list.some((held) => held.path === ref.path) ? list.map((held) => (held.path === ref.path ? ref : held)) : [...list, ref]));
+}
+
+export function detachDoc(path: string) {
+  if (docRefs().some((held) => held.path === path)) docRefs.update((list) => list.filter((held) => held.path !== path));
+}
+
+/** The attached document's editor is going (its tab closed): the card keeps the text it had then. */
+export function settleDocRef(path: string, text: string) {
+  if (!docRefs().some((held) => held.path === path && !held.excerpt && held.text !== text)) return;
+  docRefs.update((list) => list.map((held) => (held.path === path && !held.excerpt ? { ...held, text } : held)));
+}
+
+/**
+ * Makes the draft the message it will be sent as: the words typed, then the
+ * attached documents (`lib/doc-wire.ts`) — or a lone document's own text when
+ * nothing was typed. A line that is a command of the app's or the shell's is
+ * not a message about them: the documents wait for the one after it.
+ */
+function takeDocsIntoDraft(): { message: string; said: string; refs: DocRef[] } | undefined {
+  const refs = docRefs();
+  if (!refs.length) return undefined;
+  const said = draft().trim();
+  const line = said ? parseSlashLine(said) : undefined;
+  if (said.startsWith("!") || (line && appCommands().some((own) => answersTo(own, line.name)))) return undefined;
+  const parts = refs.map((ref) => ({ path: ref.path, text: ref.excerpt ? ref.text : docRefText.read(ref), ...(ref.excerpt ? { excerpt: true } : {}) }));
+  const message = composeDocMessage(said, parts);
+  batch(() => {
+    draft.set(message);
+    docRefs.set([]);
+  });
+  return { message, said, refs };
 }
 
 /** A paste's file reads land on promises; `send` waits for them so a fast paste-and-send keeps its attachments. */
@@ -2793,6 +2959,9 @@ export async function send(mode: "steer" | "followUp" = "steer") {
   };
   try {
     if (attachmentReads.size) await Promise.allSettled([...attachmentReads]);
+    // From here to the send nothing waits: the draft becomes the whole message and is cleared in the same turn,
+    // so the field never shows a document's text.
+    const withDocs = takeDocsIntoDraft();
 
     // If `send` was triggered on an open session and the user switched away while `attachmentReads` finished,
     // deliver the message to the original session's held pipe rather than misrouting it to the new session.
@@ -2896,6 +3065,13 @@ export async function send(mode: "steer" | "followUp" = "steer") {
       return;
     }
     await dispatchPrompt(text, images, mode, true);
+    // Not sent (no agent ready, no model): the words and the documents are on the composer as they were.
+    if (withDocs && draft() === withDocs.message) {
+      batch(() => {
+        draft.set(withDocs.said);
+        docRefs.set(withDocs.refs);
+      });
+    }
   } finally {
     releaseHold?.();
     finishSendCount();
@@ -3215,13 +3391,33 @@ async function takeQueuedNow(id: string, edit: boolean) {
 
 // ── Sessions ────────────────────────────────────────────────────────────────
 
+function findKnownSessionSummary(path: string | undefined): SessionSummary | undefined {
+  if (!path) return undefined;
+  const direct = sessions().find((s) => s.path === path);
+  if (direct) return direct;
+  for (const list of Object.values(sessionsByWorkspace())) {
+    const hit = list.find((s) => s.path === path);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+function hasConversationContent(): boolean {
+  if (rows().length > 0 || (state()?.messageCount ?? 0) > 0 || Boolean(state()?.sessionName)) return true;
+  const held = currentDaemonSession();
+  if (isDaemonTaskSession(held)) return true;
+  const file = state()?.sessionFile ?? held?.file;
+  return Boolean(file && findKnownSessionSummary(file));
+}
+
 /**
- * Whether the open daemon session is tied to an active run, a session tree, or
- * an external caller — if so, leaving it detaches and opens a separate daemon
- * session rather than switching files inside its process.
+ * Whether the open daemon session is tied to an active run, a session tree, an
+ * existing conversation, or an external caller — if so, leaving it detaches
+ * and opens a separate daemon session rather than switching files inside its process.
  */
 function mustDetachOnSwitch(): boolean {
   if (hasActiveOrQueuedWork()) return true;
+  if (hasConversationContent()) return true;
   const held = currentDaemonSession();
   if (held?.status === "working" || held?.status === "blocked") return true;
   if (held?.parentId || held?.initiator === "external") return true;
@@ -3237,11 +3433,14 @@ function mustDetachOnSwitch(): boolean {
 function closeActive() {
   const current = client;
   const hadWork = hasActiveOrQueuedWork();
-  const leavingCwd = projectCwdOf(workspace(), currentDaemonSession());
+  const leavingSession = currentDaemonSession();
+  const leavingCwd = projectCwdOf(workspace(), leavingSession);
   client = undefined;
+  let heldSend = false;
   if (current) {
     const holds = clientSendHolds.get(current);
     if (holds && holds.size > 0) {
+      heldSend = true;
       void Promise.allSettled([...holds]).then(() => {
         clientSendHolds.delete(current);
         clientDaemonId.delete(current);
@@ -3251,6 +3450,18 @@ function closeActive() {
       clientDaemonId.delete(current);
       current.close();
     }
+  }
+  if (
+    leavingSession &&
+    recoveredZombieIds.has(leavingSession.id) &&
+    !hadWork &&
+    !heldSend &&
+    !leavingSession.file &&
+    !rows().length &&
+    !(state()?.messageCount) &&
+    descendantSessionsOf(leavingSession.id).length === 0
+  ) {
+    retireDaemonSession(leavingSession.id);
   }
   // A run let go of keeps working off screen: re-list so its sidebar rows exist for the mark.
   if (hadWork) void refreshSessions(leavingCwd);
@@ -3369,7 +3580,8 @@ export function newSession() {
     view.set({ name: "chat" });
     return start(rootCwd, undefined, currentAgentId());
   }
-  if (!rows().length && !(state()?.messageCount) && !mustDetachOnSwitch() && view().name === "chat") {
+  if (!rows().length && !(state()?.messageCount) && !mustDetachOnSwitch()) {
+    if (view().name !== "chat") view.set({ name: "chat" });
     return focusComposer();
   }
   if (mustDetachOnSwitch() || rootCwd !== workspace()) {
@@ -3381,11 +3593,14 @@ export function newSession() {
 async function openSessionFile(path: string, ownerAgentId?: string) {
   const held = daemonSessionByFile(path);
   const targetCwd = held?.cwd ?? activeProjectPath() ?? workspace();
-  const neededAgent =
+  let neededAgent =
     held?.agentId ||
     ownerAgentId ||
-    (path.endsWith(".pipi-agent.jsonl") ? sessions().find((s) => s.path === path)?.agentId : "pi") ||
-    currentAgentId();
+    (path.endsWith(".pipi-agent.jsonl") ? findKnownSessionSummary(path)?.agentId : "pi");
+  if (!neededAgent && path.endsWith(".pipi-agent.jsonl")) {
+    neededAgent = (await backend().readSessionSnapshot(path).catch(() => undefined))?.agentId;
+  }
+  neededAgent ||= currentAgentId();
   const targetSpec = agents().find((a) => a.id === neededAgent);
   const switchHarness =
     neededAgent !== currentAgentId() &&
@@ -3404,28 +3619,36 @@ async function openSessionFile(path: string, ownerAgentId?: string) {
   return changeSession(tr("Could not open the session", "无法打开会话"), () => request("switch_session", { sessionPath: path }), { file: path });
 }
 
-export function openSession(path: string, cwd?: string) {
+export function openSession(path: string, cwd?: string, ownerAgentId?: string) {
   markSessionRead(path);
   const held = daemonSessionByFile(path);
   const effectiveCwd = cwd ?? (held ? projectCwdOf(held.cwd, held) : undefined);
   if (effectiveCwd && effectiveCwd !== activeProjectPath()) {
-    const summary = (sessionsByWorkspace()[effectiveCwd] ?? []).find((s) => s.path === path);
-    return openWorkspace(held?.cwd ?? effectiveCwd, path, held?.agentId ?? summary?.agentId);
+    const summary = (sessionsByWorkspace()[effectiveCwd] ?? []).find((s) => s.path === path) ?? findKnownSessionSummary(path);
+    return openWorkspace(held?.cwd ?? effectiveCwd, path, ownerAgentId ?? held?.agentId ?? summary?.agentId);
   }
   if (path === state()?.sessionFile && phase().name === "ready" && !isSwitching()) {
     view.set({ name: "chat" });
     focusComposer();
     return;
   }
-  const summary = sessions().find((s) => s.path === path);
-  return openSessionFile(path, summary?.agentId);
+  const summary = findKnownSessionSummary(path);
+  return openSessionFile(path, ownerAgentId ?? summary?.agentId);
 }
 
 export function duplicateSession() {
+  if (running() || bashRunning()) {
+    toast("info", tr("Wait for the run to finish before duplicating.", "请等待当前运行结束后再复制会话。"));
+    return Promise.resolve(false);
+  }
   return changeSession(tr("Could not duplicate the session", "无法复制会话"), () => request("clone"));
 }
 
 export async function forkFrom(index: number) {
+  if (running() || bashRunning()) {
+    toast("info", tr("Wait for the run to finish before forking.", "请等待当前运行结束后再创建分支。"));
+    return;
+  }
   const candidates = await attempt(tr("Could not fork", "无法创建分支"), () => request("get_fork_messages"));
   const target = candidates?.messages[index];
   if (!target) return void toast("warning", tr("This message cannot be forked from.", "无法从这条消息创建分支。"));
@@ -3484,16 +3707,21 @@ export async function archiveSession(path: string, cwd = workspace(), options?: 
       ? currentTitle()
       : summary
         ? sessionTitle(summary, tr("Conversation", "对话"))
-        : (daemonSessionByFile(path)?.title ?? tr("Conversation", "对话"));
+        : (daemonSessionByFile(path) ? daemonSessionTitle(daemonSessionByFile(path)!, tr("Conversation", "对话")) : tr("Conversation", "对话"));
   const held = daemonSessionByFile(path);
-  // A background session holding this file ends with it; the open one moves to a new file instead.
+  const open = path === state()?.sessionFile;
+  // A background session holding this file ends with it; the open one detaches onto a fresh draft.
   if (held?.loaded && held.id !== openDaemonId()) quietKill(held.id);
   // The list moves at once; leaving the open session follows, and puts the row back if it cannot.
-  const open = path === state()?.sessionFile;
   setSessionArchived(path, true, cwd);
-  if (open && !(await changeSession(tr("Could not archive the session", "无法归档会话"), requestNewSession))) {
-    setSessionArchived(path, false);
-    return;
+  if (open) {
+    const openId = openDaemonId();
+    const left = await switchInto(activeProjectPath() || workspace(), undefined, currentAgentId());
+    if (!left) {
+      setSessionArchived(path, false);
+      return;
+    }
+    if (openId) quietKill(openId);
   }
   toast("info", tr(`“${title}” archived.`, `「${title}」已归档。`), {
     icon: "archive",
@@ -3515,14 +3743,78 @@ function forgetDeletedSession(path: string) {
 }
 
 /**
- * Archives a session the daemon started under another, from its row in the
- * tree: its transcript goes to the archive as any session's does, and its row —
- * with whatever it started in turn — leaves the tree until it is restored.
+ * Archives a daemon session from its row in the sidebar: when it has a saved
+ * transcript file on disk, tucks that file into Archive; when it never wrote a
+ * transcript file (e.g. a start or run that failed before any message landed),
+ * retires the dead daemon session cleanly so the user is never stuck with an
+ * un-archivable row.
  */
-export async function archiveDaemonSession(sessionId: string) {
+export async function archiveDaemonSession(sessionId: string, options?: { force?: boolean }) {
   const session = daemonSessionOfId(sessionId);
-  if (!session?.file) return;
-  await archiveSession(session.file, projectCwdOf(session.cwd, session));
+  if (!session) return;
+  const force = options?.force === true;
+  const working = session.status === "working" || session.status === "blocked" || (session.id === openDaemonId() && isRunning());
+  if (!force && working) {
+    toast("warning", tr("This conversation is still running. Archive it after it finishes.", "对话仍在运行，结束后再归档。"), {
+      durationMs: 7000,
+      action: {
+        label: tr("Archive anyway", "仍然归档"),
+        onPress: () => void archiveDaemonSession(sessionId, { force: true }),
+      },
+    });
+    return;
+  }
+  const cwd = projectCwdOf(session.cwd, session);
+  const snapshot = session.file ? await backend().readSessionSnapshot(session.file).catch(() => undefined) : undefined;
+  const hasSaved = Boolean(
+    session.file &&
+      (sessions().some((s) => s.path === session.file) ||
+        (sessionsByWorkspace()[cwd] ?? []).some((s) => s.path === session.file) ||
+        (snapshot && snapshot.messages.length > 0)),
+  );
+  if (session.file && hasSaved) {
+    await archiveSession(session.file, cwd, { force });
+    return;
+  }
+  const title = daemonSessionTitle(session, tr("New session", "新会话"));
+  const wasOpen = session.id === openDaemonId();
+  if (wasOpen) {
+    closeActive();
+    openDaemonId.set(undefined);
+  }
+  retireDaemonSession(session.id);
+  if (wasOpen) {
+    await start(cwd, undefined, currentAgentId());
+  }
+  toast("info", tr(`“${title}” archived.`, `「${title}」已归档。`), { icon: "archive" });
+}
+
+/** Permanently deletes a daemon session (and its transcript file when present). */
+export async function removeDaemonSession(sessionId: string) {
+  const session = daemonSessionOfId(sessionId);
+  if (!session) return;
+  const cwd = projectCwdOf(session.cwd, session);
+  const file = session.file;
+  const wasOpen = session.id === openDaemonId();
+  if (wasOpen) {
+    closeActive();
+    openDaemonId.set(undefined);
+  }
+  retireDaemonSession(session.id);
+  if (file) {
+    visited.delete(file);
+    await backend().deleteSession(file).catch(() => undefined);
+    clearArchivedSessionPref(file);
+    sessionsByWorkspace.update((all) => {
+      const list = all[cwd];
+      return list ? { ...all, [cwd]: list.filter((s) => s.path !== file) } : all;
+    });
+    if (cwd === workspace()) sessions.update((list) => list.filter((s) => s.path !== file));
+    void refreshSessions(cwd);
+  }
+  if (wasOpen) {
+    await start(cwd, undefined, currentAgentId());
+  }
 }
 
 /** Restores an archived session back into its workspace's active list. */
@@ -3546,7 +3838,7 @@ export async function deleteAllArchivedSessions() {
   if (targets.length === 0) return;
   const openFile = state()?.sessionFile;
   if (openFile && targets.some((t) => t.session.path === openFile)) {
-    const left = await changeSession(tr("Could not close the session", "无法关闭会话"), requestNewSession);
+    const left = await switchInto(activeProjectPath() || workspace(), undefined, currentAgentId());
     if (!left) return;
   }
   let deleted = 0;
@@ -3558,6 +3850,7 @@ export async function deleteAllArchivedSessions() {
     if (held?.loaded && held.id !== openDaemonId()) quietKill(held.id);
     try {
       await backend().deleteSession(session.path);
+      if (held) retireDaemonSession(held.id);
       forgetDeletedSession(session.path);
       affectedCwds.add(cwd);
       deleted++;
@@ -3595,7 +3888,7 @@ export async function toggleArchiveCurrentSession() {
 
 export async function removeSession(path: string, cwd = workspace()) {
   if (path === state()?.sessionFile) {
-    const left = await changeSession(tr("Could not close the session", "无法关闭会话"), requestNewSession);
+    const left = await switchInto(activeProjectPath() || cwd, undefined, currentAgentId());
     if (!left) return;
   }
   // Deleting a run that is still going off screen stops it first: its file is going away.
@@ -3603,6 +3896,7 @@ export async function removeSession(path: string, cwd = workspace()) {
   if (held?.loaded && held.id !== openDaemonId()) quietKill(held.id);
   visited.delete(path);
   await attempt(tr("Could not delete the session", "无法删除会话"), () => backend().deleteSession(path));
+  if (held) retireDaemonSession(held.id);
   forgetDeletedSession(path);
   sessionsByWorkspace.update((all) => {
     const list = all[cwd];
@@ -3725,8 +4019,18 @@ export function showChat() {
   focusComposer();
 }
 
+/** Opens the document tab's editor on `docId` (the document's file path); the chat session stays attached. */
+export function showDoc(docId: string) {
+  const cur = view();
+  if (cur.name !== "doc" || cur.docId !== docId) view.set({ name: "doc", docId });
+}
+
+/** The surface Settings was opened over: the back-out (Escape, ⌘,, the corner gear) returns to it — chat or a document. */
+let surfaceBeforeSettings: View | null = null;
+
 export function showSettings(section: SettingsSection = "general") {
   const cur = view();
+  if (cur.name !== "settings") surfaceBeforeSettings = cur;
   if (cur.name !== "settings" || cur.section !== section || cur.agent !== undefined) {
     view.set({ name: "settings", section });
   }
@@ -3736,10 +4040,19 @@ export function showSettings(section: SettingsSection = "general") {
 /** Opens Settings on one agent's configuration (the active agent's by default): every agent is set up under Agents. */
 export function showAgentSettings(agentId: string = currentAgentId()) {
   const cur = view();
+  if (cur.name !== "settings") surfaceBeforeSettings = cur;
   if (cur.name !== "settings" || cur.section !== "agents" || cur.agent !== agentId) {
     view.set({ name: "settings", section: "agents", agent: agentId });
   }
   if (!usageLoaded()) void refreshUsageStats();
+}
+
+/** Leaves Settings for the surface it covered, defaulting to the chat when it came from nowhere else. */
+export function leaveSettings() {
+  const back = surfaceBeforeSettings;
+  surfaceBeforeSettings = null;
+  if (back?.name === "doc") view.set(back);
+  else showChat();
 }
 
 export function setPaletteOpen(open: boolean) {

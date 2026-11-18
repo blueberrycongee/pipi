@@ -13,6 +13,7 @@ import {
   activeAgent,
   chooseWorkspace,
   composerAttachments,
+  composerDocs,
   composerDraft,
   conversationKey,
   currentActivity,
@@ -770,6 +771,7 @@ export function Chat() {
   let releasedAt = 0;
   let lastUpwardInputAt = 0;
   let isDragging = false;
+  let wheelDirection = 0;
   let lastY: number | undefined;
   let lastDistance = 0;
   let lastScrollDir = 0;
@@ -832,18 +834,20 @@ export function Chat() {
       }
     }
     const watching = bottomFollowing();
-    // The actions row's seat sits under the turn's last text row — the one that
-    // can still become the reply. It never leaves before a next text row takes
-    // it (one commit: a seat lost and a seat gained is no height at all), so no
-    // seat's leaving ever pulls the rows around it.
-    let lastTextId = "";
-    for (const row of merged) if (row.kind === "text") lastTextId = row.id;
+    // The actions row's seat sits under a text row only while it trails the
+    // conversation — the one that can still become the reply. A text row with
+    // rows after it (the next step's call, a queued send) is mid-turn
+    // commentary: a seat there stands as a blank line among the steps. The seat
+    // never leaves before a next text row takes it (one commit: a seat lost and
+    // a seat gained is no height at all), so no seat's leaving ever pulls the
+    // rows around it.
+    const lastRowId = merged.at(-1)?.id;
     const rows = (watching ? stable(merged) : merged).flatMap((row): ChatRow[] =>
       row.kind !== "text"
         ? [row]
         : row.final
           ? [...proseRows(row), replyActions(row)]
-          : row.id === lastTextId
+          : row.id === lastRowId
             ? [...proseRows(row), heldActions(row)]
             : proseRows(row),
     );
@@ -973,16 +977,16 @@ export function Chat() {
       }
       if (middle === wasHero) return;
       wasHero = middle;
-      const reduced = reduceMotion();
+      const instant = reduceMotion() || (!middle && isSwitching());
       const way = middle ? dropAhead() : drop || dropAhead();
       const from = slideNow() + (middle ? way : -way);
       // Sending a multi-line draft or attachment from Welcome clears the composer in the same frame it docks:
       // compensate `stand` by the composer's height drop so `bottom-full` hero content stays pinned while fading out.
-      const shrink = !middle && heroFigure > FIGURE_REST && !composerDraft() && !composerAttachments().length ? heroFigure - FIGURE_REST : 0;
+      const shrink = !middle && heroFigure > FIGURE_REST && !composerDraft() && !composerAttachments().length && !composerDocs().length ? heroFigure - FIGURE_REST : 0;
       travel = undefined;
       // Up: the stage is where it will be, and the composer comes to it. Down: it stays where it was.
       stand.set(middle ? 0 : -(way + shrink));
-      if (reduced) slide.set(0);
+      if (instant) slide.set(0);
       else {
         const mine = (travel = { from, at: Date.now() });
         // Set first: the layout changes in this turn, and so must where the composer is drawn.
@@ -999,7 +1003,7 @@ export function Chat() {
       }
       if (middle) return;
       void stageFade.stop();
-      if (reduced || dimmedOut) return stage.set(undefined);
+      if (instant || dimmedOut) return stage.set(undefined);
       stageFade.set(1);
       void stageFade.timing(0, { duration: STAGE_OUT_MS, easing: EASING.exit });
       stageTimer = setTimeout(() => stage.set(undefined), STAGE_OUT_MS + 10);
@@ -1060,6 +1064,7 @@ export function Chat() {
 
   const onWheel = (e: WheelEvent) => {
     inputAt = Date.now();
+    wheelDirection = Math.sign(e.delta.y);
     if (e.delta.y < -0.1) {
       disengageFollow(true);
       return;
@@ -1071,6 +1076,7 @@ export function Chat() {
 
   const onDragStart = () => {
     isDragging = true;
+    wheelDirection = 0;
     inputAt = Date.now();
     endSettleEpoch++;
     endSettlePasses = 0;
@@ -1094,20 +1100,22 @@ export function Chat() {
 
   const onScroll = (e: ScrollEvent) => {
     const y = e.offset.y;
+    const max = Math.max(0, e.contentSize.height - e.size.height);
     const distance = Math.max(0, e.contentSize.height - (y + e.size.height));
     const now = Date.now();
+    const movedWithinContent = lastY !== undefined && lastY >= 0 && lastY <= lastMax + 0.5 && Math.abs(max - lastMax) <= 0.5;
 
     if (now - inputAt < INPUT_WINDOW_MS) {
-      if (lastY !== undefined && Math.abs(y - lastY) > 0.5) {
+      if (movedWithinContent && lastY !== undefined && Math.abs(y - lastY) > 0.5) {
         lastScrollDir = y < lastY ? -1 : 1;
       }
       if (
         untracked(bottomFollowing) &&
-        ((lastY !== undefined && y < lastY - 0.5 && distance > Math.max(lastDistance, 0) + 0.5) ||
-          (isDragging && distance > 12))
+        ((isDragging && wheelDirection <= 0) || untracked(selecting)) &&
+        movedWithinContent && lastY !== undefined && y < lastY - 0.5 && distance > lastDistance + 0.5
       ) {
         disengageFollow(true);
-      } else if (untracked(scrollMode) === "horizon-held" && lastY !== undefined && Math.abs(y - lastY) > 0.5) {
+      } else if (untracked(scrollMode) === "horizon-held" && movedWithinContent && lastY !== undefined && Math.abs(y - lastY) > 0.5) {
         releasedAt = now;
         if (y < lastY - 0.5) lastUpwardInputAt = now;
         scrollMode.set("free");
@@ -1124,7 +1132,7 @@ export function Chat() {
     }
     lastY = y;
     lastDistance = distance;
-    lastMax = e.contentSize.height - e.size.height;
+    lastMax = max;
     distanceFromEnd.set(distance);
 
     if (untracked(scrollMode) === "horizon") checkHorizon();
@@ -1639,6 +1647,7 @@ export function Chat() {
       >
         <View style={{ flexGrow: hero() ? HERO.rise : 1, flexShrink: 1, flexBasis: hero() ? HERO.head : 0 }} />
         <View
+          testID={hero() ? "composer-hero" : "composer-docked"}
           class="relative"
           style={{ transform: [{ translateY: slide }] }}
           onLayout={(e) => {
