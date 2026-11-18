@@ -154,6 +154,16 @@ jobs:
         run: |
           curl -fsSL https://nsh.dev/install.sh | sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - name: Write the signing keys
+        env:
+          PIPI_PACKAGE_KEY: ${{ secrets.PIPI_PACKAGE_KEY }}
+          PIPI_PACKAGE_CERT: ${{ secrets.PIPI_PACKAGE_CERT }}
+          PIPI_UPDATE_KEY: ${{ secrets.PIPI_UPDATE_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s\n' "$PIPI_PACKAGE_KEY" > "$RUNNER_TEMP/keys/release.secret"
+          printf '%s\n' "$PIPI_PACKAGE_CERT" > "$RUNNER_TEMP/keys/release.cert"
+          printf '%s\n' "$PIPI_UPDATE_KEY" > "$RUNNER_TEMP/keys/update.secret"
       - name: Publish verified assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -170,15 +180,24 @@ jobs:
 
           **Linux**: unpack `pipi-*-linux-x64.tar.gz` and run `pipi`. Needs GTK 4.14 or newer (Ubuntu 24.04 and later).
           EOF
+          # The signed package of the app's code (`updater.packages.roots` in
+          # nsh.json): the incremental update a shell new enough runs instead
+          # of the archive. Its build is nsh.json's, one counter the archives
+          # share.
+          v="${RELEASE_TAG#v}"
+          PACKAGE="dist/dev.pipi.app-$(node -p 'require("./nsh.json").build').nshpkg"
+          nsh publish --key "$RUNNER_TEMP/keys/release.secret" --cert "$RUNNER_TEMP/keys/release.cert" -o "$PACKAGE"
           # The update manifest the app's updater reads (`updater.github` in
-          # nsh.json): written next to the archives, published beside them.
+          # nsh.json): written next to the archives and the package, signed as
+          # `updater.publicKey` requires, and published beside them.
           # Only the nsh-named update archives parse — the dmg, installers and
           # receipts are assets, not manifest entries.
-          v="${RELEASE_TAG#v}"
           nsh update-manifest \
             "dist/pipi-$v-macos-aarch64.tar.gz" \
             "dist/pipi-$v-windows-x86_64.zip" \
             "dist/pipi-$v-linux-x86_64.tar.gz" \
+            --package "$PACKAGE" \
+            --key "$RUNNER_TEMP/keys/update.secret" \
             --notes release-notes.md -o dist
           gh release create "$RELEASE_TAG" --verify-tag --title "pipi $RELEASE_TAG" \
             --notes-file release-notes.md dist/*

@@ -95,6 +95,17 @@ test("closing the front tab opens its neighbour", async () => {
   await app.waitUntil(() => shows(app, REFACTOR));
 });
 
+test("double pressing a tab closes it instead of renaming it", async () => {
+  const app = await launch();
+  await twoTabs(app);
+
+  await app.press("id:tab-1");
+  await app.press("id:tab-1");
+  await app.waitUntil(() => app.count("id:tab-1") === 0);
+  expect(app.count("label:Session name")).toBe(0);
+  await app.waitUntil(() => shows(app, REFACTOR));
+});
+
 test("⌘⇧] and ⌘⇧[ walk the strip", async () => {
   const app = await launch();
   await twoTabs(app);

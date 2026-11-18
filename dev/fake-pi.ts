@@ -56,9 +56,11 @@ export interface FakeOptions {
   /**
    * An app update for the checker to find: the card comes up on its own.
    * `rate` is the download's speed in bytes per ms; `unknownSize` streams
-   * progress without a total, the indeterminate track.
+   * progress without a total, the indeterminate track. `package` offers it as
+   * a signed code package too — the check should pick the package's small
+   * `bytes`, not the archive's.
    */
-  update?: { version?: string; notes?: string; canInstall?: boolean; bytes?: number; rate?: number; unknownSize?: boolean; shell?: boolean };
+  update?: { version?: string; notes?: string; canInstall?: boolean; bytes?: number; rate?: number; unknownSize?: boolean; shell?: boolean; package?: boolean; build?: number };
 }
 
 const MODELS: Model[] = [
@@ -1399,6 +1401,20 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     // The real install never resolves: the app restarts first. So does the
     // fake — the "installing" card is what it leaves on screen.
     installAppUpdate: () => new Promise<void>(() => {}),
+    async checkAppPackage() {
+      const u = options.update;
+      if (!u?.package) return null;
+      return {
+        version: u.version ?? "9.9.9",
+        build: u.build ?? 2,
+        notes: u.notes ?? "A shinier coat, a steadier step, and everything a little quicker.",
+        size: u.bytes ?? 480_000,
+      };
+    },
+    downloadAppPackage(onProgress) {
+      return api.downloadAppUpdate!(onProgress);
+    },
+    restartToPackage: () => new Promise<void>(() => {}),
   };
   return api;
 }

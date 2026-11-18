@@ -5,6 +5,7 @@
 
 import {
   Animated,
+  type AnimatedNode,
   type AnimatedValue,
   cleanup,
   type CompositeAnimation,
@@ -292,10 +293,14 @@ const BREATH_MIN = 0.68;
 const BREATH_SETTLE_MS = 320;
 
 let breathValue: AnimatedValue | null = null;
+let breathDimNode: AnimatedNode | null = null;
 let breathAnim: CompositeAnimation | null = null;
 let breathHolders = 0;
 
 const breath = () => (breathValue ??= createAnimatedValue(1));
+/** The ink the shared wave is taking, as a node: 0 at the crest, `1 - BREATH_MIN` at the trough. */
+const breathDim = () =>
+  (breathDimNode ??= breath().interpolate({ inputRange: [BREATH_MIN, 1], outputRange: [1 - BREATH_MIN, 0] }));
 
 const startBreath = () => {
   void breath().stop();
@@ -320,13 +325,22 @@ const settleBreath = () => {
 /** The alive cue: every label still working breathes on one shared clock —
  * a turn header and the step under it inhale together, and the cue handing
  * from one row to the next carries on mid-breath instead of restarting.
+ * The wave binds each caller through its own `gate`, eased in while it is the
+ * live one and back out when the cue moves on: opacity stays `1 - dim * gate`,
+ * so a row only watching holds full ink while the wave rolls past it.
  * Compositor-driven, honors `reduceMotion()`. */
-export function useBreathingOpacity(active: () => boolean) {
-  const opacity = breath();
+export function useBreathingOpacity(active: () => boolean): AnimatedNode {
+  const gate = createAnimatedValue(0);
+  const opacity = breathDim().mul(gate).interpolate({ inputRange: [0, 1], outputRange: [1, 0] });
   let holding = false;
+  const glideGate = (to: number) => {
+    void gate.stop();
+    void gate.timing(to, { duration: BREATH_SETTLE_MS, easing: EASING.signature });
+  };
   const release = () => {
     if (!holding) return;
     holding = false;
+    glideGate(0);
     if (--breathHolders === 0) settleBreath();
   };
   effect(() => {
@@ -336,13 +350,17 @@ export function useBreathingOpacity(active: () => boolean) {
       if (on && !reduced) {
         if (holding) return;
         holding = true;
+        glideGate(1);
         if (++breathHolders === 1) startBreath();
       } else {
         release();
       }
     });
   });
-  cleanup(release);
+  cleanup(() => {
+    release();
+    void gate.stop();
+  });
   return opacity;
 }
 

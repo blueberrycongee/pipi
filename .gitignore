@@ -4,6 +4,7 @@ node_modules/
 dist/
 thirdparty/
 release/
+keys/
 *.p12
 *.p8
 .commit/

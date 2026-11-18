@@ -25,7 +25,8 @@
 // `harness.dataDir` names the app's data folder (notes are files in its `docs/`): a real one, for the tests that save.
 // `harness.files` (JSON `{path: content}`) puts real files on disk before boot: documents and notes a test names.
 // `harness.update` (JSON of FakeOptions.update) has the update checker find a new version: the card, its
-// track and its sparkles.
+// track and its sparkles. `package: true` also offers it as a signed code package — the small
+// download the check prefers over the archive.
 import * as fs from "fs/promises";
 import { mount, Storage } from "nsh";
 import wallpaperPicture from "./assets/brand/dmg-background@2x.png";

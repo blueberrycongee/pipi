@@ -59,7 +59,11 @@ multi-agent orchestration, and settings.
   looked at takes that seat over; a tab is *kept* once it is worked on (a
   message sent in its session, a document written in or taken to one) or the reader says
   so (a double press, a drag, Keep Open). Closing a tab puts the thing
-  back on the shelf; it deletes nothing and stops nothing.
+  back on the shelf; it deletes nothing and stops nothing. The pills size
+  as a browser's tabs do (`lib/strip-width.ts`): they share the strip
+  evenly down to a floor, past which it scrolls, and a close with the
+  pointer in the strip holds their width until the pointer leaves, so a
+  run of closes keeps its close button under it.
 - Documents are the strip's other surface (`store/docs.ts`,
   `views/DocEditor.tsx`): a page of the person's own words — a brief the
   composer is too small and too quick to send for, a draft the agents help
@@ -185,7 +189,9 @@ multi-agent orchestration, and settings.
 - `nsh test TabsFilm.test.tsx --target macos` — films a document coming
   forward over the chat and a tab closing (the pills flow to their new
   slots) into `.nsh/shots/tabs-*.png`, via `harness.then`'s `tab:` /
-  `closetab:` steps
+  `closetab:` steps; also the squeeze and the close-lag (`tabs-lag-*`):
+  nine pills narrowed, two closes holding their width, the pointer leaving
+  the strip handing the room back
 - `nsh test Settings.test.tsx` — Settings switches sections and subpages
   without remounting visited panes or flashing `Usage`'s empty state;
   `--target macos` checks pixel stability right after section switches
@@ -257,16 +263,27 @@ that is taken, set `PORT`.
   pipi-dev.
 - Releases ride on tags pushed to `public` (`v*` triggers
   `.github/workflows/release.yml`, which ships the signed, notarized
-  macOS DMG plus the Windows installer/zip and the Linux tar.gz, and the
-  `latest.json` manifest `nsh update-manifest` writes from the archives).
-  The repo needs the `PIPI_RELEASE_*` / `APPLE_API_*` secrets configured for
-  CI releases; `npm run release:macos` is the local fallback.
-- The app updates itself: `nsh.json` `updater.github` names the public
-  repo, and `nsh/updater` (`checkForUpdate` → `downloadUpdate` →
-  `installAndRestart`) reads the release's `latest.json` for what is newer —
-  `store/update.ts` runs the checks (on boot, then every 4h, and About →
-  Check), `views/UpdateCard.tsx` shows them. In dev and tests the check
-  finds nothing; the fake backend scripts it via `harness.update`.
+  macOS DMG plus the Windows installer/zip and the Linux tar.gz, the
+  signed `.nshpkg` of the app's code `nsh publish` writes, and the
+  signed `latest.json` manifest `nsh update-manifest` writes from the
+  archives and the package). The repo needs the `PIPI_RELEASE_*` /
+  `APPLE_API_*` secrets configured for CI releases, and `PIPI_PACKAGE_*`
+  / `PIPI_UPDATE_KEY` for the package and manifest signing;
+  `npm run release:macos` is the local fallback. `build` in `nsh.json`
+  is one counter for archives and packages — raise it every release.
+- The app updates itself, incrementally when it can: `nsh.json`
+  `updater` names the public repo, the key that signs its manifests and
+  the roots its code packages verify against. `store/update.ts` asks for
+  a package first (`checkForPackage` → `downloadPackage` →
+  `restartToPackage` — the small `.nshpkg`, which the launcher tries at
+  the next start and rolls back if it crashes) and falls back to the
+  full archive (`checkForUpdate` → `downloadUpdate` →
+  `installAndRestart`) when the shell is too old for the package or the
+  release has none — `views/UpdateCard.tsx` shows them the same way,
+  plus the package's size up front. Checks run on boot, then every 4h,
+  and About → Check. In dev and tests the check finds nothing; the fake
+  backend scripts it via `harness.update` (`package: true` for the
+  package path).
 
 ## Layout
 

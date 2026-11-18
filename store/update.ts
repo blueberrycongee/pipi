@@ -1,25 +1,43 @@
 import { signal } from "nsh";
-import type { AppUpdate } from "nsh/updater";
 import { tr } from "../lib/i18n";
-import { backend } from "./backend";
+import { backend, type Backend } from "./backend";
 import { toast } from "./app";
 
 /**
  * The app's own auto-update, on nsh's updater (`nsh.json` → `updater.github`
  * points at the public releases; `nsh update-manifest`'s `latest.json` in each
- * release says what is newer). Everything surfaces through `views/UpdateCard.tsx`
- * — a found update shows the card, a failure goes to a toast, like every app
- * error. In development and headless runs the backend reports no update, so
- * this all stays quiet.
+ * release says what is newer). A release offers two things: a signed package
+ * of the app's code — the incremental download, a `.nshpkg` of kilobytes
+ * instead of the whole installer — which a shell trusting the package roots
+ * runs from its next start, and the full app archives for when the runtime
+ * itself must change. The check asks for the package first; a shell too old
+ * for it (or a release without one) falls back to the archive. Everything
+ * surfaces through `views/UpdateCard.tsx` — a found update shows the card, a
+ * failure goes to a toast, like every app error. In development and headless
+ * runs the backend reports no update, so this all stays quiet.
  */
+
+/** What a check found, whichever channel offered it. */
+export interface FoundUpdate {
+  version: string;
+  notes?: string | null;
+  /** "package": a signed code package, the small incremental download; "app": the whole installer. */
+  kind: "package" | "app";
+  /** The download's size, when the manifest says it (packages always carry one). */
+  size?: number | null;
+  /** Full-app updates: where the user gets it by hand when it cannot install here. */
+  url?: string;
+  /** Full-app updates: whether `downloadUpdate`/`installAndRestart` work here. */
+  canInstall?: boolean;
+}
 
 export type AppUpdateState =
   | { phase: "idle" }
   | { phase: "checking" }
-  | { phase: "available"; update: AppUpdate }
-  | { phase: "downloading"; update: AppUpdate; received: number; total?: number | null }
-  | { phase: "ready"; update: AppUpdate }
-  | { phase: "installing"; update: AppUpdate };
+  | { phase: "available"; update: FoundUpdate }
+  | { phase: "downloading"; update: FoundUpdate; received: number; total?: number | null }
+  | { phase: "ready"; update: FoundUpdate }
+  | { phase: "installing"; update: FoundUpdate };
 
 const state = signal<AppUpdateState>({ phase: "idle" });
 /** The card the user closed for this run; a different version found later shows again. */
@@ -44,14 +62,42 @@ const inFlight = () => {
 const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
 /**
+ * What the update source offers this run, best first: the code package when
+ * the shell runs packages and one's newer than the running build, else the
+ * app archive. A package check that errors falls back to the archive check —
+ * but when the archive check finds nothing while the package check failed,
+ * the release meant this run to have something it could not fetch: that error
+ * is the one to report.
+ */
+async function findUpdate(b: Backend): Promise<FoundUpdate | null> {
+  let packageError: unknown;
+  if (b.checkAppPackage) {
+    try {
+      const pkg = await b.checkAppPackage();
+      if (pkg) {
+        return { version: pkg.version, notes: pkg.notes, kind: "package", size: pkg.size };
+      }
+    } catch (error) {
+      packageError = error;
+    }
+  }
+  const app = b.checkAppUpdate ? await b.checkAppUpdate() : null;
+  if (app) {
+    return { version: app.version, notes: app.notes, kind: "app", url: app.url, canInstall: app.canInstall };
+  }
+  if (packageError) throw packageError;
+  return null;
+}
+
+/**
  * Asks the update source for a newer version. `manual` is the user's own ask
  * (About → Check for Updates): its failure is an error toast and a quiet
  * "up to date" is said; a background check's failure is a warning and its
  * quiet result says nothing.
  */
 export async function checkForAppUpdate(manual = false) {
-  const check = backend().checkAppUpdate;
-  if (!check) {
+  const b = backend();
+  if (!b.checkAppUpdate && !b.checkAppPackage) {
     if (manual) toast("info", tr("Updates are not available in this build", "此构建不支持自动更新"));
     return;
   }
@@ -65,7 +111,7 @@ export async function checkForAppUpdate(manual = false) {
   if (!manual && state().phase === "available") return;
   state.set({ phase: "checking" });
   try {
-    const update = await check();
+    const update = await findUpdate(b);
     if (update) {
       state.set({ phase: "available", update });
       dismissedVersion.set(undefined);
@@ -81,16 +127,17 @@ export async function checkForAppUpdate(manual = false) {
 
 /** Starts the download of a found update; progress lands on the card. */
 export async function beginAppUpdate() {
-  const download = backend().downloadAppUpdate;
   const s = state();
-  if (!download || s.phase !== "available") return;
+  if (s.phase !== "available") return;
   const update = s.update;
-  state.set({ phase: "downloading", update, received: 0 });
+  const download = update.kind === "package" ? backend().downloadAppPackage : backend().downloadAppUpdate;
+  if (!download) return;
+  state.set({ phase: "downloading", update, received: 0, total: update.size });
   try {
     await download((progress) => {
       const now = state();
       if (now.phase === "downloading" && now.update.version === update.version) {
-        state.set({ ...now, received: progress.received, total: progress.total ?? undefined });
+        state.set({ ...now, received: progress.received, total: progress.total ?? now.total });
       }
     });
     const now = state();
@@ -105,9 +152,10 @@ export async function beginAppUpdate() {
 
 /** Swaps the downloaded build in and relaunches; only a failure returns here. */
 export async function installAppUpdate() {
-  const install = backend().installAppUpdate;
   const s = state();
-  if (!install || s.phase !== "ready") return;
+  if (s.phase !== "ready") return;
+  const install = s.update.kind === "package" ? backend().restartToPackage : backend().installAppUpdate;
+  if (!install) return;
   state.set({ phase: "installing", update: s.update });
   try {
     await install();
@@ -161,7 +209,7 @@ export function stopAppUpdateChecks() {
  */
 export function startAppUpdateChecks() {
   stopAppUpdateChecks();
-  if (!backend().checkAppUpdate) return;
+  if (!backend().checkAppUpdate && !backend().checkAppPackage) return;
   const t = timers();
   t.delay = setTimeout(() => {
     t.delay = undefined;

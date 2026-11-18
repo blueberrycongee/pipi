@@ -231,7 +231,8 @@ export function UpdateCard() {
     }
     if (s.phase === "ready") return tr("Restart to finish updating", "重启即可完成更新");
     if (s.phase === "installing") return tr("See you in a moment", "稍后见");
-    return tr("A new version is out", "新版本可用");
+    const size = s.phase === "available" ? s.update.size : undefined;
+    return size ? `${tr("A new version is out", "新版本可用")} · ${fmtBytes(size)}` : tr("A new version is out", "新版本可用");
   };
 
   const notes = () => shortNotes(update()?.notes);
@@ -259,9 +260,10 @@ export function UpdateCard() {
     const s = appUpdate();
     switch (s.phase) {
       case "available":
-        return s.update.canInstall
+        // A code package always installs; a full update may only have a page to send the user to.
+        return s.update.kind === "package" || s.update.canInstall
           ? { label: tr("Update", "更新"), icon: "download", run: () => void beginAppUpdate() }
-          : { label: tr("Download", "下载"), icon: "external", run: () => void openUrl(s.update.url) };
+          : { label: tr("Download", "下载"), icon: "external", run: () => void openUrl(s.update.url ?? "") };
       case "downloading":
         return { label: tr("Downloading…", "下载中…"), disabled: true };
       case "ready":

@@ -1,15 +1,19 @@
 {
   "name": "pipi",
   "id": "dev.pipi.app",
-  "version": "0.2.17",
-  "build": 1,
+  "version": "0.2.18",
+  "build": 3,
   "icon": "icon.png",
   "theme": "theme.json",
-  "updater": { "github": "blueberrycongee/pipi" },
+  "updater": {
+    "github": "blueberrycongee/pipi",
+    "publicKey": "bMbqkaiZD7RL+XXYkvbuorCpNaFXhty/Gc34McqlLb8=",
+    "packages": { "roots": ["T8JaNelsAvchdI4CzQCHQMyCdGrA1vAh1GG72aMne/M="] }
+  },
   "window": {
     "title": "pipi",
     "defaultSize": { "width": 1180, "height": 780 },
-    "titleBar": { "style": "hidden", "height": 44 }
+    "titleBar": { "style": "hidden", "height": 44, "controlsOffset": { "x": 16, "y": 14 } }
   },
   "tailwind": {
     "fontSize": {

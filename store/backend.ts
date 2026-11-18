@@ -1,6 +1,16 @@
 import os from "os";
 import process from "process";
-import { checkForUpdate, downloadUpdate, installAndRestart, type AppUpdate, type UpdateProgress } from "nsh/updater";
+import {
+  checkForPackage,
+  checkForUpdate,
+  downloadPackage,
+  downloadUpdate,
+  installAndRestart,
+  restartToPackage,
+  type AppUpdate,
+  type PackageUpdate,
+  type UpdateProgress,
+} from "nsh/updater";
 import { defaultAgentStatuses } from "../agents/catalog";
 import type {
   AgentHarnessStatus,
@@ -66,6 +76,12 @@ export interface Backend {
   downloadAppUpdate?(onProgress?: (progress: UpdateProgress) => void): Promise<void>;
   /** Replaces the app with the downloaded update and relaunches; settles only on failure. */
   installAppUpdate?(): Promise<void>;
+  /** Asks the update source for a signed package of the app's code (the small, incremental update); `null` when the app trusts no package roots, none is newer, or this runtime cannot run it. */
+  checkAppPackage?(): Promise<PackageUpdate | null>;
+  /** Downloads and verifies the package the last package check found; it runs from the app's next start. */
+  downloadAppPackage?(onProgress?: (progress: UpdateProgress) => void): Promise<void>;
+  /** Restarts the app into the downloaded package; settles only on failure. */
+  restartToPackage?(): Promise<void>;
 }
 
 /**
@@ -269,9 +285,12 @@ const system: Backend = {
       return undefined;
     }
   },
-  checkAppUpdate: checkForUpdate,
+  checkAppUpdate: () => checkForUpdate(),
   downloadAppUpdate: (onProgress) => downloadUpdate(onProgress),
   installAppUpdate: () => installAndRestart(),
+  checkAppPackage: () => checkForPackage(),
+  downloadAppPackage: (onProgress) => downloadPackage(onProgress),
+  restartToPackage: () => restartToPackage(),
 };
 
 let current = system;

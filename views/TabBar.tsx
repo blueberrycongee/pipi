@@ -1,5 +1,5 @@
 import { batch, Clipboard, cleanup, createAnimatedValue, effect, keymap, Overlay, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
-import type { AnimatedValue, ContextMenuEvent, GestureResponderEvent, InputRef, MouseEvent, ScrollRef, ViewRef, WheelEvent } from "nsh";
+import type { AnimatedValue, ContextMenuEvent, GestureResponderEvent, InputRef, MouseEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input } from "nsh/base";
 import { Menu, type MenuItem, titleBar } from "nsh/desktop";
 import { tr } from "../lib/i18n";
@@ -11,6 +11,7 @@ import {
   currentParentSession,
   currentTitle,
   currentView,
+  isSwitching,
   isCurrentSessionArchived,
   isRenaming,
   newSession,
@@ -24,6 +25,7 @@ import {
   wallpaper,
 } from "../store/app";
 import { docTabTitle } from "../store/docs";
+import { stripTabWidth, TAB_GAP, TAB_MAX_W } from "../lib/strip-width";
 import { prefsReady, setSidebarOpen, sidebarOpen } from "../store/prefs";
 import {
   activeTabId,
@@ -31,7 +33,6 @@ import {
   chatTabSession,
   chatTabTitle,
   closeTab,
-  cycleTab,
   keepTab,
   moveTab,
   newDocTab,
@@ -49,16 +50,10 @@ import { DURATION, EASING, Presence } from "../ui/motion";
 import { FIELD_SURFACE, GLASS_REGULAR, HEADER_GLASS, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 
-/** One tab's width: uniform so a drag's slot math is exact and the strip reads as one row. */
-const TAB_W = 160;
-/** The gap between pills (`gap-1` on the strip's content). */
-const TAB_GAP = 4;
+/** How fast the pills take a new width — a new tab's squeeze, a freed strip's growth. */
+const W_TWEEN_MS = 180;
 /** How long the strip keeps its pills on transforms after a tab opens or closes: the flow spring's rest. */
 const FLOW_REST_MS = 700;
-/** Trackpad points of travel that switch one tab (a notch of a mouse wheel switches directly). */
-const WHEEL_TAB_PX = 48;
-/** The shortest gap between wheel switches, so one flick passes tabs one by one. */
-const WHEEL_THROTTLE_MS = 120;
 
 // ── Drag to reorder ──────────────────────────────────────────────────────────
 // The sidebar's drag engine laid on its side: a held pill lifts — grows a
@@ -145,10 +140,12 @@ function StatusMark(props: { session: () => DaemonSession | undefined }) {
   );
 }
 
-/** What one tab names itself: the live title for the open session, the store's for the rest. */
+/** What one tab names itself: the live title only after that tab has landed. */
 function tabTitle(tab: OpenTab): string {
   if (tab.kind === "doc") return docTabTitle(tab.ref);
-  if (activeTabId() === tabId(tab) && currentView().name === "chat") return currentTitle();
+  // During a switch `currentTitle` follows the destination before the old
+  // surface has been replaced. Keep the old pill's text stable until landing.
+  if (!isSwitching() && activeTabId() === tabId(tab) && currentView().name === "chat") return currentTitle();
   return chatTabTitle(tab);
 }
 
@@ -170,10 +167,6 @@ export function TabBar() {
   const settle = signal<Record<string, number> | null>(null);
   /** A drop's settle; a newer drag supersedes the callbacks of an older one. */
   let settleGen = 0;
-  /** Trackpad wheel travel and the last switch's time, for "one swipe one tab". */
-  let wheelAcc = 0;
-  let wheelLast = 0;
-
   /** The strip's pills measured at lift, in scroll-content coordinates. */
   let dragFrames: PillFrame[] = [];
   /** The lifted order's signature: a strip change under the drag cancels it. */
@@ -238,6 +231,78 @@ export function TabBar() {
     row.shiftRun = springTo(row.shift, 0, FLOW_SPRING);
   }
 
+  // ── The pills' width ─────────────────────────────────────────────────────
+  //
+  // A browser's strip: the pills share the viewport evenly from TAB_MAX_W
+  // down to a floor, and only then does it scroll. A close while the pointer
+  // is over the strip does not grow them — the pills after the closed one
+  // slide a slot left and the next close button lands under the pointer,
+  // which holds their width until it leaves: a run of closes is one gesture.
+  // The width tweens on `wNow`; the places a membership change takes ride the
+  // flow spring.
+  const stripW = signal(0);
+  const wNow = signal(TAB_MAX_W);
+  /** The width a close pinned the pills at while the pointer stays in the strip. */
+  const stuckW = signal<number | undefined>(undefined);
+  let pointerInStrip = false;
+  /** The first measured width lands without a tween: a restored strip is simply there. */
+  let wSeeded = false;
+  let wTween: { from: number; to: number; at: number; frame: number } | undefined;
+
+  /** The width the pills aim at: a close's pin never grows them, and never holds them past a narrower fit. */
+  function targetW() {
+    const room = stripTabWidth(stripW(), openTabs().length);
+    const stuck = stuckW();
+    return stuck === undefined ? room : Math.min(stuck, room);
+  }
+
+  function wTick() {
+    const t = wTween;
+    if (!t) return;
+    const k = Math.min(1, (Date.now() - t.at) / W_TWEEN_MS);
+    wNow.set(t.from + (t.to - t.from) * (1 - (1 - k) ** 3));
+    if (k >= 1) wTween = undefined;
+    else t.frame = requestAnimationFrame(wTick);
+  }
+
+  function retargetW(to: number) {
+    const current = wNow();
+    // A drag or a drop's settle holds measured frames: land, don't drift.
+    if (!wSeeded || reduceMotion() || drag() || settle() || Math.abs(to - current) < 0.5) {
+      if (wTween) {
+        cancelAnimationFrame(wTween.frame);
+        wTween = undefined;
+      }
+      wNow.set(to);
+      if (stripW() > 0) wSeeded = true;
+      return;
+    }
+    if (wTween) {
+      if (wTween.to === to) return;
+      cancelAnimationFrame(wTween.frame);
+    }
+    wTween = { from: current, to, at: Date.now(), frame: requestAnimationFrame(wTick) };
+  }
+
+  effect(() => {
+    const to = targetW();
+    untracked(() => {
+      // A width move under a drag's measured pills makes its drop a guess:
+      // hand them back, then let the resize land.
+      if (drag() && Math.abs(to - wNow()) >= 0.5) finishDrag(false);
+      retargetW(to);
+    });
+  });
+  // A pin that outlived a drag's settle — the pointer left the strip
+  // mid-flight — lets go once the pills come to rest.
+  effect(() => {
+    if (drag() || settle() !== null || pointerInStrip) return;
+    untracked(() => stuckW.set(undefined));
+  });
+  cleanup(() => {
+    if (wTween) cancelAnimationFrame(wTween.frame);
+  });
+
   // ── The strip's own flow ──────────────────────────────────────────────────
   //
   // A tab that opens or closes changes the others' places. Each pill that
@@ -246,7 +311,6 @@ export function TabBar() {
   // strip's end the same way. A new pill is in its slot from its first frame
   // and only fades in. Nothing is animated that the reader did not just see
   // happen: the strip a launch restores is simply there.
-  const STRIDE = TAB_W + TAB_GAP;
   const flowing = signal(false);
   const plusShift = createAnimatedValue(0);
   let stripIds: string[] = untracked(() => openTabs().map((t) => tabId(t)));
@@ -268,23 +332,30 @@ export function TabBar() {
       stripIds = ids;
       const added = ids.filter((id) => !before.includes(id));
       const removed = before.filter((id) => !ids.includes(id));
+      // A close with the pointer in the strip pins the pills' width, so each
+      // next close lands under it; an open hands the room back at once.
+      if (removed.length && pointerInStrip) stuckW.set(wNow());
+      else if (added.length) stuckW.set(undefined);
       // A reorder is the drag's own motion (its drop rebases the offsets); only membership flows here.
       if ((!added.length && !removed.length) || !stripSeeded || reduceMotion() || drag() || settle()) return;
       bornIds.clear();
       for (const id of added) bornIds.add(id);
       queueMicrotask(() => bornIds.clear());
+      // The layout this commit uses still has the width `wNow` shows, even
+      // with a squeeze tween due: its stride is what the slots moved by.
+      const stride = wNow() + TAB_GAP;
       let moved = false;
       ids.forEach((id, index) => {
         const stood = before.indexOf(id);
         const row = pillAnims.get(id);
         if (stood < 0 || stood === index || !row) return;
         void row.shift.stop();
-        row.shift.set((stood - index) * STRIDE);
+        row.shift.set((stood - index) * stride);
         row.shiftTarget = Number.NaN;
         void pillSpring(row, 0);
         moved = true;
       });
-      const plus = (before.length - ids.length) * STRIDE;
+      const plus = (before.length - ids.length) * stride;
       if (plus) {
         void plusShift.stop();
         plusShift.set(plus);
@@ -327,6 +398,12 @@ export function TabBar() {
     settleGen++;
     settle.set(null);
     for (const row of pillAnims.values()) normalizePill(row);
+    // A width tween in flight would move the measured pills under the drag.
+    if (wTween) {
+      cancelAnimationFrame(wTween.frame);
+      wNow.set(wTween.to);
+      wTween = undefined;
+    }
     const ids = openTabs().map((t) => tabId(t));
     // The lifted order's signature lands with the lift itself: the re-layout
     // guard reads it before the measure resolves, not after.
@@ -448,6 +525,8 @@ export function TabBar() {
     const frames = dragFrames;
     const shifts = untracked(dragShifts);
     stopEdgeScroll();
+    // A drag that left the strip lets a pinned width go once it lands.
+    if (!pointerInStrip) stuckW.set(undefined);
     if (!d) {
       batch(() => {
         settle.set(null);
@@ -590,23 +669,6 @@ export function TabBar() {
     edgeFrame = requestAnimationFrame(edgeTick);
   }
 
-  const onWheel = (e: WheelEvent) => {
-    if (openTabs().length < 2) return;
-    const d = Math.abs(e.delta.y) >= Math.abs(e.delta.x) ? e.delta.y : e.delta.x;
-    if (e.deltaMode === "lines") {
-      cycleTab(d > 0 ? 1 : -1);
-      return;
-    }
-    if (Math.sign(d) !== Math.sign(wheelAcc)) wheelAcc = 0;
-    wheelAcc += d;
-    const now = Date.now();
-    if (Math.abs(wheelAcc) >= WHEEL_TAB_PX && now - wheelLast > WHEEL_THROTTLE_MS) {
-      wheelLast = now;
-      cycleTab(wheelAcc > 0 ? 1 : -1);
-      wheelAcc = 0;
-    }
-  };
-
   // The active tab always stays in view: a rename or a status mark that widened
   // its pill, or a click on a half-hidden tab, never leaves it clipped.
   effect(() => {
@@ -691,7 +753,7 @@ export function TabBar() {
           scrollbar={false}
           accessibilityLabel={tr("Session name", "会话名称")}
           placeholder={tr("Name this session", "为会话命名")}
-          class={`h-6 w-30 rounded corner-squircle px-1.5 text-sm font-medium text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
+          class={`h-6 min-w-0 flex-1 rounded corner-squircle px-1.5 text-sm font-medium text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
         />
         <If when={anchor()}>
           {(field) => <Overlay anchor={field()} onPressOutside={commit} onCancel={cancelRenaming} />}
@@ -778,25 +840,26 @@ export function TabBar() {
         accessibilityLabel={tabTitle(props.tab())}
         accessibilityState={{ selected: active() }}
         class="group relative h-7 shrink-0 flex-row items-center rounded-md corner-squircle pl-2 pr-1"
-        style={{ width: TAB_W, ...liveStyle() }}
+        style={{ width: wNow(), ...liveStyle() }}
         onPressDown={(e) => {
           draggedId = null;
           if (e.clickCount >= 2) {
-            // A double press on a tab only looked at keeps it; on one that is
-            // kept it renames the chat it is already on — renaming follows
-            // the open session, so other tabs only select.
-            selectTab(props.tab());
-            if (props.tab().preview) {
-              keepTab(id());
-              return;
-            }
-            if (active() && props.tab().kind === "chat" && props.tab().ref && sidecarPhase().name === "ready") startRenaming();
+            // Double press is the fast close gesture. Cancel the pending drag
+            // arm first: the following press event belongs to the close, not
+            // to selecting or reordering this tab.
+            disarmPress();
+            draggedId = null;
+            closeTab(id());
             return;
           }
           lastPageX = e.pagePosition.x;
           armPress(id(), e.pagePosition.x);
         }}
         onPress={() => {
+          // A double press closes the pill during press-down. The native press
+          // event may still arrive for that same view; it must not reopen or
+          // select the tab we just removed.
+          if (!openTabs().some((tab) => tabId(tab) === id())) return;
           if (draggedId === id()) {
             draggedId = null;
             return;
@@ -846,10 +909,10 @@ export function TabBar() {
             style={{ opacity: lift }}
           />
         </If>
-        {/* Fill: the active tab's card, hover on the rest — under everything in the pill. */}
+        {/* Fill: the active tab's card on its hairline edge, hover on the rest — under everything in the pill. */}
         <View
-          class={`pointer-events-none absolute inset-0 rounded-md corner-squircle transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
-            active() ? "bg-card" : "group-hover:bg-accent"
+          class={`pointer-events-none absolute inset-0 rounded-md corner-squircle border-[0.5px] transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
+            active() ? "border-hairline bg-card" : "border-transparent group-hover:bg-accent"
           }`}
         />
         {props.tab().kind === "chat" ? (
@@ -861,7 +924,18 @@ export function TabBar() {
         ) : (
           <Icon name="file" size={13} tone={active() ? "foreground" : "subtle"} class="shrink-0" />
         )}
-        <If when={renaming()} else={<Text class={`mx-1.5 min-w-0 flex-1 truncate text-sm font-medium ${props.tab().preview ? "italic" : ""}`}>{tabTitle(props.tab())}</Text>}>
+        <If
+          when={renaming()}
+          else={
+            <Text
+              class={`mx-1.5 min-w-0 flex-1 truncate text-sm font-medium transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
+                active() ? "text-foreground" : "text-muted-foreground group-hover:text-foreground"
+              } ${props.tab().preview ? "italic" : ""}`}
+            >
+              {tabTitle(props.tab())}
+            </Text>
+          }
+        >
           <RenameField />
         </If>
         {/* Trailing slot: status mark at rest, the close control over it on hover (or always on the active tab). */}
@@ -879,21 +953,18 @@ export function TabBar() {
             <Icon name="x" size={11} tone="muted-foreground" />
           </BaseButton>
         </View>
-        {/* The active mark: a short brand underline inside the pill's foot — it grows in and out, never blinks. */}
-        <Presence show={active()} scaleFrom={0.4} class="pointer-events-none absolute inset-x-3 bottom-0 h-0.5">
-          <View class="h-0.5 rounded-full bg-brand" />
-        </Presence>
       </View>
     );
   }
 
-  function newMenu() {
-    void Menu.popup([
+  /** The "+" button's other surfaces, on a right press: the press itself is the common one — a new session, at once. */
+  function newMenuItems(): MenuItem[] {
+    return [
       { label: tr("New Session", "新建会话"), shortcut: "mod+n", onSelect: () => void newSession() },
       { label: tr("New Document", "新建文档"), shortcut: "mod+shift+n", onSelect: () => void newDocTab() },
       { type: "separator" },
       { label: tr("Open Markdown File…", "打开 Markdown 文件…"), onSelect: () => void pickDocTab() },
-    ]);
+    ];
   }
 
   const parent = () => currentParentSession();
@@ -930,9 +1001,6 @@ export function TabBar() {
         }
       }}
       onMouseUp={endPointerDrag}
-      onWheel={(e) => {
-        if (!drag()) onWheel(e);
-      }}
       onFileDrop={(e) => {
         for (const uri of e.uris) {
           const path = uri.replace(/^file:\/\//, "");
@@ -952,6 +1020,16 @@ export function TabBar() {
         role="tablist"
         class="min-w-0 flex-1"
         contentClass="flex-row items-center gap-1 px-1"
+        onLayout={(e) => stripW.set(e.bounds.size.width)}
+        onMouseEnter={() => {
+          pointerInStrip = true;
+        }}
+        onMouseLeave={() => {
+          pointerInStrip = false;
+          // The pointer left the strip: a close's pin lets the pills' room
+          // back. Mid-drag the measured frames keep the width they saw.
+          if (!drag() && !settle()) stuckW.set(undefined);
+        }}
         onScroll={(e) => {
           // The strip moved under the drag's measured pills: the pointer's
           // place in the content changed with it, so the follow and the target do too.
@@ -965,12 +1043,17 @@ export function TabBar() {
         <Each of={openTabs()} key={(tab) => tabId(tab)}>
           {(tab) => <TabPill tab={tab} />}
         </Each>
-        <View class="shrink-0" style={{ transform: [{ translateX: plusShift }] }}>
+        <View
+          class="shrink-0"
+          style={{ transform: [{ translateX: plusShift }] }}
+          onContextMenu={(e: ContextMenuEvent) => Menu.popup(newMenuItems(), e.pagePosition)}
+        >
           <IconButton
             icon="plus"
             size="sm"
-            label={tr("New tab", "新建标签页")}
-            onPress={newMenu}
+            label={tr("New session", "新建会话")}
+            shortcut="mod+n"
+            onPress={() => void newSession()}
             class="my-0.5 shrink-0"
           />
         </View>

@@ -19,10 +19,45 @@ SmartScreen will warn on first launch); a final job publishes all of it as one
 GitHub Release. A manual dispatch runs every gate but publishes nothing. The
 tag must equal `v` + `nsh.json`'s version — bump `nsh.json` first.
 
-The publish job also runs `nsh update-manifest` over the staged archives and
-uploads the `latest.json` it writes beside them: that manifest is what the
-app's updater (`nsh.json` → `updater.github`, `store/update.ts`) reads when it
-checks for a newer version.
+The publish job also runs `nsh publish` into a signed `.nshpkg` of the app's
+code and `nsh update-manifest --package … --key …` over the staged archives,
+and uploads the `latest.json` and `latest.json.sig` it writes beside them:
+that manifest is what the app's updater (`nsh.json` → `updater`,
+`store/update.ts`) reads when it checks for a newer version.
+
+## Incremental (code-package) updates
+
+A release carries two things an install can take: the platform archives — the
+whole app — and a signed `.nshpkg` of only the compiled TSX and assets, an
+order of magnitude smaller. An install whose `nsh.json` was written with
+`updater.packages.roots` prefers the package when its build is newer and the
+runtime runs it, downloads it on the card like any update, and restarts into
+it; the launcher tries it for a few seconds and goes back to the previous
+build if it crashes. Only a release that bumps the runtime or what the
+platform reads from the installed app (icon, name, capabilities) needs the
+archives — every other update is the package's few megabytes.
+
+The keys live in `keys/` (gitignored, this machine only): `root` certifies
+the release key that signs packages, `update` signs the manifest. The public
+halves are pinned in `nsh.json` (`updater.packages.roots`,
+`updater.publicKey`); the secrets below publish from CI. Keep `root.secret`
+offline — whoever holds it can make every install run their code.
+
+| Secret | Content |
+| --- | --- |
+| `PIPI_PACKAGE_KEY` | `keys/release.secret` — signs the `.nshpkg` |
+| `PIPI_PACKAGE_CERT` | `keys/release.cert` — the root's certificate for it |
+| `PIPI_UPDATE_KEY` | `keys/update.secret` — signs `latest.json` |
+
+`build` in `nsh.json` is one counter for archives and packages: raise it for
+every release of either. An app runs a package only when the package's build
+is higher than the build the app shipped with, so a release's package and
+archives share the build its `nsh.json` carries. A certificate lasts 365
+days: `nsh certify --root keys/root.secret --key keys/release.pub --apps
+dev.pipi.app -o keys/release.cert` again before it runs out and update
+`PIPI_PACKAGE_CERT`. `nsh verify <pkg> --root keys/root.pub` checks a package
+as an install would; `nsh revoke` cuts off a leaked release key or a bad
+package.
 
 ## Signing configuration
 

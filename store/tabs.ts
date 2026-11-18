@@ -11,6 +11,7 @@ import {
   currentView,
   daemonSessionByFile,
   daemonSessionOfId,
+  daemonSessionTitle,
   detachDoc,
   docRefText,
   isRunning,
@@ -329,9 +330,11 @@ export function chatTabTitle(tab: OpenTab): string {
     if (summary) return sessionTitle(summary, file.split("/").pop() ?? file);
     const base = file.split("/").pop() ?? file;
     if (base && !base.endsWith(".jsonl")) return base;
-    return base.replace(/\.pipi-agent\.jsonl$|\.jsonl$/, "") || ds?.title || tr("Session", "会话");
+    return base.replace(/\.pipi-agent\.jsonl$|\.jsonl$/, "") || (ds ? daemonSessionTitle(ds) : tr("Session", "会话"));
   }
-  return ds?.title || tr("Session", "会话");
+  // The daemon calls an untitled session "New session": `daemonSessionTitle`
+  // reads that as untitled and answers in the reader's language.
+  return ds ? daemonSessionTitle(ds) : tr("Session", "会话");
 }
 
 /** Shows a tab: its chat session attaches, or its document opens. */
@@ -356,7 +359,7 @@ export function selectTab(tab: OpenTab) {
   void openSession(tab.ref);
 }
 
-/** Cycles the strip by `delta` tabs (the wheel's, ⌘⇧]'s). */
+/** Cycles the strip by `delta` tabs (⌘⇧]'s). */
 export function cycleTab(delta: number) {
   const list = tabs();
   if (list.length < 2) return;
