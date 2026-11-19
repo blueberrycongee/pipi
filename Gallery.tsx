@@ -6,7 +6,7 @@ import { Icon, type IconName } from "./ui/Icon";
 
 const MOODS: Mood[] = ["idle", "think", "work", "write", "happy", "error", "sleep"];
 const AGENTS: AgentLogoId[] = ["pi","claude","codex","devin","opencode","cursor","gemini","copilot","grok","goose","kimi","qwen","dsh","antigravity","hermes","kiro","droid","amp"];
-const ICONS: IconName[] = ["plus","x","check","chevronDown","chevronRight","chevronsUpDown","arrowUp","arrowLeft","stop","search","folder","folderOpen","folderPlus","archive","unarchive","trash","pencil","copy","terminal","thinking","file","fileEdit","filePlus","sliders","gear","github","more","alert","info","refresh","sidebar","sparkle","bolt","chip","key","external","download","fork","compact","image","enter","clock","eye","plug","message","command","steer","queue","dot","globe","wrench","agents","layers","shield","shieldLock","shieldHalf","shieldBolt"];
+const ICONS: IconName[] = ["plus","minus","x","check","chevronDown","chevronRight","chevronsUpDown","arrowUp","arrowLeft","stop","search","folder","folderOpen","folderPlus","archive","unarchive","trash","pencil","copy","terminal","thinking","file","fileEdit","filePlus","listBullet","listOrdered","listTask","quote","code","table","sliders","gear","github","more","alert","info","refresh","sidebar","sparkle","bolt","chip","key","external","download","fork","compact","image","enter","clock","eye","plug","message","command","steer","queue","dot","globe","wrench","agents","layers","shield","shieldLock","shieldHalf","shieldBolt"];
 
 mount(() => (
   <View class="flex-1 gap-6 bg-background p-8">

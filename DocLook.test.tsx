@@ -1,9 +1,10 @@
 import { open, test } from "nsh/test";
 
-// The document as it is drawn, and its way to a session and back: a full
-// document, an empty one, the `/` menu, a passage selected, the card it is on
-// the composer, the message it rode on, a draft long enough to be offered a
-// document.
+// The document as it is drawn, and its explicit way to a session and back:
+// a full document, an empty one, the `/` menu, the explicit destination menu,
+// a passage selected, `@` mention in the composer, the card it is on the
+// composer, the message it rode on, a draft expanded with ⌘E returning to its
+// origin session, and the Documents folder setting.
 //
 //   nsh test DocLook.test.tsx --target macos   → .nsh/shots/doc-*.png
 
@@ -42,17 +43,26 @@ function hello() { return a; }
 
 这是一段中文，用来看看中文排版的行高与字距是否合适，以及中英文 mixed 的效果。
 `;
-const launch = (locale = "en-US") =>
+const launch = (locale = "en-US", colorScheme: "light" | "dark" = "light") =>
   open("./Harness.tsx", {
-    width: 1180, height: 780, platform: "macos", locale,
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale,
+    colorScheme,
     storage: {
-      "harness.scenario": "welcome", "harness.distinct": "1", "harness.dataDir": dir,
+      "harness.scenario": "welcome",
+      "harness.distinct": "1",
+      "harness.dataDir": `${dir}-${locale}-${colorScheme}`,
       "harness.files": JSON.stringify({
-        [`${dir}/sample.md`]: sample,
-        [`${dir}/docs/note-a.md`]: "# Tab strip brief\n\nWhat the strip is for.\n",
-        [`${dir}/docs/note-b.md`]: "Questions for the review\n\n- one\n",
+        [`${dir}-${locale}-${colorScheme}/sample.md`]: sample,
+        [`${dir}-${locale}-${colorScheme}/docs/note-a.md`]: "# Tab strip brief\n\nWhat the strip is for.\n",
+        [`${dir}-${locale}-${colorScheme}/docs/note-b.md`]: "Questions for the review\n\n- one\n",
       }),
-      "pipi.prefs.v1": JSON.stringify({ openTabs: [{ kind: "doc", ref: `${dir}/sample.md` }] }),
+      "pipi.prefs.v1": JSON.stringify({
+        appearance: colorScheme,
+        openTabs: [{ kind: "doc", ref: `${dir}-${locale}-${colorScheme}/sample.md` }],
+      }),
     },
   });
 const EDITOR = "label:Document";
@@ -60,13 +70,25 @@ const EDITOR = "label:Document";
 test("look", async () => {
   const app = await launch();
   await app.waitFor("text:What are we building?");
+  // Open an existing conversation so the destination menu has both New Session and a named open session.
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitFor("label:Conversation >> text:Refactor the transcript reducer");
+
   await app.press("id:tab-0");
   await app.waitFor("id:doc-editor");
   await app.wait(800);
   await app.screenshot(".nsh/shots/doc-full.png");
 
-  // A new document from the sidebar: a blank page, and its row in Recent already.
-  await app.press("id:sidebar-new-doc");
+  // Explicit destination menu from the document footer.
+  await app.press("id:doc-chat-trigger");
+  await app.waitFor("id:doc-chat-menu");
+  await app.wait(300);
+  await app.screenshot(".nsh/shots/doc-targets.png");
+  await app.keyboard.press("escape");
+
+  // A new document from the Documents group's `+`: blank page, listed in Documents (not Recent).
+  await app.hover("id:sidebar-docs-action");
+  await app.press("id:sidebar-docs-action");
   await app.waitFor("text:Untitled");
   await app.wait(500);
   await app.screenshot(".nsh/shots/doc-empty.png");
@@ -77,12 +99,12 @@ test("look", async () => {
   await app.keyboard.press("escape");
   await app.keyboard.press("backspace");
 
-  // A document looked at from Recent: the strip's preview seat, its name in italics.
-  await app.press("id:sidebar-recents >> text:Tab strip brief");
+  // A document looked at from Documents: the strip's preview seat, its name in italics.
+  await app.press("id:sidebar-docs >> text:Tab strip brief");
   await app.wait(500);
   await app.screenshot(".nsh/shots/doc-note-preview.png");
 
-  // A passage selected: the bubble offers it to the session, and the foot says what will go.
+  // A passage selected: the bubble offers Ask AI, and the foot says Ask AI about Selection.
   await app.keyboard.press("mod+down");
   for (let i = 0; i < 13; i++) await app.keyboard.press("shift+left");
   await app.waitFor("id:doc-bubble-add");
@@ -90,8 +112,10 @@ test("look", async () => {
   await app.screenshot(".nsh/shots/doc-selection.png");
   await app.keyboard.press("right");
 
-  // Taken to the session: a card on the composer, the words still in the document.
-  await app.keyboard.press("mod+enter");
+  // Taken explicitly to a new session: a card on the composer, the words still in the document.
+  await app.press("id:doc-chat-trigger");
+  await app.waitFor("id:doc-chat-menu");
+  await app.press("id:doc-target-new");
   await app.waitFor("id:composer-doc");
   await app.wait(600);
   await app.screenshot(".nsh/shots/doc-card.png");
@@ -102,9 +126,15 @@ test("look", async () => {
   await app.waitFor("id:message-doc");
   await app.wait(1500);
   await app.screenshot(".nsh/shots/doc-sent.png");
+
+  // `@` mention right from the composer pulls any open or saved document.
+  await app.type("label:Message", "Also check @");
+  await app.waitFor("id:composer-doc-menu");
+  await app.wait(300);
+  await app.screenshot(".nsh/shots/doc-mention.png");
 });
 
-test("a long draft is offered a document", async () => {
+test("a long draft is offered a document and remembers its origin session", async () => {
   const app = await launch("zh-CN");
   await app.waitFor("id:sidebar-new-session");
   await app.wait(400);
@@ -119,8 +149,8 @@ test("a long draft is offered a document", async () => {
   await app.wait(800);
   await app.screenshot(".nsh/shots/doc-from-draft.png");
 
-  // And back: the document on the composer, then the message it rode on.
-  await app.keyboard.press("mod+enter");
+  // One click returns straight back to the composer it came from.
+  await app.press("id:doc-return-origin");
   await app.waitFor("id:composer-doc");
   await app.wait(600);
   await app.screenshot(".nsh/shots/doc-card-zh.png");
@@ -132,9 +162,14 @@ test("a long draft is offered a document", async () => {
 test("a file the editor cannot keep whole is shown read-only", async () => {
   const readme = `${dir}/README.md`;
   const app = await open("./Harness.tsx", {
-    width: 1180, height: 780, platform: "macos", locale: "en-US",
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
     storage: {
-      "harness.scenario": "welcome", "harness.distinct": "1", "harness.dataDir": `${dir}-ro`,
+      "harness.scenario": "welcome",
+      "harness.distinct": "1",
+      "harness.dataDir": `${dir}-ro`,
       "harness.files": JSON.stringify({ [readme]: '# Project\n\n<img src="logo.png" width="80">\n\nWhat it is, in a paragraph.\n' }),
       "pipi.prefs.v1": JSON.stringify({ openTabs: [{ kind: "doc", ref: readme }] }),
     },
@@ -144,4 +179,31 @@ test("a file the editor cannot keep whole is shown read-only", async () => {
   await app.waitFor("id:doc-editor");
   await app.wait(600);
   await app.screenshot(".nsh/shots/doc-readonly.png");
+});
+
+test("dark look", async () => {
+  const app = await launch("en-US", "dark");
+  await app.waitFor("text:What are we building?");
+  await app.press("id:tab-0");
+  await app.waitFor("id:doc-editor");
+  await app.wait(800);
+  await app.screenshot(".nsh/shots/doc-full-dark.png");
+
+  await app.hover("id:sidebar-docs-action");
+  await app.press("id:sidebar-docs-action");
+  await app.waitFor("text:Untitled");
+  await app.keyboard.press("/");
+  await app.waitFor("id:doc-slash-menu");
+  await app.wait(300);
+  await app.screenshot(".nsh/shots/doc-slash-dark.png");
+  await app.keyboard.press("escape");
+  await app.keyboard.press("backspace");
+
+  await app.press("id:sidebar-docs >> text:Tab strip brief");
+  await app.wait(500);
+  await app.keyboard.press("mod+down");
+  for (let i = 0; i < 13; i++) await app.keyboard.press("shift+left");
+  await app.waitFor("id:doc-bubble-add");
+  await app.wait(400);
+  await app.screenshot(".nsh/shots/doc-selection-dark.png");
 });

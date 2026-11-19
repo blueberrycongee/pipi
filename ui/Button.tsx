@@ -53,7 +53,7 @@ export function Button(props: {
 export function IconButton(props: {
   icon: IconName;
   label: string;
-  onPress: () => void;
+  onPress?: () => void;
   shortcut?: string;
   tone?: Tone;
   size?: "sm" | "md";

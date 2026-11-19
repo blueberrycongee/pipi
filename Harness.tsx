@@ -124,6 +124,7 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       pickedFolder: (await Storage.getItem("harness.pickedFolder")) ?? "/Users/pip/code/new-app",
       pickedImage: (await Storage.getItem("harness.pickedImage")) ?? undefined,
       pickedFile: (await Storage.getItem("harness.pickedFile")) ?? undefined,
+      pickedSaveFile: (await Storage.getItem("harness.pickedSaveFile")) ?? undefined,
       dataDir: (await Storage.getItem("harness.dataDir")) ?? undefined,
       pace: scenario === "slow" ? 400 : scenario === "stream" || scenario === "multi-slow" ? 150 : 0,
       startDelay,

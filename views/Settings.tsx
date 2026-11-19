@@ -1,4 +1,4 @@
-import { computed, effect, openUrl, Scroll, signal, Text, untracked, View } from "nsh";
+import { computed, effect, openUrl, platform, Scroll, signal, Text, untracked, View } from "nsh";
 import type { JSX } from "nsh";
 import { AlertDialog, Button as BaseButton, Popover, Tab, Tabs } from "nsh/base";
 import type { AcpDistribution, AgentHarnessStatus, RuntimeMode } from "../agents/types";
@@ -100,6 +100,7 @@ import {
   wallpaperVideoClickAction,
 } from "../store/app";
 import { backend } from "../store/backend";
+import { chooseDocsFolder, notesDir, resetDocsFolder, revealDocsFolder } from "../store/docs";
 import { appUpdate, checkForAppUpdate } from "../store/update";
 import {
   agentSendScope,
@@ -110,6 +111,7 @@ import {
   type AutoArchiveDays,
   autoArchiveDays,
   autoRetryChoice,
+  docsFolder,
   type Language,
   language,
   pipCoat,
@@ -1300,6 +1302,42 @@ function General() {
           </View>
         </Reveal>
       </SettingGroup>
+      <SettingGroup title={tr("Documents", "文档")}>
+        <SettingRow
+          title={tr("Documents folder", "文档文件夹")}
+          description={`${tildePath(notesDir(), backend().home())} · ${
+            docsFolder()
+              ? tr("Custom folder — Markdown files here appear in the sidebar.", "自定义目录 — 此目录中的 Markdown 文件会显示在侧边栏。")
+              : tr("New documents are saved here as Markdown files.", "新建文档会作为 Markdown 文件保存在此目录。")
+          }`}
+        >
+          <View class="flex-row items-center gap-2">
+            <Button
+              testID="settings-docs-folder-reveal"
+              label={platform.os === "macos" ? tr("Show in Finder", "在访达中显示") : tr("Open folder", "打开文件夹")}
+              icon="folderOpen"
+              size="sm"
+              onPress={() => void revealDocsFolder()}
+            />
+            <Button
+              testID="settings-docs-folder-pick"
+              label={tr("Change folder", "更换文件夹")}
+              icon="folder"
+              size="sm"
+              onPress={() => void chooseDocsFolder()}
+            />
+            <If when={docsFolder()}>
+              <Button
+                testID="settings-docs-folder-reset"
+                label={tr("Reset", "恢复默认")}
+                variant="ghost"
+                size="sm"
+                onPress={() => void resetDocsFolder()}
+              />
+            </If>
+          </View>
+        </SettingRow>
+      </SettingGroup>
       <SettingGroup title="pipi">
         <View class="gap-3 px-3 py-3">
           {(["cat", "dog"] as const).map((species) => (
@@ -1880,6 +1918,12 @@ function ShortcutsPage() {
         />
         <Rule />
         <ShortcutRow
+          title={tr("Attach a document", "引用文档")}
+          description={tr("Type @ to attach an open or saved document to this session.", "输入 @ 将打开或已保存的文档附到当前会话。")}
+          caps={<Kbd text="@" />}
+        />
+        <Rule />
+        <ShortcutRow
           title={tr("Run a shell command", "运行 shell 命令")}
           description={tr("! runs it and adds the output to the conversation; !! leaves it out.", "! 运行并把输出带入对话；!! 运行但不带入。")}
           caps={
@@ -1897,12 +1941,6 @@ function ShortcutsPage() {
           title={tr("Continue a draft in a document", "在文档中继续写")}
           description={tr("Moves what the composer holds into a document.", "把输入框里写到一半的内容搬进文档。")}
           caps={<Kbd keys="mod+e" />}
-        />
-        <Rule />
-        <ShortcutRow
-          title={tr("Add to chat", "添加到会话")}
-          description={tr("In a document: attaches it, or the passage selected, to the message.", "在文档中：把整篇或选中的内容附到消息上。")}
-          caps={<Kbd keys="mod+enter" />}
         />
         <Rule />
         <ShortcutRow

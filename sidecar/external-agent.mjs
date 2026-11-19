@@ -755,6 +755,16 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
   let saidText = "";
   let trailingThoughts = "";
   const calledTools = new Set();
+  // Active transient API retry reported by an ACP harness (e.g. Antigravity's
+  // `⚠ API error (attempt N): ...` banner), held in status until life resumes or the turn ends.
+  let retryState = undefined;
+
+  const clearRetry = (success = true, finalError = undefined) => {
+    if (!retryState) return;
+    const { attempt } = retryState;
+    retryState = undefined;
+    emitTurn({ type: "auto_retry_end", success, attempt, ...(finalError ? { finalError } : {}) });
+  };
 
   const openMsg = () => {
     if (msgOpen) return;
@@ -852,8 +862,20 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
     usageSummary(part) {
       if (!sampled) this.usage(part);
     },
+    retry(attempt, maxAttempts = 0, errorMessage = "") {
+      const clean = String(errorMessage || "").replace(/\s+/g, " ").trim();
+      retryState = { attempt, maxAttempts: maxAttempts || 0, errorMessage: clean };
+      emitTurn({
+        type: "auto_retry_start",
+        attempt: retryState.attempt,
+        maxAttempts: retryState.maxAttempts,
+        delayMs: 0,
+        errorMessage: retryState.errorMessage,
+      });
+    },
     thinkDelta(delta) {
       if (!delta) return;
+      clearRetry(true);
       openMsg();
       closeText();
       if (thinkIdx === undefined) {
@@ -867,6 +889,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
     },
     textDelta(delta) {
       if (!delta) return;
+      clearRetry(true);
       openMsg();
       closeThink();
       if (textIdx === undefined) {
@@ -881,6 +904,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
     },
     toolStart(id, rawName, args) {
       if (openTools.has(id)) return;
+      clearRetry(true);
       openMsg();
       closeThink();
       closeText();
@@ -944,8 +968,19 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       saidText = "";
       trailingThoughts = "";
       calledTools.clear();
+      retryState = undefined;
     },
     finish(stopReason = "stop", errorMessage = undefined, { keepOpenTools = false } = {}) {
+      if (retryState) {
+        if (stopReason === "aborted") {
+          clearRetry(false);
+        } else {
+          const finalError = errorMessage || retryState.errorMessage;
+          clearRetry(false, finalError);
+          stopReason = "error";
+          errorMessage = finalError;
+        }
+      }
       closeThink();
       closeText();
       const usage = toUsage(usageParts.splice(0));
@@ -2118,6 +2153,7 @@ function acpWokenSince(replay, known, running = acpBackgroundTools) {
     const kind = u?.sessionUpdate;
     if (kind === "agent_message_chunk") {
       const text = textOf(u.content);
+      if (parseAcpRetryNotice(text)) continue;
       if (past()) {
         if (text) items.push({ kind: "text", text });
         continue;
@@ -2450,6 +2486,27 @@ async function handleAcpPermission(msg) {
   });
 }
 
+/**
+ * Recognizes transient API retry banners that ACP agents (notably Antigravity)
+ * emit inline as a standalone `agent_message_chunk`, e.g.:
+ * `⚠ API error (attempt 1): request failed: Post "...": EOF`
+ * so the bridge translates them into Pi's `auto_retry_start`/`auto_retry_end`
+ * status events instead of polluting the transcript as permanent prose.
+ */
+const ACP_RETRY_NOTICE = /^⚠\uFE0F?\s*API error\s*\(attempt\s+(\d+)(?:\s*(?:\/|of)\s*(\d+))?\)\s*:\s*([\s\S]+)$/i;
+
+function parseAcpRetryNotice(text) {
+  if (typeof text !== "string" || !text.includes("⚠")) return undefined;
+  const match = ACP_RETRY_NOTICE.exec(text.trim());
+  if (!match) return undefined;
+  const attempt = Number(match[1]);
+  if (!Number.isFinite(attempt) || attempt < 1) return undefined;
+  const maxAttempts = match[2] ? Number(match[2]) : 0;
+  const errorMessage = match[3].replace(/\s+/g, " ").trim();
+  if (!errorMessage) return undefined;
+  return { attempt, maxAttempts: Number.isFinite(maxAttempts) && maxAttempts > 0 ? maxAttempts : 0, errorMessage };
+}
+
 function handleAcpUpdate(u) {
   acpLastEventAt = Date.now();
   const kind = u.sessionUpdate || u.type;
@@ -2463,7 +2520,12 @@ function handleAcpUpdate(u) {
     // agy echoes the prompt as it takes it: what came before the echo is a turn it ran while idle.
     if (acpLazyWake) acpStream?.split();
   } else if (kind === "agent_thought_chunk") acpStream?.thinkDelta(textOf(u.content));
-  else if (kind === "agent_message_chunk") acpStream?.textDelta(textOf(u.content));
+  else if (kind === "agent_message_chunk") {
+    const text = textOf(u.content);
+    const retry = parseAcpRetryNotice(text);
+    if (retry) acpStream?.retry(retry.attempt, retry.maxAttempts, retry.errorMessage);
+    else acpStream?.textDelta(text);
+  }
   else if (kind === "tool_call") {
     const id = String(u.toolCallId ?? `t_${Date.now()}`);
     acpRecentTools.set(id, { title: u.title || u.kind || "tool", kind: u.kind, rawInput: u.rawInput });
@@ -3120,6 +3182,7 @@ async function handleCommand(cmd) {
       autoCompactionEnabled = !!cmd.enabled;
       return undefined;
     case "set_auto_retry":
+    case "abort_retry":
       return undefined;
     case "set_runtime_mode":
       runtimeMode = cmd.mode || runtimeMode;

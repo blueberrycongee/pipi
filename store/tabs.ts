@@ -5,9 +5,13 @@ import { tr } from "../lib/i18n";
 import { sessionTitle } from "../pi/sessions";
 import {
   activeDaemonSessionCount,
+  activeProjectPath,
   attachDoc,
+  composerAttachments,
+  composerDocs,
   composerDraft,
   currentDaemonSession,
+  currentTitle,
   currentView,
   daemonSessionByFile,
   daemonSessionOfId,
@@ -15,6 +19,7 @@ import {
   detachDoc,
   docRefText,
   isRunning,
+  isSwitching,
   newSession,
   openDaemonSession,
   openSession,
@@ -25,14 +30,16 @@ import {
   showChat,
   showDoc,
   toast,
+  transcriptRows,
+  workspaceSessions,
 } from "./app";
-import { backend } from "./backend";
+import { backend, NoPickerError } from "./backend";
 import {
   closeDoc,
   deleteNoteFile,
   docAt,
+  docFileContent,
   docIsBlank,
-  docKeys,
   docPassage,
   docTabTitle,
   docText,
@@ -40,10 +47,12 @@ import {
   flushDoc,
   isNote,
   newDocPath,
+  notes,
+  notesDir,
   refreshNotes,
   syncDocs,
 } from "./docs";
-import { prefsReady, setOpenTabs, storedOpenTabs } from "./prefs";
+import { prefsReady, setGroupCollapsed, setOpenTabs, storedOpenTabs } from "./prefs";
 
 /**
  * The tab bar's working set: which surfaces are open, in which order. A tab
@@ -89,6 +98,21 @@ const daemonRefId = (ref: string) => (ref.startsWith(DAEMON_REF) ? ref.slice(DAE
 
 const tabs = signal<OpenTab[]>([]);
 export const openTabs = () => tabs();
+
+/**
+ * Documents opened by expanding a session's composer draft (`⌘E` / `draftToDoc`):
+ * remembers which chat ref they came from so they can return directly to it.
+ */
+const draftOrigins = signal<Record<string, string>>({});
+
+function clearDraftOrigin(path: string) {
+  if (!(path in draftOrigins())) return;
+  draftOrigins.update((all) => {
+    const next = { ...all };
+    delete next[path];
+    return next;
+  });
+}
 
 /** The shown chat surface's tab ref: its file, `"daemon:<id>"` file-less, `""` the draft. */
 function currentChatRef(): string {
@@ -145,6 +169,7 @@ function seatPreview(tab: OpenTab) {
 
 /** A document's tab is gone: its editor goes after a last save, and a card it has on the composer keeps what it said. */
 function letDocGo(path: string) {
+  clearDraftOrigin(path);
   const text = docText(path);
   if (text !== undefined) settleDocRef(path, text);
   void closeDoc(path);
@@ -418,6 +443,7 @@ export function closeTab(id: string) {
  * document — asking twice does not make two.
  */
 export async function newDocTab() {
+  setGroupCollapsed("docs", false);
   const blank = tabs().find((t) => t.kind === "doc" && isNote(t.ref) && docIsBlank(t.ref));
   if (blank) return openDocTab(blank.ref);
   openDocTab(await newDocPath());
@@ -426,12 +452,14 @@ export async function newDocTab() {
 /**
  * The composer's draft goes on as a document: a message that outgrew the
  * field is moved, not copied, into a new note — where Return is a new line
- * and every word is saved — with the caret after its last word. Nothing
+ * and every word is saved — with the caret after its last word. Remembers
+ * which session it came from so returning lands right back there. Nothing
  * drafted: a blank document.
  */
 export async function draftToDoc() {
   const text = composerDraft();
   if (!text.trim()) return newDocTab();
+  const origin = currentChatRef();
   const path = await newDocPath();
   try {
     await fs.writeFile(path, `${text.replace(/\s+$/, "")}\n`);
@@ -440,6 +468,8 @@ export async function draftToDoc() {
     return;
   }
   setDraft("");
+  setGroupCollapsed("docs", false);
+  draftOrigins.update((all) => ({ ...all, [path]: origin }));
   void refreshNotes();
   ensureDoc(path, { caret: "end" });
   openDocTab(path);
@@ -468,24 +498,193 @@ export async function openDocIfThere(path: string) {
 export async function pickDocTab() {
   const pick = backend().pickFile;
   if (!pick) return;
-  const path = await pick(tr("Open a Markdown document", "打开一个 Markdown 文档"), ["md", "markdown", "mdown", "txt"]);
-  if (path) openDocTab(path);
+  try {
+    const path = await pick(tr("Open a Markdown document", "打开一个 Markdown 文档"), ["md", "markdown", "mdown", "txt"]);
+    if (path) openDocTab(path);
+  } catch (error) {
+    if (error instanceof NoPickerError) {
+      toast("warning", tr("No file picker found — install zenity or kdialog to choose files.", "找不到文件选择器——请安装 zenity 或 kdialog。"));
+    }
+  }
+}
+
+/** Saves a document to a chosen path (preserving front matter and latest edits) and switches its tab there. */
+export async function saveDocAs(path: string) {
+  const pick = backend().pickSaveFile;
+  if (!pick) return;
+  await flushDoc(path);
+  const content = await docFileContent(path);
+  if (content === undefined) return;
+  const rawTitle = docTabTitle(path)
+    .replace(/[/\\:*?"<>|]+/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 64);
+  const base = rawTitle && rawTitle !== tr("Untitled", "未命名") ? rawTitle : "document";
+  const defaultName = /\.(md|markdown|txt)$/i.test(base) ? base : `${base}.md`;
+  let dest: string | undefined;
+  try {
+    dest = await pick(tr("Save document as", "文档另存为"), defaultName, activeProjectPath() || notesDir());
+  } catch (error) {
+    if (error instanceof NoPickerError) {
+      toast("warning", tr("No file picker found — install zenity or kdialog to save files.", "找不到文件选择器——请安装 zenity 或 kdialog。"));
+    }
+    return;
+  }
+  if (!dest) return;
+  if (!/\.(md|markdown|mdown|txt)$/i.test(dest)) dest = `${dest}.md`;
+  try {
+    await fs.mkdir(dest.split("/").slice(0, -1).join("/"), { recursive: true });
+    await fs.writeFile(dest, content);
+  } catch {
+    toast("warning", tr("Could not save the document", "无法保存文档"));
+    return;
+  }
+  if (dest !== path) {
+    const oldId = `doc:${path}`;
+    const destTab: OpenTab = { kind: "doc", ref: dest };
+    const list = tabs();
+    const oldIdx = list.findIndex((t) => tabId(t) === oldId);
+    const destIdx = list.findIndex((t) => tabId(t) === tabId(destTab));
+    if (oldIdx >= 0) {
+      if (destIdx >= 0) {
+        tabs.set(list.filter((_, i) => i !== oldIdx));
+      } else {
+        const next = [...list];
+        next[oldIdx] = destTab;
+        tabs.set(next);
+      }
+      persist();
+      letDocGo(path);
+      ensureDoc(dest);
+      showDoc(dest);
+    } else {
+      openDocTab(dest);
+    }
+  }
+  void refreshNotes();
+  toast("info", tr(`Saved as ${dest.split("/").pop() ?? dest}`, `已保存为 ${dest.split("/").pop() ?? dest}`));
 }
 
 // ── Between a document and a session ────────────────────────────────────────
 
-/**
- * Takes a document to the session: it is attached to the message being
- * written — the passage selected in it when there is one, else all of it —
- * and the chat comes forward. Nothing is sent and nothing is pasted: the
- * words stay in the document. Sent without a word of its own the message is
- * the document's text; with one, the document rides behind it, its file
- * named so the agent can change it where it lives (`lib/doc-wire.ts`). It
- * goes where the composer's message goes — the session in front, or
- * whichever the reader moves to before sending.
- */
-export function addDocToChat(path: string) {
-  const passage = docPassage(path);
+export interface DocChatTargetSession {
+  tab: OpenTab;
+  title: string;
+  current: boolean;
+  agentId?: string;
+}
+
+export interface DocChatTargets {
+  /** True when the strip's unstarted draft tab already holds unsent text or attachments. */
+  hasActiveDraft: boolean;
+  /** Short single-line preview of the unsent draft text. */
+  draftPreview: string;
+  /** The unstarted draft tab on the strip, if present. */
+  draftTab?: OpenTab;
+  /** Open real conversations (with a session file or daemon id), in strip order. */
+  sessions: DocChatTargetSession[];
+}
+
+/** Live display label for a real chat tab (never falls back to a generic label if the live title is known). */
+function sessionTargetTitle(tab: OpenTab, current: boolean): string {
+  const title = chatTabTitle(tab);
+  if (current && !isSwitching() && (title === tr("Session", "会话") || title === tr("New Session", "新会话"))) {
+    return currentTitle();
+  }
+  return title;
+}
+
+/** True when a chat tab is still an unstarted blank session (Pi assigns a sessionFile at boot before any message). */
+function isUnstartedChatTab(tab: OpenTab, active: string): boolean {
+  if (tab.kind !== "chat") return false;
+  if (!tab.ref) return true;
+  if (ownsChat(tab, active)) {
+    return transcriptRows().length === 0 && !(sessionState()?.messageCount) && !isRunning();
+  }
+  const ds = chatTabSession(tab);
+  if (ds && (ds.status === "working" || ds.status === "blocked")) return false;
+  const id = daemonRefId(tab.ref);
+  const file = id ? (ds?.file ?? tab.file) : tab.ref;
+  if (!file) return true;
+  if (savedSessions().some((s) => s.path === file)) return false;
+  for (const list of Object.values(workspaceSessions())) {
+    if (list.some((s) => s.path === file)) return false;
+  }
+  return true;
+}
+
+/** Explicit destinations a document can be sent/attached to — never a mystery session. */
+export function docChatTargets(): DocChatTargets {
+  const list = tabs();
+  const active = currentChatRef();
+  const draftTab = list.find((t) => t.kind === "chat" && isUnstartedChatTab(t, active));
+  const draftText = composerDraft().trim();
+  const activeIsUnstarted =
+    active === "" || (transcriptRows().length === 0 && !(sessionState()?.messageCount) && !isRunning());
+  const hasActiveDraft = Boolean(
+    draftTab &&
+      activeIsUnstarted &&
+      (draftText.length > 0 || composerDocs().length > 0 || composerAttachments().length > 0),
+  );
+  const draftPreview = draftText.replace(/\s+/g, " ").slice(0, 48);
+  const sessions: DocChatTargetSession[] = list
+    .filter((t) => t.kind === "chat" && !isUnstartedChatTab(t, active))
+    .map((tab) => {
+      const current = ownsChat(tab, active);
+      return {
+        tab,
+        title: sessionTargetTitle(tab, current),
+        current,
+        agentId: chatTabSession(tab)?.agentId,
+      };
+    });
+  return { hasActiveDraft, draftPreview, draftTab, sessions };
+}
+
+/** The exact chat tab a `⌘E` draft document came from, while that tab is still open. */
+export function docDraftOrigin(path: string): { tab: OpenTab; label: string; isBlankDraft: boolean } | undefined {
+  const origin = draftOrigins()[path];
+  if (origin === undefined) return undefined;
+  const list = tabs();
+  const active = currentChatRef();
+  const tab = origin === "" ? list.find((t) => t.kind === "chat" && !t.ref) : list.find((t) => ownsChat(t, origin));
+  if (!tab) return undefined;
+  const isBlankDraft = isUnstartedChatTab(tab, active);
+  const label = isBlankDraft ? "" : sessionTargetTitle(tab, ownsChat(tab, active));
+  return { tab, label, isBlankDraft };
+}
+
+/** Open and saved non-blank documents that can be referenced from the composer (`@`). */
+export const mentionableDocs = computed<{ path: string; title: string; open: boolean }[]>(() => {
+  const seen = new Set<string>();
+  const out: { path: string; title: string; open: boolean }[] = [];
+  for (const tab of tabs()) {
+    if (tab.kind !== "doc" || seen.has(tab.ref) || docIsBlank(tab.ref)) continue;
+    seen.add(tab.ref);
+    out.push({ path: tab.ref, title: docTabTitle(tab.ref), open: true });
+  }
+  for (const note of notes()) {
+    if (seen.has(note.path) || docIsBlank(note.path)) continue;
+    seen.add(note.path);
+    out.push({ path: note.path, title: docTabTitle(note.path), open: false });
+  }
+  return out;
+});
+
+async function readDocForChat(path: string, useSelection: boolean): Promise<{ text: string; excerpt: boolean } | undefined> {
+  if (docAt(path)) {
+    if (useSelection) return docPassage(path);
+    const text = docText(path);
+    return text !== undefined ? { text, excerpt: false } : undefined;
+  }
+  const text = plainMarkdown(await fs.readFile(path, "utf8").catch(() => "")).trim();
+  return { text, excerpt: false };
+}
+
+/** Starts a clean new session (or focuses the empty draft) with this document (or selection) attached. */
+export async function addDocToNewSession(path: string, options?: { selection?: boolean }) {
+  const passage = await readDocForChat(path, options?.selection !== false);
   if (!passage) return;
   if (!passage.text) {
     toast("info", tr("Nothing written to add yet", "还没有写下可以添加的内容"));
@@ -494,21 +693,46 @@ export function addDocToChat(path: string) {
   attachDoc({ path, title: docTabTitle(path), text: passage.text, ...(passage.excerpt ? { excerpt: true } : {}) });
   void flushDoc(path);
   keepTab(`doc:${path}`);
-  showChat();
+  clearDraftOrigin(path);
+  void newSession();
 }
 
-/** A document on the shelf taken to the session whole, without opening it: its file is read as it stands. */
-export async function addNoteToChat(path: string) {
-  const text = docText(path) ?? plainMarkdown(await fs.readFile(path, "utf8").catch(() => "")).trim();
-  if (!text) {
+/** Switches to an explicit chat tab and attaches this document (or selection) to its composer. */
+export async function addDocToTab(path: string, tab: OpenTab, options?: { selection?: boolean }) {
+  const passage = await readDocForChat(path, options?.selection !== false);
+  if (!passage) return;
+  if (!passage.text) {
     toast("info", tr("Nothing written to add yet", "还没有写下可以添加的内容"));
     return;
   }
-  attachDoc({ path, title: docTabTitle(path), text });
+  attachDoc({ path, title: docTabTitle(path), text: passage.text, ...(passage.excerpt ? { excerpt: true } : {}) });
+  void flushDoc(path);
+  keepTab(`doc:${path}`);
+  clearDraftOrigin(path);
+  selectTab(tab);
   showChat();
 }
 
-docKeys.send = addDocToChat;
+/** Returns a `⌘E` expanded draft document back to the exact session it came from. */
+export async function returnDraftDocToOrigin(path: string) {
+  const origin = docDraftOrigin(path);
+  if (origin) return addDocToTab(path, origin.tab, { selection: false });
+  return addDocToNewSession(path, { selection: false });
+}
+
+/** Pulls a document directly into the currently shown chat composer (used by `@` mentions and composer attach). */
+export async function attachDocToCurrentComposer(path: string): Promise<boolean> {
+  const passage = await readDocForChat(path, false);
+  if (!passage || !passage.text) {
+    toast("info", tr("Nothing written to add yet", "还没有写下可以添加的内容"));
+    return false;
+  }
+  attachDoc({ path, title: docTabTitle(path), text: passage.text });
+  void flushDoc(path);
+  keepTab(`doc:${path}`);
+  return true;
+}
+
 // An attached document is sent as it reads when sent: what was written after attaching goes too, and is on disk by then.
 docRefText.read = (ref) => {
   void flushDoc(ref.path);
@@ -541,6 +765,7 @@ export async function noteFromText(text: string) {
     toast("warning", tr("Could not save the document", "无法保存文档"));
     return;
   }
+  setGroupCollapsed("docs", false);
   void refreshNotes();
   openDocTab(path);
 }

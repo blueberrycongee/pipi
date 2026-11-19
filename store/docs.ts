@@ -1,5 +1,5 @@
 import * as fs from "fs/promises";
-import { computed, keymap, signal, type Signal } from "nsh";
+import { computed, keymap, reduceMotion, signal, type Signal } from "nsh";
 import {
   RichEditorPlugin,
   StarterKit,
@@ -16,7 +16,8 @@ import { plainMarkdown } from "../lib/doc-wire";
 import { tr } from "../lib/i18n";
 import { merge3 } from "../lib/merge3";
 import { currentView, toast } from "./app";
-import { backend } from "./backend";
+import { backend, NoPickerError } from "./backend";
+import { docsFolder, setDocsFolderPref } from "./prefs";
 
 /**
  * Markdown documents open in tabs. Each open document keeps one live
@@ -47,6 +48,8 @@ const COUNT_DEBOUNCE_MS = 300;
 const NOTE_PREFIX = "note-";
 /** The `/` menu's two triggers: the key as typed, and what a Chinese input method types for it. */
 export const SLASH_KEYS = ["slash", "slashCn"] as const;
+/** Decoration plugin key used to briefly mark text updated from disk by an agent or external editor. */
+const EXTERNAL_EDIT_PLUGIN = "pipiExternalEdit";
 
 const docs = new Map<string, MarkdownDoc>();
 /** Ticks when a document opens or closes: what names a document by its path (a tab, a card) asks again. */
@@ -94,6 +97,10 @@ interface DocState {
   quiet: number;
   /** The file changed the document while it was not in front: said when it next is. */
   changedUnseen: boolean;
+  /** Changed document range waiting to be flashed when the document comes forward. */
+  pendingHighlight: { from: number; to: number } | undefined;
+  /** Active timers clearing or fading the external-edit highlight. */
+  highlightTimers: ReturnType<typeof setTimeout>[];
   /** Resolves when the file has been read and the session made. */
   loaded: Promise<void>;
   stopListeners: () => void;
@@ -101,16 +108,19 @@ interface DocState {
 
 const states = new Map<string, DocState>();
 
-export const notesDir = () => `${backend().dataDir().replace(/\/$/, "")}/docs`;
+export const defaultNotesDir = () => `${backend().dataDir().replace(/\/$/, "")}/docs`;
+export const notesDir = () => (docsFolder() || defaultNotesDir()).replace(/\/$/, "");
 export const isNote = (path: string) => path.startsWith(`${notesDir()}/`);
 
 const fileName = (path: string) => path.split("/").pop() ?? path;
 const stem = (path: string) => fileName(path).replace(/\.(md|markdown|mdown|txt)$/i, "");
+/** True for pipi's own date-stamped files (`note-YYYY-MM-DD.md`), not user-named Markdown files. */
+export const isGeneratedNoteName = (path: string) => fileName(path).startsWith(NOTE_PREFIX);
 
-/** A document's display name: what its first line says, else — a note's file name says nothing — "Untitled", or the file's name. */
+/** A document's display name: what its first line says, else — a generated note's file name says nothing — "Untitled", or the file's name. */
 function displayTitle(path: string, firstLine: string) {
   if (firstLine) return firstLine;
-  return isNote(path) ? tr("Untitled", "未命名") : stem(path);
+  return isNote(path) && isGeneratedNoteName(path) ? tr("Untitled", "未命名") : stem(path);
 }
 
 /**
@@ -147,13 +157,10 @@ function liveTitle(path: string, session: RichEditorSession): string {
   if (SLASH_KEYS.some((key) => session.suggestion(key)?.active)) return "";
   const first = session.nodeAt(0) as { type?: string; content?: { text?: string }[] } | null;
   const text = (first?.content ?? []).map((inline) => inline?.text ?? "").join("").trim().slice(0, 80);
-  if (text && (first?.type === "heading" || (isNote(path) && first?.type === "paragraph"))) return text;
+  if (text && (first?.type === "heading" || (isNote(path) && isGeneratedNoteName(path) && first?.type === "paragraph"))) return text;
   // Not said by the first block: a heading further down may, which takes the document's Markdown — left to the save.
   return "";
 }
-
-/** What the editor's own keys ask of the app; `store/tabs` answers (it knows the strip and the chat). */
-export const docKeys: { send: (path: string) => void } = { send: () => {} };
 
 /**
  * The editor's keys that are the app's, ranked over the kit: an editor's
@@ -161,28 +168,23 @@ export const docKeys: { send: (path: string) => void } = { send: () => {} };
  * (split the block) and Tab ran first and the `/` menu never heard them —
  * only the arrows, which nothing else binds. `、` is what a Chinese input
  * method types for the `/` key: the menu answers the key, not the character.
- * ⌘↵ takes the document to the session (`addDocToChat`).
  */
-function appKeys(path: string) {
+function appKeys() {
   return defineExtension({
     name: "pipiKeys",
     priority: 1000,
-    addProseMirrorPlugins: () => {
-      const keys = new RichEditorPlugin("pipiSend").captureKeys(["Mod-Enter"], () => docKeys.send(path));
-      keys.capturing = true;
-      return [
-        suggestion({ char: "/", key: SLASH_KEYS[0], captureKeys: ["ArrowUp", "ArrowDown", "Enter", "Tab"] }),
-        // Only where `/` would open it (a line's start, after a space): mid-sentence `、` is the enumeration comma.
-        suggestion({ char: "、", key: SLASH_KEYS[1], captureKeys: ["ArrowUp", "ArrowDown", "Enter", "Tab"] }),
-        keys,
-      ] as never;
-    },
+    addProseMirrorPlugins: () => [
+      suggestion({ char: "/", key: SLASH_KEYS[0], captureKeys: ["ArrowUp", "ArrowDown", "Enter", "Tab"] }),
+      // Only where `/` would open it (a line's start, after a space): mid-sentence `、` is the enumeration comma.
+      suggestion({ char: "、", key: SLASH_KEYS[1], captureKeys: ["ArrowUp", "ArrowDown", "Enter", "Tab"] }),
+      new RichEditorPlugin(EXTERNAL_EDIT_PLUGIN),
+    ] as never,
   });
 }
 
-function makeSession(path: string, text: string): RichEditorSession {
+function makeSession(text: string): RichEditorSession {
   return createRichEditor({
-    extensions: [appKeys(path), StarterKit, TableKit],
+    extensions: [appKeys(), StarterKit, TableKit],
     plugins: [markdown()],
     content: text,
     format: "markdown",
@@ -209,7 +211,10 @@ function splitFront(text: string): { front: string; body: string } {
  * math (its underscores escaped). Code is the writer's own and says nothing.
  */
 function unkept(body: string): boolean {
-  const prose = body.replace(/^ {0,3}(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^ {0,3}\1[^\n]*$|(?![\s\S]))/gm, "").replace(/`[^`\n]*`/g, "");
+  const prose = body
+    .replace(/^ {0,3}(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^ {0,3}\1[^\n]*$|(?![\s\S]))/gm, "")
+    .replace(/`[^`\n]*`/g, "")
+    .replace(/\\[!-/:-@[-`{-~]/g, "");
   return (
     /<\/?[A-Za-z][\w-]*(?:\s[^<>\n]*)?\/?>/.test(prose) ||
     prose.includes("<!--") ||
@@ -263,17 +268,51 @@ function lastPos(session: RichEditorSession): number {
 /** The document's text before `pos`, a line per block: where a caret is, in characters. */
 const textBefore = (session: RichEditorSession, pos: number) => session.textBetween(0, pos, "\n").length;
 
+function clearHighlight(state: DocState, session?: RichEditorSession) {
+  while (state.highlightTimers.length) {
+    const timer = state.highlightTimers.pop();
+    if (timer !== undefined) clearTimeout(timer);
+  }
+  state.pendingHighlight = undefined;
+  try {
+    session?.setDecorations(EXTERNAL_EDIT_PLUGIN, []);
+  } catch {}
+}
+
+function flashHighlight(state: DocState, session: RichEditorSession, range: { from: number; to: number }) {
+  clearHighlight(state, session);
+  if (range.from >= range.to) return;
+  const paint = (cls: string) => {
+    try {
+      session.setDecorations(EXTERNAL_EDIT_PLUGIN, [{ from: range.from, to: range.to, kind: "inline", attrs: { class: cls } }]);
+    } catch {}
+  };
+  paint("rounded-xs bg-brand-soft");
+  if (reduceMotion()) {
+    state.highlightTimers.push(
+      setTimeout(() => {
+        clearHighlight(state, session);
+      }, 1800),
+    );
+    return;
+  }
+  state.highlightTimers.push(
+    setTimeout(() => paint("rounded-xs bg-brand/5"), 1550),
+    setTimeout(() => clearHighlight(state, session), 1850),
+  );
+}
+
 /**
  * Replaces the document as one change undo takes back, and leaves the caret
  * in the words it was in: the text before and after what changed is the same
- * text, so a place in it maps across.
+ * text, so a place in it maps across. Returns the changed ProseMirror range
+ * when the new text contains changed or inserted content.
  */
-function replaceContent(session: RichEditorSession, text: string) {
+function replaceContent(session: RichEditorSession, text: string): { from: number; to: number } | undefined {
   const selection = session.selection as { anchor?: number; head?: number };
   const was = session.textBetween(undefined, undefined, "\n");
   const places = [selection.anchor, selection.head].map((pos) => (pos === undefined ? undefined : textBefore(session, pos)));
   session.setContent(text, "markdown");
-  if (places[0] === undefined) return;
   const now = session.textBetween(undefined, undefined, "\n");
   let head = 0;
   while (head < was.length && head < now.length && was[head] === now[head]) head++;
@@ -293,17 +332,22 @@ function replaceContent(session: RichEditorSession, text: string) {
     }
     return low;
   };
-  const anchor = posOf(across(places[0]));
-  const headPos = places[1] === undefined || places[1] === places[0] ? anchor : posOf(across(places[1]));
-  try {
-    session.run(setTextSelection(anchor, headPos));
-  } catch {
-    // No caret can stand there: it stays where the change left it.
+  const changedEnd = now.length - tail;
+  const changed = changedEnd > head ? { from: posOf(head), to: posOf(changedEnd) } : undefined;
+  if (places[0] !== undefined) {
+    const anchor = posOf(across(places[0]));
+    const headPos = places[1] === undefined || places[1] === places[0] ? anchor : posOf(across(places[1]));
+    try {
+      session.run(setTextSelection(anchor, headPos));
+    } catch {
+      // No caret can stand there: it stays where the change left it.
+    }
   }
+  return changed && changed.from < changed.to ? changed : undefined;
 }
 
 const setTitle = (path: string, state: DocState, session: RichEditorSession, text: string) =>
-  state.titleText.set(displayTitle(path, liveTitle(path, session) || titleLine(text, isNote(path))));
+  state.titleText.set(displayTitle(path, liveTitle(path, session) || titleLine(text, isNote(path) && isGeneratedNoteName(path))));
 
 /**
  * Takes in what the file has become since the editor last read or wrote it.
@@ -331,12 +375,13 @@ function reconcile(path: string, state: DocState, session: RichEditorSession, di
   if (theirs === mine) return;
   const merged = mine === base ? { text: theirs, conflict: false } : merge3(base, mine, theirs);
   if (merged.text !== mine) {
-    replaceContent(session, merged.text);
+    const changed = replaceContent(session, merged.text);
     // The change is the file's: the listener that hears it has nothing to save.
     state.quiet = session.revision;
     setTitle(path, state, session, merged.text);
     countWords(state, session);
     state.changedUnseen = true;
+    state.pendingHighlight = changed;
     sayChanged(path, state);
   }
   if (merged.conflict) {
@@ -357,10 +402,18 @@ function reconcile(path: string, state: DocState, session: RichEditorSession, di
  */
 function sayChanged(path: string, state: DocState) {
   const view = currentView();
-  if (!state.changedUnseen || view.name !== "doc" || view.docId !== path) return;
-  state.changedUnseen = false;
-  const undo = keymap.label("mod+z");
-  toast("info", tr(`This document was updated from its file — ${undo} takes it back`, `文档已随文件的改动更新，${undo} 可撤回`));
+  if (view.name !== "doc" || view.docId !== path) return;
+  if (state.changedUnseen) {
+    state.changedUnseen = false;
+    const undo = keymap.label("mod+z");
+    toast("info", tr(`This document was updated from its file — ${undo} takes it back`, `文档已随文件的改动更新，${undo} 可撤回`));
+  }
+  const range = state.pendingHighlight;
+  const session = state.session();
+  if (range && session) {
+    state.pendingHighlight = undefined;
+    flashHighlight(state, session, range);
+  }
 }
 
 async function writeDoc(path: string, state: DocState, session: RichEditorSession) {
@@ -375,8 +428,9 @@ async function writeDoc(path: string, state: DocState, session: RichEditorSessio
     clearTimeout(state.saveTimer);
     state.saveTimer = undefined;
   }
-  // A note nobody wrote in is not a note: nothing is made for it, and one emptied again is taken off the shelf.
-  if (isNote(path) && session.isEmpty) {
+  // A generated note nobody wrote in is not a note: nothing is made for it, and one emptied again is taken off the shelf.
+  // User-named Markdown files (e.g. in a custom documents folder) are never deleted when emptied.
+  if (isNote(path) && isGeneratedNoteName(path) && session.isEmpty) {
     if (state.onDisk) await fs.unlink(path).catch(() => undefined);
     state.onDisk = false;
     state.disk = undefined;
@@ -425,7 +479,10 @@ function scheduleSave(path: string, state: DocState, session: RichEditorSession)
   state.dirtyFlag.set(true);
   const title = liveTitle(path, session);
   if (title) state.titleText.set(title);
-  if (state.countTimer === undefined) {
+  // Transitioning between empty and non-empty updates immediately so footer actions enable/disable without lag.
+  if (session.isEmpty || state.wordCount() === 0) {
+    countWords(state, session);
+  } else if (state.countTimer === undefined) {
     state.countTimer = setTimeout(() => {
       state.countTimer = undefined;
       if (states.get(path) === state) state.wordCount.set(session.words());
@@ -502,6 +559,8 @@ export function ensureDoc(path: string, options?: { caret?: "end" }): MarkdownDo
     front: "",
     quiet: -1,
     changedUnseen: false,
+    pendingHighlight: undefined,
+    highlightTimers: [],
     loaded: Promise.resolve(),
     stopListeners: () => {},
   };
@@ -525,19 +584,22 @@ export function ensureDoc(path: string, options?: { caret?: "end" }): MarkdownDo
       if (states.get(path) !== state) return;
       // A file that is not there yet (a new document) starts empty; the first save makes it.
       const { front, body } = splitFront(disk?.text ?? "");
-      const session = makeSession(path, body);
+      const session = makeSession(body);
       state.onDisk = disk !== undefined;
       state.disk = disk?.text;
       state.mtime = disk?.mtime ?? 0;
       state.front = front;
       state.base = session.getMarkdown();
-      if (!isNote(path) && unkept(body)) {
+      if (!isGeneratedNoteName(path) && unkept(body)) {
         state.readOnlyFlag.set(true);
         session.setEditable(false);
       }
       if (options?.caret === "end") session.run(focusAt("end"));
       state.stopListeners = session.on("update", () => {
-        if (session.revision !== state.quiet) scheduleSave(path, state, session);
+        if (session.revision !== state.quiet) {
+          clearHighlight(state, session);
+          scheduleSave(path, state, session);
+        }
       });
       setTitle(path, state, session, body);
       state.wordCount.set(session.words());
@@ -589,6 +651,18 @@ export function docText(path: string): string | undefined {
   return session ? plainMarkdown(session.getMarkdown()).trim() : undefined;
 }
 
+/** Full file contents to write when saving a copy elsewhere: preserves front matter and latest edits. */
+export async function docFileContent(path: string): Promise<string | undefined> {
+  const state = states.get(path);
+  const session = state?.session();
+  if (state && session) {
+    if (state.readOnlyFlag() && state.disk !== undefined) return state.disk;
+    const text = session.getMarkdown();
+    return state.front ? `${state.front}${state.front.endsWith("\n") ? "" : "\n"}\n${text}` : text;
+  }
+  return fs.readFile(path, "utf8").catch(() => undefined);
+}
+
 /** Closes under way, by path: a document opened again meanwhile reads the file only after the last save landed. */
 const closings = new Map<string, Promise<void>>();
 
@@ -610,6 +684,7 @@ export function closeDoc(path: string): Promise<void> {
     }
     if (state.countTimer !== undefined) clearTimeout(state.countTimer);
     state.stopListeners();
+    clearHighlight(state, session);
     if (session && state.dirtyFlag()) state.saveTail = state.saveTail.then(() => writeDoc(path, state, session));
     await state.saveTail.catch(() => undefined);
     session?.dispose();
@@ -695,7 +770,7 @@ let notesAsk = 0;
 export const notes = computed<NoteSummary[]>(() => {
   const listed = noteList();
   const unwritten = openNotes()
-    .filter((open) => !listed.some((n) => n.path === open.path))
+    .filter((open) => isNote(open.path) && !listed.some((n) => n.path === open.path))
     .map((open) => ({ path: open.path, title: "", modified: open.since }));
   return unwritten.length ? [...unwritten, ...listed].sort((a, b) => b.modified - a.modified) : listed;
 });
@@ -715,9 +790,10 @@ export async function refreshNotes() {
           // Unchanged since it was last listed: its title stands, the file is not read again.
           if (before && before.modified === stat.mtimeMs) return before;
           const text = await fs.readFile(path, "utf8");
-          // A file with no words in it is no note (one left by a heading typed and taken back).
-          if (!titleLine(text, true) && !text.replace(/[#>*_`~\-\s|]/g, "")) return undefined;
-          return { path, title: displayTitle(path, titleLine(text, true)), modified: stat.mtimeMs };
+          const generated = isGeneratedNoteName(path);
+          // A generated note with no words in it is no note (one left by a heading typed and taken back).
+          if (generated && !titleLine(text, true) && !text.replace(/[#>*_`~\-\s|]/g, "")) return undefined;
+          return { path, title: displayTitle(path, titleLine(text, generated)), modified: stat.mtimeMs };
         } catch {
           return undefined;
         }
@@ -741,4 +817,46 @@ export async function deleteNoteFile(path: string) {
   if (!isNote(path)) return;
   await fs.unlink(path).catch(() => undefined);
   await refreshNotes();
+}
+
+/** Lets the user choose a custom folder where pipi stores and lists Markdown documents. */
+export async function chooseDocsFolder() {
+  try {
+    const picked = await backend().pickFolder(tr("Choose documents folder", "选择文档文件夹"));
+    if (!picked) return;
+    setDocsFolderPref(picked);
+    await refreshNotes();
+  } catch (error) {
+    if (error instanceof NoPickerError) {
+      toast("warning", tr("No file picker found — install zenity or kdialog to choose folders.", "找不到文件选择器——请安装 zenity 或 kdialog。"));
+    } else {
+      toast("warning", tr("Could not change the documents folder", "无法更改文档文件夹"));
+    }
+  }
+}
+
+/** Restores the default documents folder (`<dataDir>/docs`). */
+export async function resetDocsFolder() {
+  setDocsFolderPref(undefined);
+  await refreshNotes();
+}
+
+/** Opens the documents folder in Finder / Explorer / the file manager. */
+export async function revealDocsFolder() {
+  const dir = notesDir();
+  await fs.mkdir(dir, { recursive: true }).catch(() => undefined);
+  await backend().revealPath?.(dir).catch(() => {
+    toast("warning", tr("Could not open the documents folder", "无法打开文档文件夹"));
+  });
+}
+
+/** Reveals a document's file on disk (flushing pending edits first; falls back to its folder if unwritten). */
+export async function revealDoc(path: string) {
+  await flushDoc(path);
+  const exists = await fs.exists(path).catch(() => false);
+  const target = exists ? path : path.split("/").slice(0, -1).join("/") || notesDir();
+  if (!exists) await fs.mkdir(target, { recursive: true }).catch(() => undefined);
+  await backend().revealPath?.(target).catch(() => {
+    toast("warning", tr("Could not show the document in the file manager", "无法在文件管理器中显示文档"));
+  });
 }

@@ -70,6 +70,10 @@ export interface Backend {
   pickImage?(prompt: string): Promise<string | undefined>;
   /** Shows the system's file picker limited to `extensions` (without dots); resolves with the picked path, or `undefined` when cancelled. Throws `NoPickerError` when no picker tool exists. */
   pickFile?(prompt: string, extensions?: string[]): Promise<string | undefined>;
+  /** Shows the system's Save As dialog; resolves with the destination path, or `undefined` when cancelled. Throws `NoPickerError` when no picker tool exists. */
+  pickSaveFile?(prompt: string, defaultName?: string, defaultDir?: string): Promise<string | undefined>;
+  /** Reveals a file or opens a folder in the OS file manager (Finder / Explorer / xdg-open). */
+  revealPath?(path: string): Promise<void>;
   /** Asks the app's update source (`nsh.json` → `updater`) for a newer version; `null` when up to date or updates don't apply here. */
   checkAppUpdate?(): Promise<AppUpdate | null>;
   /** Downloads the update the last check found; rejects when there is none or it cannot install here. */
@@ -283,6 +287,62 @@ const system: Backend = {
     } catch (error) {
       if (error instanceof NoPickerError) throw error;
       return undefined;
+    }
+  },
+  async pickSaveFile(prompt, defaultName = "document.md", defaultDir) {
+    try {
+      if (process.platform === "macos") {
+        const parts = [`choose file name with prompt ${JSON.stringify(prompt)}`, `default name ${JSON.stringify(defaultName)}`];
+        if (defaultDir) parts.push(`default location (POSIX file ${JSON.stringify(defaultDir)})`);
+        const script = `POSIX path of (${parts.join(" ")})`;
+        const { code, stdout } = await process.run("osascript", ["-e", script], { timeoutMs: 600_000 });
+        const path = stdout.trim();
+        return code === 0 && path ? path : undefined;
+      }
+      if (process.platform === "windows") {
+        const script = [
+          "Add-Type -AssemblyName System.Windows.Forms",
+          `$d = New-Object System.Windows.Forms.SaveFileDialog`,
+          `$d.Title = ${JSON.stringify(prompt)}`,
+          `$d.FileName = ${JSON.stringify(defaultName)}`,
+          ...(defaultDir ? [`$d.InitialDirectory = ${JSON.stringify(defaultDir)}`] : []),
+          `$d.Filter = 'Markdown|*.md;*.markdown|All files|*.*'`,
+          `if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }`,
+        ].join("; ");
+        const { code, stdout } = await process.run("powershell.exe", ["-NoProfile", "-NonInteractive", "-STA", "-Command", script], { timeoutMs: 600_000 });
+        const path = stdout.trim().split(/\r?\n/).pop()?.trim() ?? "";
+        return code === 0 && path ? path : undefined;
+      }
+      if (process.platform === "linux") {
+        const seed = defaultDir ? `${defaultDir.replace(/\/+$/, "")}/${defaultName}` : defaultName;
+        const out = await runDesktopPicker([
+          ["zenity", ["--file-selection", "--save", "--confirm-overwrite", `--title=${prompt}`, `--filename=${seed}`, "--file-filter=Markdown | *.md *.markdown", "--file-filter=All files | *"]],
+          ["kdialog", ["--getsavefilename", seed, "*.md *.markdown|Markdown", "--title", prompt]],
+        ]);
+        return out || undefined;
+      }
+      return undefined;
+    } catch (error) {
+      if (error instanceof NoPickerError) throw error;
+      return undefined;
+    }
+  },
+  async revealPath(path) {
+    if (!path) return;
+    if (process.platform === "macos") {
+      await process.run("sh", ["-c", 'if [ -d "$1" ]; then open "$1"; else open -R "$1"; fi', "_", path]);
+      return;
+    }
+    if (process.platform === "windows") {
+      const script = [
+        `$p = ${JSON.stringify(path)}`,
+        `if (Test-Path -LiteralPath $p -PathType Container) { Start-Process explorer.exe -ArgumentList $p } else { Start-Process explorer.exe -ArgumentList ("/select," + $p) }`,
+      ].join("; ");
+      await process.run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script]);
+      return;
+    }
+    if (process.platform === "linux") {
+      await process.run("sh", ["-c", 'if [ -d "$1" ]; then xdg-open "$1"; else xdg-open "$(dirname "$1")"; fi', "_", path]);
     }
   },
   checkAppUpdate: () => checkForUpdate(),

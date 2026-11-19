@@ -28,7 +28,7 @@ import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
-import { FOCUS_RING, HOVER_REVEAL, PRESS } from "../ui/styles";
+import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { clearProseState, PROSE, ProseBlock, proseVeilUntil, type ProseRow } from "./Prose";
 
@@ -572,10 +572,10 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
               role="button"
               onPress={() => void openDocIfThere(doc().path)}
               tooltip={tip(tr("Open the document", "打开文档"))}
-              class={`-mx-1 select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle px-1 py-0.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
+              class={`group -mx-1 select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle px-1 py-0.5 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
             >
               <Icon name="file" size={14} tone="muted-foreground" />
-              <Text class="shrink truncate text-xs text-muted-foreground">
+              <Text class="shrink truncate text-xs text-muted-foreground transition-colors duration-100 group-hover:text-foreground">
                 {(doc().excerpt ? "" : titleLine(doc().text, true)) || docTabTitle(doc().path)}
                 {doc().excerpt ? tr(" · selection", " · 选中的内容") : ""}
               </Text>

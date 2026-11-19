@@ -2,7 +2,8 @@ import { readFile } from "fs/promises";
 import { Canvas, cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, Overlay, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
 import type { InputRef, PasteEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input, Popover } from "nsh/base";
-import { money } from "../lib/format";
+import { money, tildePath } from "../lib/format";
+import { matchDocMentions, readDocMention, removeDocMention, type DocMentionInput } from "../lib/doc-mention";
 import { commandSourceLabel, tr } from "../lib/i18n";
 import { matchCommands, matchOptions, readSlashInput } from "../lib/slash";
 import { compactNumber } from "../pi/transcript";
@@ -36,13 +37,14 @@ import {
   transcriptRows,
   waitingCount,
 } from "../store/app";
+import { backend } from "../store/backend";
 import { docAt } from "../store/docs";
 import { SEND_MODES, sendMode, setSendMode, type SendMode } from "../store/prefs";
-import { draftToDoc, openDocTab } from "../store/tabs";
+import { attachDocToCurrentComposer, draftToDoc, mentionableDocs, openDocTab, pickDocTab } from "../store/tabs";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, enter, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, SPRING } from "../ui/motion";
-import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, POPUP, PRESS } from "../ui/styles";
+import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { AgentPicker, PermissionPicker } from "./AgentPicker";
 import { ExtensionPrompt } from "./ExtensionDialog";
@@ -321,6 +323,267 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
   );
 }
 
+interface DocMentionRow {
+  path: string;
+  title: string;
+  open: boolean;
+}
+
+/**
+ * `@` document mention state in the composer: pulls an open or saved Markdown
+ * document straight into the active session's attachment tray without leaving
+ * the conversation. Closes automatically when nothing matches so typing
+ * decorators or scoped package names (`@scope/pkg`) never traps Enter or Tab.
+ */
+function useDocMention(
+  caretPos: () => number,
+  slashOpen: () => boolean,
+  onPick: (row: DocMentionRow, mention: DocMentionInput) => void,
+) {
+  const selected = signal(0);
+  const keyed = signal(0, { equals: false });
+  const dismissedStart = signal<number | undefined>(undefined);
+  const input = computed(() => (currentView().name === "chat" && !slashOpen() ? readDocMention(composerDraft(), caretPos()) : undefined));
+  const rows = computed<DocMentionRow[]>(() => {
+    const asked = input();
+    if (!asked || asked.start === dismissedStart()) return [];
+    return matchDocMentions(mentionableDocs(), asked.query);
+  });
+  const open = () => rows().length > 0;
+  const current = () => rows()[Math.min(selected(), rows().length - 1)] as DocMentionRow | undefined;
+
+  effect(() => {
+    rows();
+    selected.set(0);
+  });
+  effect(() => {
+    if (input()?.start !== dismissedStart()) dismissedStart.set(undefined);
+  });
+  effect(() => {
+    if (!open()) return;
+    cleanup(keymap.bind("escape", () => dismissedStart.set(untracked(input)?.start), { when: "always" }));
+    const move = (by: number) => {
+      selected.update((at) => (Math.min(at, rows().length - 1) + by + rows().length) % rows().length);
+      keyed.set(0);
+    };
+    cleanup(keymap.bind({ up: () => move(-1), down: () => move(1) }, { when: "always", repeat: true }));
+    cleanup(
+      keymap.bind(
+        "tab",
+        () => {
+          const row = current();
+          const mention = untracked(input);
+          if (row && mention) onPick(row, mention);
+        },
+        { when: "always" },
+      ),
+    );
+  });
+  const dismiss = () => {
+    const start = untracked(input)?.start;
+    if (start !== undefined) dismissedStart.set(start);
+  };
+  return { input, rows, selected, keyed, open, current, dismiss };
+}
+
+/** The `@` document mention popup anchored above the composer column, matching `SlashMenu`. */
+function DocMentionMenu(props: {
+  menu: ReturnType<typeof useDocMention>;
+  onChoose: (row: DocMentionRow) => void;
+  anchor?: ViewRef;
+  width: number;
+}) {
+  const mounted = signal(false);
+  const opacity = createAnimatedValue(0);
+  const translateY = createAnimatedValue(6);
+  const scale = createAnimatedValue(0.97);
+  const shown = keepLast(() => {
+    const list = props.menu.rows();
+    return list.length > 0 ? list : undefined;
+  }, [] as DocMentionRow[]);
+  const rowViews = new Map<string, ViewRef>();
+  let list: ScrollRef | undefined;
+  let exitTimer: ReturnType<typeof setTimeout> | undefined;
+
+  effect(() => {
+    props.menu.keyed();
+    const row = untracked(props.menu.current);
+    if (row) rowViews.get(row.path)?.reveal({ vertical: "nearest", animated: false });
+  });
+  let showing = false;
+  effect(() => {
+    const now = props.menu.rows().length > 0;
+    if (now && showing) list?.scrollTo({ y: 0, animated: false });
+    showing = now;
+  });
+
+  effect(() => {
+    const open = props.menu.open();
+    const reduced = reduceMotion();
+    untracked(() => {
+      clearTimeout(exitTimer);
+      void opacity.stop();
+      void translateY.stop();
+      void scale.stop();
+      if (open) {
+        mounted.set(true);
+        if (reduced) {
+          opacity.set(1);
+          translateY.set(0);
+          scale.set(1);
+        } else {
+          opacity.set(0);
+          translateY.set(6);
+          scale.set(0.97);
+          void opacity.timing(1, { duration: 160, easing: EASING.entrance });
+          void translateY.spring(0, SPRING.snappy);
+          void scale.spring(1, SPRING.snappy);
+        }
+      } else if (mounted()) {
+        if (reduced) {
+          opacity.set(0);
+          mounted.set(false);
+        } else {
+          void opacity.timing(0, { duration: 130, easing: EASING.exit });
+          void translateY.timing(4, { duration: 130, easing: EASING.exit });
+          void scale.timing(0.98, { duration: 130, easing: EASING.exit });
+          exitTimer = setTimeout(() => mounted.set(false), 135);
+        }
+      }
+    });
+  });
+
+  cleanup(() => {
+    clearTimeout(exitTimer);
+    void opacity.stop();
+    void translateY.stop();
+    void scale.stop();
+  });
+
+  return (
+    <If when={mounted()}>
+      <If when={props.anchor}>
+        {(anchor) => (
+          <Overlay
+            anchor={anchor()}
+            placement="top"
+            align="start"
+            offset={8}
+            margin={12}
+            onPressOutside={props.menu.open() ? () => props.menu.dismiss() : undefined}
+          >
+            <View
+              testID="composer-doc-menu"
+              class={`overflow-hidden ${POPUP}${props.menu.open() ? "" : " pointer-events-none"}`}
+              style={{ ...GLASS_REGULAR, width: props.width, opacity, transform: [{ translateY }, { scale }] }}
+              role="menu"
+              accessibilityLabel={tr("Documents", "文档")}
+            >
+              <Scroll ref={list} class="max-h-60" contentClass="p-1">
+                <Each of={shown() ?? []} key={(row) => row.path}>
+                  {(row, index) => (
+                    <View
+                      ref={(view: ViewRef) => rowViews.set(row().path, view)}
+                      role="menuitem"
+                      focusable={false}
+                      onPress={() => props.onChoose(row())}
+                      onMouseMove={() => {
+                        if (props.menu.selected() !== index()) props.menu.selected.set(index());
+                      }}
+                      class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS}`}
+                      classList={{ "bg-accent": index() === props.menu.selected() }}
+                    >
+                      <Icon name="file" size={14} tone="muted-foreground" class="shrink-0" />
+                      <Text class="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{row().title}</Text>
+                      <If when={row().open}>
+                        <Text class="shrink-0 text-xs text-subtle">{tr("Open", "已打开")}</Text>
+                      </If>
+                    </View>
+                  )}
+                </Each>
+              </Scroll>
+            </View>
+          </Overlay>
+        )}
+      </If>
+    </If>
+  );
+}
+
+/** Quiet toolbar button for mouse users to attach an existing document to this session. */
+function DocAttachPicker(props: { onOpen: () => void }) {
+  const open = signal(false);
+  const docs = () => mentionableDocs();
+  const home = backend().home();
+  return (
+    <Presence show={docs().length > 0} scaleFrom={0.85}>
+      <Popover
+        open={open()}
+        onOpenChange={(e) => {
+          if (e.open) props.onOpen();
+          open.set(e.open);
+        }}
+        placement="top"
+        align="end"
+        offset={8}
+        margin={12}
+        popupClass={`w-64 overflow-hidden p-1 ${POPUP}`}
+        popupStyle={popupStyle("top", "end")}
+        popupStartingStyle={popupHiddenStyle("top", "end")}
+        popupEndingStyle={popupLeavingStyle("top", "end")}
+        trigger={
+          <IconButton
+            testID="composer-attach-doc"
+            icon="file"
+            size="sm"
+            tone="muted-foreground"
+            label={tr("Attach document (@)", "引用文档 (@)")}
+            tipPlacement="top"
+          />
+        }
+      >
+        <View testID="composer-doc-picker" class="gap-0.5">
+          <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
+            {tr("Attach document", "引用文档")}
+          </Text>
+          <Scroll class="max-h-56" contentClass="gap-0.5">
+            <Each of={docs()} key={(doc) => doc.path}>
+              {(doc) => (
+                <BaseButton
+                  onPress={() => {
+                    open.set(false);
+                    void attachDocToCurrentComposer(doc().path);
+                    focusComposer();
+                  }}
+                  tooltip={tip(tildePath(doc().path, home), undefined, "left")}
+                  class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+                >
+                  <Icon name="file" size={14} tone="muted-foreground" class="shrink-0" />
+                  <Text class="min-w-0 flex-1 truncate text-sm text-foreground">{doc().title}</Text>
+                  <If when={doc().open}>
+                    <Text class="shrink-0 text-xs text-subtle">{tr("Open", "已打开")}</Text>
+                  </If>
+                </BaseButton>
+              )}
+            </Each>
+          </Scroll>
+          <View class="mx-2 my-1 h-px bg-border" />
+          <BaseButton
+            onPress={() => {
+              open.set(false);
+              void pickDocTab();
+            }}
+            class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+          >
+            <Icon name="folderOpen" size={14} tone="subtle" class="shrink-0" />
+            <Text class="min-w-0 flex-1 truncate text-sm text-muted-foreground">{tr("Open Markdown File…", "打开 Markdown 文件…")}</Text>
+          </BaseButton>
+        </View>
+      </Popover>
+    </Presence>
+  );
+}
+
 /**
  * A document riding on the message: a card naming it, and whether all of it
  * goes or a passage. A press goes back to the document — the words are still
@@ -334,10 +597,10 @@ function DocCard(props: { doc: DocRef }) {
         onPress={() => openDocTab(props.doc.path)}
         accessibilityLabel={title()}
         tooltip={tip(tr("Back to the document", "回到文档"))}
-        class={`size-full flex-row items-center gap-2.5 rounded-lg corner-squircle border-[0.5px] border-hairline-hover bg-background/70 pl-2 pr-3 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
+        class={`size-full flex-row items-center gap-2.5 rounded-lg corner-squircle border-[0.5px] border-hairline-hover bg-background/70 pl-2 pr-3 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:border-hairline-focus hover:bg-accent`}
       >
-        <View class="size-9 shrink-0 items-center justify-center rounded-md corner-squircle bg-muted">
-          <Icon name="file" size={16} tone="muted-foreground" />
+        <View class={`size-9 shrink-0 items-center justify-center rounded-md corner-squircle ${props.doc.excerpt ? "bg-brand-soft" : "bg-muted"}`}>
+          <Icon name="file" size={16} tone={props.doc.excerpt ? "brand-text" : "muted-foreground"} />
         </View>
         <View class="min-w-0 flex-1">
           <Text class="truncate text-sm font-medium text-foreground">{title()}</Text>
@@ -505,9 +768,25 @@ const sendModeText = (mode: SendMode): { icon: IconName; label: string; hint: st
 export function Composer() {
   let input: InputRef | undefined;
   let selection = { start: 0, end: 0 };
+  const caretPos = signal(0);
   let trackedDraft = untracked(composerDraft);
   const height = signal(MIN_HEIGHT);
   const slash = useSlashMenu();
+  const applyDocMention = (row: DocMentionRow, mention: DocMentionInput) => {
+    const next = removeDocMention(composerDraft(), mention);
+    trackedDraft = next.text;
+    selection = { start: next.caret, end: next.caret };
+    caretPos.set(next.caret);
+    setDraft(next.text);
+    input?.setSelection(next.caret, next.caret);
+    void attachDocToCurrentComposer(row.path);
+    focusComposer();
+  };
+  const docMention = useDocMention(caretPos, slash.open, applyDocMention);
+  const dismissMenus = () => {
+    slash.dismiss();
+    docMention.dismiss();
+  };
   /** The composer's column, which the slash menu stands on and whose width it takes. */
   const column = signal<ViewRef | undefined>(undefined);
   const columnWidth = signal(0);
@@ -553,6 +832,7 @@ export function Composer() {
     if (draft !== trackedDraft) {
       trackedDraft = draft;
       selection = { start: draft.length, end: draft.length };
+      caretPos.set(draft.length);
       if (!draft) height.set(MIN_HEIGHT);
     }
   });
@@ -577,12 +857,25 @@ export function Composer() {
     setDraft(row.runs);
     fireSend(mode);
   };
+  const chooseDocMention = (row: DocMentionRow) => {
+    const mention = docMention.input();
+    if (mention) applyDocMention(row, mention);
+    else void attachDocToCurrentComposer(row.path);
+  };
   const submit = (mode?: "steer" | "followUp") => {
     const row = slash.current();
     if (row) return choose(row, mode);
+    const mentioned = docMention.current();
+    if (mentioned) return chooseDocMention(mentioned);
     fireSend(mode);
   };
-  keymap.bind("mod+enter", () => submit("followUp"), { when: "always" });
+  keymap.bind(
+    "mod+enter",
+    () => {
+      if (currentView().name === "chat") submit("followUp");
+    },
+    { when: "always" },
+  );
 
   /** A menu choice is the send button's new behavior — and fires it at once when a draft waits. */
   const pickSendMode = (mode: SendMode) => {
@@ -710,6 +1003,7 @@ export function Composer() {
       >
         <ExtensionPrompt />
         <SlashMenu menu={slash} onChoose={choose} anchor={column()} width={columnWidth()} />
+        <DocMentionMenu menu={docMention} onChoose={chooseDocMention} anchor={column()} width={columnWidth()} />
         <AttachmentTray />
         <View class={`relative rounded-[22px] corner-squircle ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
           <ExtensionLines below={false} />
@@ -727,10 +1021,12 @@ export function Composer() {
               const caret = Math.max(0, Math.min(value.length, start + inserted));
               trackedDraft = value;
               selection = { start: caret, end: caret };
+              caretPos.set(caret);
               setDraft(value);
             }}
             onSelectionChange={({ start, end }) => {
               selection = { start, end };
+              caretPos.set(end);
             }}
             onSubmit={() => submit()}
             onCompositionChange={({ composing: now }) => composing.set(now)}
@@ -770,15 +1066,16 @@ export function Composer() {
           <ExtensionLines below />
           <View class="flex-row items-end justify-between gap-2 pb-2 pl-2.5 pr-2 pt-2">
             <View class="min-w-0 flex-1 flex-row flex-wrap items-center gap-0.5">
-              <AgentPicker onOpen={slash.dismiss} />
-              <ModelPicker onOpen={slash.dismiss} />
-              <ThinkingPicker onOpen={slash.dismiss} />
+              <AgentPicker onOpen={dismissMenus} />
+              <ModelPicker onOpen={dismissMenus} />
+              <ThinkingPicker onOpen={dismissMenus} />
             </View>
             <View class="shrink-0 flex-row items-center gap-1.5">
               <If when={ready()}>
                 <ContextMeter />
               </If>
-              <PermissionPicker onOpen={slash.dismiss} />
+              <DocAttachPicker onOpen={dismissMenus} />
+              <PermissionPicker onOpen={dismissMenus} />
               <View style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
                 <If
                   when={showStop()}
@@ -803,8 +1100,8 @@ export function Composer() {
                             sendMenuClosedAt = 0;
                             return;
                           }
-                          // The menu is the send's: the slash menu behind it would take the press's send.
-                          slash.dismiss();
+                          // The menu is the send's: the slash or mention menu behind it would take the press's send.
+                          dismissMenus();
                           sendMenuOpen.update((v) => !v);
                         }}
                         disabled={!canSend()}

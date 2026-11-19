@@ -65,31 +65,36 @@ multi-agent orchestration, and settings.
   pointer in the strip holds their width until the pointer leaves, so a
   run of closes keeps its close button under it.
 - Documents are the strip's other surface (`store/docs.ts`,
-  `views/DocEditor.tsx`): a page of the person's own words — a brief the
-  composer is too small and too quick to send for, a draft the agents help
-  with — and the one reason it is here is that the agents are a key away.
-  A real Markdown file behind one live `RichEditorSession` per open tab,
-  saved on a debounce and flushed on close. Notes are the documents the
-  app keeps itself under `<dataDir>/docs/`, named by their first line:
-  they stand in the sidebar's 最近 among the sessions, from the press
-  that made them (a note whose tab is closed is put away, not lost; one
-  nobody wrote in leaves nothing behind), and the palette finds the ones
-  that have sunk. The ways in are where the need is: 新文档 under 新会话
-  (⌘⇧N), the composer's own door once a draft passes its second line (⌘E
-  moves the draft into a document — `draftToDoc`), a reply's "Save as
-  Document". The way out is one (`addDocToChat`): ⌘↵ attaches the
-  document — the passage selected, else all of it — to the composer's
-  message as a card (`DocRef` in `store/app.ts`) and brings the chat
-  forward. Nothing is pasted and nothing is sent: the words stay in the
-  document, the card goes wherever the composer's message goes, and a
-  whole document is sent as it reads when sent. Sent without a word the
-  message *is* the document's text; with one, the document rides behind
-  the words in a block naming its file (`lib/doc-wire.ts`), so an agent
-  with file tools changes it where it lives. No part of the app strips
-  those blocks: the bubble reads them back as cards (`views/Rows.tsx`),
-  and a title is the words (`titleWords`, twinned in
-  `sidecar/session-index.mjs`). What goes to an agent is `plainMarkdown`
-  — the serializer's escapes (`foo\_bar`, `\<tag>`) taken off.
+  `views/DocEditor.tsx`): a page of the person's own words — an article or
+  note the agents help polish, a long brief the composer is too small and too
+  quick to send for — while keeping the shell's primary Coding Agent identity
+  clean. A real Markdown file behind one live `RichEditorSession` per open
+  tab, saved on a debounce and flushed on close. Notes live in a transparent,
+  configurable local folder (default `<dataDir>/docs/`, configurable in
+  Settings → General → Documents, with Finder/file-manager reveal and Save
+  As). They sit in their own quiet collapsible `文档` (Documents) group in the
+  sidebar — never crowding 新会话 at the top and never mixed into 最近's
+  session stream — and user-named files in a custom folder are never deleted
+  when emptied. The ways in are where the need is: `文档`'s `+` (⌘⇧N), the
+  composer's own door once a draft passes its second line (⌘E moves the draft
+  into a document — `draftToDoc` — and remembers which session it came from),
+  a reply's "Save as Document", or opening/dropping any `.md`. Taking a
+  document to an agent is always explicit — there is no blind ⌘↵ send in a
+  document: from a session's composer, `@` (`lib/doc-mention.ts`) or the
+  attach icon pulls an open or saved document straight into the active
+  session; from a document, "Discuss with AI" (or "Ask AI" on a selection)
+  lets you start a clean New Session or pick an open session by name (and a
+  ⌘E draft offers one-click return to its exact origin session). Nothing is
+  pasted and nothing is sent automatically: the words stay in the document,
+  the card (`DocRef` in `store/app.ts`) rides on the composer's message, and
+  a whole document is sent as it reads when sent. Sent without a word the
+  message *is* the document's text; with one, the document rides behind the
+  words in a block naming its file (`lib/doc-wire.ts`), so an agent with file
+  tools changes it where it lives. No part of the app strips those blocks:
+  the bubble reads them back as cards (`views/Rows.tsx`), and a title is the
+  words (`titleWords`, twinned in `sidecar/session-index.mjs`). What goes to
+  an agent is `plainMarkdown` — the serializer's escapes (`foo\_bar`,
+  `\<tag>`) taken off.
 - A document's file is not the editor's alone, and the editor never writes
   over what it has not read (`reconcile` in `store/docs.ts`): what an
   agent or another editor wrote comes into the open document first, as one
@@ -176,16 +181,20 @@ multi-agent orchestration, and settings.
   and its Escape, a dropped `.md`, a typed heading renaming its tab
 - `nsh test Docs.test.tsx` — the document from end to end: `/` listing
   blocks and Enter picking (`、` under a Chinese input method opens it
-  too), a new document in 最近 from the press that made it, ⌘↵ attaching
-  it (or the passage selected) to the message and what that message is
-  sent as, a long draft going on as a document (⌘E), what an agent writes
-  to the file landing in the open document and merging with what was
-  typed meanwhile (the scripted Pi rewrites a document handed to it when
-  asked to "rewrite", and "recite <path>" prints a file), front matter
-  kept, a lossy file read-only; `nsh test DocLook.test.tsx --target macos`
-  shoots each of those into `.nsh/shots/doc-*.png`; `nsh test
-  lib/doc-wire.test.ts` / `lib/merge3.test.ts` — the message's wire form
-  and the three-way merge
+  too), sidebar top keeping only 新会话 while documents live in their own
+  collapsible `文档` group (not 最近), configurable documents folder in
+  Settings and Save As with front matter intact, ⌘↵ doing nothing inside a
+  document, explicit session destinations ("Discuss with AI" → New Session or
+  named open sessions; "Ask AI" on selection), a long draft expanded with ⌘E
+  returning to its exact origin session, `@` in the composer pulling a
+  document straight into the active session, what an agent writes to the file
+  landing in the open document and merging with what was typed meanwhile (the
+  scripted Pi rewrites a document handed to it when asked to "rewrite", and
+  "recite <path>" prints a file), front matter kept, a lossy file read-only;
+  `nsh test DocLook.test.tsx --target macos` shoots each of those into
+  `.nsh/shots/doc-*.png`; `nsh test lib/doc-wire.test.ts` /
+  `lib/doc-mention.test.ts` / `lib/merge3.test.ts` — the message's wire form,
+  `@` mention parsing, and the three-way merge
 - `nsh test TabsFilm.test.tsx --target macos` — films a document coming
   forward over the chat and a tab closing (the pills flow to their new
   slots) into `.nsh/shots/tabs-*.png`, via `harness.then`'s `tab:` /

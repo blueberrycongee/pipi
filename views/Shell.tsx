@@ -7,6 +7,7 @@ import {
   type JSX,
   keymap,
   LayoutAnimation,
+  platform,
   reduceMotion,
   signal,
   untracked,
@@ -58,8 +59,8 @@ import {
   sidebarOpen,
   sidebarWidth,
 } from "../store/prefs";
-import { flushDocs, refreshNotes, syncDocs } from "../store/docs";
-import { activeTabId, closeTab, cycleTab, draftToDoc, newDocTab, openTabs, pickDocTab } from "../store/tabs";
+import { flushDocs, refreshNotes, revealDoc, syncDocs } from "../store/docs";
+import { activeTabId, closeTab, cycleTab, draftToDoc, newDocTab, openTabs, pickDocTab, saveDocAs } from "../store/tabs";
 import { EASING } from "../ui/motion";
 import { SIDEBAR_GLASS, WALLPAPER_FROST } from "../ui/styles";
 import { isZoomOpen, ZoomLayer } from "../ui/Zoom";
@@ -207,6 +208,22 @@ function applicationMenu() {
           onSelect: () => void draftToDoc(),
         },
         { label: tr("Open Markdown File…", "打开 Markdown 文件…"), onSelect: () => void pickDocTab() },
+        {
+          label: tr("Save Document As…", "文档另存为…"),
+          disabled: currentView().name !== "doc",
+          onSelect: () => {
+            const v = currentView();
+            if (v.name === "doc") void saveDocAs(v.docId);
+          },
+        },
+        {
+          label: platform.os === "macos" ? tr("Show Document in Finder", "在访达中显示文档") : tr("Show Document in File Manager", "在文件管理器中显示文档"),
+          disabled: currentView().name !== "doc",
+          onSelect: () => {
+            const v = currentView();
+            if (v.name === "doc") void revealDoc(v.docId);
+          },
+        },
         { label: tr("Add Project Folder…", "添加项目文件夹…"), shortcut: "mod+o", onSelect: () => void chooseWorkspace() },
         { type: "separator" },
         { label: tr("Export as HTML", "导出为 HTML"), onSelect: () => void exportHtml() },

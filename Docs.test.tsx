@@ -1,22 +1,24 @@
 import { expect, open, test } from "nsh/test";
 
-// The document: a page of one's own words, with the agents a key away.
-//
-// Writing: the `/` menu answers Enter, Tab and the arrows (and `、`, what a
-// Chinese input method types for the same key); an input method composes in
-// place. Keeping: a document is in 最近 beside the sessions from the press
-// that made it, a press away once its tab is closed, and gone when nobody
-// wrote in it. Going to a session: ⌘↵ attaches it to the composer's message —
-// the passage selected, else all of it; sent without a word it is the
-// message, with one it rides behind the words. Coming back: what an agent
-// writes to the file is in the open document, and undo takes it out again.
+// Documents inside a Coding Agent: quiet, transparent local Markdown files
+// tucked into their own sidebar group (never crowding New session or Recent),
+// with explicit AI handoffs (never a blind ⌘↵ into a hidden chat) and `@`
+// mentions right from the composer.
 //
 //   nsh test Docs.test.tsx
 
 // Notes are real files: one data folder per launch keeps each scenario blank.
 let seq = 0;
 const freshDir = () => `/tmp/pipi-docs-${Date.now()}-${++seq}`;
-const launch = (options: { dir?: string; files?: Record<string, string>; tabs?: string[] } = {}) =>
+const launch = (
+  options: {
+    dir?: string;
+    files?: Record<string, string>;
+    tabs?: string[];
+    pickedFolder?: string;
+    pickedSaveFile?: string;
+  } = {},
+) =>
   open("./Harness.tsx", {
     width: 1180,
     height: 780,
@@ -27,6 +29,8 @@ const launch = (options: { dir?: string; files?: Record<string, string>; tabs?: 
       "harness.distinct": "1",
       "harness.dataDir": options.dir ?? freshDir(),
       "harness.files": JSON.stringify(options.files ?? {}),
+      ...(options.pickedFolder ? { "harness.pickedFolder": options.pickedFolder } : {}),
+      ...(options.pickedSaveFile ? { "harness.pickedSaveFile": options.pickedSaveFile } : {}),
       "pipi.prefs.v1": JSON.stringify({ openTabs: (options.tabs ?? []).map((ref) => ({ kind: "doc", ref })) }),
     },
   });
@@ -35,6 +39,7 @@ type Launched = Awaited<ReturnType<typeof launch>>;
 const EDITOR = "label:Document";
 const COMPOSER = "label:Message";
 const RECENT = "id:sidebar-recents";
+const DOCS = "id:sidebar-docs";
 const said = (app: Launched, text: string) => app.texts().includes(text);
 const mentions = (app: Launched, text: string) => app.texts().some((line) => line.includes(text));
 
@@ -42,6 +47,13 @@ async function newNote(app: Launched) {
   await app.waitFor("text:What are we building?");
   await app.keyboard.press("mod+shift+n");
   await app.waitFor(EDITOR);
+}
+
+/** Picks the primary destination ("New Session" or "Current Draft") from the document footer menu. */
+async function discussInPrimary(app: Launched) {
+  await app.press("id:doc-chat-trigger");
+  await app.waitFor("id:doc-chat-menu");
+  await app.press("id:doc-target-new");
 }
 
 /** What the last message was sent as: the bubble's Copy puts the wire text on the clipboard. */
@@ -62,13 +74,10 @@ test("'/' lists blocks; the arrows move and Enter picks — every time", async (
   await app.keyboard.press("enter");
   await app.waitUntil(() => app.count("id:doc-slash-menu") === 0);
   await app.type(EDITOR, "Plan");
-  // The typed `/` is gone and the text is the picked block's (it names the note's tab).
   await app.waitUntil(() => said(app, "Plan"));
   expect(said(app, "/")).toBe(false);
-  // The second row is Heading 2: the words are set as a heading's.
   expect(app.spanStyle("id:doc-editor >> text:Plan").fontWeight).toBeGreaterThanOrEqual(600);
 
-  // Again, in a new block: the menu opens fresh — the last Enter is not replayed.
   await app.keyboard.press("enter");
   await app.type(EDITOR, "/");
   await app.waitFor("id:doc-slash-menu");
@@ -91,7 +100,6 @@ test("a query narrows the list, Tab picks, and nothing to offer gives Enter back
   await app.waitUntil(() => said(app, "said"));
   expect(said(app, "/quo")).toBe(false);
 
-  // Nothing matches: the menu is gone, and Enter is the text's again — a new line.
   await app.keyboard.press("enter");
   await app.keyboard.press("enter");
   await app.type(EDITOR, "/zzz");
@@ -119,45 +127,51 @@ test("an input method's marked text shows in place and is not the document's unt
   await app.type(EDITOR, "标题 ");
   await app.compose(EDITOR, "xie dian");
   await app.waitUntil(() => mentions(app, "xie dian"));
-  // Still composing: the document is named and counted by what is in it.
   await app.wait(500);
-  expect(app.count(`${RECENT} >> text:标题`)).toBe(1);
+  expect(app.count(`${DOCS} >> text:标题`)).toBe(1);
+  expect(app.count(`${RECENT} >> text:标题`)).toBe(0);
   expect(mentions(app, "2 words")).toBe(true);
   await app.compose(EDITOR, "");
   await app.type(EDITOR, "写点自己的话");
-  await app.waitFor(`${RECENT} >> text:标题 写点自己的话`);
-  // Counted as the language counts: a character is a word.
+  await app.waitFor(`${DOCS} >> text:标题 写点自己的话`);
   await app.waitUntil(() => mentions(app, "8 words"));
 });
 
-// ── Keeping ─────────────────────────────────────────────────────────────────
+// ── Sidebar & Storage ───────────────────────────────────────────────────────
 
-test("a new document is in Recent from the press that made it; asked for twice it is one", async () => {
+test("sidebar top stays pure (New session only); documents live in their own group, not Recent", async () => {
   const app = await launch();
   await app.waitFor("text:What are we building?");
-  await app.press("id:sidebar-new-doc");
+  expect(app.count("id:sidebar-new-session")).toBe(1);
+  expect(app.count("id:sidebar-new-doc")).toBe(0);
+
+  await app.press("id:sidebar-docs-action");
   await app.waitFor(EDITOR);
-  await app.waitFor(`${RECENT} >> text:Untitled`);
-  await app.press("id:sidebar-new-doc");
+  await app.waitFor(`${DOCS} >> text:Untitled`);
+  expect(app.count(`${RECENT} >> text:Untitled`)).toBe(0);
+
+  // Asking twice reuses the single blank note.
+  await app.hover("id:sidebar-docs-action");
+  await app.press("id:sidebar-docs-action");
   await app.wait(300);
-  expect(app.count(`${RECENT} >> text:Untitled`)).toBe(1);
+  expect(app.count(`${DOCS} >> text:Untitled`)).toBe(1);
   expect(app.count("id:tab-2")).toBe(0);
-  // Nothing in it: nothing to take to a session.
-  expect(app.enabled("id:doc-add")).toBe(false);
+  expect(app.enabled("id:doc-chat-trigger")).toBe(false);
 });
 
-test("a document whose tab is closed is in Recent, a press away", async () => {
+test("a document whose tab is closed stays in Documents, a press away", async () => {
   const app = await launch();
   await newNote(app);
   await app.type(EDITOR, "Reading list");
-  // Named by its first line, where it stood from the start.
-  await app.waitFor(`${RECENT} >> text:Reading list`);
+  await app.waitFor(`${DOCS} >> text:Reading list`);
+  expect(app.count(`${RECENT} >> text:Reading list`)).toBe(0);
+
   await app.press("id:tab-1 >> label:Close tab");
   await app.waitUntil(() => app.count("id:tab-1") === 0);
   await app.wait(300);
-  expect(app.count(`${RECENT} >> text:Reading list`)).toBe(1);
+  expect(app.count(`${DOCS} >> text:Reading list`)).toBe(1);
 
-  await app.press(`${RECENT} >> text:Reading list`);
+  await app.press(`${DOCS} >> text:Reading list`);
   await app.waitFor(EDITOR);
   await app.waitUntil(() => mentions(app, "2 words"));
 });
@@ -165,58 +179,13 @@ test("a document whose tab is closed is in Recent, a press away", async () => {
 test("a document nobody wrote in leaves nothing behind", async () => {
   const app = await launch();
   await newNote(app);
-  await app.waitFor(`${RECENT} >> text:Untitled`);
-  // A heading typed and taken back is still nothing written.
+  await app.waitFor(`${DOCS} >> text:Untitled`);
   await app.type(EDITOR, "# ");
   await app.wait(1000);
   await app.press("id:tab-1 >> label:Close tab");
   await app.waitUntil(() => app.count("id:tab-1") === 0);
   await app.wait(400);
-  expect(app.count(`${RECENT} >> text:Untitled`)).toBe(0);
-});
-
-test("a reply is kept as a document", async () => {
-  const app = await launch();
-  await app.waitFor("text:What are we building?");
-  await app.press(`${RECENT} >> text:Refactor the transcript reducer`);
-  await app.waitFor("id:reply-to-note");
-  await app.press("id:reply-to-note");
-  await app.waitFor(EDITOR);
-  await app.waitUntil(() => app.count(`${RECENT} >> label:Refactor the transcript reducer`) + app.count("id:doc-editor") > 0);
-  expect(app.count("id:tab-1")).toBe(1);
-});
-
-// ── To a session ────────────────────────────────────────────────────────────
-
-test("⌘↵ attaches the document to the message; sent without a word, it is the message", async () => {
-  const app = await launch();
-  await newNote(app);
-  await app.type(EDITOR, "Ship the tabs on Friday, in snake_case and <xml> as written");
-  await app.keyboard.press("mod+enter");
-  // The chat comes forward with the document on the composer — its words are not pasted into the field.
-  await app.waitFor("id:composer-doc");
-  expect(app.value(COMPOSER) ?? "").toBe("");
-  expect(mentions(app, "Say what to do with it, or just send")).toBe(true);
-
-  await app.submit(COMPOSER);
-  // The bubble is the document's own words, as written: no escapes, no block around them.
-  await app.waitFor("label:Conversation >> text:Ship the tabs on Friday, in snake_case and <xml> as written");
-  expect(app.count("id:message-doc")).toBe(0);
-  expect(app.count("id:composer-doc")).toBe(0);
-});
-
-test("⌘↵ in a document sends nothing: what the composer already held is the word about it", async () => {
-  const app = await launch();
-  await app.waitFor("text:What are we building?");
-  await app.type(COMPOSER, "half a thought");
-  await app.press("id:sidebar-new-doc");
-  await app.waitFor(EDITOR);
-  await app.type(EDITOR, "The rest of it");
-  await app.keyboard.press("mod+enter");
-  await app.waitFor("id:composer-doc");
-  await app.wait(400);
-  expect(app.value(COMPOSER)).toBe("half a thought");
-  expect(app.count("label:Conversation >> text:half a thought")).toBe(0);
+  expect(app.count(`${DOCS} >> text:Untitled`)).toBe(0);
 });
 
 test("a tab on a note nobody wrote in does not come back with the app", async () => {
@@ -224,40 +193,175 @@ test("a tab on a note nobody wrote in does not come back with the app", async ()
   const app = await launch({ dir, tabs: [`${dir}/docs/note-2020-01-01.md`] });
   await app.waitFor("text:What are we building?");
   await app.waitUntil(() => app.count("id:tab-1") === 0);
-  expect(app.count(`${RECENT} >> text:Untitled`)).toBe(0);
+  expect(app.count(`${DOCS} >> text:Untitled`)).toBe(0);
 });
 
-test("sent with a word about it, the document rides behind the words and names its file", async () => {
+test("a reply is kept as a document inside Documents", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  await app.press(`${RECENT} >> text:Refactor the transcript reducer`);
+  await app.waitFor("id:reply-to-note");
+  await app.press("id:reply-to-note");
+  await app.waitFor(EDITOR);
+  await app.waitUntil(() => app.count(`${DOCS} >> text:Here is the plan.`) > 0 || app.count("id:doc-editor") > 0);
+  expect(app.count("id:tab-1")).toBe(1);
+});
+
+test("Settings shows the documents folder, switches to a custom folder, and resets", async () => {
+  const dir = freshDir();
+  const custom = `${dir}/my-articles`;
+  const app = await launch({
+    dir,
+    pickedFolder: custom,
+    files: {
+      [`${dir}/docs/note-2026-01-01.md`]: "# Default Note\n\nInside default.\n",
+      [`${custom}/architecture.md`]: "# Architecture Notes\n\nInside custom folder.\n",
+    },
+  });
+  await app.waitFor("text:What are we building?");
+  await app.waitFor(`${DOCS} >> text:Default Note`);
+
+  // Open Settings -> General -> Documents folder.
+  await app.keyboard.press("mod+,");
+  await app.waitFor("id:settings-docs-folder-pick");
+  expect(mentions(app, `${dir}/docs`)).toBe(true);
+  await app.press("id:settings-docs-folder-pick");
+  await app.waitFor("id:settings-docs-folder-reset");
+  expect(mentions(app, custom)).toBe(true);
+
+  await app.keyboard.press("escape");
+  await app.waitFor(`${DOCS} >> text:Architecture Notes`);
+  expect(app.count(`${DOCS} >> text:Default Note`)).toBe(0);
+
+  // Reset restores the default folder.
+  await app.keyboard.press("mod+,");
+  await app.waitFor("id:settings-docs-folder-reset");
+  await app.press("id:settings-docs-folder-reset");
+  await app.waitUntil(() => app.count("id:settings-docs-folder-reset") === 0);
+  await app.keyboard.press("escape");
+  await app.waitFor(`${DOCS} >> text:Default Note`);
+});
+
+test("Save As writes the document with front matter intact to the chosen path", async () => {
+  const dir = freshDir();
+  const post = `${dir}/draft.md`;
+  const exported = `${dir}/exported/final-post.md`;
+  const app = await launch({
+    dir,
+    pickedSaveFile: exported,
+    files: { [post]: "---\ntitle: Draft\n---\n\n# My Post\n\nBody.\n" },
+    tabs: [post],
+  });
+  await app.waitFor("text:What are we building?");
+  await app.press("id:tab-0");
+  await app.waitFor(EDITOR);
+  await app.keyboard.press("mod+down");
+  await app.type(EDITOR, " Polished.");
+
+  await app.rightClick("id:tab-0");
+  await app.chooseMenuItem("Save As…");
+  await app.waitUntil(() => mentions(app, "Saved as final-post.md"));
+
+  await app.keyboard.press("mod+l");
+  await app.type(COMPOSER, `recite ${exported}`);
+  await app.submit(COMPOSER);
+  await app.waitUntil(() => mentions(app, "title: Draft") && mentions(app, "Body. Polished."), { timeout: 8000 });
+});
+
+// ── Explicit AI handoffs & composer @ pull ──────────────────────────────────
+
+test("⌘↵ in a document does nothing — never jumps to a hidden session", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  await app.press(`${RECENT} >> text:Refactor the transcript reducer`);
+  await app.waitFor("label:Conversation >> text:Refactor the transcript reducer");
+
+  await app.keyboard.press("mod+shift+n");
+  await app.waitFor(EDITOR);
+  await app.type(EDITOR, "Quiet technical article draft");
+  await app.keyboard.press("mod+enter");
+  await app.wait(400);
+  // Still writing peacefully in the document; nothing attached or sent.
+  expect(app.count("id:doc-editor")).toBe(1);
+  expect(app.count("id:composer-doc")).toBe(0);
+});
+
+test("Discuss with AI lets you start a clean New Session or target a named open session", async () => {
   const dir = freshDir();
   const app = await launch({ dir });
-  await newNote(app);
-  await app.type(EDITOR, "Launch brief");
-  await app.keyboard.press("mod+enter");
+  await app.waitFor("text:What are we building?");
+
+  // Open and keep an existing conversation so it stays on the strip beside a New Session.
+  await app.press(`${RECENT} >> text:Refactor the transcript reducer`);
+  await app.waitFor("label:Conversation >> text:Refactor the transcript reducer");
+  await app.rightClick("id:tab-0");
+  await app.chooseMenuItem("Keep Open");
+
+  await app.keyboard.press("mod+shift+n");
+  await app.waitFor(EDITOR);
+  await app.type(EDITOR, "Ship the tabs on Friday, in snake_case and <xml> as written");
+
+  // Open explicit destination menu: offers New Session + the named open session.
+  await app.press("id:doc-chat-trigger");
+  await app.waitFor("id:doc-chat-menu");
+  expect(app.count("id:doc-chat-menu >> text:New Session")).toBe(1);
+  expect(app.count("id:doc-chat-menu >> text:Refactor the transcript reducer")).toBe(1);
+
+  // Choose New Session: lands on a clean fresh session (not inside Refactor).
+  await app.press("id:doc-target-new");
   await app.waitFor("id:composer-doc");
+  await app.waitFor("text:What are we building?");
+  expect(app.value(COMPOSER) ?? "").toBe("");
+  expect(mentions(app, "Say what to do with it, or just send")).toBe(true);
+
+  await app.submit(COMPOSER);
+  await app.waitFor("label:Conversation >> text:Ship the tabs on Friday, in snake_case and <xml> as written");
+  expect(app.count("id:message-doc")).toBe(0);
+  expect(app.count("id:composer-doc")).toBe(0);
+
+  // Now take the same document explicitly to the named existing session (Refactor stays at tab-0).
+  await app.press("id:tab-1");
+  await app.waitFor(EDITOR);
+  await app.press("id:doc-chat-trigger");
+  await app.waitFor("id:doc-chat-menu");
+  await app.press("id:doc-target-tab-0");
+  await app.waitFor("id:composer-doc");
+  await app.waitFor("label:Conversation >> text:Refactor the transcript reducer");
   await app.type(COMPOSER, "Tighten this");
   await app.submit(COMPOSER);
-  // The bubble says the word and names the document; the session is titled by the word.
   await app.waitFor("label:Conversation >> text:Tighten this");
-  await app.waitFor("id:message-doc >> text:Launch brief");
+  await app.waitFor("id:message-doc");
   const wire = await sentText(app);
   expect(wire.startsWith(`Tighten this\n\n<document path="${dir}/docs/note-`)).toBe(true);
-  expect(wire.endsWith(`.md">\nLaunch brief\n</document>`)).toBe(true);
-  await app.waitFor(`${RECENT} >> text:Tighten this`);
-
-  // The card on the message leads back to the document.
-  await app.press("id:message-doc");
-  await app.waitFor(EDITOR);
+  expect(wire.endsWith(`.md">\nShip the tabs on Friday, in snake_case and <xml> as written\n</document>`)).toBe(true);
 });
 
-test("a passage selected goes alone; what is written after attaching is sent too", async () => {
+test("an unsent draft in the composer is offered as Current Draft without losing typed words", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  await app.type(COMPOSER, "half a thought");
+  await app.press("id:sidebar-docs-action");
+  await app.waitFor(EDITOR);
+  await app.type(EDITOR, "The rest of it");
+  await app.press("id:doc-chat-trigger");
+  await app.waitFor("id:doc-chat-menu");
+  expect(app.count("id:doc-chat-menu >> text:Current Draft")).toBe(1);
+  await app.press("id:doc-target-new");
+  await app.waitFor("id:composer-doc");
+  await app.wait(300);
+  expect(app.value(COMPOSER)).toBe("half a thought");
+  expect(app.count("label:Conversation >> text:half a thought")).toBe(0);
+});
+
+test("a passage selected offers Ask AI with explicit session choices", async () => {
   const app = await launch();
   await newNote(app);
   await app.type(EDITOR, "Keep this. Polish that");
   for (let i = 0; i < 11; i++) await app.keyboard.press("shift+left");
-  // The bubble offers the passage, and the foot says what will go.
   await app.waitFor("id:doc-bubble-add");
-  await app.waitUntil(() => said(app, "Add Selection to Chat"));
+  await app.waitUntil(() => said(app, "Ask AI about Selection"));
   await app.press("id:doc-bubble-add");
+  await app.chooseMenuItem("New Session");
   await app.waitFor("id:composer-doc >> text:Selection");
   await app.type(COMPOSER, "Reword");
   await app.submit(COMPOSER);
@@ -271,9 +375,8 @@ test("a document attached is sent as it reads when sent", async () => {
   const app = await launch();
   await newNote(app);
   await app.type(EDITOR, "First thought");
-  await app.keyboard.press("mod+enter");
+  await discussInPrimary(app);
   await app.waitFor("id:composer-doc");
-  // Back to the document for one more line, then to the chat without attaching again.
   await app.press("id:composer-doc >> label:First thought");
   await app.waitFor(EDITOR);
   await app.type(EDITOR, ", and a second");
@@ -283,22 +386,56 @@ test("a document attached is sent as it reads when sent", async () => {
   await app.waitFor("label:Conversation >> text:First thought, and a second");
 });
 
-test("a long draft goes on as a document, and comes back attached", async () => {
+test("a draft expanded with ⌘E remembers its exact origin session and returns straight to it", async () => {
   const app = await launch();
   await app.waitFor("text:What are we building?");
-  // Short: the field is enough, and nothing is offered.
+  await app.press(`${RECENT} >> text:Refactor the transcript reducer`);
+  await app.waitFor("label:Conversation >> text:Refactor the transcript reducer");
+
   await app.type(COMPOSER, "A brief.");
   expect(app.count("id:composer-to-doc")).toBe(0);
   await app.keyboard.press("mod+e");
   await app.waitFor(EDITOR);
-  // Moved, not copied: the document has the words, the field has none.
   await app.waitUntil(() => mentions(app, "A brief."));
+  await app.waitFor("id:doc-return-origin");
+  expect(mentions(app, "Refactor the transcript reducer")).toBe(true);
+
   await app.type(EDITOR, " With room to go on.");
-  await app.keyboard.press("mod+enter");
+  await app.press("id:doc-return-origin");
   await app.waitFor("id:composer-doc");
+  await app.waitFor("label:Conversation >> text:Refactor the transcript reducer");
   expect(app.value(COMPOSER) ?? "").toBe("");
   await app.submit(COMPOSER);
   await app.waitFor("label:Conversation >> text:A brief. With room to go on.");
+});
+
+test("typing @ in the composer pulls a document into this session; unmatched @ never traps Enter", async () => {
+  const dir = freshDir();
+  const app = await launch({
+    dir,
+    files: { [`${dir}/docs/note-arch.md`]: "# Architecture Notes\n\nKeep the surface calm.\n" },
+  });
+  await app.waitFor("text:What are we building?");
+  await app.waitFor(`${DOCS} >> text:Architecture Notes`);
+
+  await app.type(COMPOSER, "Review @Arch");
+  await app.waitFor("id:composer-doc-menu");
+  expect(app.count("id:composer-doc-menu >> text:Architecture Notes")).toBe(1);
+  await app.submit(COMPOSER);
+  await app.waitUntil(() => app.count("id:composer-doc-menu") === 0);
+  await app.waitFor("id:composer-doc >> text:Architecture Notes");
+  expect(app.value(COMPOSER)).toBe("Review");
+
+  await app.submit(COMPOSER);
+  await app.waitFor("label:Conversation >> text:Review");
+  await app.waitFor("id:message-doc >> text:Architecture Notes");
+
+  // Unmatched @ (e.g. decorator or npm scope) does not open the menu or trap Enter.
+  await app.type(COMPOSER, "Check @scope/pkg");
+  await app.wait(150);
+  expect(app.count("id:composer-doc-menu")).toBe(0);
+  await app.submit(COMPOSER);
+  await app.waitFor("label:Conversation >> text:Check @scope/pkg");
 });
 
 // ── And back ────────────────────────────────────────────────────────────────
@@ -307,9 +444,8 @@ test("what an agent writes to the file is in the open document, and undo takes i
   const app = await launch();
   await newNote(app);
   await app.type(EDITOR, "A draft of the plan");
-  await app.keyboard.press("mod+enter");
+  await discussInPrimary(app);
   await app.waitFor("id:composer-doc");
-  // The scripted agent rewrites the file it was handed: "draft" becomes "final".
   await app.type(COMPOSER, "rewrite this");
   await app.submit(COMPOSER);
   await app.waitFor("id:message-doc");
@@ -318,9 +454,7 @@ test("what an agent writes to the file is in the open document, and undo takes i
   await app.press("id:message-doc");
   await app.waitFor(EDITOR);
   await app.waitUntil(() => mentions(app, "A final of the plan"));
-  // Words that changed without the writer's hand are said, with the way back.
   await app.waitUntil(() => mentions(app, "This document was updated from its file"));
-  // The agent's change is one step the writer can take back.
   await app.keyboard.press("mod+z");
   await app.waitUntil(() => mentions(app, "A draft of the plan"));
 });
@@ -330,14 +464,13 @@ test("typed while the agent writes: both stand, on screen and on disk", async ()
   const note = `${dir}/docs/note-plan.md`;
   const app = await launch({ dir, files: { [note]: "# Plan\n\nThe draft opening.\n\nThe closing.\n" } });
   await app.waitFor("text:What are we building?");
-  await app.press(`${RECENT} >> text:Plan`);
+  await app.press(`${DOCS} >> text:Plan`);
   await app.waitFor(EDITOR);
-  await app.keyboard.press("mod+enter");
+  await discussInPrimary(app);
   await app.waitFor("id:composer-doc");
   await app.type(COMPOSER, "rewrite this slowly");
   await app.submit(COMPOSER);
   await app.waitFor("id:message-doc");
-  // Back in the document at once, writing at its end while the agent's change lands on the opening.
   await app.press("id:message-doc");
   await app.waitFor(EDITOR);
   await app.keyboard.press("mod+down");
@@ -345,7 +478,6 @@ test("typed while the agent writes: both stand, on screen and on disk", async ()
   await app.waitUntil(() => mentions(app, "The final opening."), { timeout: 8000 });
   expect(mentions(app, "The closing. Typed meanwhile.")).toBe(true);
 
-  // The file holds both, once the save lands.
   await app.wait(1200);
   await app.keyboard.press("mod+l");
   await app.type(COMPOSER, `recite ${note}`);
@@ -362,7 +494,6 @@ test("a file's front matter is kept as written through an edit", async () => {
   await app.waitFor("text:What are we building?");
   await app.press("id:tab-0");
   await app.waitFor(EDITOR);
-  // The editor shows the document, not its front matter.
   expect(mentions(app, "title: Hello")).toBe(false);
   await app.keyboard.press("mod+down");
   await app.type(EDITOR, " More.");
@@ -385,6 +516,5 @@ test("a file holding what the editor cannot keep is shown, not rewritten", async
   await app.type(EDITOR, " typed");
   await app.wait(1200);
   expect(mentions(app, "Text. typed")).toBe(false);
-  // It still goes to a session.
-  expect(app.enabled("id:doc-add")).toBe(true);
+  expect(app.enabled("id:doc-chat-trigger")).toBe(true);
 });

@@ -84,8 +84,10 @@ interface Prefs {
    * path → rank (same timestamp domain as `modified`, which it overrides).
    */
   sessionRanks: Record<string, Record<string, number>>;
-  /** Sidebar functional groups folded away: `"workspaces"`, `"recents"`, `"archived"`. */
+  /** Sidebar functional groups folded away: `"workspaces"`, `"recents"`, `"docs"`, `"archived"`. */
   collapsedGroups: string[];
+  /** Custom folder for Markdown documents; when unset, `<dataDir>/docs` is used. */
+  docsFolder?: string;
   /** Saved sessions tucked into Archived (never deleted on disk), keyed by session `.jsonl` path. */
   archivedSessions: Record<string, ArchivedSessionMeta>;
   /** Days without activity before an inactive conversation is archived automatically; `0` turns it off. */
@@ -343,6 +345,7 @@ export async function loadPrefs() {
         recentRanks: normalizeRanks(parsed.recentRanks),
         sessionRanks: normalizeRankMap(parsed.sessionRanks),
         collapsedGroups,
+        docsFolder: typeof parsed.docsFolder === "string" && parsed.docsFolder.trim() ? parsed.docsFolder.trim().replace(/\/+$/, "") : undefined,
         archivedSessions: normalizeArchivedSessions(parsed.archivedSessions),
         openTabs: normalizeOpenTabs(parsed.openTabs),
         autoArchiveDays: AUTO_ARCHIVE_DAYS.includes(parsed.autoArchiveDays as AutoArchiveDays)
@@ -428,6 +431,12 @@ export const isSessionArchived = (path: string | undefined) =>
   !!path && Object.prototype.hasOwnProperty.call(prefs().archivedSessions, path);
 export const autoArchiveDays = () => prefs().autoArchiveDays;
 export const storedOpenTabs = () => prefs().openTabs;
+export const docsFolder = () => prefs().docsFolder;
+
+export function setDocsFolderPref(folder: string | undefined) {
+  const trimmed = folder?.trim().replace(/\/+$/, "") || undefined;
+  change({ docsFolder: trimmed });
+}
 
 /** Remembers the tab strip's surfaces between launches; the order is the strip's. */
 export function setOpenTabs(tabs: StoredOpenTab[]) {

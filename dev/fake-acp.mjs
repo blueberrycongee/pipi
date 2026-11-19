@@ -214,6 +214,48 @@ async function runTurn(sessionId, text) {
     timer.unref?.();
     return "wait-for-cancel";
   }
+  if (/retry-ok/i.test(text)) {
+    const first = `tc_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: first, title: "read", kind: "read", status: "in_progress", rawInput: { path: "DocLook.test.tsx" } });
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: first, status: "completed", content: [{ type: "content", content: { type: "text", text: "ok" } }] });
+    update(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: '⚠ API error (attempt 1): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF\n',
+      },
+    });
+    const second = `tc_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: second, title: "bash", kind: "execute", status: "in_progress", rawInput: { command: "nsh test DocLook.test.tsx --target macos" } });
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: second, status: "completed", content: [{ type: "content", content: { type: "text", text: "pass" } }] });
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Recovered after retry." } });
+    return "end_turn";
+  }
+  if (/retry-fail/i.test(text)) {
+    update(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: '⚠ API error (attempt 1): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF' },
+    });
+    update(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: '⚠ API error (attempt 2): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF' },
+    });
+    return "end_turn";
+  }
+  if (/retry-abort/i.test(text)) {
+    update(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: '⚠ API error (attempt 1): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF' },
+    });
+    return "wait-for-cancel";
+  }
+  if (/retry-quote/i.test(text)) {
+    update(sessionId, {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: 'The log showed ⚠ API error (attempt 1): EOF during the outage.' },
+    });
+    return "end_turn";
+  }
   if (AGY && /background/i.test(text)) return backgroundTurn(sessionId, text);
   const toolCallId = `tc_${seq++}`;
   const editTool = /edit/i.test(text);

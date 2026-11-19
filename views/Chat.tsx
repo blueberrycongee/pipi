@@ -106,7 +106,9 @@ function activityLabel(said: boolean) {
     case "compacting":
       return tr("Compacting context", "正在压缩上下文");
     case "retrying":
-      return tr(`Retrying (${activity.attempt} of ${activity.maxAttempts})`, `正在重试（${activity.attempt}/${activity.maxAttempts}）`);
+      return activity.maxAttempts > 0
+        ? tr(`Retrying (${activity.attempt} of ${activity.maxAttempts})`, `正在重试（${activity.attempt}/${activity.maxAttempts}）`)
+        : tr(`Retrying (attempt ${activity.attempt})`, `正在重试（第 ${activity.attempt} 次）`);
     case "writing":
       return said ? "" : tr("Writing", "正在回复");
     case "tool": {

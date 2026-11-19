@@ -250,28 +250,36 @@ keeps 10, and a rule 20. Two paragraphs that cannot be told apart are one
 paragraph to the reader.
 
 Under the page, one 44pt line on the column's own edges. Left, in `text-xs`
-`subtle`: how much is written and that it is kept ("328 字 · 自动保存"). That
-is a property, not a state — nothing here or on the tab blinks with each
-pause in typing; a save that fails is a toast. Right: the page's one action,
-"Add to Chat" with its key (⌘↵), a quiet secondary button — the brand stays
-on the composer's send, where a message actually leaves. It names what will
-go ("Add Selection to Chat" while a passage is selected) and is disabled on
-an empty page.
+`subtle`: how much is written and that it is kept ("328 字 · 自动保存", or the
+file's compact path for external files); hovering shows the full path and a
+click reveals the file on disk. That is a property, not a state — nothing here
+or on the tab blinks with each pause in typing; a save that fails is a toast.
+Right: a quiet secondary button that names an explicit destination instead of
+blindly pushing via ⌘↵ — "Discuss with AI ▾" ("Ask AI about Selection ▾" when a
+passage is selected), opening a menu with "New Session" (or "Current Draft"
+when unsent text already waits in the composer) and each open session by name.
+A draft expanded from a session with ⌘E remembers its exact origin and shows a
+one-click "Back to …" split button instead. The brand stays on the composer's
+send, where a message actually leaves.
 
 A document rides on a message the way an image does: attached, not pasted.
-On the composer it is a card in the tray, ahead of the images (56 high, 208
-wide: a file tile, its name, "Document" or "Selection"); a press goes back
-to the document, ✕ on hover removes it, and the field's hint says the rule —
-words are what to do with it, none sends it as it is. In the sent bubble it
-is named, not printed: a `text-xs` line with the file mark under the words,
-like the images line, and a press opens it.
+From any session's composer, typing `@` (or pressing the quiet document icon
+that appears once documents exist) pulls an open or saved document straight
+into the tray without leaving the chat. On the composer it is a card in the
+tray, ahead of the images (56 high, 208 wide: a file tile, its name, "Document"
+or "Selection"); a press goes back to the document, ✕ on hover removes it, and
+the field's hint says the rule — words are what to do with it, none sends it as
+it is. In the sent bubble it is named, not printed: a `text-xs` line with the
+file mark under the words, like the images line, and a press opens it.
 
 The composer's own door to a document is an `expand` mark at the field's top
 right, there from the draft's third line on (⌘E): a draft that long is
 offered room. The field's right margin (36) is that mark's seat always, so
-its arrival never re-wraps what is written. In the sidebar, 新文档 stands
-under 新会话, and a document's row in 最近 leads with the `file` mark where a
-session's has its engine — no trailing mark: a document has no run to report.
+its arrival never re-wraps what is written. The sidebar stays purely a coding
+agent shell: its top holds only 新会话, 最近 lists only sessions, and documents
+live in their own quiet collapsible 文档 group (with `+` to create one, and
+full path tooltips + Finder reveal / Save As on right-click) backed by a
+transparent folder configurable in Settings → General.
 
 ## Elevation
 

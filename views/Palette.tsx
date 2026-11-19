@@ -1,4 +1,4 @@
-import { computed, Text, View } from "nsh";
+import { computed, platform, Text, View } from "nsh";
 import { Command, type CommandItem } from "nsh/base";
 import { runtimeModeRank } from "../agents/catalog";
 import type { RuntimeMode } from "../agents/types";
@@ -56,9 +56,9 @@ import {
   workspaceSessions,
 } from "../store/app";
 import { backend } from "../store/backend";
-import { docTabTitle, notes } from "../store/docs";
+import { docTabTitle, notes, revealDocsFolder } from "../store/docs";
 import { recentWorkspaces } from "../store/prefs";
-import { newDocTab, openDocTab } from "../store/tabs";
+import { newDocTab, openDocTab, pickDocTab, saveDocAs } from "../store/tabs";
 import { Icon, type IconName } from "../ui/Icon";
 import { FloatingLayer } from "../ui/motion";
 import { runtimeModeIcon, runtimeModeText, thinkingText, tr } from "../lib/i18n";
@@ -236,7 +236,38 @@ export function Palette() {
             run: () => void openSession(session.path, cwd),
           };
         }),
-      // Every document the app keeps: one that has sunk in 最近 is found by what it is called.
+      // Document actions and every saved document in the configured documents folder.
+      {
+        id: "open-doc",
+        label: tr("Open Markdown File…", "打开 Markdown 文件…"),
+        group: tr("Documents", "文档"),
+        keywords: ["open document", "markdown", "file", "打开文档"],
+        icon: "folderOpen",
+        run: () => void pickDocTab(),
+      },
+      ...(currentView().name === "doc"
+        ? [
+            {
+              id: "save-doc-as",
+              label: tr("Save Document As…", "文档另存为…"),
+              group: tr("Documents", "文档"),
+              keywords: ["save as", "export", "markdown", "另存为", "保存文档"],
+              icon: "download" as const,
+              run: () => {
+                const v = currentView();
+                if (v.name === "doc") void saveDocAs(v.docId);
+              },
+            },
+          ]
+        : []),
+      {
+        id: "reveal-docs-folder",
+        label: platform.os === "macos" ? tr("Show Documents Folder in Finder", "在访达中显示文档文件夹") : tr("Open Documents Folder", "打开文档文件夹"),
+        group: tr("Documents", "文档"),
+        keywords: ["documents", "notes", "folder", "finder", "文档", "文件夹"],
+        icon: "folder",
+        run: () => void revealDocsFolder(),
+      },
       ...notes().map((note): Action => {
         const title = docTabTitle(note.path);
         return {

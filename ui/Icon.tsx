@@ -39,6 +39,12 @@ const ICONS = {
   file: { stroke: "M4 2.5h5l3 3v8H4zM9 2.5v3h3" },
   fileEdit: { stroke: "M8.5 2.5H4v11h4M8.5 2.5l3.5 3.5v1.5M9.5 13.5l.4-2 3.1-3.1 1.6 1.6-3.1 3.1z" },
   filePlus: { stroke: "M4 2.5h5l3 3v8H4zM9 2.5v3h3M8 8v3.5M6.25 9.75h3.5" },
+  listBullet: { stroke: "M3.25 4.5v.1M3.25 8v.1M3.25 11.5v.1M6.25 4.5h7M6.25 8h7M6.25 11.5h7" },
+  listOrdered: { stroke: "M3.5 3.25v3.5M2.75 4l.75-.75M2.75 10.1a1.1 1.1 0 0 1 2 .6c0 .8-2 1.3-2 2.05h2.1M7.25 4.5h6M7.25 8h6M7.25 11.5h6" },
+  listTask: { stroke: "M2.5 5l1.25 1.25L6.25 3.75M8.5 5h5M2.75 9.75h3.25v3.25h-3.25zM8.5 11.5h5" },
+  quote: { stroke: "M3 4v8M6.5 5.5h6.5M6.5 8h5M6.5 10.5h6" },
+  code: { stroke: "M5.5 4.75L2.25 8l3.25 3.25M10.5 4.75L13.75 8l-3.25 3.25M9 3.75l-2 8.5" },
+  table: { stroke: "M2.5 3.5h11v9h-11zM2.5 6.75h11M8 6.75v5.75" },
   sliders: { stroke: "M2.5 5h4M10.5 5h3M2.5 11h2M8.5 11h5M10 5a1.75 1.75 0 1 1-3.5 0 1.75 1.75 0 0 1 3.5 0zM8 11a1.75 1.75 0 1 1-3.5 0A1.75 1.75 0 0 1 8 11z" },
   gear: {
     stroke:

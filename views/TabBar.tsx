@@ -1,4 +1,4 @@
-import { batch, Clipboard, cleanup, createAnimatedValue, effect, keymap, Overlay, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
+import { batch, Clipboard, cleanup, createAnimatedValue, effect, keymap, Overlay, platform, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
 import type { AnimatedValue, ContextMenuEvent, GestureResponderEvent, InputRef, MouseEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input } from "nsh/base";
 import { Menu, type MenuItem, titleBar } from "nsh/desktop";
@@ -24,21 +24,24 @@ import {
   unarchiveCurrentSession,
   wallpaper,
 } from "../store/app";
-import { docTabTitle } from "../store/docs";
+import { docTabTitle, revealDoc } from "../store/docs";
 import { stripTabWidth, TAB_GAP, TAB_MAX_W } from "../lib/strip-width";
 import { prefsReady, setSidebarOpen, sidebarOpen } from "../store/prefs";
 import {
   activeTabId,
-  addNoteToChat,
+  addDocToNewSession,
+  addDocToTab,
   chatTabSession,
   chatTabTitle,
   closeTab,
+  docChatTargets,
   keepTab,
   moveTab,
   newDocTab,
   openDocTab,
   openTabs,
   pickDocTab,
+  saveDocAs,
   selectTab,
   tabId,
   type OpenTab,
@@ -722,8 +725,30 @@ export function TabBar() {
       });
     }
     if (tab.kind === "doc") {
+      const targets = docChatTargets();
       items.push({ type: "separator" });
-      items.push({ label: tr("Add to Chat", "添加到会话"), onSelect: () => void addNoteToChat(tab.ref) });
+      items.push({
+        label: targets.hasActiveDraft ? tr("Add to Current Draft", "添加到当前草稿") : tr("New Session with Document", "用新会话讨论"),
+        onSelect: () =>
+          targets.hasActiveDraft && targets.draftTab
+            ? void addDocToTab(tab.ref, targets.draftTab, { selection: false })
+            : void addDocToNewSession(tab.ref, { selection: false }),
+      });
+      for (const s of targets.sessions) {
+        items.push({
+          label: tr(`Add to “${s.title}”`, `添加到「${s.title}」`),
+          onSelect: () => void addDocToTab(tab.ref, s.tab, { selection: false }),
+        });
+      }
+      items.push({ type: "separator" });
+      items.push({
+        label: platform.os === "macos" ? tr("Show in Finder", "在访达中显示") : tr("Show in File Manager", "在文件管理器中显示"),
+        onSelect: () => void revealDoc(tab.ref),
+      });
+      items.push({
+        label: tr("Save As…", "另存为…"),
+        onSelect: () => void saveDocAs(tab.ref),
+      });
       items.push({
         label: tr("Copy Path", "复制路径"),
         onSelect: () => void Clipboard.writeText(tab.ref),

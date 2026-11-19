@@ -32,6 +32,8 @@ export interface FakeOptions {
   pickedImage?: string;
   /** File path returned when `pickFile` is called. */
   pickedFile?: string;
+  /** Destination path returned when `pickSaveFile` is called. */
+  pickedSaveFile?: string;
   /** The app's data folder (notes live in its `docs/`): a real, writable one for the tests that save. */
   dataDir?: string;
   /** Milliseconds between streamed records (0: all at once). */
@@ -1374,6 +1376,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     pickFolder: async () => options.pickedFolder,
     pickImage: async () => options.pickedImage,
     pickFile: async () => options.pickedFile,
+    pickSaveFile: async () => options.pickedSaveFile,
+    revealPath: async () => undefined,
     async checkAppUpdate() {
       const u = options.update;
       if (!u) return null;

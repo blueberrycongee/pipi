@@ -75,8 +75,8 @@ import {
   workspaceSessions,
 } from "../store/app";
 import { backend } from "../store/backend";
-import { type NoteSummary, notes } from "../store/docs";
-import { addNoteToChat, deleteNote, docTabTitle, newDocTab, openDocTab } from "../store/tabs";
+import { chooseDocsFolder, type NoteSummary, notes, revealDoc, revealDocsFolder } from "../store/docs";
+import { addDocToNewSession, addDocToTab, deleteNote, docChatTargets, docTabTitle, newDocTab, openDocTab, pickDocTab, saveDocAs } from "../store/tabs";
 import {
   isGroupCollapsed,
   isSessionArchived,
@@ -101,10 +101,10 @@ import { tip } from "../ui/Tip";
 /** A row inside an expanded workspace folder: a saved session. */
 type FolderItem = { id: string; session?: SessionSummary; child?: DaemonSession };
 
-type GroupId = "workspaces" | "recents" | "archived";
+type GroupId = "workspaces" | "recents" | "docs" | "archived";
 
-/** A row in 最近: a saved session, a daemon session of a tree with no saved row to hang under, or a document the app keeps. */
-type RecentItem = { id: string; session?: SessionSummary; child?: DaemonSession; cwd?: string; note?: NoteSummary };
+/** A row in 最近: a saved session, or a daemon session of a tree with no saved row to hang under. */
+type RecentItem = { id: string; session?: SessionSummary; child?: DaemonSession; cwd?: string };
 
 /** How many sessions 最近 lists before its footer offers to show the rest. */
 const RECENT_LIMIT = 100;
@@ -184,11 +184,12 @@ const openFile = () => {
 /** The active folder's list can be trusted: its agent is ready, or a session change knows where it lands. */
 const listSteady = () => sidecarPhase().name === "ready" || pendingSession() !== undefined;
 
-/** True on a fresh single-folder install with nothing saved or archived yet. */
+/** True on a fresh single-folder install with nothing saved, archived, or written yet. */
 const singleEmpty = computed(
   () =>
     projects().length === 1 &&
     savedSessions().length === 0 &&
+    notes().length === 0 &&
     archivedSessionItems().length === 0 &&
     !daemonSessions().some(
       (ds) => !(ds.id === openDaemonId() && isDraftSession()) && (Boolean(ds.parentId) || daemonRootEarnsRow(ds)),
@@ -993,27 +994,18 @@ const daemonStandingOf = (session: DaemonSession) => {
 };
 /** The sessions a project folder lists, active folder or parked one. */
 const sessionsOf = (cwd: string) => (cwd === activeProjectPath() ? savedSessions() : (workspaceSessions()[cwd] ?? []));
-/** A document's standing, by its file: first sight of its row, like a session's — one being written keeps its place. */
-const noteStandingOf = (note: NoteSummary) => {
-  const known = recentStanding.get(note.path);
-  if (known !== undefined) return known;
-  recentStanding.set(note.path, note.modified);
-  return note.modified;
-};
-/** What a root row of 最近 is ranked and dragged by: a session's or a document's file, a daemon tree's id. */
-const recentKey = (item: RecentItem) => item.note?.path ?? item.session?.path ?? `daemon:${item.child!.id}`;
+/** What a root row of 最近 is ranked and dragged by: a session's file, or a daemon tree's id. */
+const recentKey = (item: RecentItem) => item.session?.path ?? `daemon:${item.child!.id}`;
 const standOf = (item: RecentItem) =>
   recentRankOverrides()[recentKey(item)] ??
-  (item.note ? noteStandingOf(item.note) : item.session ? standingOf(item.session) : daemonStandingOf(item.child!));
-const createdOf = (item: RecentItem) => item.note?.modified ?? item.session?.created ?? item.child?.createdAt ?? 0;
+  (item.session ? standingOf(item.session) : daemonStandingOf(item.child!));
+const createdOf = (item: RecentItem) => item.session?.created ?? item.child?.createdAt ?? 0;
 
 /**
- * What was worked on lately, sessions across every open folder and the
- * documents written beside them, in one list: the forest's roots in the place each
- * first took (`recentStanding`), every root's daemon descendants nested under it
- * in tree order — the tree a session started shows here as it does in 工作区.
- * A document is a root like a session is: found where the eye already goes,
- * next to the session it was written for.
+ * What was worked on lately — sessions across every open folder in one list:
+ * the forest's roots in the place each first took (`recentStanding`), every
+ * root's daemon descendants nested under it in tree order — the tree a session
+ * started shows here as it does in 工作区.
  * Roots are saved sessions and the daemon trees no saved row claims (external or
  * detached runs, starts still without a file); a child whose own tree hides keeps
  * a flat row rather than going missing.
@@ -1063,13 +1055,11 @@ const allRecents = computed<RecentItem[]>(() => {
     roots.push({ id: `recent:${session.path}`, session, cwd });
   }
   for (const ds of tops.values()) roots.push({ id: `recent-daemon:${ds.id}`, child: ds });
-  for (const note of notes()) roots.push({ id: `recent-note:${note.path}`, note });
   roots.sort((a, b) => standOf(b) - standOf(a) || createdOf(b) - createdOf(a) || a.id.localeCompare(b.id));
 
   const out: RecentItem[] = [];
   for (const root of roots) {
     out.push(root);
-    if (root.note) continue;
     const children = root.session ? childSessionsOf(root.session.path) : childSessionsOfDaemon(root.child!.id);
     for (const child of children) out.push({ id: `recent-child:${child.id}`, child });
   }
@@ -1271,7 +1261,7 @@ function startNewSessionIn(cwd: string) {
 }
 
 /**
- * A functional group's heading (工作区 / 最近 / 已归档): the quiet label, the fold cue
+ * A functional group's heading (工作区 / 最近 / 文档 / 已归档): the quiet label, the fold cue
  * that only an open group hides until hovered, and the group's own action.
  * The label sits on the same left axis as every row's text.
  */
@@ -1280,13 +1270,28 @@ function GroupHeading(props: {
   label: string;
   count: number;
   action?: { icon: IconName; label: string; shortcut?: string; onPress: () => void };
+  alwaysShowAction?: boolean;
+  onContextMenu?: (e: ContextMenuEvent) => void;
 }) {
   const collapsed = () => isGroupCollapsed(props.id);
+  const actionReveal = () =>
+    props.alwaysShowAction
+      ? "opacity-55 hover:opacity-100 group-hover:opacity-100 focus-within:opacity-100"
+      : inert(HOVER_REVEAL);
   return (
-    <View class={hoverGroup()}>
+    <View class={hoverGroup()} onContextMenu={props.onContextMenu}>
       <BaseButton
-        onPress={() => toggleGroupCollapsed(props.id)}
-        accessibilityLabel={collapsed() ? tr(`Expand ${props.label}`, `展开 ${props.label}`) : tr(`Collapse ${props.label}`, `收起 ${props.label}`)}
+        onPress={() => {
+          if (props.count > 0) toggleGroupCollapsed(props.id);
+          else props.action?.onPress();
+        }}
+        accessibilityLabel={
+          props.count === 0
+            ? (props.action?.label ?? props.label)
+            : collapsed()
+              ? tr(`Expand ${props.label}`, `展开 ${props.label}`)
+              : tr(`Collapse ${props.label}`, `收起 ${props.label}`)
+        }
         hitSlop={{ bottom: 6 }}
         class={`h-6 w-full min-w-0 flex-row items-center gap-1 rounded-md corner-squircle pl-2.5 ${props.action ? "pr-8" : "pr-2.5"} ${calm(ROW_PRESS)}`}
       >
@@ -1294,13 +1299,15 @@ function GroupHeading(props: {
         <If when={collapsed() && props.count > 0}>
           <Text class="text-xs tabular-nums text-subtle">{String(props.count)}</Text>
         </If>
-        <View
-          class={`shrink-0 transition-all duration-200 ease-out-quint motion-reduce:transition-none ${
-            collapsed() ? "opacity-55" : "rotate-90 opacity-0 group-hover:opacity-100"
-          }`}
-        >
-          <Icon name="chevronRight" size={12} tone="subtle" />
-        </View>
+        <If when={props.count > 0}>
+          <View
+            class={`shrink-0 transition-all duration-200 ease-out-quint motion-reduce:transition-none ${
+              collapsed() ? "opacity-55" : "rotate-90 opacity-0 group-hover:opacity-100"
+            }`}
+          >
+            <Icon name="chevronRight" size={12} tone="subtle" />
+          </View>
+        </If>
       </BaseButton>
       <If when={props.action}>
         {(action) => (
@@ -1312,7 +1319,7 @@ function GroupHeading(props: {
             shortcut={action().shortcut}
             tipPlacement="right"
             onPress={() => action().onPress()}
-            class={`absolute right-1 top-0 transition-opacity ${inert(HOVER_REVEAL)}`}
+            class={`absolute right-1 top-0 transition-opacity ${actionReveal()}`}
           />
         )}
       </If>
@@ -1326,14 +1333,23 @@ function FunctionalGroup(props: {
   label: string;
   count: number;
   action?: { icon: IconName; label: string; shortcut?: string; onPress: () => void };
+  alwaysShowAction?: boolean;
+  onContextMenu?: (e: ContextMenuEvent) => void;
   first?: boolean;
   children?: JSX.Element;
 }) {
   const collapsed = () => isGroupCollapsed(props.id);
   return (
     <View class={props.first ? "pt-1" : "pt-6"}>
-      <Collapsible open={!collapsed()} reveal content={<View class="pt-1.5">{props.children}</View>}>
-        <GroupHeading id={props.id} label={props.label} count={props.count} action={props.action} />
+      <Collapsible open={!collapsed() && props.count > 0} reveal content={<View class="pt-1.5">{props.children}</View>}>
+        <GroupHeading
+          id={props.id}
+          label={props.label}
+          count={props.count}
+          action={props.action}
+          alwaysShowAction={props.alwaysShowAction}
+          onContextMenu={props.onContextMenu}
+        />
       </Collapsible>
     </View>
   );
@@ -1965,33 +1981,49 @@ async function confirmDeleteNote(note: NoteSummary) {
 }
 
 /**
- * A document in 最近: something written here, beside the sessions it was
- * written for. A press looks at it (the strip's preview seat); writing in it
- * keeps its tab. It drags among the sessions as one of them.
+ * A document in the sidebar's quiet 文档 group: a press looks at it (the strip's
+ * preview seat), writing in it keeps its tab, and hovering shows where the file lives.
  */
 function NoteRow(props: { note: NoteSummary }) {
+  const home = backend().home();
   const selected = () => {
     const v = currentView();
     return v.name === "doc" && v.docId === props.note.path;
   };
-  const menu = (e: ContextMenuEvent) =>
-    Menu.popup(
+  const revealLabel = () => (platform.os === "macos" ? tr("Show in Finder", "在访达中显示") : tr("Show in File Manager", "在文件管理器中显示"));
+  const menu = (e: ContextMenuEvent) => {
+    const targets = docChatTargets();
+    const sessionItems: MenuItem[] = targets.sessions.map((s) => ({
+      label: tr(`Add to “${s.title}”`, `添加到「${s.title}」`),
+      onSelect: () => void addDocToTab(props.note.path, s.tab, { selection: false }),
+    }));
+    return Menu.popup(
       [
         { label: tr("Open", "打开"), onSelect: () => openDocTab(props.note.path) },
-        { label: tr("Add to Chat", "添加到会话"), onSelect: () => void addNoteToChat(props.note.path) },
+        {
+          label: targets.hasActiveDraft ? tr("Add to Current Draft", "添加到当前草稿") : tr("New Session with Document", "用新会话讨论"),
+          onSelect: () =>
+            targets.hasActiveDraft && targets.draftTab
+              ? void addDocToTab(props.note.path, targets.draftTab, { selection: false })
+              : void addDocToNewSession(props.note.path, { selection: false }),
+        },
+        ...sessionItems,
+        { type: "separator" },
+        { label: revealLabel(), onSelect: () => void revealDoc(props.note.path) },
+        { label: tr("Save As…", "另存为…"), onSelect: () => void saveDocAs(props.note.path) },
         { label: tr("Copy Path", "复制路径"), onSelect: () => void Clipboard.writeText(props.note.path) },
         { type: "separator" },
         { label: tr("Delete…", "删除…"), onSelect: () => void confirmDeleteNote(props.note) },
       ],
       e.pagePosition,
     );
+  };
   return (
-    <DropRow list="recents" id={props.note.path} onContextMenu={menu}>
+    <View class={hoverGroup()} onContextMenu={menu}>
       <BaseButton
         selected={selected()}
         onPress={() => openDocTab(props.note.path, { preview: true })}
-        onPressDown={() => armMouseDrag({ list: "recents", id: props.note.path })}
-        onPressUp={endMouseDrag}
+        tooltip={tip(tildePath(props.note.path, home), undefined, "right")}
         class={calm(sessionRowClass(false, false, false))}
       >
         <View class={ICON_SLOT}>
@@ -1999,14 +2031,28 @@ function NoteRow(props: { note: NoteSummary }) {
         </View>
         <Text class={sessionTitleClass(selected())}>{docTabTitle(props.note.path)}</Text>
       </BaseButton>
-    </DropRow>
+    </View>
   );
 }
 
-/** The scrollable tree: 工作区's project folders, 最近's sessions and documents, and 已归档's tucked-away sessions. */
+/** The scrollable tree: 工作区's project folders, 最近's sessions, 文档's Markdown notes, and 已归档's tucked-away sessions. */
 function SidebarTree() {
   const recentCount = () => allRecents().length + (hasRecentDraft() ? 1 + childSessionsOfOpen().length : 0);
   const showRecents = () => recentCount() > 0;
+  const docsGroupMenu = (e: ContextMenuEvent) =>
+    Menu.popup(
+      [
+        { label: tr("New Document", "新建文档"), shortcut: "mod+shift+n", onSelect: () => void newDocTab() },
+        { label: tr("Open Markdown File…", "打开 Markdown 文件…"), onSelect: () => void pickDocTab() },
+        { type: "separator" },
+        {
+          label: platform.os === "macos" ? tr("Show Folder in Finder", "在访达中显示文件夹") : tr("Open Documents Folder", "打开文档文件夹"),
+          onSelect: () => void revealDocsFolder(),
+        },
+        { label: tr("Change Documents Folder…", "更改文档文件夹…"), onSelect: () => void chooseDocsFolder() },
+      ],
+      e.pagePosition,
+    );
 
   // The rows under the pointer are about to move: any relist is a move under a
   // resting pointer — a draft row opening, a daemon push, a rescan, an
@@ -2016,6 +2062,9 @@ function SidebarTree() {
       projects().join(";"),
       allRecents()
         .map((item) => item.id)
+        .join(";"),
+      notes()
+        .map((n) => n.path)
         .join(";"),
       savedSessions()
         .map((s) => s.path)
@@ -2113,9 +2162,7 @@ function SidebarTree() {
               </Reveal>
               <Each of={recents()} key={(item) => item.id}>
                 {(item) =>
-                  item().note ? (
-                    <NoteRow note={item().note!} />
-                  ) : item().child ? (
+                  item().child ? (
                     <DaemonSessionRow session={item().child!} group="recents" nested={item().id.startsWith("recent-child:")} />
                   ) : (
                     <SessionRow session={item().session!} cwd={item().cwd!} group="recents" />
@@ -2138,6 +2185,28 @@ function SidebarTree() {
             </View>
           </FunctionalGroup>
         </Reveal>
+        <FunctionalGroup
+          id="docs"
+          label={tr("Documents", "文档")}
+          count={notes().length}
+          alwaysShowAction={notes().length === 0}
+          onContextMenu={docsGroupMenu}
+          action={{
+            icon: "plus",
+            label: tr("New document", "新建文档"),
+            shortcut: "mod+shift+n",
+            onPress: () => {
+              setGroupCollapsed("docs", false);
+              void newDocTab();
+            },
+          }}
+        >
+          <View testID="sidebar-docs">
+            <Each of={notes()} key={(note) => note.path}>
+              {(note) => <NoteRow note={note()} />}
+            </Each>
+          </View>
+        </FunctionalGroup>
         <Reveal open={archivedSessionItems().length > 0}>
           <FunctionalGroup
             id="archived"
@@ -2218,7 +2287,7 @@ export function Sidebar() {
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
         </If>
       </View>
-      <View class={`shrink-0 flex-row items-center gap-1 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
+      <View class={`shrink-0 flex-row items-center gap-1 pb-2 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
         <BaseButton
           testID="sidebar-new-session"
           onPress={startNewSession}
@@ -2234,21 +2303,6 @@ export function Sidebar() {
         <If when={!leftControls()}>
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
         </If>
-      </View>
-      {/* The other thing to start here: a page of one's own words — a brief, a draft — with the agents a key away. */}
-      <View class={`shrink-0 pb-2 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
-        <BaseButton
-          testID="sidebar-new-doc"
-          onPress={() => void newDocTab()}
-          accessibilityLabel={tr("New document", "新文档")}
-          tooltip={tip(tr("New document", "新文档"), "mod+shift+n", "right")}
-          class={`h-8 min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle px-2.5 ${ROW_PRESS}`}
-        >
-          <View class={ICON_SLOT}>
-            <Icon name="filePlus" size={14} tone="muted-foreground" />
-          </View>
-          <Text class="text-base text-sidebar-foreground">{tr("New document", "新文档")}</Text>
-        </BaseButton>
       </View>
       <SidebarTree />
       <View class="border-t border-sidebar-border px-2 py-1">
