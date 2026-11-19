@@ -17,6 +17,7 @@ const launch = (
     tabs?: string[];
     pickedFolder?: string;
     pickedSaveFile?: string;
+    clock?: Record<string, never>;
   } = {},
 ) =>
   open("./Harness.tsx", {
@@ -24,6 +25,7 @@ const launch = (
     height: 780,
     platform: "macos",
     locale: "en-US",
+    ...(options.clock ? { clock: options.clock } : {}),
     storage: {
       "harness.scenario": "welcome",
       "harness.distinct": "1",
@@ -49,11 +51,10 @@ async function newNote(app: Launched) {
   await app.waitFor(EDITOR);
 }
 
-/** Picks the primary destination ("New Session" or "Current Draft") from the document footer menu. */
-async function discussInPrimary(app: Launched) {
-  await app.press("id:doc-chat-trigger");
-  await app.waitFor("id:doc-chat-menu");
-  await app.press("id:doc-target-new");
+/** Sends the open document to a clean new session, chosen on its sidebar row's menu. */
+async function discussInPrimary(app: Launched, title: string) {
+  await app.rightClick(`${DOCS} >> text:${title}`);
+  await app.chooseMenuItem("New Session with Document");
 }
 
 /** What the last message was sent as: the bubble's Copy puts the wire text on the clipboard. */
@@ -85,6 +86,21 @@ test("'/' lists blocks; the arrows move and Enter picks — every time", async (
   expect(app.count("id:doc-slash-menu")).toBe(1);
   await app.keyboard.press("escape");
   await app.waitUntil(() => app.count("id:doc-slash-menu") === 0);
+});
+
+test("changing body size restyles the open document without editing its words", async () => {
+  const dir = freshDir();
+  const path = `${dir}/plan.md`;
+  const app = await launch({ dir, files: { [path]: "Notes for tomorrow\n" }, tabs: [path] });
+  await app.waitFor("text:What are we building?");
+  await app.press("id:tab-0");
+  await app.waitFor(EDITOR);
+  const line = "id:doc-editor >> text:Notes for tomorrow";
+  expect(app.spanStyle(line).fontSize).toBe(14);
+  await app.press("label:Settings");
+  await app.press("label:Increase body text size");
+  // The live editor behind Settings changes in place; this is not a fresh render on tab selection.
+  expect(app.spanStyle(line).fontSize).toBe(15);
 });
 
 test("a query narrows the list, Tab picks, and nothing to offer gives Enter back", async () => {
@@ -156,7 +172,6 @@ test("sidebar top stays pure (New session only); documents live in their own gro
   await app.wait(300);
   expect(app.count(`${DOCS} >> text:Untitled`)).toBe(1);
   expect(app.count("id:tab-2")).toBe(0);
-  expect(app.enabled("id:doc-chat-trigger")).toBe(false);
 });
 
 test("a document whose tab is closed stays in Documents, a press away", async () => {
@@ -194,17 +209,6 @@ test("a tab on a note nobody wrote in does not come back with the app", async ()
   await app.waitFor("text:What are we building?");
   await app.waitUntil(() => app.count("id:tab-1") === 0);
   expect(app.count(`${DOCS} >> text:Untitled`)).toBe(0);
-});
-
-test("a reply is kept as a document inside Documents", async () => {
-  const app = await launch();
-  await app.waitFor("text:What are we building?");
-  await app.press(`${RECENT} >> text:Refactor the transcript reducer`);
-  await app.waitFor("id:reply-to-note");
-  await app.press("id:reply-to-note");
-  await app.waitFor(EDITOR);
-  await app.waitUntil(() => app.count(`${DOCS} >> text:Here is the plan.`) > 0 || app.count("id:doc-editor") > 0);
-  expect(app.count("id:tab-1")).toBe(1);
 });
 
 test("Settings shows the documents folder, switches to a custom folder, and resets", async () => {
@@ -286,7 +290,7 @@ test("⌘↵ in a document does nothing — never jumps to a hidden session", as
   expect(app.count("id:composer-doc")).toBe(0);
 });
 
-test("Discuss with AI lets you start a clean New Session or target a named open session", async () => {
+test("a document's tab menu sends it to a clean New Session or a named open session", async () => {
   const dir = freshDir();
   const app = await launch({ dir });
   await app.waitFor("text:What are we building?");
@@ -301,14 +305,9 @@ test("Discuss with AI lets you start a clean New Session or target a named open 
   await app.waitFor(EDITOR);
   await app.type(EDITOR, "Ship the tabs on Friday, in snake_case and <xml> as written");
 
-  // Open explicit destination menu: offers New Session + the named open session.
-  await app.press("id:doc-chat-trigger");
-  await app.waitFor("id:doc-chat-menu");
-  expect(app.count("id:doc-chat-menu >> text:New Session")).toBe(1);
-  expect(app.count("id:doc-chat-menu >> text:Refactor the transcript reducer")).toBe(1);
-
-  // Choose New Session: lands on a clean fresh session (not inside Refactor).
-  await app.press("id:doc-target-new");
+  // Choose New Session on the tab's menu: lands on a clean fresh session (not inside Refactor).
+  await app.rightClick("id:tab-1");
+  await app.chooseMenuItem("New Session with Document");
   await app.waitFor("id:composer-doc");
   await app.waitFor("text:What are we building?");
   expect(app.value(COMPOSER) ?? "").toBe("");
@@ -322,9 +321,8 @@ test("Discuss with AI lets you start a clean New Session or target a named open 
   // Now take the same document explicitly to the named existing session (Refactor stays at tab-0).
   await app.press("id:tab-1");
   await app.waitFor(EDITOR);
-  await app.press("id:doc-chat-trigger");
-  await app.waitFor("id:doc-chat-menu");
-  await app.press("id:doc-target-tab-0");
+  await app.rightClick("id:tab-1");
+  await app.chooseMenuItem("Add to “Refactor the transcript reducer”");
   await app.waitFor("id:composer-doc");
   await app.waitFor("label:Conversation >> text:Refactor the transcript reducer");
   await app.type(COMPOSER, "Tighten this");
@@ -343,10 +341,8 @@ test("an unsent draft in the composer is offered as Current Draft without losing
   await app.press("id:sidebar-docs-action");
   await app.waitFor(EDITOR);
   await app.type(EDITOR, "The rest of it");
-  await app.press("id:doc-chat-trigger");
-  await app.waitFor("id:doc-chat-menu");
-  expect(app.count("id:doc-chat-menu >> text:Current Draft")).toBe(1);
-  await app.press("id:doc-target-new");
+  await app.rightClick("id:tab-1");
+  await app.chooseMenuItem("Add to Current Draft");
   await app.waitFor("id:composer-doc");
   await app.wait(300);
   expect(app.value(COMPOSER)).toBe("half a thought");
@@ -359,7 +355,6 @@ test("a passage selected offers Ask AI with explicit session choices", async () 
   await app.type(EDITOR, "Keep this. Polish that");
   for (let i = 0; i < 11; i++) await app.keyboard.press("shift+left");
   await app.waitFor("id:doc-bubble-add");
-  await app.waitUntil(() => said(app, "Ask AI about Selection"));
   await app.press("id:doc-bubble-add");
   await app.chooseMenuItem("New Session");
   await app.waitFor("id:composer-doc >> text:Selection");
@@ -371,11 +366,67 @@ test("a passage selected offers Ask AI with explicit session choices", async () 
   expect(wire.includes("Keep this")).toBe(false);
 });
 
+test("selection bubble defers during rapid sweeps, updates marks in place, and orb reads live selection immediately", async () => {
+  const app = await launch({ clock: {} });
+  await newNote(app);
+  await app.type(EDITOR, "Smooth selection sweep");
+
+  // Rapid Shift+Left steps keep the glass bubble unmounted until the sweep pauses.
+  for (let i = 0; i < 5; i++) {
+    await app.keyboard.press("shift+left");
+    expect(app.count("id:doc-bubble-add")).toBe(0);
+    await app.wait(32);
+  }
+  // Once paused past the settle window, the bubble and word count settle cleanly in one pass.
+  await app.wait(120);
+  await app.waitFor("id:doc-bubble-add");
+  expect(mentions(app, "1 word selected")).toBe(true);
+
+  // Toggling a mark from the bubble applies immediately and keeps the bubble open without flickering.
+  await app.press("label:Bold");
+  expect(app.count("id:doc-bubble-add")).toBe(1);
+  expect(app.spanStyle("id:doc-editor >> text:sweep").fontWeight).toBeGreaterThanOrEqual(600);
+
+  // Collapsing clears immediately, and clicking the orb mid-sweep reads the live selection synchronously before settle.
+  await app.keyboard.press("right");
+  await app.waitUntil(() => app.count("id:doc-bubble-add") === 0);
+  for (let i = 0; i < 5; i++) await app.keyboard.press("shift+left");
+  expect(app.count("id:doc-bubble-add")).toBe(0);
+  await app.press("id:doc-orb-trigger");
+  await app.waitFor("id:doc-orb-selection-chip");
+  expect(mentions(app, "1 word selected")).toBe(true);
+});
+
+test("mouse drag selection keeps bubble hidden mid-drag and reveals immediately on drop", async () => {
+  const dir = freshDir();
+  const path = `${dir}/docs/note-drag.md`;
+  const app = await launch({
+    dir,
+    files: {
+      [path]: "# Drag Smoothness\n\nFirst paragraph with enough words to drag cleanly.\n\nSecond paragraph below it.\n",
+    },
+    tabs: [path],
+  });
+  await app.waitFor("text:What are we building?");
+  await app.press("id:tab-0");
+  await app.waitFor(EDITOR);
+  await app.wait(250);
+
+  // While dragging with pointer down, the glass selection bubble stays unmounted (zero mid-drag reflow/blur).
+  await app.dragAndHold("id:doc-editor >> text:First paragraph with enough words to drag cleanly.", { y: 80 });
+  expect(app.count("id:doc-bubble-add")).toBe(0);
+
+  // Releasing the pointer settles the selection bubble and word count immediately.
+  await app.drop();
+  await app.waitFor("id:doc-bubble-add");
+  expect(mentions(app, "selected")).toBe(true);
+});
+
 test("a document attached is sent as it reads when sent", async () => {
   const app = await launch();
   await newNote(app);
   await app.type(EDITOR, "First thought");
-  await discussInPrimary(app);
+  await discussInPrimary(app, "First thought");
   await app.waitFor("id:composer-doc");
   await app.press("id:composer-doc >> label:First thought");
   await app.waitFor(EDITOR);
@@ -444,12 +495,12 @@ test("what an agent writes to the file is in the open document, and undo takes i
   const app = await launch();
   await newNote(app);
   await app.type(EDITOR, "A draft of the plan");
-  await discussInPrimary(app);
+  await discussInPrimary(app, "A draft of the plan");
   await app.waitFor("id:composer-doc");
   await app.type(COMPOSER, "rewrite this");
   await app.submit(COMPOSER);
   await app.waitFor("id:message-doc");
-  await app.waitFor("id:reply-to-note");
+  await app.waitFor("label:Copy reply");
 
   await app.press("id:message-doc");
   await app.waitFor(EDITOR);
@@ -466,7 +517,7 @@ test("typed while the agent writes: both stand, on screen and on disk", async ()
   await app.waitFor("text:What are we building?");
   await app.press(`${DOCS} >> text:Plan`);
   await app.waitFor(EDITOR);
-  await discussInPrimary(app);
+  await discussInPrimary(app, "Plan");
   await app.waitFor("id:composer-doc");
   await app.type(COMPOSER, "rewrite this slowly");
   await app.submit(COMPOSER);
@@ -516,5 +567,4 @@ test("a file holding what the editor cannot keep is shown, not rewritten", async
   await app.type(EDITOR, " typed");
   await app.wait(1200);
   expect(mentions(app, "Text. typed")).toBe(false);
-  expect(app.enabled("id:doc-chat-trigger")).toBe(true);
 });

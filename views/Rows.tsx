@@ -23,14 +23,16 @@ import {
 } from "../pi/turns";
 import { conversationKey, copyMessage, copyText, daemonSessionOfId, forkFrom, messageQueue, openDaemonSession, takeQueued, transcriptRows } from "../store/app";
 import { docTabTitle, titleLine } from "../store/docs";
-import { noteFromText, openDocIfThere } from "../store/tabs";
+import { openDocIfThere } from "../store/tabs";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { clearProseState, PROSE, ProseBlock, proseVeilUntil, type ProseRow } from "./Prose";
+import { readingType, codeType } from "../ui/typography";
+import { readingSize, FONT_SIZES } from "../store/prefs";
+import { clearProseState, proseClasses, ProseBlock, proseVeilUntil, type ProseRow } from "./Prose";
 
 /**
  * The rows of the chat. `List` recycles its cells, so every row reads its
@@ -467,10 +469,11 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
     return read;
   };
   const said = () => parts().said;
+  const measureKey = () => `${props.row.id}:${readingSize()}`;
   const foldable = () => {
-    const measured = userLineCounts()[props.row.id];
+    const measured = userLineCounts()[measureKey()];
     if (measured !== undefined) return measured > USER_FOLD_LINES;
-    return hardBreakLines(said()) > USER_FOLD_LINES || roughUserLines(said()) >= USER_PREFOLD_LINES;
+    return hardBreakLines(said()) > USER_FOLD_LINES || roughUserLines(said(), undefined, readingSize() / FONT_SIZES.reading.default) >= USER_PREFOLD_LINES;
   };
   const folded = () => foldable() && !open();
   const fold = () => toggle(props.row.id, false);
@@ -550,14 +553,15 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
             accessibilityState={folded() ? { expanded: false } : undefined}
           >
             <Text
-              class={`text-md text-secondary-foreground ${folded() ? "line-clamp-6" : ""}`}
+              class={`${readingType()} text-secondary-foreground ${folded() ? "line-clamp-6" : ""}`}
               style={folded() ? { maskImage: "linear-gradient(to bottom, black 64%, transparent 94%)" } : undefined}
               onTextLayout={(e) => {
                 const n = e.lines.length;
                 // Fewer lines than the text's own breaks (or a zero-height headless stub box) is not a real layout pass.
                 if (n < hardBreakLines(said()) || (n === 1 && (e.lines[0]?.bounds.size.height ?? 0) === 0)) return;
                 if (folded() && n >= USER_FOLD_LINES) return;
-                if (n !== userLineCounts()[props.row.id]) userLineCounts.update((all) => ({ ...all, [props.row.id]: n }));
+                const key = measureKey();
+                if (n !== userLineCounts()[key]) userLineCounts.update((all) => ({ ...all, [key]: n }));
               }}
             >
               {said()}
@@ -718,19 +722,7 @@ function ReplyActionsView(props: { row: ReplyActionsRow }) {
   return (
     <View class="h-6 select-none flex-row items-center">
       <Presence show={!props.row.held} scaleFrom={1} class="-ml-1">
-        <View class="flex-row items-center">
-          <CopyButton id={props.row.id} text={props.row.text} label={tr("Copy reply", "复制回复")} />
-          {/* The reply kept as a document: something to edit, and to take to another session. */}
-          <IconButton
-            testID="reply-to-note"
-            icon="fileEdit"
-            size="sm"
-            tone="subtle"
-            tipPlacement="bottom"
-            label={tr("Save as Document", "存为文档")}
-            onPress={() => void noteFromText(props.row.text)}
-          />
-        </View>
+        <CopyButton id={props.row.id} text={props.row.text} label={tr("Copy reply", "复制回复")} />
       </Presence>
     </View>
   );
@@ -909,7 +901,7 @@ function ThinkingRow(props: { row: Extract<Row, { kind: "thinking" }>; defaultOp
 function ReasoningBody(props: { text: string }) {
   return (
     <View class="mb-1 border-l border-hairline py-1 pl-3.5" selectable>
-      <Text class="text-sm leading-relaxed text-muted-foreground">{props.text.trim()}</Text>
+      <Text class={`${readingType("sm")} leading-relaxed text-muted-foreground`}>{props.text.trim()}</Text>
     </View>
   );
 }
@@ -922,10 +914,10 @@ function Output(props: { text: string; command?: string; tone?: "error"; insetCl
       <Scroll class="max-h-72" contentClass="p-3">
         <View>
           <If when={props.command}>
-            <Text class={`font-mono text-xs leading-relaxed text-subtle ${shown().text ? "pb-2" : ""}`}>{`$ ${props.command}`}</Text>
+            <Text class={`font-mono ${codeType()} leading-relaxed text-subtle ${shown().text ? "pb-2" : ""}`}>{`$ ${props.command}`}</Text>
           </If>
           <If when={!props.command || !!shown().text}>
-            <Text class={`font-mono text-xs leading-relaxed ${props.tone === "error" ? "text-destructive" : "text-muted-foreground"}`}>
+            <Text class={`font-mono ${codeType()} leading-relaxed ${props.tone === "error" ? "text-destructive" : "text-muted-foreground"}`}>
               {shown().text || tr("No output.", "无输出。")}
             </Text>
           </If>
@@ -964,7 +956,7 @@ function ToolDetail(props: { row: ToolRow; insetClass?: string }) {
             markdown={`\`\`\`diff\n${clip(diff(), 400).text}\n\`\`\``}
             selectable
             codeBlockScrollbar={false}
-            classes={{ codeBlock: PROSE.codeBlock, codeBlockCode: "p-3 text-xs" }}
+            classes={{ codeBlock: proseClasses().codeBlock, codeBlockCode: `p-3 ${codeType()}` }}
           />
         </View>
       )}
@@ -1227,6 +1219,8 @@ function NoticeRow(props: { row: Extract<Row, { kind: "notice" }> }) {
   );
 }
 
+const detailProse = () => ({ ...proseClasses(), root: `gap-2 ${readingType("sm")} text-muted-foreground` });
+
 /** A mark in the conversation's history: where context was compacted, a branch summarized. */
 function SummaryRow(props: { row: Extract<Row, { kind: "summary" }> }) {
   const open = () => isOpen(props.row.id, false);
@@ -1236,7 +1230,7 @@ function SummaryRow(props: { row: Extract<Row, { kind: "summary" }> }) {
       reveal
       content={
         <View class="mt-2 rounded-lg corner-squircle border border-border bg-card px-3 py-2.5">
-          <TextView markdown={props.row.text} selectable codeBlockScrollbar={false} tableScrollbar={false} classes={{ ...PROSE, root: "gap-2 text-sm text-muted-foreground" }} />
+          <TextView markdown={props.row.text} selectable codeBlockScrollbar={false} tableScrollbar={false} classes={detailProse()} />
         </View>
       }
     >
@@ -1265,7 +1259,7 @@ function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
       reveal
       content={
         <View class="mt-2 rounded-lg corner-squircle border border-border bg-card px-3 py-2.5">
-          <TextView markdown={props.row.text} selectable codeBlockScrollbar={false} tableScrollbar={false} classes={{ ...PROSE, root: "gap-2 text-sm text-muted-foreground" }} />
+          <TextView markdown={props.row.text} selectable codeBlockScrollbar={false} tableScrollbar={false} classes={detailProse()} />
         </View>
       }
     >

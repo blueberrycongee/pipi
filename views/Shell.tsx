@@ -66,7 +66,7 @@ import { SIDEBAR_GLASS, WALLPAPER_FROST } from "../ui/styles";
 import { isZoomOpen, ZoomLayer } from "../ui/Zoom";
 import { CompareDialog } from "./AgentPicker";
 import { Chat } from "./Chat";
-import { DocDeck } from "./DocEditor";
+import { DocDeck, notifyDocPointerUp } from "./DocEditor";
 import { ExtensionDialog, hasInlinePrompt } from "./ExtensionDialog";
 import { Palette } from "./Palette";
 import { Settings } from "./Settings";
@@ -629,6 +629,7 @@ export function Shell() {
       onMouseMove={
         DYNAMIC_WALLPAPER_ENABLED
           ? (e) => {
+              if (e.pressedButton !== null && currentView().name === "doc") return;
               notifyWallpaperPointerMove(e.pagePosition.x, e.pagePosition.y);
             }
           : undefined
@@ -640,21 +641,19 @@ export function Shell() {
             }
           : undefined
       }
-      onMouseUp={
-        DYNAMIC_WALLPAPER_ENABLED
-          ? (e) => {
-              if (
-                currentView().name === "chat" &&
-                !isPaletteOpen() &&
-                !isCompareOpen() &&
-                !pendingDialog() &&
-                !isWallpaperAdjustOpen()
-              ) {
-                notifyWallpaperClick(e.pagePosition.x, e.pagePosition.y);
-              }
-            }
-          : undefined
-      }
+      onMouseUp={(e) => {
+        notifyDocPointerUp();
+        if (
+          DYNAMIC_WALLPAPER_ENABLED &&
+          currentView().name === "chat" &&
+          !isPaletteOpen() &&
+          !isCompareOpen() &&
+          !pendingDialog() &&
+          !isWallpaperAdjustOpen()
+        ) {
+          notifyWallpaperClick(e.pagePosition.x, e.pagePosition.y);
+        }
+      }}
     >
       <SidebarSplit>
         <Chat />

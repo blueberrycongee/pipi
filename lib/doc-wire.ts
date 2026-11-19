@@ -30,6 +30,13 @@ export interface DocPart {
   excerpt?: boolean;
 }
 
+/** Inline document-editor intent appended after `<document>`/`<selection>` so agents edit the live open file directly. */
+export interface DocEditorContext {
+  path: string;
+  editable: boolean;
+  scope?: "document" | "selection";
+}
+
 const tagOf = (part: DocPart) => (part.excerpt ? "selection" : "document");
 const attr = (value: string) => value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 const unattr = (value: string) => value.replace(/&quot;/g, '"').replace(/&amp;/g, "&");
@@ -39,19 +46,60 @@ function block(part: DocPart) {
   return `<${tag} path="${attr(part.path)}">\n${part.text.trim()}\n</${tag}>`;
 }
 
+/** Trailing context block that tells any agent the user is looking at this live document and expects direct edits to its file. */
+export function formatDocEditorContext(ctx: DocEditorContext): string {
+  const pathAttr = attr(ctx.path);
+  const scopeAttr = ctx.scope === "selection" ? ' scope="selection"' : "";
+  if (!ctx.editable) {
+    return [
+      `<doc_editor_context path="${pathAttr}" editable="false"${scopeAttr}>`,
+      `The user is viewing this Markdown document in read-only mode in pipi. Do not modify the file on disk unless the user asks to edit the raw file; answer in chat instead.`,
+      `</doc_editor_context>`,
+    ].join("\n");
+  }
+  if (ctx.scope === "selection") {
+    return [
+      `<doc_editor_context path="${pathAttr}" editable="true" scope="selection">`,
+      `The user is viewing this live Markdown document in pipi with the above passage selected, and sent this message from the document's floating assistant.`,
+      `Default expectation: update only that selected passage in-place inside "${ctx.path}" with your file tools (read the file first if needed to locate its exact context, and keep the rest of the document untouched) — changes on disk appear immediately in the open editor with one-click Undo.`,
+      `Do not create another file, and do not merely paste a replacement draft in chat when the user wants that passage updated; after editing the file, reply briefly summarizing what changed.`,
+      `Only leave the file untouched if the user is purely asking a question or clarification about the selection.`,
+      `</doc_editor_context>`,
+    ].join("\n");
+  }
+  return [
+    `<doc_editor_context path="${pathAttr}" editable="true">`,
+    `The user is viewing this live Markdown document in pipi and sent this message from the document's floating assistant.`,
+    `Default expectation: edit or write directly into "${ctx.path}" with your file tools — changes on disk appear immediately in the open editor with one-click Undo.`,
+    `Do not create another file, and do not merely paste a replacement draft in chat when the user wants the document written or updated; after editing the file, reply briefly summarizing what changed.`,
+    `Only leave the file untouched if the user is purely asking a question, review, or clarification with no changes requested.`,
+    `</doc_editor_context>`,
+  ].join("\n");
+}
+
+/** Strips a trailing `<doc_editor_context>` block appended for the model, keeping everything else intact. */
+export function stripDocEditorContext(text: string): string {
+  const marker = "\n\n<doc_editor_context ";
+  const idx = text.lastIndexOf(marker);
+  if (idx < 0) return text;
+  const tail = text.slice(idx + 2);
+  return /^<doc_editor_context\b[^>]*>[\s\S]*?<\/doc_editor_context>\s*$/.test(tail) ? text.slice(0, idx) : text;
+}
+
 /**
  * The message a send makes of what was typed and the documents attached.
  * Alone and unremarked, a document goes as its own text — unless that text
  * would read as a command (`/name`, `!cmd`), which a document never is.
  */
-export function composeDocMessage(said: string, parts: readonly DocPart[]): string {
+export function composeDocMessage(said: string, parts: readonly DocPart[], editorContext?: DocEditorContext): string {
   const words = said.trim();
   if (!parts.length) return words;
-  if (!words && parts.length === 1) {
+  if (!words && parts.length === 1 && !editorContext) {
     const text = parts[0].text.trim();
     if (text && !/^[/!]/.test(text) && !OPENING.test(text)) return text;
   }
-  return [words, ...parts.map(block)].filter(Boolean).join("\n\n");
+  const base = [words, ...parts.map(block)].filter(Boolean).join("\n\n");
+  return editorContext ? `${base}\n\n${formatDocEditorContext(editorContext)}` : base;
 }
 
 const OPENING = /^<(document|selection) path="([^"\n]*)">\n/;
@@ -85,12 +133,13 @@ function blocksOf(tail: string): DocPart[] | undefined {
 
 /** A sent message read back: the words typed, and the documents that rode on them. */
 export function splitDocMessage(text: string): { said: string; docs: DocPart[] } {
+  const cleaned = stripDocEditorContext(text);
   const opening = /(^|\n\n)<(?:document|selection) path="[^"\n]*">\n/g;
-  for (let found = opening.exec(text); found; found = opening.exec(text)) {
-    const docs = blocksOf(text.slice(found.index + found[1].length));
-    if (docs) return { said: text.slice(0, found.index), docs };
+  for (let found = opening.exec(cleaned); found; found = opening.exec(cleaned)) {
+    const docs = blocksOf(cleaned.slice(found.index + found[1].length));
+    if (docs) return { said: cleaned.slice(0, found.index), docs };
   }
-  return { said: text, docs: [] };
+  return { said: cleaned, docs: [] };
 }
 
 /**

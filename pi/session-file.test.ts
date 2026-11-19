@@ -1,5 +1,5 @@
 import { expect, test } from "nsh/test";
-import { parseSessionSnapshot } from "./session-file";
+import { parseSessionSnapshot, piHistoryMessages } from "./session-file";
 
 // A saved session file is the switch's first look at the destination: what it
 // reads is what the chat shows while the engine is still starting. Pi's files
@@ -95,7 +95,7 @@ test("a stale background flag on a saved tool call does not survive the read unl
   expect((warm.messages[0] as { content: { background?: boolean }[] }).content[0].background).toBe(true);
 });
 
-test("Pi projection matches SessionManager: wrapped context_edit replacements, nested compactions, empty branch summaries, legacy hookMessage, and latest assistant model", () => {
+test("compaction and context edits change model context, never the saved conversation", () => {
   const snap = parseSessionSnapshot(
     [
       JSON.stringify(PI_HEADER),
@@ -107,7 +107,7 @@ test("Pi projection matches SessionManager: wrapped context_edit replacements, n
         parentId: "a0",
         timestamp: "2026-01-01T00:00:03.000Z",
         tokensBefore: 50000,
-        firstKeptEntryId: "u1",
+        firstKeptEntryId: "c1",
         summary: "Earlier summary that a later compaction supersedes",
       }),
       user("u1", "c1", "before second compaction"),
@@ -149,9 +149,21 @@ test("Pi projection matches SessionManager: wrapped context_edit replacements, n
 
   expect(snap.model).toEqual({ id: "claude-opus-4-6", provider: "anthropic" });
   expect(snap.thinkingLevel).toBe("high");
-  expect(snap.messages.map((m) => m.role)).toEqual(["compactionSummary", "user", "assistant", "custom", "assistant"]);
-  expect((snap.messages[0] as { summary: string }).summary).toBe("Latest compaction summary");
-  expect((snap.messages[2] as { content: { text: string }[] }).content).toEqual([{ type: "text", text: "[trimmed tool output]" }]);
+  expect(snap.messages.map((m) => m.role)).toEqual(["user", "assistant", "compactionSummary", "user", "compactionSummary", "assistant", "custom", "assistant"]);
+  expect(snap.messages[0]).toMatchObject({ content: [{ text: "very old" }] });
+  expect(snap.messages[4]).toMatchObject({ summary: "Latest compaction summary" });
+  expect(snap.messages[5]).toMatchObject({ content: [{ text: "raw verbose output" }] });
+});
+
+test("RPC history follows the engine's leaf, not the last appended branch", () => {
+  const entries = [
+    JSON.parse(user("u", null, "original question")),
+    { type: "compaction", id: "c", parentId: "u", firstKeptEntryId: "c", summary: "summary" },
+    JSON.parse(assistant("a", "c", "continued")),
+    JSON.parse(user("other", "u", "different branch")),
+  ];
+  expect(piHistoryMessages(entries, "a").map(m => m.role)).toEqual(["user", "compactionSummary", "assistant"]);
+  expect(piHistoryMessages(entries, null)).toEqual([]);
 });
 
 test("CRLF endings parse, U+2028 inside a string is not a break, and a torn tail is skipped", () => {

@@ -155,6 +155,13 @@ export interface Model {
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }
 
+export interface PiTreeEntry extends Record<string, unknown> {
+  type: string;
+  id?: string;
+  parentId?: string | null;
+  timestamp?: string | number;
+}
+
 export interface SessionState {
   model?: Model;
   thinkingLevel: ThinkingLevel;
@@ -220,6 +227,7 @@ export interface Commands {
   new_session: { args: { parentSession?: string }; data: { cancelled: boolean } };
   get_state: { args: {}; data: SessionState };
   get_messages: { args: {}; data: { messages: AgentMessage[] } };
+  get_entries: { args: {}; data: { entries: PiTreeEntry[]; leafId: string | null } };
   set_model: { args: { provider: string; modelId: string }; data: Model };
   get_available_models: { args: {}; data: { models: Model[] } };
   set_thinking_level: { args: { level: ThinkingLevel }; data: undefined };

@@ -86,6 +86,33 @@ test("Settings switches sections and subpages without remounting or leaking hidd
   await app.waitUntil(() => app.count("id:settings-nav-agents") === 0);
 });
 
+test("font sizes apply independently to an open chat, persist, and reset", async () => {
+  const key = "pipi.prefs.v1";
+  const app = await open("./Harness.tsx", {
+    width: 1180, height: 780, platform: "macos", locale: "en-US",
+    storage: { "harness.scenario": "history", [key]: JSON.stringify({ fontSizes: { reading: 100, code: -5 } }) },
+  });
+  await app.waitFor("text:Here is the plan.");
+  await app.press("label:Settings");
+  expect(app.enabled("label:Increase body text size")).toBe(false);
+  expect(app.enabled("label:Decrease code size")).toBe(false);
+  await app.press("label:Decrease body text size");
+  await app.press("label:Increase code size");
+  await app.press("label:Increase code size");
+  expect(app.spanStyle("text:git diff --stat").fontSize).toBe(12);
+  await tryShotBytes(app, `${OUT}-font-sizes.png`);
+  expect(JSON.parse(app.storage()[key]).fontSizes).toEqual({ reading: 21, code: 12 });
+  await app.keyboard.press("escape");
+  await app.waitUntil(() => app.count("id:settings-nav-general") === 0);
+  expect(app.spanStyle("label:Conversation >> text:Look around and tell me what this project is").fontSize).toBe(21);
+  expect(app.spanStyle("text:Here is the plan.").fontSize).toBe(21);
+  expect(app.spanStyle("text:const answer = 42;").fontSize).toBe(12);
+  expect(app.spanStyle("text:Ask Pi…").fontSize).toBe(21);
+  await app.press("label:Settings");
+  await app.press("text:Reset sizes");
+  expect(JSON.parse(app.storage()[key]).fontSizes).toEqual({ reading: 14, code: 11 });
+});
+
 test("Shortcuts lists the app's keys as platform caps", async () => {
   const app = await open("./Harness.tsx", {
     width: 1180,

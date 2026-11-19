@@ -114,6 +114,12 @@ import {
   docsFolder,
   type Language,
   language,
+  FONT_SIZES,
+  type FontRole,
+  readingSize,
+  codeSize,
+  setFontSize,
+  resetFontSizes,
   pipCoat,
   preferredRuntimeMode,
   runInBackground,
@@ -143,6 +149,7 @@ import { Icon, type IconName } from "../ui/Icon";
 import { animateNextLayout, delayedFade, FloatingLayer, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, ViewDeck } from "../ui/motion";
 import { FOCUS_RING, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
+import { readingType, codeType } from "../ui/typography";
 import { CroppedWallpaperSurface, openWallpaperAdjust } from "./Wallpaper";
 
 const SECTIONS: { id: SettingsSection; label: () => string; icon: IconName }[] = [
@@ -1033,6 +1040,22 @@ function wallpaperPauseModeLabel(mode: WallpaperPauseMode) {
   }
 }
 
+function FontSizeRow(props: { role: FontRole; title: string; description: string }) {
+  const size = props.role === "reading" ? readingSize : codeSize;
+  const limits = FONT_SIZES[props.role];
+  return (
+    <SettingRow title={props.title} description={props.description}>
+      <View class="flex-row items-center rounded-lg corner-squircle bg-card p-0.5">
+        <IconButton icon="minus" size="sm" label={tr(`Decrease ${props.title.toLowerCase()} size`, `减小${props.title}字号`)}
+          disabled={size() <= limits.min} onPress={() => setFontSize(props.role, size() - 1)} />
+        <Text class="w-11 text-center text-sm tabular-nums text-foreground">{`${size()} pt`}</Text>
+        <IconButton icon="plus" size="sm" label={tr(`Increase ${props.title.toLowerCase()} size`, `增大${props.title}字号`)}
+          disabled={size() >= limits.max} onPress={() => setFontSize(props.role, size() + 1)} />
+      </View>
+    </SettingRow>
+  );
+}
+
 /** App-wide preferences only: the model, thinking and run knobs belong to a session and its harness. */
 function General() {
   return (
@@ -1045,7 +1068,23 @@ function General() {
         <SettingRow title={tr("Language", "语言")}>
           <Segmented label={tr("Language", "语言")} value={language()} options={LANGUAGE_VALUES.map((value) => ({ value, label: languageOptionLabel(value) }))} onChange={setLanguage} />
         </SettingRow>
+      </SettingGroup>
+      <SettingGroup title={tr("Font size", "字号")}>
+        <FontSizeRow role="reading" title={tr("Body text", "正文")} description={tr("Messages, drafts and documents", "消息、输入框与文档")} />
         <Rule />
+        <FontSizeRow role="code" title={tr("Code", "代码")} description={tr("Code blocks and tool output", "代码块与工具输出")} />
+        <Rule />
+        <View class="flex-row items-center justify-between gap-4 py-3">
+          <View class="min-w-0 flex-1 gap-1">
+            <Text class={`${readingType()} text-foreground`}>{tr("A preview of your text.", "这是一行正文预览。")}</Text>
+            <Text class={`${codeType()} font-mono text-muted-foreground`}>git diff --stat</Text>
+          </View>
+          <Button size="sm" variant="ghost" label={tr("Reset sizes", "恢复默认字号")}
+            disabled={readingSize() === FONT_SIZES.reading.default && codeSize() === FONT_SIZES.code.default}
+            onPress={resetFontSizes} />
+        </View>
+      </SettingGroup>
+      <SettingGroup title={tr("Background", "背景")}>
         <SettingRow
           title={tr("Wallpaper", "壁纸")}
           description={

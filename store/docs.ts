@@ -4,12 +4,16 @@ import {
   RichEditorPlugin,
   StarterKit,
   TableKit,
+  chain,
   createRichEditor,
   defineExtension,
+  deleteRange,
   focus as focusAt,
+  insertContent,
   markdown,
   setTextSelection,
   suggestion,
+  undo as undoCommand,
   type RichEditorSession,
 } from "nsh/base";
 import { plainMarkdown } from "../lib/doc-wire";
@@ -54,6 +58,29 @@ const EXTERNAL_EDIT_PLUGIN = "pipiExternalEdit";
 const docs = new Map<string, MarkdownDoc>();
 /** Ticks when a document opens or closes: what names a document by its path (a tab, a card) asks again. */
 const opened = signal(0);
+let updateEventSeq = 0;
+
+/** Listeners informed when a document tab closes (used by the inline AI assistant store to detach cleanly). */
+const docCloseListeners = new Set<(path: string) => void>();
+export function onDocClosed(listener: (path: string) => void): () => void {
+  docCloseListeners.add(listener);
+  return () => docCloseListeners.delete(listener);
+}
+
+/** Optional predicate checked before firing the global file-update toast (suppressed when an inline doc assistant is already displaying its update pill + inline badge). */
+let suppressDiskToast: ((path: string) => boolean) | undefined;
+export function setDiskUpdateToastSuppressor(fn: ((path: string) => boolean) | undefined) {
+  suppressDiskToast = fn;
+}
+
+/** A visible update landed on an open document from disk or from an applied AI reply. */
+export interface DocUpdateEvent {
+  id: number;
+  at: number;
+  source: "disk" | "insert" | "replace" | "append";
+  deltaWords: number;
+  conflict: boolean;
+}
 
 export interface MarkdownDoc {
   /** The backing file's absolute path — the document's identity and its tab's ref. */
@@ -70,6 +97,12 @@ export interface MarkdownDoc {
   words: () => number;
   /** The file holds what the editor cannot keep (raw HTML, footnotes): it is shown, never rewritten. */
   readOnly: () => boolean;
+  /** Most recent visible update banner (disk sync or applied AI edit), cleared on dismiss or undo. */
+  lastUpdate: () => DocUpdateEvent | undefined;
+  /** Monotonic counter incremented every time an update lands on this document. */
+  updateSeq: () => number;
+  /** Dismisses the floating update pill without undoing the edit. */
+  dismissUpdate: () => void;
 }
 
 interface DocState {
@@ -79,6 +112,8 @@ interface DocState {
   savingFlag: Signal<boolean>;
   wordCount: Signal<number>;
   readOnlyFlag: Signal<boolean>;
+  lastUpdateEvent: Signal<DocUpdateEvent | undefined>;
+  updateCount: Signal<number>;
   saveTimer: ReturnType<typeof setTimeout> | undefined;
   countTimer: ReturnType<typeof setTimeout> | undefined;
   /** Serializes writes and reads of the file so a save never overlaps a newer one, or a look at the disk. */
@@ -95,8 +130,12 @@ interface DocState {
   front: string;
   /** The session's revision after a change that was the file's, not the person's: no save answers it. */
   quiet: number;
+  /** Revision whose update triggered an intentional highlight (kept alive until a subsequent edit). */
+  highlightRev: number;
   /** The file changed the document while it was not in front: said when it next is. */
   changedUnseen: boolean;
+  /** Pending update banner waiting to appear when the document comes forward. */
+  pendingUpdate: DocUpdateEvent | undefined;
   /** Changed document range waiting to be flashed when the document comes forward. */
   pendingHighlight: { from: number; to: number } | undefined;
   /** Active timers clearing or fading the external-edit highlight. */
@@ -268,27 +307,35 @@ function lastPos(session: RichEditorSession): number {
 /** The document's text before `pos`, a line per block: where a caret is, in characters. */
 const textBefore = (session: RichEditorSession, pos: number) => session.textBetween(0, pos, "\n").length;
 
+function applyDecorations(state: DocState, session: RichEditorSession, decorations: Parameters<RichEditorSession["setDecorations"]>[1]) {
+  const before = session.revision;
+  try {
+    session.setDecorations(EXTERNAL_EDIT_PLUGIN, decorations);
+  } catch {}
+  const after = session.revision;
+  if (after !== before) {
+    if (state.quiet === before) state.quiet = after;
+    if (state.highlightRev === before) state.highlightRev = after;
+  }
+}
+
 function clearHighlight(state: DocState, session?: RichEditorSession) {
   while (state.highlightTimers.length) {
     const timer = state.highlightTimers.pop();
     if (timer !== undefined) clearTimeout(timer);
   }
   state.pendingHighlight = undefined;
-  try {
-    session?.setDecorations(EXTERNAL_EDIT_PLUGIN, []);
-  } catch {}
+  if (session) applyDecorations(state, session, []);
 }
 
 function flashHighlight(state: DocState, session: RichEditorSession, range: { from: number; to: number }) {
   clearHighlight(state, session);
   if (range.from >= range.to) return;
   const paint = (cls: string) => {
-    try {
-      session.setDecorations(EXTERNAL_EDIT_PLUGIN, [{ from: range.from, to: range.to, kind: "inline", attrs: { class: cls } }]);
-    } catch {}
+    applyDecorations(state, session, [{ from: range.from, to: range.to, kind: "inline", attrs: { class: cls } }]);
   };
-  paint("rounded-xs bg-brand-soft");
   if (reduceMotion()) {
+    paint("rounded-xs bg-brand-soft");
     state.highlightTimers.push(
       setTimeout(() => {
         clearHighlight(state, session);
@@ -296,10 +343,50 @@ function flashHighlight(state: DocState, session: RichEditorSession, range: { fr
     );
     return;
   }
+  // Smooth multi-stage highlight sweep: blooms gently into the brand tint, holds briefly, then dissolves back into the paper.
+  paint("rounded-xs bg-brand/22");
   state.highlightTimers.push(
-    setTimeout(() => paint("rounded-xs bg-brand/5"), 1550),
-    setTimeout(() => clearHighlight(state, session), 1850),
+    setTimeout(() => paint("rounded-xs bg-brand/16"), 220),
+    setTimeout(() => paint("rounded-xs bg-brand/12"), 950),
+    setTimeout(() => paint("rounded-xs bg-brand/8"), 1350),
+    setTimeout(() => paint("rounded-xs bg-brand/4"), 1700),
+    setTimeout(() => clearHighlight(state, session), 2050),
   );
+}
+
+/** Finds the ProseMirror position corresponding to a character offset in `session.textBetween(0, pos, "\n")`. */
+function posAtChar(session: RichEditorSession, end: number, chars: number): number {
+  let low = 0;
+  let high = end;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (textBefore(session, mid) < chars) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+/** Computes common prefix & suffix lengths ignoring trailing newline skew so a single-word rewrite never highlights the rest of the document. */
+function diffSpan(wasRaw: string, nowRaw: string): { head: number; tail: number; wasLen: number; nowLen: number } {
+  const was = wasRaw.replace(/\s+$/, "");
+  const now = nowRaw.replace(/\s+$/, "");
+  let head = 0;
+  while (head < was.length && head < now.length && was[head] === now[head]) head++;
+  let tail = 0;
+  while (tail < was.length - head && tail < now.length - head && was[was.length - 1 - tail] === now[now.length - 1 - tail]) tail++;
+  return { head, tail, wasLen: was.length, nowLen: now.length };
+}
+
+/** Computes the exact changed ProseMirror range after mutating `session` from previous plain text `was`. */
+function diffChangedRange(session: RichEditorSession, was: string): { from: number; to: number } | undefined {
+  const now = session.textBetween(undefined, undefined, "\n");
+  const { head, tail, nowLen } = diffSpan(was, now);
+  const changedEnd = nowLen - tail;
+  if (changedEnd <= head) return undefined;
+  const end = lastPos(session);
+  const from = posAtChar(session, end, head);
+  const to = posAtChar(session, end, changedEnd);
+  return from < to ? { from, to } : undefined;
 }
 
 /**
@@ -314,25 +401,12 @@ function replaceContent(session: RichEditorSession, text: string): { from: numbe
   const places = [selection.anchor, selection.head].map((pos) => (pos === undefined ? undefined : textBefore(session, pos)));
   session.setContent(text, "markdown");
   const now = session.textBetween(undefined, undefined, "\n");
-  let head = 0;
-  while (head < was.length && head < now.length && was[head] === now[head]) head++;
-  let tail = 0;
-  while (tail < was.length - head && tail < now.length - head && was[was.length - 1 - tail] === now[now.length - 1 - tail]) tail++;
+  const { head, tail, wasLen, nowLen } = diffSpan(was, now);
   const end = lastPos(session);
   /** Where a place in the old text is in the new: as it was before the change, as far from the end after it, at its edge inside it. */
-  const across = (at: number) => (at <= head ? at : at >= was.length - tail ? now.length - (was.length - at) : Math.min(head, now.length));
-  /** The first position with that much text before it. */
-  const posOf = (chars: number) => {
-    let low = 0;
-    let high = end;
-    while (low < high) {
-      const mid = (low + high) >> 1;
-      if (textBefore(session, mid) < chars) low = mid + 1;
-      else high = mid;
-    }
-    return low;
-  };
-  const changedEnd = now.length - tail;
+  const across = (at: number) => (at <= head ? at : at >= wasLen - tail ? Math.max(0, nowLen - (wasLen - at)) : Math.min(head, nowLen));
+  const posOf = (chars: number) => posAtChar(session, end, chars);
+  const changedEnd = nowLen - tail;
   const changed = changedEnd > head ? { from: posOf(head), to: posOf(changedEnd) } : undefined;
   if (places[0] !== undefined) {
     const anchor = posOf(across(places[0]));
@@ -375,14 +449,26 @@ function reconcile(path: string, state: DocState, session: RichEditorSession, di
   if (theirs === mine) return;
   const merged = mine === base ? { text: theirs, conflict: false } : merge3(base, mine, theirs);
   if (merged.text !== mine) {
+    const beforeWords = session.words();
     const changed = replaceContent(session, merged.text);
     // The change is the file's: the listener that hears it has nothing to save.
     state.quiet = session.revision;
+    state.highlightRev = session.revision;
     setTitle(path, state, session, merged.text);
     countWords(state, session);
+    const event: DocUpdateEvent = {
+      id: ++updateEventSeq,
+      at: Date.now(),
+      source: "disk",
+      deltaWords: session.words() - beforeWords,
+      conflict: merged.conflict,
+    };
+    state.updateCount.update((n) => n + 1);
     state.changedUnseen = true;
+    state.pendingUpdate = event;
     state.pendingHighlight = changed;
     sayChanged(path, state);
+    if (isNote(path)) void refreshNotes();
   }
   if (merged.conflict) {
     toast("warning", tr("This document also changed on disk; where both changed the same lines, what you wrote was kept", "文档在磁盘上也被修改了；两边改到同一处的地方保留了你写的"));
@@ -405,8 +491,15 @@ function sayChanged(path: string, state: DocState) {
   if (view.name !== "doc" || view.docId !== path) return;
   if (state.changedUnseen) {
     state.changedUnseen = false;
-    const undo = keymap.label("mod+z");
-    toast("info", tr(`This document was updated from its file — ${undo} takes it back`, `文档已随文件的改动更新，${undo} 可撤回`));
+    if (!suppressDiskToast?.(path)) {
+      const undo = keymap.label("mod+z");
+      toast("info", tr(`This document was updated from its file — ${undo} takes it back`, `文档已随文件的改动更新，${undo} 可撤回`));
+    }
+  }
+  if (state.pendingUpdate) {
+    const ev = state.pendingUpdate;
+    state.pendingUpdate = undefined;
+    state.lastUpdateEvent.set(ev);
   }
   const range = state.pendingHighlight;
   const session = state.session();
@@ -549,6 +642,8 @@ export function ensureDoc(path: string, options?: { caret?: "end" }): MarkdownDo
     savingFlag: signal(false),
     wordCount: signal(0),
     readOnlyFlag: signal(false),
+    lastUpdateEvent: signal<DocUpdateEvent | undefined>(undefined),
+    updateCount: signal(0),
     saveTimer: undefined,
     countTimer: undefined,
     saveTail: Promise.resolve(),
@@ -558,7 +653,9 @@ export function ensureDoc(path: string, options?: { caret?: "end" }): MarkdownDo
     base: "",
     front: "",
     quiet: -1,
+    highlightRev: -1,
     changedUnseen: false,
+    pendingUpdate: undefined,
     pendingHighlight: undefined,
     highlightTimers: [],
     loaded: Promise.resolve(),
@@ -572,6 +669,9 @@ export function ensureDoc(path: string, options?: { caret?: "end" }): MarkdownDo
     saving: () => state.savingFlag(),
     words: () => state.wordCount(),
     readOnly: () => state.readOnlyFlag(),
+    lastUpdate: () => state.lastUpdateEvent(),
+    updateSeq: () => state.updateCount(),
+    dismissUpdate: () => state.lastUpdateEvent.set(undefined),
   };
   docs.set(path, doc);
   states.set(path, state);
@@ -595,9 +695,13 @@ export function ensureDoc(path: string, options?: { caret?: "end" }): MarkdownDo
         session.setEditable(false);
       }
       if (options?.caret === "end") session.run(focusAt("end"));
-      state.stopListeners = session.on("update", () => {
-        if (session.revision !== state.quiet) {
-          clearHighlight(state, session);
+      state.stopListeners = session.on("update", (ev) => {
+        const rev = (ev as { revision?: number } | undefined)?.revision ?? session.revision;
+        if (rev !== state.quiet && session.revision !== state.quiet) {
+          if (rev !== state.highlightRev && session.revision !== state.highlightRev) {
+            clearHighlight(state, session);
+            if (state.lastUpdateEvent()) state.lastUpdateEvent.set(undefined);
+          }
           scheduleSave(path, state, session);
         }
       });
@@ -666,11 +770,91 @@ export async function docFileContent(path: string): Promise<string | undefined> 
 /** Closes under way, by path: a document opened again meanwhile reads the file only after the last save landed. */
 const closings = new Map<string, Promise<void>>();
 
+/**
+ * Applies an AI reply directly into the open document as one undoable step,
+ * highlights the exact changed text range with a smooth sweep, and surfaces
+ * the floating update pill so the user can undo in one press (`⌘Z`).
+ */
+export function applyDocEdit(
+  path: string,
+  mode: "replace" | "insert" | "append",
+  markdownText: string,
+  range?: { from: number; to: number },
+): boolean {
+  const state = states.get(path);
+  const session = state?.session();
+  const body = markdownText.trim();
+  if (!state || !session || state.readOnlyFlag() || !body) return false;
+  const beforeText = session.textBetween(undefined, undefined, "\n");
+  const beforeWords = session.words();
+  let changed: { from: number; to: number } | undefined;
+
+  if (mode === "append") {
+    const existing = session.getMarkdown().trimEnd();
+    const combined = existing ? `${existing}\n\n${body}` : body;
+    changed = replaceContent(session, combined);
+    session.run(focusAt("end"));
+  } else if (mode === "replace" && range && range.to > range.from) {
+    const end = lastPos(session);
+    const from = Math.max(0, Math.min(range.from, end));
+    const to = Math.max(from, Math.min(range.to, end));
+    if (to > from) {
+      const ok = session.run(chain([deleteRange({ from, to }), insertContent(body, "markdown")]));
+      if (!ok) {
+        session.run(setTextSelection(from, to));
+        session.insertContent(body, "markdown");
+      }
+    } else {
+      session.insertContent(body, "markdown");
+    }
+    changed = diffChangedRange(session, beforeText);
+  } else {
+    session.insertContent(body, "markdown");
+    changed = diffChangedRange(session, beforeText);
+  }
+
+  state.highlightRev = session.revision;
+  setTitle(path, state, session, session.getMarkdown());
+  countWords(state, session);
+  const ev: DocUpdateEvent = {
+    id: ++updateEventSeq,
+    at: Date.now(),
+    source: mode,
+    deltaWords: session.words() - beforeWords,
+    conflict: false,
+  };
+  state.updateCount.update((n) => n + 1);
+  state.lastUpdateEvent.set(ev);
+  if (changed) flashHighlight(state, session, changed);
+  scheduleSave(path, state, session);
+  session.focus();
+  return true;
+}
+
+/** Undoes the last change in the open document and clears any active update banner/highlight. */
+export function undoDoc(path: string): boolean {
+  const state = states.get(path);
+  const session = state?.session();
+  if (!state || !session || state.readOnlyFlag()) return false;
+  const ok = session.run(undoCommand());
+  clearHighlight(state, session);
+  state.lastUpdateEvent.set(undefined);
+  setTitle(path, state, session, session.getMarkdown());
+  countWords(state, session);
+  session.focus();
+  return ok;
+}
+
 /** Flushes pending writes and lets the document's session go. */
 export function closeDoc(path: string): Promise<void> {
   const doc = docs.get(path);
   const state = states.get(path);
   if (!doc || !state) return closings.get(path) ?? Promise.resolve();
+  for (const listener of [...docCloseListeners]) {
+    try {
+      listener(path);
+    } catch {}
+  }
   // Off the books at once: the same path opened again is a new document, not this one on its way out.
   docs.delete(path);
   states.delete(path);
@@ -685,7 +869,10 @@ export function closeDoc(path: string): Promise<void> {
     if (state.countTimer !== undefined) clearTimeout(state.countTimer);
     state.stopListeners();
     clearHighlight(state, session);
-    if (session && state.dirtyFlag()) state.saveTail = state.saveTail.then(() => writeDoc(path, state, session));
+    const cleanEmptyGenerated = Boolean(session && state.onDisk && session.isEmpty && isNote(path) && isGeneratedNoteName(path));
+    if (session && (state.dirtyFlag() || cleanEmptyGenerated)) {
+      state.saveTail = state.saveTail.then(() => writeDoc(path, state, session));
+    }
     await state.saveTail.catch(() => undefined);
     session?.dispose();
     // The shelf lists what the save left before the open note's own row goes: a written note never blinks off it.
@@ -724,6 +911,44 @@ export function flushDoc(path: string): Promise<void> {
   clearTimeout(state.saveTimer);
   state.saveTimer = undefined;
   state.saveTail = state.saveTail.then(() => writeDoc(path, state, session));
+  return state.saveTail;
+}
+
+/**
+ * Ensures an open writable document exists on disk with its latest contents
+ * before handing its path to an inline agent — including a brand-new blank note,
+ * so the agent's read/edit tools can update the file immediately without ENOENT.
+ */
+export function ensureDocOnDisk(path: string): Promise<void> {
+  const state = states.get(path);
+  if (!state) return Promise.resolve();
+  state.saveTail = state.saveTail.then(async () => {
+    await state.loaded;
+    const session = state.session();
+    if (!session || states.get(path) !== state || state.readOnlyFlag()) return;
+    if (state.saveTimer !== undefined) {
+      clearTimeout(state.saveTimer);
+      state.saveTimer = undefined;
+      await writeDoc(path, state, session);
+    }
+    if (state.onDisk) return;
+    const text = session.getMarkdown();
+    const out = state.front ? `${state.front}${state.front.endsWith("\n") ? "" : "\n"}\n${text}` : text;
+    try {
+      await fs.mkdir(path.split("/").slice(0, -1).join("/"), { recursive: true });
+      await fs.writeFile(path, out);
+      state.onDisk = true;
+      state.disk = out;
+      state.base = text;
+      state.mtime = await fs.stat(path).then(
+        (stat) => stat.mtimeMs,
+        () => 0,
+      );
+      if (state.saveTimer === undefined) state.dirtyFlag.set(false);
+    } catch {
+      toast("warning", tr("Could not prepare the document file", "无法准备文档文件"));
+    }
+  });
   return state.saveTail;
 }
 

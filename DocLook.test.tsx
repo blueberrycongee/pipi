@@ -1,10 +1,10 @@
 import { open, test } from "nsh/test";
 
 // The document as it is drawn, and its explicit way to a session and back:
-// a full document, an empty one, the `/` menu, the explicit destination menu,
-// a passage selected, `@` mention in the composer, the card it is on the
-// composer, the message it rode on, a draft expanded with ⌘E returning to its
-// origin session, and the Documents folder setting.
+// a full document, an empty one, the `/` menu, a passage selected, `@`
+// mention in the composer, the card it is on the composer, the message it
+// rode on, a draft expanded with ⌘E returning to its origin session, and the
+// Documents folder setting.
 //
 //   nsh test DocLook.test.tsx --target macos   → .nsh/shots/doc-*.png
 
@@ -79,13 +79,6 @@ test("look", async () => {
   await app.wait(800);
   await app.screenshot(".nsh/shots/doc-full.png");
 
-  // Explicit destination menu from the document footer.
-  await app.press("id:doc-chat-trigger");
-  await app.waitFor("id:doc-chat-menu");
-  await app.wait(300);
-  await app.screenshot(".nsh/shots/doc-targets.png");
-  await app.keyboard.press("escape");
-
   // A new document from the Documents group's `+`: blank page, listed in Documents (not Recent).
   await app.hover("id:sidebar-docs-action");
   await app.press("id:sidebar-docs-action");
@@ -104,7 +97,7 @@ test("look", async () => {
   await app.wait(500);
   await app.screenshot(".nsh/shots/doc-note-preview.png");
 
-  // A passage selected: the bubble offers Ask AI, and the foot says Ask AI about Selection.
+  // A passage selected: the bubble offers Pip inline and Ask AI to a session.
   await app.keyboard.press("mod+down");
   for (let i = 0; i < 13; i++) await app.keyboard.press("shift+left");
   await app.waitFor("id:doc-bubble-add");
@@ -113,9 +106,8 @@ test("look", async () => {
   await app.keyboard.press("right");
 
   // Taken explicitly to a new session: a card on the composer, the words still in the document.
-  await app.press("id:doc-chat-trigger");
-  await app.waitFor("id:doc-chat-menu");
-  await app.press("id:doc-target-new");
+  await app.rightClick("id:tab-1");
+  await app.chooseMenuItem("New Session with Document");
   await app.waitFor("id:composer-doc");
   await app.wait(600);
   await app.screenshot(".nsh/shots/doc-card.png");

@@ -2,7 +2,7 @@ import { readFile } from "fs/promises";
 import { Canvas, cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, Overlay, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
 import type { InputRef, PasteEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input, Popover } from "nsh/base";
-import { money, tildePath } from "../lib/format";
+import { money } from "../lib/format";
 import { matchDocMentions, readDocMention, removeDocMention, type DocMentionInput } from "../lib/doc-mention";
 import { commandSourceLabel, tr } from "../lib/i18n";
 import { matchCommands, matchOptions, readSlashInput } from "../lib/slash";
@@ -37,15 +37,15 @@ import {
   transcriptRows,
   waitingCount,
 } from "../store/app";
-import { backend } from "../store/backend";
 import { docAt } from "../store/docs";
-import { SEND_MODES, sendMode, setSendMode, type SendMode } from "../store/prefs";
-import { attachDocToCurrentComposer, draftToDoc, mentionableDocs, openDocTab, pickDocTab } from "../store/tabs";
+import { readingSize, FONT_SIZES, SEND_MODES, sendMode, setSendMode, type SendMode } from "../store/prefs";
+import { attachDocToCurrentComposer, draftToDoc, mentionableDocs, openDocTab } from "../store/tabs";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, enter, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, SPRING } from "../ui/motion";
 import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
+import { readingType } from "../ui/typography";
 import { AgentPicker, PermissionPicker } from "./AgentPicker";
 import { ExtensionPrompt } from "./ExtensionDialog";
 import { ModelPicker, ThinkingPicker } from "./ModelPicker";
@@ -511,79 +511,6 @@ function DocMentionMenu(props: {
 }
 
 /** Quiet toolbar button for mouse users to attach an existing document to this session. */
-function DocAttachPicker(props: { onOpen: () => void }) {
-  const open = signal(false);
-  const docs = () => mentionableDocs();
-  const home = backend().home();
-  return (
-    <Presence show={docs().length > 0} scaleFrom={0.85}>
-      <Popover
-        open={open()}
-        onOpenChange={(e) => {
-          if (e.open) props.onOpen();
-          open.set(e.open);
-        }}
-        placement="top"
-        align="end"
-        offset={8}
-        margin={12}
-        popupClass={`w-64 overflow-hidden p-1 ${POPUP}`}
-        popupStyle={popupStyle("top", "end")}
-        popupStartingStyle={popupHiddenStyle("top", "end")}
-        popupEndingStyle={popupLeavingStyle("top", "end")}
-        trigger={
-          <IconButton
-            testID="composer-attach-doc"
-            icon="file"
-            size="sm"
-            tone="muted-foreground"
-            label={tr("Attach document (@)", "引用文档 (@)")}
-            tipPlacement="top"
-          />
-        }
-      >
-        <View testID="composer-doc-picker" class="gap-0.5">
-          <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
-            {tr("Attach document", "引用文档")}
-          </Text>
-          <Scroll class="max-h-56" contentClass="gap-0.5">
-            <Each of={docs()} key={(doc) => doc.path}>
-              {(doc) => (
-                <BaseButton
-                  onPress={() => {
-                    open.set(false);
-                    void attachDocToCurrentComposer(doc().path);
-                    focusComposer();
-                  }}
-                  tooltip={tip(tildePath(doc().path, home), undefined, "left")}
-                  class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
-                >
-                  <Icon name="file" size={14} tone="muted-foreground" class="shrink-0" />
-                  <Text class="min-w-0 flex-1 truncate text-sm text-foreground">{doc().title}</Text>
-                  <If when={doc().open}>
-                    <Text class="shrink-0 text-xs text-subtle">{tr("Open", "已打开")}</Text>
-                  </If>
-                </BaseButton>
-              )}
-            </Each>
-          </Scroll>
-          <View class="mx-2 my-1 h-px bg-border" />
-          <BaseButton
-            onPress={() => {
-              open.set(false);
-              void pickDocTab();
-            }}
-            class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
-          >
-            <Icon name="folderOpen" size={14} tone="subtle" class="shrink-0" />
-            <Text class="min-w-0 flex-1 truncate text-sm text-muted-foreground">{tr("Open Markdown File…", "打开 Markdown 文件…")}</Text>
-          </BaseButton>
-        </View>
-      </Popover>
-    </Presence>
-  );
-}
-
 /**
  * A document riding on the message: a card naming it, and whether all of it
  * goes or a passage. A press goes back to the document — the words are still
@@ -1038,13 +965,13 @@ export function Composer() {
             autoCorrect={false}
             disabled={sidecarPhase().name === "failed"}
             accessibilityLabel={tr("Message", "消息")}
-            class="ml-4 mr-9 mt-4 text-md text-foreground caret-brand"
-            style={{ height: height() }}
+            class={`ml-4 mr-9 mt-4 ${readingType()} text-foreground caret-brand`}
+            style={{ height: Math.max(height(), Math.ceil(MIN_HEIGHT * readingSize() / FONT_SIZES.reading.default)) }}
           />
           {/* A draft past its second line is offered room: it goes on as a document, where Return is
               a new line and every word is kept. The field's right margin is the button's seat always,
               so its arrival never re-wraps what is written. */}
-          <Presence show={height() >= LONG_DRAFT_HEIGHT} scaleFrom={0.85} class="absolute right-2 top-2.5">
+          <Presence show={height() >= Math.round(LONG_DRAFT_HEIGHT * readingSize() / FONT_SIZES.reading.default)} scaleFrom={0.85} class="absolute right-2 top-2.5">
             <IconButton
               testID="composer-to-doc"
               icon="expand"
@@ -1060,7 +987,7 @@ export function Composer() {
               integer offsets under the dock's transform and visibly steps a frame late. */}
           <If when={showPlaceholder()}>
             <View class="pointer-events-none absolute left-4 right-9 top-4">
-              <Text class="truncate text-md text-subtle">{placeholder()}</Text>
+              <Text class={`truncate ${readingType()} text-subtle`}>{placeholder()}</Text>
             </View>
           </If>
           <ExtensionLines below />
@@ -1074,7 +1001,6 @@ export function Composer() {
               <If when={ready()}>
                 <ContextMeter />
               </If>
-              <DocAttachPicker onOpen={dismissMenus} />
               <PermissionPicker onOpen={dismissMenus} />
               <View style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
                 <If

@@ -87,6 +87,31 @@ test("update card: the code package is the download the check prefers", async ()
   await app.waitFor("text:Restarting pipi 0.3.0");
 });
 
+test("update card: a shell-only archive update stays quiet after a package restart", async () => {
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    // Already running the 0.3.0 code package on an older installed shell:
+    // checkAppPackage finds nothing newer, and checkAppUpdate flags `shell: true`.
+    storage: {
+      "harness.settings": "about",
+      "harness.update": JSON.stringify({ ...UPDATE, shell: true }),
+    },
+  });
+  await app.waitFor("text:Updates");
+
+  // Past the automatic boot check (3.5s): the update card does not reappear.
+  await app.wait(4200);
+  expect(app.texts()).not.toContain("pipi 0.3.0 is available");
+
+  // A manual check from About agrees the app is up to date.
+  await app.press("text:Check");
+  await app.waitFor("text:pipi is up to date");
+  expect(app.texts()).not.toContain("pipi 0.3.0 is available");
+});
+
 test("update card: indeterminate track", async () => {
   const app = await open("./Harness.tsx", {
     width: 1180,

@@ -159,6 +159,13 @@ density: 13pt is the interface size, 14pt the reading size.
 | `text-xl` | 17 / 24 | h1 in replies |
 | `text-2xl` | 20 / 26 | Page and stage titles (semibold, tight) |
 
+Settings → General → Font size keeps two independent choices in 1pt steps:
+body text (12–22pt, default 14) for messages, drafts and documents, and code
+(10–20pt, default 11) for code blocks and expanded tool output. Headings,
+inline code and line heights follow the surrounding prose; controls, captions
+and navigation keep their interface scale. Both choices have one live preview
+and one reset to the defaults.
+
 Weights: regular, `font-medium` for names and selected things,
 `font-semibold` for titles. Numbers that change use `tabular-nums`.
 
@@ -242,7 +249,7 @@ the marks. The column is the conversation's, a step narrower (720): prose
 being written, not replies being read.
 
 The editor lays blocks out as a flow with no gap of its own, so the rhythm is
-each block's margins (`EDITOR_CLASSES`, `views/DocEditor.tsx`): paragraphs
+each block's margins (`editorClasses`, `views/DocEditor.tsx`): paragraphs
 stand 12 apart; a heading opens a section with more above it than below
 (24 over an h1 or h2, 20 over an h3, 4–8 under); a list's items sit 4 apart,
 as close as lines of one thought; what is boxed — code, a table, a quote —
@@ -254,13 +261,45 @@ Under the page, one 44pt line on the column's own edges. Left, in `text-xs`
 file's compact path for external files); hovering shows the full path and a
 click reveals the file on disk. That is a property, not a state — nothing here
 or on the tab blinks with each pause in typing; a save that fails is a toast.
-Right: a quiet secondary button that names an explicit destination instead of
-blindly pushing via ⌘↵ — "Discuss with AI ▾" ("Ask AI about Selection ▾" when a
-passage is selected), opening a menu with "New Session" (or "Current Draft"
-when unsent text already waits in the composer) and each open session by name.
-A draft expanded from a session with ⌘E remembers its exact origin and shows a
-one-click "Back to …" split button instead. The brand stays on the composer's
-send, where a message actually leaves.
+Right: nothing, unless the document was expanded from a session's draft with
+⌘E — then a one-click "Back to …" names its exact origin session. The ways a
+document reaches an agent stay explicit — the composer's `@`, the tab's and
+sidebar row's menus, "Ask AI" on a selection — never a blind ⌘↵ into a hidden
+session. The brand stays on the composer's send, where a message actually
+leaves.
+
+Floating in the bottom-right corner above the footer sits the document's inline
+AI orb (`views/DocOrb.tsx`, `store/doc-assistant.ts`): a 46pt Liquid Glass
+circle holding Pip (`idle` at rest, rotating cobalt halo while working, tiny
+cobalt pearl when an unread reply waits) tucked out of the 720pt reading
+column's way. Hovering (or pressing ⌘J / clicking Pip in a selection's bubble
+menu) smoothly blooms a Liquid Glass mini-composer up and leftward out of the
+anchored Pip seat (synchronized 2D critically damped spring, fixed-width stage
+so text never squishes mid-morph): a spacious prompt input above a compact
+toolbar with independent Engine, Model, Thinking/Effort (shown only for models
+that reason), and Permission pickers aligned to the same 16pt left edge as the
+main composer, plus a removable selection chip when a passage is highlighted.
+Opening any picker popover keeps the mini-composer steadily open, while Escape
+closes an open popover first before collapsing back to the orb. Requests sent
+from the document's floating assistant carry an edit-first `<doc_editor_context>`
+pointing at the open file (materializing even a newly created blank note on disk
+before sending) so agents directly write or update the document in front of the
+user instead of merely pasting replacement drafts in chat; while an empty
+writable document is being drafted, a delayed breathing drafting skeleton
+(`DocDraftingSkeleton`) fills the 720pt column softly until content lands.
+Submitting raises a matching right-aligned Liquid Glass reply drawer directly
+above the bar — keeping the left side of the document visible alongside the
+reply — showing a breathing skeleton shimmer while thinking/running tools, then
+pipi's veiled streaming Markdown prose, Copy (plus Replace / Insert / Append
+whenever the reply was not already written straight to disk), and seamless
+handoff to a full chat tab. Whenever the document updates from disk or an
+applied edit, a compositor-driven refresh choreography (`DocRefreshSweep`: a
+brief translucent ink-settle veil swept top-to-bottom by a luminous cobalt
+shimmer curtain and hairline crest over the reading column), a multi-stage
+inline highlight sweep on the exact changed span, and a top-left floating
+"Document updated · Undo" pill make the update unmistakable without interrupting
+reading; slow file opens reveal a delayed breathing page skeleton (`DocSkeleton`)
+only past 180ms so fast local reads never flash.
 
 A document rides on a message the way an image does: attached, not pasted.
 From any session's composer, typing `@` (or pressing the quiet document icon

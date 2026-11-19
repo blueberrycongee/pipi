@@ -263,11 +263,11 @@ function estimateParagraphLines(line: string, maxWidthPt: number): number {
  * Calibrated pre-layout line estimate for `UserRow` (`text-md` = 14pt in a
  * `~504pt` inner bubble). Counts grapheme clusters rather than UTF-16 code units.
  */
-export function roughUserLines(text: string, maxWidthPt = USER_BUBBLE_INNER_PT): number {
+export function roughUserLines(text: string, maxWidthPt = USER_BUBBLE_INNER_PT, fontScale = 1): number {
   if (!text) return 0;
   let total = 0;
   for (const paragraph of text.split("\n")) {
-    total += estimateParagraphLines(paragraph, maxWidthPt);
+    total += estimateParagraphLines(paragraph, maxWidthPt / fontScale);
   }
   return total;
 }

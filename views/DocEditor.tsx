@@ -1,9 +1,11 @@
 import {
+  batch,
   cleanup,
   colorScheme,
   computed,
   createAnimatedValue,
   effect,
+  keymap,
   platform,
   reduceMotion,
   signal,
@@ -21,7 +23,6 @@ import {
   exitSuggestion,
   insertContent,
   insertTable,
-  Popover,
   RichEditor,
   setBlockType,
   toggleList,
@@ -37,13 +38,22 @@ import { activeLanguage, tr } from "../lib/i18n";
 import { currentView, showChat, wallpaper } from "../store/app";
 import { backend } from "../store/backend";
 import { ensureDoc, isNote, revealDoc, SLASH_KEYS, syncDoc, type MarkdownDoc } from "../store/docs";
+import { ensureDocAssistant, type DocSelection } from "../store/doc-assistant";
 import { addDocToNewSession, addDocToTab, docChatTargets, docDraftOrigin, openTabs, returnDraftDocToOrigin } from "../store/tabs";
-import { AgentLogo } from "../ui/AgentLogo";
 import { Icon, type IconName } from "../ui/Icon";
-import { type DeckPane, DURATION, EASING, keepLast, LayerActive, popupHiddenStyle, popupLeavingStyle, popupStyle, ViewDeck } from "../ui/motion";
-import { RollingText } from "../ui/RollingText";
+import { type DeckPane, DURATION, EASING, keepLast, LayerActive, ViewDeck } from "../ui/motion";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
+import { readingType, codeType } from "../ui/typography";
 import { tip } from "../ui/Tip";
+import {
+  createDocOrbPointerBridge,
+  DocActivityRibbon,
+  DocDraftingSkeleton,
+  DocFloatingOrb,
+  DocRefreshSweep,
+  DocSkeleton,
+  DocUpdatePill,
+} from "./DocOrb";
 
 interface SlashItem {
   id: string;
@@ -98,7 +108,7 @@ interface SlashState {
  * above it than below, and what is boxed (code, a table, a quote) keeps a
  * little more room than prose.
  */
-const EDITOR_CLASSES = {
+const editorClasses = computed(() => ({
   root: "flex-1",
   content: "mx-auto w-full max-w-180 px-10",
   placeholder: "text-subtle",
@@ -110,17 +120,17 @@ const EDITOR_CLASSES = {
   composition: "underline",
   taskCheckbox:
     "mr-2 mt-2.5 size-4 rounded-xs corner-squircle border border-hairline-focus bg-background transition-all duration-150 ease-out-quint hover:border-brand/70 active:scale-90 motion-reduce:transition-none motion-reduce:active:scale-100 checked:border-brand checked:bg-brand",
-  listMarker: "text-subtle tabular-nums",
+  listMarker: `${readingType()} text-subtle tabular-nums`,
   selectedCell: "bg-brand-soft",
   tableGrip: "rounded-full bg-hairline-hover transition-colors duration-100 hover:bg-brand",
   tableResizeHandle: "bg-brand/60",
   tableDropIndicator: "bg-brand",
   nodes: {
-    paragraph: "my-1.5 text-md leading-relaxed text-foreground",
-    "heading[level=1]": "mb-2 mt-6 text-3xl font-semibold leading-tight tracking-tight text-foreground",
-    "heading[level=2]": "mb-1.5 mt-6 text-xl font-semibold leading-snug tracking-tight text-foreground",
-    "heading[level=3]": "mb-1 mt-5 text-lg font-semibold leading-snug text-foreground",
-    heading: "mb-1 mt-4 text-md font-semibold leading-snug text-foreground",
+    paragraph: `my-1.5 ${readingType()} leading-relaxed text-foreground`,
+    "heading[level=1]": `mb-2 mt-6 ${readingType("3xl")} font-semibold leading-tight tracking-tight text-foreground`,
+    "heading[level=2]": `mb-1.5 mt-6 ${readingType("xl")} font-semibold leading-snug tracking-tight text-foreground`,
+    "heading[level=3]": `mb-1 mt-5 ${readingType("lg")} font-semibold leading-snug text-foreground`,
+    heading: `mb-1 mt-4 ${readingType()} font-semibold leading-snug text-foreground`,
     bulletList: "my-1 pl-6",
     orderedList: "my-1 pl-6",
     taskList: "my-1 pl-1",
@@ -129,7 +139,7 @@ const EDITOR_CLASSES = {
     taskItem: "-my-1",
     "taskItem[checked=true]": "-my-1 opacity-60",
     blockquote: "my-2.5 border-l-2 border-hairline-focus pl-4",
-    codeBlock: "my-2.5 rounded-xl corner-squircle border border-border bg-sunken px-4 py-3.5 font-mono text-xs leading-relaxed text-foreground",
+    codeBlock: `my-2.5 rounded-xl corner-squircle border border-border bg-sunken px-4 py-3.5 font-mono ${codeType()} leading-relaxed text-foreground`,
     horizontalRule: "my-5 h-px bg-border",
     table: "my-2.5 w-full rounded-lg corner-squircle border border-border",
     tableCell: "border border-border px-3 py-0.5",
@@ -139,10 +149,10 @@ const EDITOR_CLASSES = {
     bold: "font-semibold",
     italic: "italic",
     strike: "text-muted-foreground line-through",
-    code: "rounded-sm corner-squircle bg-muted px-1.5 py-0.5 font-mono text-sm text-foreground",
+    code: `rounded-sm corner-squircle bg-muted px-1.5 py-0.5 font-mono ${readingType("sm")} text-foreground`,
     link: "text-brand-text underline",
   },
-};
+}));
 
 const SLASH_MENU_W = 240;
 const SLASH_ROW_H = 32;
@@ -179,15 +189,34 @@ function edgeFade(direction: "to bottom" | "to top", solidPx: number, fadePx: nu
   return `linear-gradient(${direction}, ${stops.join(", ")})`;
 }
 
+const CJK_RUN_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]+/g;
+const WORD_RE = /[A-Za-z0-9\u00C0-\u024F\u0400-\u04FF]+(?:['’-][A-Za-z0-9\u00C0-\u024F\u0400-\u04FF]+)*/g;
+
 /** Words in a selected passage, CJK-aware without relying on `\p{...}` in QuickJS. */
 function countSelectionWords(text: string): number {
   const trimmed = text.trim();
   if (!trimmed) return 0;
-  const cjkRe = /[\u3400-\u4DBF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/g;
-  const cjk = trimmed.match(cjkRe)?.length ?? 0;
-  const rest = trimmed.replace(cjkRe, " ");
-  const words = rest.match(/[A-Za-z0-9\u00C0-\u024F\u0400-\u04FF]+(?:['’-][A-Za-z0-9\u00C0-\u024F\u0400-\u04FF]+)*/g)?.length ?? 0;
-  return cjk + words;
+  let total = 0;
+  const runs = trimmed.match(CJK_RUN_RE);
+  if (runs) {
+    for (let i = 0; i < runs.length; i++) total += runs[i]!.length;
+  }
+  const words = trimmed.match(WORD_RE);
+  if (words) total += words.length;
+  return total;
+}
+
+/** Brief settle pause before raising the selection bubble after a keyboard sweep or mouse-down before drag. */
+const SELECTION_SETTLE_MS = 110;
+/** Two keyboard selection steps within this window hide an already-open bubble until the sweep settles. */
+const RAPID_EXTEND_MS = 180;
+/** Safety settle when a drag leaves the app window and releases on the desktop without a window mouse-up. */
+const OUTSIDE_RELEASE_MS = 260;
+
+const pointerUpListeners = new Set<() => void>();
+/** Notifies open document editors when a mouse button releases anywhere in the window. */
+export function notifyDocPointerUp() {
+  for (const fn of pointerUpListeners) fn();
 }
 
 /**
@@ -304,7 +333,10 @@ function BubbleButton(props: {
   class?: string;
   rev: () => number;
 }) {
-  const on = () => (props.rev(), props.session.isActive(props.mark));
+  const on = computed(() => {
+    props.rev();
+    return props.session.isActive(props.mark);
+  });
   return (
     <BaseButton
       onPress={() => props.session.run(toggleMark(props.mark))}
@@ -322,27 +354,54 @@ function BubbleButton(props: {
   );
 }
 
+interface EditorPointerBridge {
+  onMove: (pressed: boolean) => void;
+  onLeave: () => void;
+  onUp: () => void;
+}
+
 /**
  * The editor on a document whose file has been read. It listens to the
- * session once, and on a keystroke does only what a keystroke can change:
- * the `/` menu's state and whether text is selected. Nothing here serializes
- * the document as it is typed.
+ * session once, and keeps active selection drags completely free of glass
+ * bubble reflows, FFI text copies, word-count regexes, and cross-pane signal
+ * churn — settling the bubble menu, footer count, and AI selection context in
+ * one batch the instant the drag releases (or a keyboard sweep pauses).
  */
 function Editor(props: {
   doc: MarkdownDoc;
   session: RichEditorSession;
   picked: { (): boolean; set: (on: boolean) => void };
   pickedWords: Signal<number>;
+  liveSelection: Signal<DocSelection | undefined>;
+  drafting: () => boolean;
+  onDraggingChange: (dragging: boolean) => void;
+  bindPointer: (bridge: EditorPointerBridge) => () => void;
+  bindSelectionReader: (reader: () => DocSelection | undefined) => () => void;
 }) {
   const session = props.session;
   const slash = signal<SlashState | null>(null);
   const index = signal(0);
-  /** Text is selected: the bubble menu's marks apply, and the passage is what goes to a session. */
+  /** Text selection has settled: footer count and AI selection scope follow this. */
   const picked = props.picked;
-  /** Ticks while text is selected, so the marks' buttons follow the selection. */
+  /** Selection bubble menu is mounted (kept unmounted while actively dragging or sweeping). */
+  const bubbleOpen = signal(false);
+  /** Ticks when a settled selection or its marks change, so the marks' buttons follow. */
   const rev = signal(0);
   /** Captured keys already answered, by trigger: a count that only grows, never replayed. */
   const keysSeen = new Map<string, number>();
+
+  let pointerDown = false;
+  let pointerOutside = false;
+  let dragSelecting = false;
+  let lastSyncedRev = -1;
+  let lastFrom = -1;
+  let lastTo = -1;
+  let committedFrom = -1;
+  let committedTo = -1;
+  let committedRev = -1;
+  let lastRangeChangeAt = 0;
+  let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  let outsideTimer: ReturnType<typeof setTimeout> | undefined;
 
   const items = computed(() => slashFilter(slash()?.query ?? ""));
 
@@ -358,57 +417,263 @@ function Editor(props: {
     session.focus();
   }
 
-  function sync() {
-    let found: SlashState | null = null;
-    for (const key of SLASH_KEYS) {
-      const s = session.suggestion(key);
-      if (!s) continue;
-      const seen = keysSeen.get(key);
-      const pressed = s.active && seen !== undefined && s.keyCount > seen ? s.lastKey : undefined;
-      keysSeen.set(key, s.keyCount);
-      if (!s.active || found) continue;
-      found = { key, id: s.decorationId ?? "", from: s.range.from, to: s.range.to, query: s.query ?? "" };
-      const before = slash();
-      if (before?.id !== found.id) index.set(0);
-      const list = slashFilter(found.query);
-      if (!list.length) {
-        // Nothing to offer: the menu must not keep Enter and Tab from the text.
-        session.run(exitSuggestion(key));
-        found = null;
-        continue;
-      }
-      if (before && before.query !== found.query) index.set(0);
-      if (pressed === "ArrowUp") index.update((i) => (Math.min(i, list.length - 1) - 1 + list.length) % list.length);
-      else if (pressed === "ArrowDown") index.update((i) => (i + 1) % list.length);
-      else if (pressed === "Enter" || pressed === "Tab") {
-        slash.set(found);
-        apply(list[Math.min(index(), list.length - 1)]);
-        return;
-      }
+  function clearTimers() {
+    if (settleTimer !== undefined) {
+      clearTimeout(settleTimer);
+      settleTimer = undefined;
     }
-    const before = slash();
-    if (found?.id !== before?.id || found?.from !== before?.from || found?.to !== before?.to || found?.query !== before?.query) slash.set(found);
-    const sel = session.selection as { type?: string; anchor?: number; head?: number };
-    const has = sel.type === "text" && sel.anchor !== undefined && sel.head !== undefined && sel.anchor !== sel.head;
-    if (has !== picked()) picked.set(has);
-    if (has) {
-      rev.update((n) => n + 1);
-      const from = Math.min(sel.anchor!, sel.head!);
-      const to = Math.max(sel.anchor!, sel.head!);
-      props.pickedWords.set(countSelectionWords(session.textBetween(from, to, " ")));
-    } else if (props.pickedWords() !== 0) {
-      props.pickedWords.set(0);
+    if (outsideTimer !== undefined) {
+      clearTimeout(outsideTimer);
+      outsideTimer = undefined;
     }
   }
-  session.on("transaction", sync);
-  session.on("selectionUpdate", sync);
-  sync();
+
+  function setDragSelecting(next: boolean) {
+    if (dragSelecting === next) return;
+    dragSelecting = next;
+    props.onDraggingChange(next);
+  }
+
+  function rawTextRange(): { from: number; to: number } | undefined {
+    const sel = session.selection as { type?: string; anchor?: number; head?: number };
+    if (sel.type !== "text" || sel.anchor === undefined || sel.head === undefined || sel.anchor === sel.head) {
+      return undefined;
+    }
+    return { from: Math.min(sel.anchor, sel.head), to: Math.max(sel.anchor, sel.head) };
+  }
+
+  /** Reads the live selection synchronously on demand (⌘J, orb click/hover), reusing the settled cache when current. */
+  function readLiveSelection(): DocSelection | undefined {
+    const range = rawTextRange();
+    if (!range) return undefined;
+    const cached = untracked(props.liveSelection);
+    if (cached && cached.from === range.from && cached.to === range.to && committedRev === session.revision) {
+      return cached;
+    }
+    const text = session.textBetween(range.from, range.to, "\n\n").trim();
+    if (!text) return undefined;
+    return { from: range.from, to: range.to, text, words: countSelectionWords(text) };
+  }
+
+  function clearSelectionState() {
+    clearTimers();
+    lastFrom = -1;
+    lastTo = -1;
+    committedFrom = -1;
+    committedTo = -1;
+    committedRev = -1;
+    batch(() => {
+      if (untracked(bubbleOpen)) bubbleOpen.set(false);
+      if (untracked(picked)) picked.set(false);
+      if (untracked(props.pickedWords) !== 0) props.pickedWords.set(0);
+      if (untracked(props.liveSelection) !== undefined) props.liveSelection.set(undefined);
+    });
+  }
+
+  function commitSelection() {
+    clearTimers();
+    const range = rawTextRange();
+    if (!range) {
+      clearSelectionState();
+      return;
+    }
+    const { from, to } = range;
+    lastFrom = from;
+    lastTo = to;
+
+    const revNow = session.revision;
+    lastSyncedRev = revNow;
+    const prev = untracked(props.liveSelection);
+    let nextSel = prev;
+    let words = untracked(props.pickedWords);
+    if (from !== committedFrom || to !== committedTo || revNow !== committedRev) {
+      const text = session.textBetween(from, to, "\n\n").trim();
+      words = countSelectionWords(text);
+      nextSel = text
+        ? prev && prev.from === from && prev.to === to && prev.text === text && prev.words === words
+          ? prev
+          : { from, to, text, words }
+        : undefined;
+      committedFrom = from;
+      committedTo = to;
+      committedRev = revNow;
+    }
+
+    batch(() => {
+      if (!untracked(picked)) picked.set(true);
+      if (!untracked(bubbleOpen)) bubbleOpen.set(true);
+      rev.update((n) => n + 1);
+      if (untracked(props.pickedWords) !== words) props.pickedWords.set(words);
+      if (untracked(props.liveSelection) !== nextSel) props.liveSelection.set(nextSel);
+    });
+  }
+
+  function scheduleSettle(delayMs = SELECTION_SETTLE_MS) {
+    if (settleTimer !== undefined) clearTimeout(settleTimer);
+    settleTimer = setTimeout(() => {
+      settleTimer = undefined;
+      if (!dragSelecting) commitSelection();
+    }, delayMs);
+  }
+
+  function scheduleOutsideFallback() {
+    if (outsideTimer !== undefined) clearTimeout(outsideTimer);
+    outsideTimer = setTimeout(() => {
+      outsideTimer = undefined;
+      if ((pointerDown || dragSelecting) && pointerOutside) {
+        pointerDown = false;
+        setDragSelecting(false);
+        commitSelection();
+      }
+    }, OUTSIDE_RELEASE_MS);
+  }
+
+  function finishPointerDrag() {
+    const wasDragging = dragSelecting;
+    const hadPending = settleTimer !== undefined;
+    const wasDown = pointerDown;
+    pointerDown = false;
+    setDragSelecting(false);
+    if (outsideTimer !== undefined) {
+      clearTimeout(outsideTimer);
+      outsideTimer = undefined;
+    }
+    if (!wasDragging && !hadPending && !wasDown && (untracked(bubbleOpen) || !session.isFocused)) {
+      return;
+    }
+    const range = rawTextRange();
+    if (!range) {
+      if (wasDragging || hadPending || untracked(picked) || untracked(bubbleOpen)) clearSelectionState();
+      return;
+    }
+    // Commit immediately on mouse release (zero lag after drag or double-click).
+    if (wasDragging || hadPending || (wasDown && !untracked(bubbleOpen)) || (session.isFocused && !untracked(bubbleOpen))) {
+      commitSelection();
+    }
+  }
+
+  function sync(initial = false) {
+    const revNow = session.revision;
+    const slashActive = untracked(slash) !== null;
+    // Coalesce duplicate or queued transactions that observe the same settled revision.
+    if (!initial && !slashActive && revNow === lastSyncedRev) return;
+    lastSyncedRev = revNow;
+
+    if (!dragSelecting || slashActive) {
+      let found: SlashState | null = null;
+      for (const key of SLASH_KEYS) {
+        const s = session.suggestion(key);
+        if (!s) continue;
+        const seen = keysSeen.get(key);
+        const pressed = s.active && seen !== undefined && s.keyCount > seen ? s.lastKey : undefined;
+        keysSeen.set(key, s.keyCount);
+        if (!s.active || found) continue;
+        found = { key, id: s.decorationId ?? "", from: s.range.from, to: s.range.to, query: s.query ?? "" };
+        const before = untracked(slash);
+        if (before?.id !== found.id) index.set(0);
+        const list = slashFilter(found.query);
+        if (!list.length) {
+          // Nothing to offer: the menu must not keep Enter and Tab from the text.
+          session.run(exitSuggestion(key));
+          found = null;
+          continue;
+        }
+        if (before && before.query !== found.query) index.set(0);
+        if (pressed === "ArrowUp") index.update((i) => (Math.min(i, list.length - 1) - 1 + list.length) % list.length);
+        else if (pressed === "ArrowDown") index.update((i) => (i + 1) % list.length);
+        else if (pressed === "Enter" || pressed === "Tab") {
+          slash.set(found);
+          apply(list[Math.min(index(), list.length - 1)]);
+          return;
+        }
+      }
+      const before = untracked(slash);
+      if (found?.id !== before?.id || found?.from !== before?.from || found?.to !== before?.to || found?.query !== before?.query) {
+        slash.set(found);
+      }
+    }
+
+    const range = rawTextRange();
+    if (!range) {
+      clearSelectionState();
+      return;
+    }
+
+    if (initial) {
+      commitSelection();
+      return;
+    }
+
+    const rangeChanged = range.from !== lastFrom || range.to !== lastTo;
+    lastFrom = range.from;
+    lastTo = range.to;
+
+    if (pointerDown && (rangeChanged || dragSelecting)) {
+      // Actively dragging a text selection: keep the glass bubble unmounted and defer FFI/word-count work until release.
+      setDragSelecting(true);
+      if (untracked(bubbleOpen)) bubbleOpen.set(false);
+      if (settleTimer !== undefined) {
+        clearTimeout(settleTimer);
+        settleTimer = undefined;
+      }
+      if (pointerOutside) scheduleOutsideFallback();
+      return;
+    }
+
+    if (!rangeChanged && untracked(bubbleOpen)) {
+      // Same range (e.g. toggling Bold/Italic): refresh mark buttons immediately without hiding the bar.
+      commitSelection();
+      return;
+    }
+
+    const now = Date.now();
+    const rapid = now - lastRangeChangeAt < RAPID_EXTEND_MS;
+    lastRangeChangeAt = now;
+    if (untracked(bubbleOpen) && rapid) {
+      bubbleOpen.set(false);
+    }
+    scheduleSettle(SELECTION_SETTLE_MS);
+  }
+
+  const stopTx = session.on("transaction", () => sync(false));
+  const unbindPointer = props.bindPointer({
+    onMove(pressed) {
+      pointerOutside = false;
+      if (outsideTimer !== undefined) {
+        clearTimeout(outsideTimer);
+        outsideTimer = undefined;
+      }
+      if (pressed) {
+        pointerDown = true;
+      } else if (pointerDown || dragSelecting) {
+        finishPointerDrag();
+      }
+    },
+    onLeave() {
+      pointerOutside = true;
+      if (pointerDown || dragSelecting) scheduleOutsideFallback();
+    },
+    onUp: finishPointerDrag,
+  });
+  const unbindReader = props.bindSelectionReader(readLiveSelection);
+  cleanup(() => {
+    clearTimers();
+    stopTx();
+    pointerUpListeners.delete(finishPointerDrag);
+    unbindPointer();
+    unbindReader();
+    setDragSelecting(false);
+  });
+  sync(true);
 
   // In front on the deck: the caret is the document's. Asked again a turn
   // later — the pane is laid out (`display`) in the commit this runs in.
   const layerActive = LayerActive();
   effect(() => {
     if (!layerActive()) {
+      clearTimers();
+      pointerDown = false;
+      setDragSelecting(false);
       // Behind the chat (or a sheet): the keyboard is not the document's.
       if (untracked(() => session.isFocused)) session.blur();
       return;
@@ -417,7 +682,17 @@ function Editor(props: {
     void syncDoc(props.doc.path);
     session.focus();
     const timer = setTimeout(() => session.focus(), 0);
-    cleanup(() => clearTimeout(timer));
+    pointerUpListeners.add(finishPointerDrag);
+    const unbind = keymap.bind(
+      "mod+j",
+      () => ensureDocAssistant(props.doc.path).requestFocus(readLiveSelection()),
+      { when: "always" },
+    );
+    cleanup(() => {
+      clearTimeout(timer);
+      pointerUpListeners.delete(finishPointerDrag);
+      unbind();
+    });
   });
 
   return (
@@ -426,21 +701,21 @@ function Editor(props: {
         editor={session}
         autoFocus
         accessibilityLabel={tr("Document", "文档")}
-        placeholder={tr("Write a brief, a draft, anything…  “/” for blocks", "写需求、写文章、随手记…  输入“/”插入块")}
+        placeholder={props.drafting() ? "" : tr("Write a brief, a draft, anything…  “/” for blocks", "写需求、写文章、随手记…  输入“/”插入块")}
         placeholders={{
           heading: tr("Heading", "标题"),
           blockquote: tr("Quote", "引用"),
           codeBlock: tr("Code", "代码"),
         }}
-        classes={EDITOR_CLASSES}
-        styles={{ content: { paddingTop: topBarHeight() + 28, paddingBottom: 120 } }}
+        classes={editorClasses()}
+        styles={{ content: { paddingTop: topBarHeight() + 28, paddingBottom: 156 } }}
         bubbleMenuPlacement={slash() ? "bottom" : "top"}
         bubbleMenuOffset={slash() ? 6 : 8}
         bubbleMenu={
           <If
             when={slash()}
             else={
-              <If when={picked()}>
+              <If when={bubbleOpen()}>
                 <PopIn placement="top">
                   <View class={`flex-row items-center gap-0.5 p-1 ${POPUP}`} style={GLASS_REGULAR}>
                     <If when={!props.doc.readOnly()}>
@@ -450,6 +725,16 @@ function Editor(props: {
                       <BubbleButton session={session} mark="code" label="</>" title={tr("Inline Code", "行内代码")} shortcut="mod+e" class="font-mono" rev={rev} />
                       <View class="mx-1 h-4 w-px bg-border" />
                     </If>
+                    {/* Quick inline AI right inside the document floating bar. */}
+                    <BaseButton
+                      testID="doc-bubble-quick-ai"
+                      onPress={() => ensureDocAssistant(props.doc.path).requestFocus(readLiveSelection())}
+                      tooltip={tip(tr("Edit or ask inline with Pip", "在文档中直接唤起 AI 处理"), "mod+j", "top")}
+                      class="group h-7 flex-row items-center gap-1 rounded-md corner-squircle px-2 transition-colors duration-100 ease-out-quint hover:bg-brand-soft active:scale-[0.96] motion-reduce:transition-none motion-reduce:active:scale-100"
+                    >
+                      <Icon name="sparkle" size={13} tone="brand-text" />
+                      <Text class="text-sm font-medium text-brand-text">{tr("Pip", "Pip")}</Text>
+                    </BaseButton>
                     {/* Explicit session choice for the selected passage — never a mystery target. */}
                     <BaseButton
                       testID="doc-bubble-add"
@@ -536,81 +821,12 @@ function openSelectionMenu(path: string) {
   void Menu.popup(items);
 }
 
-/** Explicit destination rows inside the footer's AI discussion popover. */
-function DocChatMenuItems(props: { path: string; picked: () => boolean; onDone: () => void }) {
-  const targets = () => docChatTargets();
-  return (
-    <View testID="doc-chat-menu" class="gap-0.5">
-      <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
-        {props.picked()
-          ? tr("Ask about selection in…", "在哪个会话中讨论选中内容")
-          : tr("Discuss this document in…", "在哪个会话中讨论这篇文档")}
-      </Text>
-      <BaseButton
-        testID="doc-target-new"
-        onPress={() => {
-          const t = targets();
-          if (t.hasActiveDraft && t.draftTab) void addDocToTab(props.path, t.draftTab);
-          else void addDocToNewSession(props.path);
-          props.onDone();
-        }}
-        class={`min-h-9 flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1.5 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
-      >
-        <Icon name="pencil" size={14} tone="foreground" class="shrink-0" />
-        <View class="min-w-0 flex-1">
-          <Text class="truncate text-base text-foreground">
-            {targets().hasActiveDraft ? tr("Current Draft", "当前草稿") : tr("New Session", "新建会话")}
-          </Text>
-          <Text class="truncate text-xs text-subtle">
-            {targets().hasActiveDraft
-              ? targets().draftPreview || tr("Attach to the draft in progress", "附到正在编辑的草稿")
-              : props.picked()
-                ? tr("Start a clean session with this selection", "开启干净的新会话并附上选中内容")
-                : tr("Start a clean session with this document", "开启干净的新会话并附上这篇文档")}
-          </Text>
-        </View>
-      </BaseButton>
-      <If when={targets().sessions.length > 0}>
-        <View>
-          <View class="mx-2 my-1 h-px bg-border" />
-          <Text class="px-2 pb-1 pt-1 text-xs font-medium text-subtle" role="header">
-            {tr("Open sessions", "已打开的会话")}
-          </Text>
-          <Each of={targets().sessions} key={(s) => s.tab.ref}>
-            {(s, index) => (
-              <BaseButton
-                testID={`doc-target-tab-${index()}`}
-                onPress={() => {
-                  void addDocToTab(props.path, s().tab);
-                  props.onDone();
-                }}
-                class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
-              >
-                {s().agentId ? (
-                  <AgentLogo id={s().agentId!} size={14} tone="muted-foreground" class="shrink-0" />
-                ) : (
-                  <Icon name="terminal" size={13} tone="muted-foreground" class="shrink-0" />
-                )}
-                <Text class="min-w-0 flex-1 truncate text-base text-foreground">{s().title}</Text>
-                <If when={s().current}>
-                  <Text class="shrink-0 text-xs text-subtle">{tr("Current", "当前")}</Text>
-                </If>
-              </BaseButton>
-            )}
-          </Each>
-        </View>
-      </If>
-    </View>
-  );
-}
-
 /**
  * The document's foot: how much is written and where the file lives (clickable
- * to reveal on disk), and an explicit destination picker when taking the
- * document to an agent — never a blind shortcut into a hidden session.
+ * to reveal on disk), and — for a draft expanded out of a session with ⌘E — a
+ * one-click way straight back to the session it came from.
  */
 function DocFoot(props: { doc: MarkdownDoc; picked: () => boolean; pickedWords: () => number }) {
-  const menuOpen = signal(false);
   const home = backend().home();
   const external = () => !isNote(props.doc.path);
   const fullPath = () => tildePath(props.doc.path, home);
@@ -674,85 +890,19 @@ function DocFoot(props: { doc: MarkdownDoc; picked: () => boolean; pickedWords: 
             </Text>
           </BaseButton>
         </View>
-        <If
-          when={origin()}
-          else={
-            <Popover
-              open={menuOpen()}
-              onOpenChange={(e) => {
-                if (e.open && disabled()) return;
-                menuOpen.set(e.open);
-              }}
-              placement="top"
-              align="end"
-              offset={8}
-              margin={12}
-              popupClass={`w-68 overflow-hidden p-1 ${POPUP}`}
-              popupStyle={popupStyle("top", "end")}
-              popupStartingStyle={popupHiddenStyle("top", "end")}
-              popupEndingStyle={popupLeavingStyle("top", "end")}
-              trigger={
-                <BaseButton
-                  testID="doc-chat-trigger"
-                  disabled={disabled()}
-                  class={`h-7 shrink-0 flex-row items-center justify-center gap-1.5 rounded-md corner-squircle border-[0.5px] border-hairline bg-secondary px-2.5 text-sm text-secondary-foreground hover:border-hairline-hover hover:bg-secondary/80 active:bg-secondary/70 disabled:opacity-40 disabled:hover:border-hairline disabled:hover:bg-secondary ${PRESS} ${PRESS_SCALE} ${FOCUS_RING}`}
-                >
-                  <Icon name="message" size={14} tone={props.picked() ? "brand-text" : "foreground"} />
-                  <RollingText
-                    text={() => (props.picked() ? tr("Ask AI about Selection", "问 AI 选中内容") : tr("Discuss with AI", "找 AI 讨论"))}
-                    class="text-sm font-medium text-secondary-foreground"
-                  />
-                  <Icon name="chevronDown" size={12} tone="subtle" />
-                </BaseButton>
-              }
-            >
-              <DocChatMenuItems path={props.doc.path} picked={props.picked} onDone={() => menuOpen.set(false)} />
-            </Popover>
-          }
-        >
+        <If when={origin()}>
           {(src) => (
-            <View class="h-7 shrink-0 flex-row items-stretch rounded-md corner-squircle border-[0.5px] border-hairline bg-secondary">
-              <BaseButton
-                testID="doc-return-origin"
-                onPress={() => void returnDraftDocToOrigin(props.doc.path)}
-                disabled={disabled()}
-                class={`flex-row items-center gap-1.5 rounded-l-md corner-squircle pl-2.5 pr-2 text-sm text-secondary-foreground hover:bg-secondary/80 active:bg-secondary/70 disabled:opacity-40 ${PRESS} ${FOCUS_RING}`}
-              >
-                <Icon name="arrowLeft" size={13} tone="foreground" />
-                <Text class="max-w-52 truncate text-sm font-medium text-secondary-foreground">
-                  {src().isBlankDraft ? tr("Back to Composer", "回到输入框") : tr(`Back to “${src().label}”`, `回到「${src().label}」`)}
-                </Text>
-              </BaseButton>
-              <View class="my-1.5 w-px bg-hairline" />
-              <Popover
-                open={menuOpen()}
-                onOpenChange={(e) => {
-                  if (e.open && disabled()) return;
-                  menuOpen.set(e.open);
-                }}
-                placement="top"
-                align="end"
-                offset={8}
-                margin={12}
-                popupClass={`w-68 overflow-hidden p-1 ${POPUP}`}
-                popupStyle={popupStyle("top", "end")}
-                popupStartingStyle={popupHiddenStyle("top", "end")}
-                popupEndingStyle={popupLeavingStyle("top", "end")}
-                trigger={
-                  <BaseButton
-                    testID="doc-chat-trigger"
-                    disabled={disabled()}
-                    accessibilityLabel={tr("Choose session", "选择目标会话")}
-                    tooltip={tip(tr("Choose another session", "选择其他会话"), undefined, "top")}
-                    class={`w-6 items-center justify-center rounded-r-md corner-squircle hover:bg-secondary/80 active:bg-secondary/70 disabled:opacity-40 ${PRESS} ${FOCUS_RING}`}
-                  >
-                    <Icon name="chevronDown" size={12} tone="subtle" />
-                  </BaseButton>
-                }
-              >
-                <DocChatMenuItems path={props.doc.path} picked={props.picked} onDone={() => menuOpen.set(false)} />
-              </Popover>
-            </View>
+            <BaseButton
+              testID="doc-return-origin"
+              onPress={() => void returnDraftDocToOrigin(props.doc.path)}
+              disabled={disabled()}
+              class={`h-7 shrink-0 flex-row items-center gap-1.5 rounded-md corner-squircle border-[0.5px] border-hairline bg-secondary px-2.5 text-sm text-secondary-foreground hover:border-hairline-hover hover:bg-secondary/80 active:bg-secondary/70 disabled:opacity-40 disabled:hover:border-hairline disabled:hover:bg-secondary ${PRESS} ${PRESS_SCALE} ${FOCUS_RING}`}
+            >
+              <Icon name="arrowLeft" size={13} tone="foreground" />
+              <Text class="max-w-52 truncate text-sm font-medium text-secondary-foreground">
+                {src().isBlankDraft ? tr("Back to Composer", "回到输入框") : tr(`Back to “${src().label}”`, `回到「${src().label}」`)}
+              </Text>
+            </BaseButton>
           )}
         </If>
       </View>
@@ -768,27 +918,115 @@ function DocFoot(props: { doc: MarkdownDoc; picked: () => boolean; pickedWords: 
  */
 export function DocEditor(props: { path: string }) {
   const doc = ensureDoc(props.path);
+  const assistant = ensureDocAssistant(props.path);
   const picked = signal(false);
   const pickedWords = signal(0);
+  const liveSelection = signal<DocSelection | undefined>(undefined);
   const readyAtMount = untracked(() => Boolean(doc.session()));
   const editorOpacity = createAnimatedValue(readyAtMount || untracked(reduceMotion) ? 1 : 0);
+  const editorY = createAnimatedValue(readyAtMount || untracked(reduceMotion) ? 0 : 4);
+  const editorSettled = signal(readyAtMount || untracked(reduceMotion));
   let revealed = readyAtMount;
+  let revealTimer: ReturnType<typeof setTimeout> | undefined;
   effect(() => {
     const ready = Boolean(doc.session());
     if (!ready || revealed) return;
     revealed = true;
     if (untracked(reduceMotion)) {
       editorOpacity.set(1);
+      editorY.set(0);
+      editorSettled.set(true);
       return;
     }
-    void editorOpacity.timing(1, { duration: 160, easing: EASING.entrance });
+    void editorOpacity.timing(1, { duration: 170, easing: EASING.entrance });
+    void editorY.timing(0, { duration: 190, easing: EASING.signature });
+    revealTimer = setTimeout(() => {
+      revealTimer = undefined;
+      editorSettled.set(true);
+    }, 200);
   });
-  cleanup(() => void editorOpacity.stop());
+  cleanup(() => {
+    clearTimeout(revealTimer);
+    void editorOpacity.stop();
+    void editorY.stop();
+  });
+
+  const orbPointer = createDocOrbPointerBridge();
+  let editorPointer: EditorPointerBridge | undefined;
+  let selectionReader: (() => DocSelection | undefined) | undefined;
+  const drafting = () => Boolean(doc.session()) && !doc.readOnly() && doc.words() === 0 && assistant.running();
 
   return (
-    <View testID="doc-editor" class="min-h-0 min-w-0 flex-1 bg-background">
-      <View class="min-h-0 flex-1" style={{ opacity: editorOpacity }}>
-        <If when={doc.session()}>{(session) => <Editor doc={doc} session={session()} picked={picked} pickedWords={pickedWords} />}</If>
+    <View
+      testID="doc-editor"
+      class="relative min-h-0 min-w-0 flex-1 bg-background"
+      onMouseMove={(e) => {
+        editorPointer?.onMove(e.pressedButton !== null);
+        orbPointer.onPaneMove(e);
+      }}
+      onMouseLeave={() => {
+        editorPointer?.onLeave();
+        orbPointer.onPaneLeave();
+      }}
+      onMouseUp={() => {
+        editorPointer?.onUp();
+      }}
+      onTouchStart={() => {
+        editorPointer?.onMove(true);
+      }}
+      onTouchMove={() => {
+        editorPointer?.onMove(true);
+      }}
+      onTouchEnd={() => {
+        editorPointer?.onUp();
+      }}
+      onTouchCancel={() => {
+        editorPointer?.onUp();
+      }}
+    >
+      <View class="relative min-h-0 flex-1">
+        <DocSkeleton show={() => !doc.session()} />
+        <View
+          class="min-h-0 flex-1"
+          style={editorSettled() ? undefined : { opacity: editorOpacity, transform: [{ translateY: editorY }] }}
+        >
+          <If when={doc.session()}>
+            {(session) => (
+              <Editor
+                doc={doc}
+                session={session()}
+                picked={picked}
+                pickedWords={pickedWords}
+                liveSelection={liveSelection}
+                drafting={drafting}
+                onDraggingChange={(dragging) => orbPointer.setDraggingSelection(dragging)}
+                bindPointer={(bridge) => {
+                  editorPointer = bridge;
+                  return () => {
+                    if (editorPointer === bridge) editorPointer = undefined;
+                  };
+                }}
+                bindSelectionReader={(reader) => {
+                  selectionReader = reader;
+                  return () => {
+                    if (selectionReader === reader) selectionReader = undefined;
+                  };
+                }}
+              />
+            )}
+          </If>
+        </View>
+        <DocDraftingSkeleton show={drafting} hasContent={() => doc.words() > 0} />
+        <DocRefreshSweep doc={doc} />
+        <DocActivityRibbon active={() => assistant.running()} />
+        <DocUpdatePill doc={doc} />
+        <DocFloatingOrb
+          doc={doc}
+          liveSelection={liveSelection}
+          readLiveSelection={() => (selectionReader ? selectionReader() : untracked(liveSelection))}
+          pointerBridge={orbPointer}
+          onReturnFocus={() => doc.session()?.focus()}
+        />
       </View>
       <DocFoot doc={doc} picked={picked} pickedWords={pickedWords} />
     </View>

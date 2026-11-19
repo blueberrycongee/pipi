@@ -78,14 +78,14 @@ multi-agent orchestration, and settings.
   when emptied. The ways in are where the need is: `文档`'s `+` (⌘⇧N), the
   composer's own door once a draft passes its second line (⌘E moves the draft
   into a document — `draftToDoc` — and remembers which session it came from),
-  a reply's "Save as Document", or opening/dropping any `.md`. Taking a
+  or opening/dropping any `.md`. Taking a
   document to an agent is always explicit — there is no blind ⌘↵ send in a
-  document: from a session's composer, `@` (`lib/doc-mention.ts`) or the
-  attach icon pulls an open or saved document straight into the active
-  session; from a document, "Discuss with AI" (or "Ask AI" on a selection)
-  lets you start a clean New Session or pick an open session by name (and a
-  ⌘E draft offers one-click return to its exact origin session). Nothing is
-  pasted and nothing is sent automatically: the words stay in the document,
+  document: from a session's composer, `@` (`lib/doc-mention.ts`) pulls an
+  open or saved document straight into the active
+  session; from a document, the tab's or sidebar row's menu (or "Ask AI" on
+  a selection) starts a clean New Session or adds to an open session by name
+  (and a ⌘E draft offers one-click return to its exact origin session).
+  Nothing is pasted and nothing is sent automatically: the words stay in the document,
   the card (`DocRef` in `store/app.ts`) rides on the composer's message, and
   a whole document is sent as it reads when sent. Sent without a word the
   message *is* the document's text; with one, the document rides behind the
@@ -108,7 +108,7 @@ multi-agent orchestration, and settings.
   cannot keep (raw HTML, footnotes, link definitions, math) opens
   read-only — shown, never rewritten. The editor lays blocks out as a
   flow with no gap of its own: the page's rhythm is each block's margins
-  (`EDITOR_CLASSES`).
+  (`editorClasses`).
 - Nothing is bundled: `agents/catalog.ts` lists the built-in harnesses
   and the user's custom ACP configs, `sidecar/probe-agents.mjs` finds
   them on PATH (never triggering OAuth popups or project hooks), and each
@@ -184,7 +184,7 @@ multi-agent orchestration, and settings.
   too), sidebar top keeping only 新会话 while documents live in their own
   collapsible `文档` group (not 最近), configurable documents folder in
   Settings and Save As with front matter intact, ⌘↵ doing nothing inside a
-  document, explicit session destinations ("Discuss with AI" → New Session or
+  document, explicit session destinations (a tab's menu → New Session or
   named open sessions; "Ask AI" on selection), a long draft expanded with ⌘E
   returning to its exact origin session, `@` in the composer pulling a
   document straight into the active session, what an agent writes to the file
@@ -192,9 +192,16 @@ multi-agent orchestration, and settings.
   scripted Pi rewrites a document handed to it when asked to "rewrite", and
   "recite <path>" prints a file), front matter kept, a lossy file read-only;
   `nsh test DocLook.test.tsx --target macos` shoots each of those into
-  `.nsh/shots/doc-*.png`; `nsh test lib/doc-wire.test.ts` /
-  `lib/doc-mention.test.ts` / `lib/merge3.test.ts` — the message's wire form,
-  `@` mention parsing, and the three-way merge
+  `.nsh/shots/doc-*.png`; `nsh test DocOrb.test.tsx` tests the document's
+  floating Pip orb (`views/DocOrb.tsx`, `store/doc-assistant.ts`): circular
+  orb at rest, hover bloom into a bottom-right mini-composer with independent
+  engine/model/effort/permission pickers, skeleton shimmer into veiled streaming
+  replies, live document update pill + surgical inline highlight + one-click
+  undo, in-place replace/insert, and full-chat handoff (`nsh test
+  DocOrbLook.test.tsx --target macos` shoots light/dark states into
+  `.nsh/shots/doc-orb-*.png`); `nsh test
+  lib/doc-wire.test.ts` / `lib/doc-mention.test.ts` / `lib/merge3.test.ts` —
+  the message's wire form, `@` mention parsing, and the three-way merge
 - `nsh test TabsFilm.test.tsx --target macos` — films a document coming
   forward over the chat and a tab closing (the pills flow to their new
   slots) into `.nsh/shots/tabs-*.png`, via `harness.then`'s `tab:` /

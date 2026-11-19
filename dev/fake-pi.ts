@@ -1,7 +1,7 @@
 import * as fs from "fs/promises";
 import { acpDefaultModel, builtinAgentSpec, defaultAgentStatuses } from "../agents/catalog";
 import type { AgentHarnessStatus, CustomAgentConfig, RuntimeMode, WorktreeInfo } from "../agents/types";
-import { titleWords } from "../lib/doc-wire";
+import { splitDocMessage, titleWords } from "../lib/doc-wire";
 import type { Exit, Transport } from "../pi/client";
 import type { DaemonAttachSpec, DaemonCallbacks, DaemonClient, DaemonSession } from "../pi/daemon";
 import type { AgentMessage, ImageContent, Model, SessionState } from "../pi/protocol";
@@ -201,8 +201,12 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   /** One agent process: its own session, messages and stream state, as Pi has per process. */
   const transport = (cwd: string, agentId: string, initial: AgentMessage[], custom?: { id: string; name: string; defaultModel?: string }): Transport => {
     // A fresh session opens on the engine's configured default, like Pi — not on the last pick.
-    const engineModel = defaultModel;
-    const engineThinking = defaultThinking;
+    const agentModels = modelsForAgent(agentId, custom);
+    const engineModel = agentId === "pi" ? defaultModel : (agentModels[0] ?? UNKNOWN);
+    const engineThinking: SessionState["thinkingLevel"] = engineModel.reasoning ? (agentId === "pi" ? defaultThinking : "medium") : "off";
+    let currentModel = engineModel;
+    let currentThinking = engineThinking;
+    let currentRuntimeMode: RuntimeMode = "full-access";
     let messages = initial;
     let sessionFile: string | undefined = initial.length ? "/sessions/one.jsonl" : undefined;
     // A session opened on history carries the name its file was saved with.
@@ -215,8 +219,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     const queued = { steering: [] as string[], followUp: [] as string[] };
     let isCompacting = false;
     const snapshotState = (): SessionState => ({
-      model: defaultModel,
-      thinkingLevel: defaultThinking,
+      model: currentModel,
+      thinkingLevel: currentThinking,
       isStreaming,
       isCompacting,
       steeringMode,
@@ -608,12 +612,27 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       let reply = options.reply ?? (prompt.includes("long") ? LONG_REPLY : REPLY);
       // A document rode on the prompt (`lib/doc-wire.ts`) and the words ask to "rewrite" it: the agent
       // changes the file where it lives, as one with file tools does — every "draft" in it becomes "final".
+      const saidPrompt = splitDocMessage(prompt).said;
       const attached = /<(?:document|selection) path="([^"]+)">/.exec(prompt)?.[1];
-      if (attached && prompt.includes("rewrite")) {
+      const editableCtx = /<doc_editor_context\b[^>]*editable="true"/.test(prompt);
+      if (attached && saidPrompt.includes("rewrite")) {
         // "slowly": the file is written a while into the run — time for the person to go on typing in it.
-        if (prompt.includes("slowly")) await later(1500);
+        if (saidPrompt.includes("slowly")) await later(1500);
         const text = await fs.readFile(attached, "utf8").catch(() => undefined);
         if (text !== undefined) await fs.writeFile(attached, text.replace(/draft/g, "final").replace(/Draft/g, "Final")).catch(() => undefined);
+      } else if (attached && editableCtx && saidPrompt.includes("draft doc")) {
+        // "draft doc": writes into a newly materialized blank document after a short beat so drafting skeleton + refresh sweep show.
+        const text = await fs.readFile(attached, "utf8").catch(() => undefined);
+        if (text !== undefined) {
+          if (saidPrompt.includes("slowly")) await later(1200);
+          await fs
+            .writeFile(
+              attached,
+              "# Generated Plan\n\nWritten directly into this live document so you see the update immediately.\n\n## Next\n\n- Review the wording\n- Share with the team\n",
+            )
+            .catch(() => undefined);
+          reply = "Drafted the plan directly into the document.";
+        }
       }
       // "recite <path>": the reply is what that file holds now — how a test reads the disk.
       const recited = /^recite (\S+)/.exec(prompt)?.[1];
@@ -707,12 +726,25 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       switch (command.type) {
         case "get_state":
           return snapshotState();
-        case "get_messages":
-          return { messages };
+        case "get_entries": {
+          if (agentId !== "pi") throw new Error("Unknown command: get_entries");
+          const entries = messages.map((message, i) => ({
+            id: String(i), parentId: i ? String(i - 1) : null,
+            ...(message.role === "compactionSummary"
+              ? { type: "compaction", firstKeptEntryId: String(i), summary: message.summary, tokensBefore: message.tokensBefore, timestamp: message.timestamp }
+              : { type: "message", message }),
+          }));
+          return { entries, leafId: entries.at(-1)?.id ?? null };
+        }
+        case "get_messages": {
+          // The fake Pi's compactions retain no older messages in model context.
+          const boundary = agentId === "pi" ? messages.findLastIndex(m => m.role === "compactionSummary") : -1;
+          return { messages: boundary < 0 ? messages : messages.slice(boundary) };
+        }
         case "get_available_models":
           return { models: modelsForAgent(agentId, custom) };
         case "get_available_thinking_levels":
-          return { levels: defaultModel.reasoning ? ["off", "minimal", "low", "medium", "high"] : ["off"] };
+          return { levels: currentModel.reasoning ? ["off", "minimal", "low", "medium", "high"] : ["off"] };
         case "get_commands":
           // Pi lists the command pipi's own extension registers too (`pipi-runtime-mode`): plumbing the menu must not show.
           // Another engine reports its own commands through the bridge (`source: "agent"`): as Claude Code does,
@@ -735,18 +767,27 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
               };
         case "get_session_stats":
           return { sessionId, sessionFile, userMessages: 1, assistantMessages: 2, toolCalls: 2, toolResults: 2, totalMessages: messages.length, tokens: { input: 4570, output: 360, cacheRead: 0, cacheWrite: 0, total: 4930 }, cost: 0.016, contextUsage: { tokens: 24000, contextWindow: 200000, percent: 12 } };
-        case "prompt":
+        case "prompt": {
+          const msgText = String(command.message);
+          if (msgText.startsWith("/pipi-runtime-mode ")) {
+            const next = msgText.slice("/pipi-runtime-mode ".length).trim();
+            if (next === "approval-required" || next === "auto-accept-edits" || next === "full-access") {
+              currentRuntimeMode = next;
+            }
+            return { disposition: "handled" };
+          }
           if (options.noModels) throw new Error("No API key found for the selected model.");
           // "refuse": Pi turns the prompt down before any run starts (a key gone missing, a model that left).
-          if (String(command.message).includes("refuse")) throw new Error("No API key found for the selected model.");
+          if (msgText.includes("refuse")) throw new Error("No API key found for the selected model.");
           if (isStreaming) {
             const bucket = command.streamingBehavior === "steer" ? queued.steering : queued.followUp;
-            bucket.push(String(command.message));
+            bucket.push(msgText);
             emit({ type: "queue_update", steering: queued.steering, followUp: queued.followUp });
             return { disposition: "queued" };
           }
-          void run(String(command.message), command.images as ImageContent[] | undefined);
+          void run(msgText, command.images as ImageContent[] | undefined);
           return { disposition: "started" };
+        }
         case "abort":
           aborted = isStreaming;
           if (queued.steering.length > 0 || queued.followUp.length > 0) {
@@ -772,8 +813,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           sessionFile = undefined;
           sessionName = undefined;
           sessionId = `session-${++sessionSeq}`;
-          defaultModel = engineModel;
-          defaultThinking = engineThinking;
+          currentModel = engineModel;
+          currentThinking = engineThinking;
           return { cancelled: false };
         case "switch_session": {
           queued.steering.length = 0;
@@ -790,12 +831,19 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         case "set_model": {
           const model = modelsForAgent(agentId, custom).find((m) => m.id === command.modelId && m.provider === command.provider);
           if (!model) throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
-          defaultModel = model;
+          currentModel = model;
           return model;
         }
         case "set_thinking_level":
-          defaultThinking = command.level as SessionState["thinkingLevel"];
+          currentThinking = command.level as SessionState["thinkingLevel"];
           return undefined;
+        case "set_runtime_mode": {
+          const next = String(command.mode ?? "");
+          if (next === "approval-required" || next === "auto-accept-edits" || next === "full-access") {
+            currentRuntimeMode = next;
+          }
+          return { mode: currentRuntimeMode };
+        }
         case "set_session_name":
           sessionName = String(command.name);
           sessions = sessions.map((s) => (s.path === sessionFile ? { ...s, name: sessionName } : s));
@@ -1031,8 +1079,6 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     await startup();
     activeCwd = s.cwd;
     activeAgent = s.agentId;
-    defaultModel = modelsForAgent(s.agentId, s.custom)[0] ?? UNKNOWN;
-    defaultThinking = defaultModel.reasoning ? "medium" : "off";
     if (!initialHistorySessionId && s.agentId === "pi" && !s.file && (options.history?.length ?? 0) > 0) {
       initialHistorySessionId = s.id;
     }

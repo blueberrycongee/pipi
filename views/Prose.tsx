@@ -16,7 +16,7 @@
 //    chunk is fading (`veilClock`). A span inside a `<Text>` is a run of its
 //    attributed string, not a view, so it takes no native animated color.
 
-import { createAnimatedValue, Image, openUrl, reduceMotion, Scroll, signal, Text, token, View } from "nsh";
+import { computed, createAnimatedValue, Image, openUrl, reduceMotion, Scroll, signal, Text, token, View } from "nsh";
 import type { AnimatedValue, JSX, TextStyle } from "nsh";
 import { Button as BaseButton, TextView } from "nsh/base";
 import type { TextViewBlock, TextViewDocument, TextViewImage, TextViewInline, TextViewListItem } from "nsh/base";
@@ -41,43 +41,45 @@ import { Icon } from "../ui/Icon";
 import { EASING } from "../ui/motion";
 import { FOCUS_RING, HOVER_REVEAL, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
+import { readingType, codeType } from "../ui/typography";
+import { readingSize, FONT_SIZES } from "../store/prefs";
 import { openZoom } from "../ui/Zoom";
 
 /** Shared typography classes for `TextView` fallback blocks (alerts, math, settled code). */
-export const PROSE = {
-  root: "gap-3 text-md text-foreground",
+export const proseClasses = computed(() => ({
+  root: `gap-3 ${readingType()} text-foreground`,
   heading: "text-foreground font-semibold tracking-tight",
-  heading1: "mt-2 text-xl",
-  heading2: "mt-2 text-lg",
-  heading3: "mt-1.5 text-md",
-  heading4: "mt-1 text-md",
-  code: "rounded-sm corner-squircle bg-muted px-1 text-sm text-foreground",
+  heading1: `mt-2 ${readingType("xl")}`,
+  heading2: `mt-2 ${readingType("lg")}`,
+  heading3: `mt-1.5 ${readingType()}`,
+  heading4: `mt-1 ${readingType()}`,
+  code: `rounded-sm corner-squircle bg-muted px-1 ${readingType("sm")} text-foreground`,
   codeBlock: "rounded-xl corner-squircle border border-border bg-sunken",
-  codeBlockCode: "p-3.5 text-xs leading-relaxed",
+  codeBlockCode: `p-3.5 ${codeType()} leading-relaxed`,
   link: "text-brand-text",
   blockquote: "border-l-2 border-border pl-3.5 text-muted-foreground",
   table: "rounded-lg corner-squircle border border-border",
   tableHead: "bg-muted",
-  tableCell: "px-3 py-1.5 text-sm",
-  tableHeaderCell: "text-xs font-semibold text-muted-foreground",
+  tableCell: `px-3 py-1.5 ${readingType("sm")}`,
+  tableHeaderCell: `${readingType("xs")} font-semibold text-muted-foreground`,
   rule: "border-border",
   listMarker: "text-subtle",
-} as const;
+}));
 
 /** Gentle opacity entrance for newly created structural blocks (tables, rules, code cards). */
 const BLOCK_FADE_MS = 220;
 
 /** The table's typography inside the zoom layer: the same recipe, a step roomier. */
-const ZOOM_TABLE_PROSE = {
-  ...PROSE,
-  tableCell: "px-3.5 py-2 text-base",
-  tableHeaderCell: "text-sm font-semibold text-muted-foreground",
-} as const;
+const zoomTableClasses = computed(() => ({
+  ...proseClasses(),
+  tableCell: `px-3.5 py-2 ${readingType("base")}`,
+  tableHeaderCell: `${readingType("sm")} font-semibold text-muted-foreground`,
+}));
 
 /** Opens a table in the window's zoom layer: a snapshot rendered through `TextView`, wide tables scroll inside it. */
 function zoomTable(block: Extract<TextViewBlock, { type: "table" }>) {
   openZoom({
-    render: () => <TextView document={{ blocks: [block] }} classes={ZOOM_TABLE_PROSE} selectable links="open" />,
+    render: () => <TextView document={{ blocks: [block] }} classes={zoomTableClasses()} selectable links="open" />,
   });
 }
 
@@ -211,7 +213,7 @@ function collectRuns(content: readonly TextViewInline[], marks: InlineMarks, out
       case "small":
       case "subscript":
       case "superscript":
-        collectRuns(n.content, { ...marks, cls: `${marks.cls} text-xs` }, out);
+        collectRuns(n.content, { ...marks, cls: `${marks.cls} ${readingType("xs")}` }, out);
         break;
       case "code":
         if (n.code) {
@@ -230,7 +232,7 @@ function collectRuns(content: readonly TextViewInline[], marks: InlineMarks, out
           out.push({
             ...marks,
             text: n.text,
-            cls: `${marks.cls} font-mono text-xs rounded-sm corner-squircle px-1`,
+            cls: `${marks.cls} font-mono ${readingType("xs")} rounded-sm corner-squircle px-1`,
             bg: "muted",
           });
         }
@@ -479,14 +481,14 @@ function blockFadeNode(v: RowVeil, index: number): { opacity: AnimatedValue } | 
 
 /* ── Block Components ────────────────────────────────────────────────────── */
 
-const HEADING_CLASSES: Record<1 | 2 | 3 | 4 | 5 | 6, string> = {
-  1: "mt-2 text-xl font-semibold tracking-tight leading-snug",
-  2: "mt-2 text-lg font-semibold tracking-tight leading-snug",
-  3: "mt-1.5 text-md font-semibold leading-snug",
-  4: "mt-1 text-base font-semibold leading-snug",
-  5: "mt-1 text-sm font-semibold leading-snug",
-  6: "mt-1 text-sm font-medium leading-snug",
-};
+const headingClasses = computed(() => ({
+  1: `mt-2 ${readingType("xl")} font-semibold tracking-tight leading-snug`,
+  2: `mt-2 ${readingType("lg")} font-semibold tracking-tight leading-snug`,
+  3: `mt-1.5 ${readingType()} font-semibold leading-snug`,
+  4: `mt-1 ${readingType("base")} font-semibold leading-snug`,
+  5: `mt-1 ${readingType("sm")} font-semibold leading-snug`,
+  6: `mt-1 ${readingType("sm")} font-medium leading-snug`,
+}));
 
 function StreamingCodeCard(props: { code: string; chunks: VeilChunk[] }) {
   const codeSpans = () => {
@@ -495,7 +497,7 @@ function StreamingCodeCard(props: { code: string; chunks: VeilChunk[] }) {
     const local = sliceChunks(props.chunks, 0, text.length);
     const hex = token("foreground");
     if (local.length === 0) {
-      return [<Text class="font-mono text-xs leading-relaxed" style={{ color: hex }}>{text}</Text>];
+      return [<Text class={`font-mono ${codeType()} leading-relaxed`} style={{ color: hex }}>{text}</Text>];
     }
     const cuts = veilCuts(local, 0, text.length);
     const out: JSX.Element[] = [];
@@ -507,7 +509,7 @@ function StreamingCodeCard(props: { code: string; chunks: VeilChunk[] }) {
       const alpha = hit ? activeChunkAlpha(props.chunks, hit.chunk, a - hit.chunk.start) : 1;
       out.push(
         <Text
-          class="font-mono text-xs leading-relaxed"
+          class={`font-mono ${codeType()} leading-relaxed`}
           style={{ color: alpha >= 1 ? hex : withAlpha(hex, alpha) }}
         >
           {text.slice(a, b)}
@@ -517,13 +519,13 @@ function StreamingCodeCard(props: { code: string; chunks: VeilChunk[] }) {
     return out;
   };
 
-  // Identical box and metrics to the settled code block (`PROSE.codeBlock`), so the
+  // Identical box and metrics to the settled code block (`proseClasses`), so the
   // card does not change size when highlighting takes over once its veil finishes.
   return (
     <View selectable class="overflow-hidden rounded-xl corner-squircle border border-border bg-sunken">
       <Scroll horizontal class="w-full" contentClass="p-3.5">
         <View>
-          <Text class="font-mono text-xs leading-relaxed">{codeSpans()}</Text>
+          <Text class={`font-mono ${codeType()} leading-relaxed`}>{codeSpans()}</Text>
         </View>
       </Scroll>
     </View>
@@ -543,7 +545,6 @@ function VeiledListView(props: {
   chunks: () => ReadonlyMap<string, VeilChunk[]>;
 }) {
   const bullets = ["•", "◦", "▪"];
-  const textSize = "text-md leading-relaxed";
   // The marker column is one width for the whole list, sized for its widest
   // number: a fixed column breaks "10." over two lines ("1" / "0."). It is a
   // minimum, so a marker wider than the estimate widens its row, never wraps.
@@ -551,7 +552,7 @@ function VeiledListView(props: {
     if (!props.block.ordered) return MARKER_MIN_WIDTH;
     const last = (props.block.start ?? 1) + Math.max(0, props.block.items.length - 1);
     const digits = String(last).length;
-    return Math.max(MARKER_MIN_WIDTH, Math.ceil(digits * MARKER_DIGIT_WIDTH + MARKER_DOT_WIDTH));
+    return Math.max(MARKER_MIN_WIDTH, Math.ceil((digits * MARKER_DIGIT_WIDTH + MARKER_DOT_WIDTH) * readingSize() / FONT_SIZES.reading.default));
   };
 
   // Loose items sit a little farther apart — still thin: a selection dropped
@@ -570,7 +571,7 @@ function VeiledListView(props: {
                 when={isTask()}
                 else={
                   <View class="shrink-0 items-end pt-[1px]" style={{ minWidth: markerWidth() }}>
-                    <Text class={`${textSize} tabular-nums text-subtle`}>{markerText()}</Text>
+                    <Text class={`${readingType()} leading-relaxed tabular-nums text-subtle`}>{markerText()}</Text>
                   </View>
                 }
               >
@@ -592,7 +593,7 @@ function VeiledListView(props: {
                       <View>
                         <If when={child().type === "paragraph" ? (child() as Extract<TextViewBlock, { type: "paragraph" }>) : undefined}>
                           {(para) => (
-                            <Text class={textSize}>
+                            <Text class={`${readingType()} leading-relaxed`}>
                               {renderVeiledInlines(para().content, props.chunks().get(key()) ?? [], props.baseTone)}
                             </Text>
                           )}
@@ -643,7 +644,7 @@ function VeiledTableView(props: {
               <Each of={props.block.head} key="index">
                 {(cell, c) => (
                   <View class="min-w-24 flex-1 px-3 py-1.5">
-                    <Text class={`text-xs font-semibold ${alignClass(c())}`}>
+                    <Text class={`${readingType("xs")} font-semibold ${alignClass(c())}`}>
                       {renderVeiledInlines(cell().content, props.chunks().get(`th:${props.blockIdx()}:${c()}`) ?? [], "muted")}
                     </Text>
                   </View>
@@ -656,7 +657,7 @@ function VeiledTableView(props: {
                   <Each of={row()} key="index">
                     {(cell, c) => (
                       <View class="min-w-24 flex-1 px-3 py-1.5">
-                        <Text class={`text-sm leading-relaxed ${alignClass(c())}`}>
+                        <Text class={`${readingType("sm")} leading-relaxed ${alignClass(c())}`}>
                           {renderVeiledInlines(cell().content, props.chunks().get(`td:${props.blockIdx()}:${r()}:${c()}`) ?? [], "fg")}
                         </Text>
                       </View>
@@ -679,7 +680,7 @@ function FallbackTextViewBlock(props: { block: TextViewBlock; settled: boolean }
   return (
     <TextView
       document={{ blocks: [props.block] }}
-      classes={PROSE}
+      classes={proseClasses()}
       selectable
       links="open"
       codeBlockScrollbar={false}
@@ -1011,7 +1012,6 @@ export function ProseBlock(props: { row: ProseRow }) {
   const index = () => props.row.index;
   const chunksOf = (key: string): VeilChunk[] => (props.row.chunks.get(key) as VeilChunk[] | undefined) ?? [];
   const chunksMap = () => props.row.chunks;
-  const textSize = "text-md leading-relaxed";
 
   const fadeStyle = () => {
     const node = rowVeil(props.row.rowId).blockNodes.get(index()) as AnimatedValue | undefined;
@@ -1063,7 +1063,7 @@ export function ProseBlock(props: { row: ProseRow }) {
   return (
     <If
       when={props.row.block}
-      else={<TextView document={{ blocks: [], footnotes: props.row.footnotes ?? [] }} classes={PROSE} selectable links="open" codeBlockScrollbar={false} tableScrollbar={false} />}
+      else={<TextView document={{ blocks: [], footnotes: props.row.footnotes ?? [] }} classes={proseClasses()} selectable links="open" codeBlockScrollbar={false} tableScrollbar={false} />}
     >
       <View style={fadeStyle()}>
         <If
@@ -1111,7 +1111,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                               <View>
                                 <If when={qChild().type === "paragraph" ? (qChild() as Extract<TextViewBlock, { type: "paragraph" }>) : undefined}>
                                   {(qp) => (
-                                    <Text class={`${textSize} italic`}>
+                                    <Text class={`${readingType()} leading-relaxed italic`}>
                                       {renderVeiledInlines(qp().content, chunksOf(`bq:${index()}:${k()}`), "muted")}
                                     </Text>
                                   )}
@@ -1151,7 +1151,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                 const key = () => `h:${index()}`;
                 return (
                   <View selectable>
-                    <Text role="header" accessibilityLevel={heading().level} class={HEADING_CLASSES[heading().level]}>
+                    <Text role="header" accessibilityLevel={heading().level} class={headingClasses()[heading().level]}>
                       {renderVeiledInlines(heading().content, chunksOf(key()), "fg")}
                     </Text>
                   </View>
@@ -1164,7 +1164,7 @@ export function ProseBlock(props: { row: ProseRow }) {
             const key = () => `p:${index()}`;
             return (
               <View selectable>
-                <Text class={textSize}>{renderVeiledInlines(para().content, chunksOf(key()), "fg")}</Text>
+                <Text class={`${readingType()} leading-relaxed`}>{renderVeiledInlines(para().content, chunksOf(key()), "fg")}</Text>
               </View>
             );
           }}

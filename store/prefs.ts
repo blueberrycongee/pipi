@@ -1,4 +1,4 @@
-import { setColorScheme, setTheme, signal, Storage } from "nsh";
+import { computed, setColorScheme, setTheme, signal, Storage } from "nsh";
 import type { AgentOverride, CustomAgentConfig, RuntimeMode } from "../agents/types";
 import type { ThinkingLevel } from "../pi/protocol";
 import { isCoat, type CoatId } from "../mascot/geometry";
@@ -25,6 +25,16 @@ import {
 
 /** What pipi remembers between launches, kept in the app's own storage. */
 export type Appearance = "system" | "light" | "dark";
+export const FONT_SIZES = {
+  reading: { min: 12, default: 14, max: 22 },
+  code: { min: 10, default: 11, max: 20 },
+} as const;
+export type FontRole = keyof typeof FONT_SIZES;
+function normalizeSize(role: FontRole, value: unknown): number {
+  const limits = FONT_SIZES[role];
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(limits.min, Math.min(limits.max, Math.round(value))) : limits.default;
+}
 export type Language = "system" | "en" | "zh";
 export const AUTO_ARCHIVE_DAYS = [0, 7, 14, 30, 90] as const;
 export type AutoArchiveDays = (typeof AUTO_ARCHIVE_DAYS)[number];
@@ -97,6 +107,7 @@ interface Prefs {
   /** The last active project folder. */
   activeWorkspace?: string;
   appearance: Appearance;
+  fontSizes: Record<FontRole, number>;
   /** Which coat Pip wears: the same mascot in a different coat (`mascot/geometry.ts` → `COATS`). */
   pipCoat: CoatId;
   language: Language;
@@ -174,6 +185,7 @@ const DEFAULTS: Prefs = {
   autoArchiveDays: 0,
   openTabs: [],
   appearance: "system",
+  fontSizes: { reading: FONT_SIZES.reading.default, code: FONT_SIZES.code.default },
   pipCoat: "ghost",
   language: "system",
   sidebarOpen: true,
@@ -338,6 +350,10 @@ export async function loadPrefs() {
       prefs.set({
         ...DEFAULTS,
         ...parsed,
+        fontSizes: {
+          reading: normalizeSize("reading", parsed.fontSizes?.reading),
+          code: normalizeSize("code", parsed.fontSizes?.code),
+        },
         agentOverrides: parsed.agentOverrides ?? {},
         customAgents: Array.isArray(parsed.customAgents) ? parsed.customAgents : [],
         agentSessionChoices: normalizeSessionChoices(parsed.agentSessionChoices),
@@ -441,6 +457,16 @@ export function setDocsFolderPref(folder: string | undefined) {
 /** Remembers the tab strip's surfaces between launches; the order is the strip's. */
 export function setOpenTabs(tabs: StoredOpenTab[]) {
   change({ openTabs: tabs });
+}
+
+export const readingSize = computed(() => prefs().fontSizes.reading);
+export const codeSize = computed(() => prefs().fontSizes.code);
+export function setFontSize(role: FontRole, value: number) {
+  change({ fontSizes: { ...prefs().fontSizes, [role]: normalizeSize(role, value) } });
+}
+
+export function resetFontSizes() {
+  change({ fontSizes: DEFAULTS.fontSizes });
 }
 
 export const appearance = () => prefs().appearance;

@@ -35,7 +35,7 @@ import {
   type WallpaperVideoClickAction,
 } from "../lib/wallpaper";
 import type { Mood } from "../mascot/geometry";
-import { type Exit, PiClient, PiError } from "../pi/client";
+import { type Exit, PiClient, PiError, type Transport } from "../pi/client";
 import type { CredentialKind } from "../pi/credentials";
 import { DaemonClient, type DaemonSession } from "../pi/daemon";
 import type {
@@ -54,6 +54,7 @@ import type {
   SlashCommand,
   ThinkingLevel,
 } from "../pi/protocol";
+import { piHistoryMessages } from "../pi/session-file";
 import { type SessionSnapshot, type SessionSummary, sessionTitle } from "../pi/sessions";
 import { EMPTY_USAGE, type UsageStats } from "../pi/usage";
 import { killAllSidecars, SidecarError } from "../pi/sidecar";
@@ -377,8 +378,43 @@ type Heading = {
   welcome?: boolean;
 };
 
-/** Cached models per agent id so switching to a fresh session knows ahead whether the agent has models. */
+/** Cached models and thinking levels per agent id so fresh/inline sessions know ahead what an engine offers. */
 const modelsByAgent = new Map<string, Model[]>();
+const levelsByAgent = new Map<string, ThinkingLevel[]>();
+const catalogCacheVersion = signal(0);
+
+export function cachedModelsForAgent(agentId: string): Model[] {
+  catalogCacheVersion();
+  const cached = modelsByAgent.get(agentId);
+  if (cached && cached.length > 0) return cached;
+  if (agentId === currentAgentId()) {
+    const live = models();
+    if (live.length > 0) return live;
+  }
+  return agents().find((a) => a.id === agentId)?.models ?? [];
+}
+
+export function cacheAgentModels(agentId: string, list: Model[]) {
+  if (!agentId) return;
+  if (list.length) modelsByAgent.set(agentId, list);
+  else modelsByAgent.delete(agentId);
+  catalogCacheVersion.update((n) => n + 1);
+}
+
+export function cachedThinkingLevelsForAgent(agentId: string): ThinkingLevel[] {
+  catalogCacheVersion();
+  const cached = levelsByAgent.get(agentId);
+  if (cached && cached.length > 0) return cached;
+  if (agentId === currentAgentId()) return levels();
+  return ["off"];
+}
+
+export function cacheAgentThinkingLevels(agentId: string, list: ThinkingLevel[]) {
+  if (!agentId) return;
+  if (list.length) levelsByAgent.set(agentId, list);
+  else levelsByAgent.delete(agentId);
+  catalogCacheVersion.update((n) => n + 1);
+}
 
 function agentHasModel(agentId: string): boolean {
   if (agentId === currentAgentId() && hasModel()) return true;
@@ -1298,7 +1334,8 @@ function upsertDaemonSession(session: DaemonSession) {
   }
   // The open session speaks through its own stream — but only while a client is attached to it:
   // one let go of (in the gap before the next attach) reports off screen like any other.
-  if (!prev || open) return;
+  const inlineFront = inlineDaemonWatchers.get(session.id)?.() === true;
+  if (!prev || open || inlineFront) return;
   const wasLive = prev.status === "working" || prev.status === "blocked";
   if (quietSessions.delete(session.id)) return;
   const title = daemonSessionTitle(session);
@@ -1309,6 +1346,80 @@ function upsertDaemonSession(session: DaemonSession) {
   } else if (session.status === "blocked" && prev.status !== "blocked") {
     toast("info", tr(`${title} is waiting for you.`, `${title} 正在等待你的确认。`));
   }
+}
+
+/** Inline surfaces (such as a document's floating AI assistant) watching a daemon session live. */
+const inlineDaemonWatchers = new Map<string, () => boolean>();
+const teardownListeners = new Set<() => void>();
+
+export function registerInlineDaemon(id: string, isFront: () => boolean) {
+  inlineDaemonWatchers.set(id, isFront);
+}
+
+export function unregisterInlineDaemon(id: string) {
+  inlineDaemonWatchers.delete(id);
+}
+
+export function onStoreTeardown(listener: () => void): () => void {
+  teardownListeners.add(listener);
+  return () => teardownListeners.delete(listener);
+}
+
+export function setInlineDaemonRuntimeMode(id: string, mode: RuntimeMode) {
+  daemonClient?.setRuntimeMode(id, mode);
+}
+
+/**
+ * Attaches an independent daemon session using the active agent, workspace,
+ * and runtime configuration (for inline surfaces like the document floating AI).
+ * Also returns the user's preferred model/thinking choice for that agent.
+ */
+export async function attachInlineSession(options: {
+  id?: string;
+  cwd?: string;
+  agentId?: string;
+  title?: string;
+  runtimeMode?: RuntimeMode;
+}): Promise<{
+  transport: Transport;
+  session: DaemonSession;
+  daemon: DaemonClient;
+  agentId: string;
+  agentName: string;
+  preferredModel?: { provider: string; id: string };
+  preferredThinking?: ThinkingLevel;
+}> {
+  const daemon = await ensureDaemon();
+  if (!daemon) throw new Error(tr("The session daemon is not running", "会话守护进程未运行"));
+  const agentId = options.agentId ?? currentAgentId();
+  const spec = agents().find((a) => a.id === agentId);
+  const effectiveId = spec ? spec.id : "pi";
+  const driver = spec?.driver ?? (effectiveId === "pi" ? "pi" : "acp");
+  const customCfg = storedCustomAgents().find((c) => c.id === effectiveId);
+  const override = storedAgentOverrides()[effectiveId];
+  const cwd = options.cwd || activeProjectPath() || workspace();
+  const { transport, session } = await daemon.attach({
+    id: options.id,
+    title: options.title,
+    cwd,
+    agentId: effectiveId,
+    agentName: spec?.name ?? effectiveId,
+    driver,
+    runtimeMode: options.runtimeMode ?? currentRuntimeMode(),
+    binaryPath: override?.binaryPath,
+    extraArgs: override?.extraArgs,
+    customAgent: customCfg,
+  });
+  const choice = storedSessionChoice(effectiveId);
+  return {
+    transport,
+    session,
+    daemon,
+    agentId: effectiveId,
+    agentName: spec?.name ?? effectiveId,
+    preferredModel: choice?.model,
+    preferredThinking: choice?.thinkingLevel,
+  };
 }
 
 /** Ends a daemon session the store asked to end, so its last push does not read as a death. */
@@ -1399,6 +1510,12 @@ function teardownStore() {
   flushFrame = undefined;
   const active = client;
   client = undefined;
+  for (const listener of [...teardownListeners]) {
+    try {
+      listener();
+    } catch {}
+  }
+  inlineDaemonWatchers.clear();
   for (const started of clientDaemonId.keys()) started.close(0);
   clientDaemonId.clear();
   clientSendHolds.clear();
@@ -1411,6 +1528,7 @@ function teardownStore() {
   daemonClient = undefined;
   daemonStarting = undefined;
   modelsByAgent.clear();
+  levelsByAgent.clear();
   stopAppUpdateChecks();
 }
 
@@ -1558,7 +1676,7 @@ async function launch(
       // The daemon already put the process on `reopen`'s session file before answering the attach.
       const [, history] = await Promise.all([
         refreshState(),
-        withStartupTimeout(request("get_messages"), agentLabel),
+        withStartupTimeout(displayHistory(started, effectiveAgentId), agentLabel),
       ]);
       if (mine !== generation) return;
       const current = state() ?? first;
@@ -1604,7 +1722,7 @@ async function launch(
       void finishLaunch().catch(failLaunch);
       return;
     }
-    await finishFreshLaunch(first, agentLabel);
+    await finishFreshLaunch(started, first, agentLabel);
   } catch (error) {
     failLaunch(error);
   }
@@ -1615,11 +1733,11 @@ async function launch(
    * commands, the saved sessions, credentials, git — are the sidebar's and the pickers',
    * not the conversation's: they fill in behind the screen instead of holding it.
    */
-  async function finishFreshLaunch(first: SessionState, agentLabel: string) {
+  async function finishFreshLaunch(started: PiClient, first: SessionState, agentLabel: string) {
     const listCwd = projectCwdOf(cwd, currentDaemonSession());
     void Promise.all([refreshCommands(), refreshSessions(listCwd), refreshCredentials(), refreshGitWorkspace(cwd)]);
     const supporting = Promise.all([refreshModels(effectiveAgentId), refreshLevels()]);
-    const history = preserveRows ? undefined : await withStartupTimeout(request("get_messages"), agentLabel);
+    const history = preserveRows ? undefined : await withStartupTimeout(displayHistory(started, effectiveAgentId), agentLabel);
     await supporting;
     if (mine !== generation) return;
     const chosen = await applySessionChoices(first, false);
@@ -1784,7 +1902,7 @@ function revive(agentLabel: string, cutShort: boolean, lost: Extract<Phase, { na
       if (retry !== undefined) started.request("set_auto_retry", { enabled: retry }).catch(() => undefined);
       const [next, history] = await Promise.all([
         withStartupTimeout(started.request("get_state"), agentLabel),
-        withStartupTimeout(started.request("get_messages"), agentLabel),
+        withStartupTimeout(displayHistory(started, agentId), agentLabel),
       ]);
       if (mine !== generation) return;
       state.set(next);
@@ -2199,16 +2317,17 @@ async function refreshModels(agentId = currentAgentId()) {
   try {
     const list = (await request("get_available_models")).models;
     models.set(list);
-    if (list.length) modelsByAgent.set(agentId, list);
-    else modelsByAgent.delete(agentId);
+    cacheAgentModels(agentId, list);
   } catch {
     models.set([]);
   }
 }
 
-async function refreshLevels() {
+async function refreshLevels(agentId = currentAgentId()) {
   try {
-    levels.set((await request("get_available_thinking_levels")).levels);
+    const next = (await request("get_available_thinking_levels")).levels;
+    levels.set(next);
+    cacheAgentThinkingLevels(agentId, next);
   } catch {
     levels.set(["off"]);
   }
@@ -2332,13 +2451,29 @@ export async function refreshCredentials() {
   }
 }
 
+/** External bridges already return the full display stream, including their pending turn.
+ * Native Pi's get_messages is model context; get_entries is the unabridged session tree. */
+async function displayHistory(from: PiClient, agentId: string): Promise<{ messages: AgentMessage[] }> {
+  if (agentId === "pi") {
+    try {
+      const { entries, leafId } = await from.request("get_entries");
+      return { messages: piHistoryMessages(entries, leafId) };
+    } catch (error) {
+      // Older Pi versions predate get_entries. Do not mask an actual history read failure.
+      if (!(error instanceof PiError && /unknown command/i.test(error.message))) throw error;
+    }
+  }
+  return from.request("get_messages");
+}
+
 /**
  * Loads the session the active agent has open: its state and messages land at
  * once; what its model supports follows in the background — an external engine
  * only knows it once its own session is negotiated, which a switch must not wait on.
  */
 async function syncSession() {
-  const [, history] = await Promise.all([refreshState(), request("get_messages")]);
+  if (!client) throw new PiError("history", tr("Agent is not running", "智能体未运行"));
+  const [, history] = await Promise.all([refreshState(), displayHistory(client, currentAgentId())]);
   landHistory(history.messages);
   reportSessionFile();
   void refreshLevels();
@@ -3391,7 +3526,7 @@ async function takeQueuedNow(id: string, edit: boolean) {
 
 // ── Sessions ────────────────────────────────────────────────────────────────
 
-function findKnownSessionSummary(path: string | undefined): SessionSummary | undefined {
+export function findKnownSessionSummary(path: string | undefined): SessionSummary | undefined {
   if (!path) return undefined;
   const direct = sessions().find((s) => s.path === path);
   if (direct) return direct;

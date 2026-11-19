@@ -1,4 +1,4 @@
-import { cleanup, createAnimatedValue, createMotion, effect, openUrl, reduceMotion, signal, Text, untracked, View } from "nsh";
+import { cleanup, computed, createAnimatedValue, createMotion, effect, openUrl, reduceMotion, signal, Text, untracked, View } from "nsh";
 import { TextView } from "nsh/base";
 import { tr } from "../lib/i18n";
 import { mendStreamingMarkdown } from "../lib/mend";
@@ -8,7 +8,7 @@ import { Button, IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { BREATH_MS, EASING, Presence, SPRING } from "../ui/motion";
 import { POPUP } from "../ui/styles";
-import { PROSE } from "./Prose";
+import { proseClasses } from "./Prose";
 
 /**
  * The update card, floating bottom-right: an update the checker found lands
@@ -45,8 +45,8 @@ const fmtBytes = (n: number) =>
 const NOTES_LIMIT = 140;
 
 /** The notes' typography: the card's scale — small, muted, headings only set off by weight. */
-const NOTES_CLASSES = {
-  ...PROSE,
+const notesClasses = computed(() => ({
+  ...proseClasses(),
   root: "gap-1.5 text-xs leading-4 text-muted-foreground",
   heading1: "text-xs",
   heading2: "text-xs",
@@ -56,7 +56,7 @@ const NOTES_CLASSES = {
   heading6: "text-xs",
   code: "rounded-sm corner-squircle bg-muted px-1 text-foreground",
   tableCell: "px-3 py-1.5 text-xs",
-} as const;
+}));
 
 function shortNotes(notes: string | null | undefined): string {
   if (!notes) return "";
@@ -305,7 +305,7 @@ export function UpdateCard() {
               links="open"
               codeBlockScrollbar={false}
               tableScrollbar={false}
-              classes={NOTES_CLASSES}
+              classes={notesClasses()}
             />
           </If>
 

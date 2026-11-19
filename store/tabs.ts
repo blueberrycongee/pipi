@@ -18,6 +18,7 @@ import {
   daemonSessionTitle,
   detachDoc,
   docRefText,
+  findKnownSessionSummary,
   isRunning,
   isSwitching,
   newSession,
@@ -342,20 +343,26 @@ export function chatTabSession(tab: OpenTab) {
   return id ? daemonSessionOfId(id) : daemonSessionByFile(tab.ref);
 }
 
-/** A chat tab's label: the live title for the open session, the registry's or the file's for the rest. */
+/** A chat tab's label: the name its sidebar row shows — a daemon row's word for a nested or fileless session, else its file's listed title. */
 export function chatTabTitle(tab: OpenTab): string {
-  if (!tab.ref) return tr("New Session", "新会话");
+  if (!tab.ref) return tr("New session", "新会话");
   const id = daemonRefId(tab.ref);
   const ds = id ? daemonSessionOfId(id) : daemonSessionByFile(tab.ref);
   const file = id ? (ds?.file ?? tab.file) : tab.ref;
   if (file) {
-    // A saved conversation's name is stable even while its daemon is running
-    // and reports a transient title from the latest prompt.
-    const summary = savedSessions().find((s) => s.path === file);
-    if (summary) return sessionTitle(summary, file.split("/").pop() ?? file);
+    const summary = findKnownSessionSummary(file);
+    if (summary) {
+      // A daemon child's sidebar row hangs under its tree as the daemon's name
+      // for it — a task's given title — not its file's first words.
+      if (ds?.parentId) return daemonSessionTitle(ds);
+      // A saved conversation's name is stable even while its daemon is running
+      // and reports a transient title from the latest prompt.
+      return sessionTitle(summary, file.split("/").pop() ?? file);
+    }
+    if (ds) return daemonSessionTitle(ds);
     const base = file.split("/").pop() ?? file;
     if (base && !base.endsWith(".jsonl")) return base;
-    return base.replace(/\.pipi-agent\.jsonl$|\.jsonl$/, "") || (ds ? daemonSessionTitle(ds) : tr("Session", "会话"));
+    return base.replace(/\.pipi-agent\.jsonl$|\.jsonl$/, "") || tr("Session", "会话");
   }
   // The daemon calls an untitled session "New session": `daemonSessionTitle`
   // reads that as untitled and answers in the reader's language.
@@ -589,7 +596,7 @@ export interface DocChatTargets {
 /** Live display label for a real chat tab (never falls back to a generic label if the live title is known). */
 function sessionTargetTitle(tab: OpenTab, current: boolean): string {
   const title = chatTabTitle(tab);
-  if (current && !isSwitching() && (title === tr("Session", "会话") || title === tr("New Session", "新会话"))) {
+  if (current && !isSwitching() && (title === tr("Session", "会话") || title === tr("New session", "新会话"))) {
     return currentTitle();
   }
   return title;
@@ -753,22 +760,6 @@ effect(() => {
     void syncDocs();
   });
 });
-
-/** Keeps a piece of a conversation (a reply) as a new document, opened beside the chat. */
-export async function noteFromText(text: string) {
-  const body = text.trim();
-  if (!body) return;
-  const path = await newDocPath();
-  try {
-    await fs.writeFile(path, `${body}\n`);
-  } catch {
-    toast("warning", tr("Could not save the document", "无法保存文档"));
-    return;
-  }
-  setGroupCollapsed("docs", false);
-  void refreshNotes();
-  openDocTab(path);
-}
 
 /** Deletes a note for good: its tab closes, its file goes. */
 export async function deleteNote(path: string) {

@@ -1,5 +1,5 @@
 import { expect, test } from "nsh/test";
-import { composeDocMessage, plainMarkdown, splitDocMessage } from "./doc-wire";
+import { composeDocMessage, plainMarkdown, splitDocMessage, titleWords } from "./doc-wire";
 
 // A document riding on a message: what goes to the agent, and what the bubble reads back.
 //
@@ -69,4 +69,41 @@ test("a hard break is its line break; structure stays", () => {
 test("a stray backtick stops at its paragraph", () => {
   expect(plainMarkdown("it\\`s a\\_b\n\nnext c\\_d")).toBe("it`s a_b\n\nnext c_d");
   expect(plainMarkdown("open ` never closed a\\_b\n\nnext c\\_d")).toBe("open ` never closed a\\_b\n\nnext c_d");
+});
+
+test("inline document editor context instructs direct edits while staying invisible to bubbles and titles", () => {
+  const full = composeDocMessage("Write an architecture overview", [{ path: NOTE, text: "" }], {
+    path: NOTE,
+    editable: true,
+    scope: "document",
+  });
+  expect(full).toContain('<doc_editor_context path="');
+  expect(full).toContain(`directly into "${NOTE}"`);
+  expect(splitDocMessage(full)).toEqual({
+    said: "Write an architecture overview",
+    docs: [{ path: NOTE, text: "" }],
+  });
+  expect(titleWords(full)).toBe("Write an architecture overview");
+
+  const sel = composeDocMessage("Tighten this", [{ path: NOTE, text: "Selected words.", excerpt: true }], {
+    path: NOTE,
+    editable: true,
+    scope: "selection",
+  });
+  expect(sel).toContain('scope="selection"');
+  expect(sel).toContain("only that selected passage in-place");
+  expect(splitDocMessage(sel)).toEqual({
+    said: "Tighten this",
+    docs: [{ path: NOTE, text: "Selected words.", excerpt: true }],
+  });
+
+  const ro = composeDocMessage("Summarize", [{ path: NOTE, text: "# Doc" }], {
+    path: NOTE,
+    editable: false,
+  });
+  expect(ro).toContain('editable="false"');
+  expect(splitDocMessage(ro)).toEqual({
+    said: "Summarize",
+    docs: [{ path: NOTE, text: "# Doc" }],
+  });
 });

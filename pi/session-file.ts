@@ -5,14 +5,9 @@ import type {
   BranchSummaryMessage,
   CompactionSummaryMessage,
   CustomMessage,
-  ImageContent,
   Model,
-  TextContent,
-  ThinkingContent,
+  PiTreeEntry,
   ThinkingLevel,
-  ToolCall,
-  ToolResultMessage,
-  UserMessage,
 } from "./protocol";
 
 /**
@@ -129,13 +124,6 @@ function parseExternalSnapshot(lines: Record<string, unknown>[], options?: Sessi
   };
 }
 
-interface PiTreeEntry extends Record<string, unknown> {
-  type: string;
-  id?: string;
-  parentId?: string | null;
-  timestamp?: string | number;
-}
-
 function normalizePiMessage(raw: AgentMessage): AgentMessage {
   const stamped = normalizeMessageTimestamp(raw);
   const role = (stamped as { role?: unknown }).role;
@@ -155,60 +143,11 @@ function normalizePiMessage(raw: AgentMessage): AgentMessage {
   return stamped;
 }
 
-function applyContextReplacement(msg: AgentMessage, replacement: unknown): AgentMessage | undefined {
-  if (replacement === null) return undefined;
-  if (replacement === undefined) return msg;
-  const unwrapped =
-    replacement && typeof replacement === "object" && !Array.isArray(replacement) && "content" in replacement
-      ? (replacement as { content: unknown }).content
-      : replacement;
-  if (unwrapped === null) return undefined;
-  if (unwrapped === undefined) return msg;
-  if (msg.role === "assistant") {
-    const content: (TextContent | ThinkingContent | ToolCall)[] =
-      typeof unwrapped === "string"
-        ? [{ type: "text", text: unwrapped }]
-        : Array.isArray(unwrapped)
-          ? (unwrapped as (TextContent | ThinkingContent | ToolCall)[])
-          : msg.content;
-    return { ...msg, content };
-  }
-  if (msg.role === "toolResult") {
-    const content: (TextContent | ImageContent)[] =
-      typeof unwrapped === "string"
-        ? [{ type: "text", text: unwrapped }]
-        : Array.isArray(unwrapped)
-          ? (unwrapped as (TextContent | ImageContent)[])
-          : msg.content;
-    return { ...msg, content } as ToolResultMessage;
-  }
-  if (msg.role === "user") {
-    const content =
-      typeof unwrapped === "string" || Array.isArray(unwrapped)
-        ? (unwrapped as UserMessage["content"])
-        : msg.content;
-    return { ...msg, content };
-  }
-  if (msg.role === "custom") {
-    const content =
-      typeof unwrapped === "string" || Array.isArray(unwrapped)
-        ? (unwrapped as CustomMessage["content"])
-        : msg.content;
-    return { ...msg, content };
-  }
-  return msg;
-}
-
-function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
-  const header = lines[0];
-  const entries = lines.slice(1) as PiTreeEntry[];
-  let name: string | undefined;
+function activeBranch(entries: PiTreeEntry[], leafId?: string | null): PiTreeEntry[] {
+  if (leafId === null) return [];
   const byId = new Map<string, PiTreeEntry>();
   let hasTreeIds = false;
   for (const entry of entries) {
-    if (entry.type === "session_info" && typeof entry.name === "string" && entry.name) {
-      name = entry.name;
-    }
     if (typeof entry.id === "string" && entry.id) {
       byId.set(entry.id, entry);
       hasTreeIds = true;
@@ -220,7 +159,7 @@ function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
   if (hasTreeIds && entries.length > 0) {
     const reversed: PiTreeEntry[] = [];
     const seen = new Set<string>();
-    let cur: PiTreeEntry | undefined = entries[entries.length - 1];
+    let cur: PiTreeEntry | undefined = leafId === undefined ? entries.at(-1) : byId.get(leafId);
     while (cur) {
       if (typeof cur.id === "string") {
         if (seen.has(cur.id)) break;
@@ -235,6 +174,17 @@ function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
     pathEntries = entries;
   }
 
+  return pathEntries;
+}
+
+function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
+  const header = lines[0];
+  const entries = lines.slice(1) as PiTreeEntry[];
+  const pathEntries = activeBranch(entries);
+  let name: string | undefined;
+  for (const entry of entries) {
+    if (entry.type === "session_info" && typeof entry.name === "string" && entry.name) name = entry.name;
+  }
   let model: { id: string; provider?: string } | undefined;
   let thinkingLevel: ThinkingLevel | undefined;
 
@@ -261,61 +211,27 @@ function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
     }
   }
 
-  // `buildContextEntries()`: honor the latest compaction along the active path.
-  let compactionIdx = -1;
-  for (let i = pathEntries.length - 1; i >= 0; i--) {
-    if (pathEntries[i].type === "compaction") {
-      compactionIdx = i;
-      break;
-    }
-  }
+  return {
+    kind: "pi",
+    id: typeof header.id === "string" ? header.id : undefined,
+    agentId: "pi",
+    driver: "pi",
+    cwd: typeof header.cwd === "string" ? header.cwd : undefined,
+    name,
+    model,
+    thinkingLevel,
+    messages: branchMessages(pathEntries),
+  };
+}
 
-  let selected: PiTreeEntry[];
-  if (compactionIdx >= 0) {
-    const compaction = pathEntries[compactionIdx];
-    const firstKeptId = typeof compaction.firstKeptEntryId === "string" ? compaction.firstKeptEntryId : undefined;
-    let keptIdx = -1;
-    if (firstKeptId && firstKeptId !== compaction.id) {
-      for (let i = 0; i < compactionIdx; i++) {
-        if (pathEntries[i].id === firstKeptId) {
-          keptIdx = i;
-          break;
-        }
-      }
-    } else if (!firstKeptId && typeof compaction.firstKeptEntryIndex === "number") {
-      const legacyIdx = compaction.firstKeptEntryIndex;
-      if (legacyIdx >= 0 && legacyIdx < compactionIdx) keptIdx = legacyIdx;
-    }
-    const kept =
-      keptIdx >= 0
-        ? pathEntries
-            .slice(keptIdx, compactionIdx)
-            .filter(
-              (e) =>
-                e.type !== "compaction" &&
-                !(e.type === "message" && (e.message as { role?: unknown } | undefined)?.role === "system"),
-            )
-        : [];
-    selected = [compaction, ...kept, ...pathEntries.slice(compactionIdx + 1)];
-  } else {
-    selected = pathEntries;
-  }
+/** The display history, not Pi's model context: keep original messages and each divider where it occurred. */
+export function piHistoryMessages(entries: PiTreeEntry[], leafId: string | null): AgentMessage[] {
+  return branchMessages(activeBranch(entries, leafId));
+}
 
-  const edits = new Map<string, unknown>();
-  for (const entry of selected) {
-    if (entry.type === "context_edit") {
-      const target =
-        typeof entry.targetId === "string" && entry.targetId
-          ? entry.targetId
-          : typeof entry.targetEntryId === "string"
-            ? entry.targetEntryId
-            : "";
-      if (target) edits.set(target, entry.replacement);
-    }
-  }
-
+function branchMessages(entries: PiTreeEntry[]): AgentMessage[] {
   const messages: AgentMessage[] = [];
-  for (const entry of selected) {
+  for (const entry of entries) {
     switch (entry.type) {
       case "compaction": {
         const msg: CompactionSummaryMessage = {
@@ -349,32 +265,19 @@ function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
           display: Boolean(entry.display),
           timestamp: parseTimestamp(entry.timestamp),
         };
-        const edited = entry.id && edits.has(entry.id) ? applyContextReplacement(raw, edits.get(entry.id)) : raw;
-        if (edited) messages.push(edited);
+        messages.push(raw);
         break;
       }
       case "message": {
         if (!entry.message || typeof entry.message !== "object") break;
         const raw = normalizePiMessage(entry.message as AgentMessage);
-        if (raw.role === "system") break;
-        const edited = entry.id && edits.has(entry.id) ? applyContextReplacement(raw, edits.get(entry.id)) : raw;
-        if (edited) messages.push(edited);
+        if (raw.role !== "system") messages.push(raw);
         break;
       }
     }
   }
 
-  return {
-    kind: "pi",
-    id: typeof header.id === "string" ? header.id : undefined,
-    agentId: "pi",
-    driver: "pi",
-    cwd: typeof header.cwd === "string" ? header.cwd : undefined,
-    name,
-    model,
-    thinkingLevel,
-    messages,
-  };
+  return messages;
 }
 
 /** Parses raw JSONL session file contents into a `SessionSnapshot`; `undefined` if unrecognized or empty. */

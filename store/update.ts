@@ -64,10 +64,12 @@ const errorMessage = (error: unknown) => (error instanceof Error ? error.message
 /**
  * What the update source offers this run, best first: the code package when
  * the shell runs packages and one's newer than the running build, else the
- * app archive. A package check that errors falls back to the archive check —
- * but when the archive check finds nothing while the package check failed,
- * the release meant this run to have something it could not fetch: that error
- * is the one to report.
+ * app archive — skipping a `shell: true` archive, which means the running
+ * code package is already at that version or later and only the outer app
+ * shell is behind. A package check that errors falls back to the archive
+ * check — but when the archive check finds nothing while the package check
+ * failed, the release meant this run to have something it could not fetch:
+ * that error is the one to report.
  */
 async function findUpdate(b: Backend): Promise<FoundUpdate | null> {
   let packageError: unknown;
@@ -82,7 +84,7 @@ async function findUpdate(b: Backend): Promise<FoundUpdate | null> {
     }
   }
   const app = b.checkAppUpdate ? await b.checkAppUpdate() : null;
-  if (app) {
+  if (app && !app.shell) {
     return { version: app.version, notes: app.notes, kind: "app", url: app.url, canInstall: app.canInstall };
   }
   if (packageError) throw packageError;
