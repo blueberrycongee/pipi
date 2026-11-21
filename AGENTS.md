@@ -51,19 +51,18 @@ multi-agent orchestration, and settings.
   of a client (`closeActive`, `removeParked`) before closing it.
 - The sidebar is the shelf and the strip is the desk. The shelf
   (`views/Sidebar.tsx`) lists every session and note there is, by project
-  and by age — a press there *looks* at one. The strip
-  (`views/TabBar.tsx`, state in `store/tabs.ts`) holds the few surfaces in
-  hand: chat sessions and Markdown documents, a press apart. So that
-  looking does not litter the desk, what was only looked at sits in the
-  strip's one **preview** seat — its name in italics — and the next thing
-  looked at takes that seat over; a tab is *kept* once it is worked on (a
-  message sent in its session, a document written in or taken to one) or the reader says
-  so (a double press, a drag, Keep Open). Closing a tab puts the thing
-  back on the shelf; it deletes nothing and stops nothing. The pills size
-  as a browser's tabs do (`lib/strip-width.ts`): they share the strip
+  and by age. The strip (`views/TabBar.tsx`, state in `store/tabs.ts`) holds
+  the surfaces in hand — chat sessions and Markdown documents, a press
+  apart — following Obsidian's tab rule: the reader owns every tab. A plain
+  click in the sidebar navigates inside the **current** tab (replacing what
+  it shows, or switching to its existing tab if already open) without adding
+  a new tab; `⌘`-click, middle-click, `"Open in New Tab"`, `+`, or `⌘T`
+  opens a new tab. There is no italic preview seat. Closing a tab puts the
+  thing back on the shelf; it deletes nothing and stops nothing. The pills
+  size as a browser's tabs do (`lib/strip-width.ts`): they share the strip
   evenly down to a floor, past which it scrolls, and a close with the
-  pointer in the strip holds their width until the pointer leaves, so a
-  run of closes keeps its close button under it.
+  pointer in the strip holds their width until the pointer leaves, so a run
+  of closes keeps its close button under it.
 - Documents are the strip's other surface (`store/docs.ts`,
   `views/DocEditor.tsx`): a page of the person's own words — an article or
   note the agents help polish, a long brief the composer is too small and too
@@ -176,9 +175,10 @@ multi-agent orchestration, and settings.
   shown with the click, and that nothing passes through while the agent loads;
   `nsh test SwitchFilm.test.tsx --target macos` films the changes into
   `.nsh/shots/switch-*.png` (compare frames: the fades do not show in `texts()`)
-- `nsh test Tabs.test.tsx` — the strip: shelf-looks sharing the one preview
-  seat, what keeps a tab, neighbours on a close, ⌘⇧]/⌘⇧[, the drag's reorder
-  and its Escape, a dropped `.md`, a typed heading renaming its tab
+- `nsh test Tabs.test.tsx` — the strip: sidebar clicks navigating in the
+  current tab, `+`/⌘T/⌘-click/"Open in New Tab" opening new tabs, no preview
+  seat, neighbours on a close, ⌘⇧]/⌘⇧[, the drag's reorder and its Escape, a
+  dropped `.md`, a typed heading renaming its tab
 - `nsh test Docs.test.tsx` — the document from end to end: `/` listing
   blocks and Enter picking (`、` under a Chinese input method opens it
   too), sidebar top keeping only 新会话 while documents live in their own
@@ -316,8 +316,8 @@ that is taken, set `PORT`.
   (`auth.json`), `providers.ts`
 - `store/` — `app.ts` (all state and actions; signals are private),
   `backend.ts` (everything that touches the machine, swappable in tests),
-  `prefs.ts`, `tabs.ts` (the strip: which surfaces are open, the preview
-  seat, doc⇄chat), `docs.ts` (open Markdown documents, their files kept
+  `prefs.ts`, `tabs.ts` (the strip: Obsidian-style tab navigation,
+  doc⇄chat), `docs.ts` (open Markdown documents, their files kept
   in step with the disk, and the notes listed in 最近), `update.ts` (the app's own update checks and the card's state)
 - `views/` — screens; `ui/` — the component kit; `mascot/` — Pip
 - `sidecar/` — Node helpers run as children: `probe-agents.mjs` (PATH

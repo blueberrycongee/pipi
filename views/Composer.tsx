@@ -521,7 +521,7 @@ function DocCard(props: { doc: DocRef }) {
   return (
     <View testID="composer-doc" class="group relative h-14 w-52 shrink-0" style={enter("zoomIn")}>
       <BaseButton
-        onPress={() => openDocTab(props.doc.path)}
+        onPress={() => openDocTab(props.doc.path, { newTab: true })}
         accessibilityLabel={title()}
         tooltip={tip(tr("Back to the document", "回到文档"))}
         class={`size-full flex-row items-center gap-2.5 rounded-lg corner-squircle border-[0.5px] border-hairline-hover bg-background/70 pl-2 pr-3 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:border-hairline-focus hover:bg-accent`}

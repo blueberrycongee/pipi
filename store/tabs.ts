@@ -1,5 +1,5 @@
 import * as fs from "fs/promises";
-import { cleanup, computed, effect, signal, untracked } from "nsh";
+import { batch, cleanup, computed, effect, signal, untracked } from "nsh";
 import { plainMarkdown } from "../lib/doc-wire";
 import { tr } from "../lib/i18n";
 import { sessionTitle } from "../pi/sessions";
@@ -22,8 +22,10 @@ import {
   isRunning,
   isSwitching,
   newSession,
+  newSessionInWorkspace,
   openDaemonSession,
   openSession,
+  pendingSession,
   savedSessions,
   sessionState,
   setDraft,
@@ -60,27 +62,21 @@ import { prefsReady, setGroupCollapsed, setOpenTabs, storedOpenTabs } from "./pr
  * is a chat session or a markdown document.
  *
  * The sidebar is the shelf — every session and note there is, by project and
- * by age; a press there *looks* at one. The strip is the desk — the few
- * things in hand, a press apart. So that looking does not litter the desk,
- * what was only looked at sits in the strip's one **preview** seat (its name
- * in italics), and the next thing looked at takes that seat over. A tab is
- * *kept* once it is worked on — its session runs, its document is written in
- * or taken to a session — or the reader says so (a double press, a drag,
- * New/Open). Closing a tab puts the thing back on the shelf; it deletes
- * nothing and stops nothing.
+ * by age. The strip follows Obsidian's rule: the reader owns its tabs. A plain
+ * click in the sidebar navigates inside the **current** tab (replacing what it
+ * shows, or switching to an existing tab if that surface is already open);
+ * `⌘`-click, middle-click, `"Open in New Tab"`, `+`, or `⌘T` opens a new tab.
+ * There is no preview seat and no tab ever spawns or vanishes on its own.
+ * Closing a tab puts the thing back on the shelf; it deletes nothing and stops
+ * nothing.
  *
  * A chat tab's `ref` is the conversation's identity — its session file —
  * not the daemon attach underneath it: one attached agent switches session
  * files in place, and the tab belongs to the conversation, so switching
  * back re-opens the file (the daemon re-attaches as needed). A session with
  * no file yet (a task still on its first run) keeps `"daemon:<id>"` until
- * the daemon says its file; `""` while the chat is still an unstarted draft.
- *
- * The store only *follows* the app: an effect turns every shown chat into a
- * tab, so sessions opened from anywhere — sidebar, palette, `session_send`,
- * a parent chip — appear on the strip without those callers knowing about
- * tabs. Tabs are never dropped when their session leaves the registry: a
- * click re-attaches, and a stale one keeps its title for next launch.
+ * the daemon says its file; `""` or `"draft:<n>"` while the tab is an
+ * unstarted new session.
  */
 
 export interface OpenTab {
@@ -88,17 +84,31 @@ export interface OpenTab {
   ref: string;
   /** chat with a `"daemon:"` ref only: the session file it resolved to once. */
   file?: string;
-  /** Only looked at so far: the next thing looked at takes this tab's seat. */
-  preview?: boolean;
 }
 
 export const tabId = (tab: OpenTab) => `${tab.kind}:${tab.ref}`;
 
 const DAEMON_REF = "daemon:";
+const DRAFT_REF = "draft:";
 const daemonRefId = (ref: string) => (ref.startsWith(DAEMON_REF) ? ref.slice(DAEMON_REF.length) : undefined);
+export const isDraftRef = (ref: string) => ref === "" || ref.startsWith(DRAFT_REF);
 
 const tabs = signal<OpenTab[]>([]);
 export const openTabs = () => tabs();
+
+/** Which draft tab is active when the chat view shows an unstarted new session. */
+const activeDraftRef = signal<string | undefined>(undefined);
+/** Last active tab on the strip (remembered while Settings is open so sidebar clicks replace it). */
+let lastActiveId: string | undefined;
+let draftSeq = 0;
+
+function nextDraftRef(): string {
+  const used = new Set(tabs().map((t) => t.ref));
+  while (true) {
+    const ref = `${DRAFT_REF}${++draftSeq}`;
+    if (!used.has(ref)) return ref;
+  }
+}
 
 /**
  * Documents opened by expanding a session's composer draft (`⌘E` / `draftToDoc`):
@@ -115,13 +125,45 @@ function clearDraftOrigin(path: string) {
   });
 }
 
-/** The shown chat surface's tab ref: its file, `"daemon:<id>"` file-less, `""` the draft. */
-function currentChatRef(): string {
+/** True when the chat surface is an unstarted blank new session (even if Pi assigned a file at boot). */
+function isCurrentChatUnstarted(): boolean {
+  const pending = pendingSession();
+  if (pending) return !pending.file && !pending.daemonId;
+  const ds = currentDaemonSession();
+  if (ds && (ds.parentId || ds.initiator === "external" || ds.status !== "idle" || ds.unread)) return false;
+  if (transcriptRows().length > 0 || (sessionState()?.messageCount ?? 0) > 0 || isRunning()) return false;
+  const file = sessionState()?.sessionFile;
+  if (file && findKnownSessionSummary(file)) return false;
+  return true;
+}
+
+/** The shown chat surface's real conversation ref: pending destination, else file, else daemon id, else "". */
+function liveChatRef(): string {
+  const pending = pendingSession();
+  if (pending) {
+    if (pending.file) return pending.file;
+    if (pending.daemonId) {
+      const ds = daemonSessionOfId(pending.daemonId);
+      return ds?.file ?? `${DAEMON_REF}${pending.daemonId}`;
+    }
+    return "";
+  }
   const file = sessionState()?.sessionFile;
   if (file) return file;
   const ds = currentDaemonSession();
   if (ds?.file) return ds.file;
   return ds ? `${DAEMON_REF}${ds.id}` : "";
+}
+
+/** The shown chat surface's tab ref: its file, `"daemon:<id>"` file-less, or the active draft tab's ref. */
+function currentChatRef(): string {
+  const real = isCurrentChatUnstarted() ? "" : liveChatRef();
+  if (real) return real;
+  const list = tabs();
+  const preferred = activeDraftRef();
+  if (preferred !== undefined && list.some((t) => t.kind === "chat" && t.ref === preferred)) return preferred;
+  const anyDraft = list.find((t) => t.kind === "chat" && isDraftRef(t.ref));
+  return anyDraft ? anyDraft.ref : "";
 }
 
 /** The tab the main pane is on; `undefined` on surfaces outside the strip (settings). */
@@ -138,36 +180,6 @@ function persist() {
   if (prefsReady()) setOpenTabs(tabs());
 }
 
-function indexOf(tab: OpenTab) {
-  return tabs().findIndex((t) => tabId(t) === tabId(tab));
-}
-
-function insertTab(tab: OpenTab) {
-  if (indexOf(tab) >= 0) return;
-  tabs.set([...tabs(), tab]);
-  persist();
-}
-
-/**
- * Seats a tab that was only looked at: in the preview seat when the strip has
- * one (what sat there goes back to the shelf), else at the strip's end.
- */
-function seatPreview(tab: OpenTab) {
-  if (indexOf(tab) >= 0) return;
-  const list = tabs();
-  const seat = list.findIndex((t) => t.preview);
-  if (seat < 0) {
-    insertTab({ ...tab, preview: true });
-    return;
-  }
-  const left = list[seat];
-  const next = [...list];
-  next[seat] = { ...tab, preview: true };
-  tabs.set(next);
-  persist();
-  if (left.kind === "doc") letDocGo(left.ref);
-}
-
 /** A document's tab is gone: its editor goes after a last save, and a card it has on the composer keeps what it said. */
 function letDocGo(path: string) {
   clearDraftOrigin(path);
@@ -176,31 +188,87 @@ function letDocGo(path: string) {
   void closeDoc(path);
 }
 
-/** The tab stays: it was worked on, or the reader said so. */
-export function keepTab(id: string | undefined) {
-  if (!id || !tabs().some((t) => t.preview && tabId(t) === id)) return;
-  tabs.set(tabs().map((t) => (t.preview && tabId(t) === id ? { ...t, preview: undefined } : t)));
-  persist();
-}
-
 /** The tab already stands for the shown chat: by its ref, or by a `"daemon:"` name whose session the file belongs to. */
 const ownsChat = (t: OpenTab, ref: string) =>
   t.kind === "chat" &&
+  !isDraftRef(t.ref) &&
   (t.ref === ref || (daemonRefId(t.ref) !== undefined && daemonSessionOfId(daemonRefId(t.ref)!)?.file === ref));
 
 /**
- * Chat refs closed while they were shown: activating the neighbour is async,
- * so the surface still reports the closed ref for a moment — the effect must
- * not resurrect its tab in that window. A ban lifts once the surface shows
- * any other ref, so re-opening the session later makes a tab again.
+ * Chat refs closed or replaced while they were shown: activating the next
+ * session is async, so the surface can still report the old ref for a moment —
+ * the follow-effect must not resurrect its tab in that window. A ban lifts
+ * once the surface moves to any other ref, or when opened again explicitly.
  */
 const closedShownRefs = new Set<string>();
 
+function banShownChatRef(ref: string | undefined, file?: string) {
+  if (ref && !isDraftRef(ref)) {
+    closedShownRefs.add(ref);
+    const d = daemonRefId(ref);
+    const f = d ? (daemonSessionOfId(d)?.file ?? file) : undefined;
+    if (f) closedShownRefs.add(f);
+  }
+}
+
+/** Index of the active tab (or the last active tab before Settings opened). */
+function currentSlotIndex(list: OpenTab[]): number {
+  const active = activeTabId() ?? lastActiveId;
+  if (active) {
+    const at = list.findIndex((t) => tabId(t) === active);
+    if (at >= 0) return at;
+  }
+  return list.length - 1;
+}
+
+/** Replaces the tab at `slot` with `tab` (or appends when the strip is empty), letting any replaced doc go. */
+function replaceSlot(list: OpenTab[], slot: number, tab: OpenTab) {
+  if (slot < 0 || slot >= list.length) {
+    tabs.set([...list, tab]);
+    persist();
+    return;
+  }
+  const left = list[slot];
+  if (tabId(left) === tabId(tab)) return;
+  if (left.kind === "chat") banShownChatRef(left.ref, left.file);
+  const next = [...list];
+  next[slot] = tab;
+  tabs.set(next);
+  persist();
+  if (left.kind === "doc") letDocGo(left.ref);
+}
+
 /**
- * Follows the app: the shown chat's tab exists. The boot draft's seat goes to
- * the first session that attaches in place — a fresh strip grows no dead
- * draft — and a tab still on its daemon name takes the file's once the
- * session says it.
+ * Places `tab` on the strip: if it is already open, keeps the strip as is (the
+ * caller switches to it); otherwise replaces the current tab (`"replace"`) or
+ * appends a new one (`"new"`).
+ */
+function placeTab(tab: OpenTab, mode: "replace" | "new") {
+  const list = tabs();
+  const existing = list.findIndex((t) =>
+    tab.kind === "chat" && tab.ref && !isDraftRef(tab.ref) ? ownsChat(t, tab.ref) : tabId(t) === tabId(tab),
+  );
+  if (existing >= 0) return;
+  if (mode === "new") {
+    tabs.set([...list, tab]);
+    persist();
+    return;
+  }
+  replaceSlot(list, currentSlotIndex(list), tab);
+}
+
+effect(() => {
+  const active = activeTabId();
+  if (active && untracked(tabs).some((t) => tabId(t) === active)) {
+    lastActiveId = active;
+  }
+});
+
+/**
+ * Follows the app: ensures the shown chat has its tab without ever spawning
+ * unasked-for tabs. An active draft tab promotes in place once its session
+ * starts; a chat opened directly (outside `openSessionTab`) replaces the
+ * current tab in place unless it is already open in the strip.
  */
 effect(() => {
   if (currentView().name !== "chat") {
@@ -208,69 +276,56 @@ effect(() => {
     closedShownRefs.clear();
     return;
   }
-  const ref = currentChatRef();
-  const file = daemonRefId(ref) ? undefined : ref || undefined;
+  const real = isCurrentChatUnstarted() ? "" : liveChatRef();
+  const file = real && !daemonRefId(real) ? real : undefined;
   untracked(() => {
-    for (const closed of [...closedShownRefs]) if (closed !== ref) closedShownRefs.delete(closed);
+    for (const closed of [...closedShownRefs]) if (closed !== real) closedShownRefs.delete(closed);
     const list = tabs();
-    if (!ref) {
-      if (!list.some((t) => t.kind === "chat" && !t.ref)) insertTab({ kind: "chat", ref: "" });
-      return;
-    }
-    // The surface still reports a ref whose tab was just closed: hold off
-    // until the neighbour's open lands and reports its own.
-    if (closedShownRefs.has(ref)) return;
-    const draftIndex = list.findIndex((t) => t.kind === "chat" && !t.ref);
-    if (draftIndex >= 0) {
-      // The draft became a real session: it keeps its place on the strip.
-      if (!list.some((t) => ownsChat(t, ref))) {
-        const next = [...list];
-        // Only looked at, until it runs: a draft the reader sent from is running already.
-        next[draftIndex] = { kind: "chat", ref, file, preview: true };
-        tabs.set(next);
+    if (!real) {
+      const preferred = activeDraftRef();
+      if (preferred !== undefined && list.some((t) => t.kind === "chat" && t.ref === preferred)) return;
+      if (list.some((t) => t.kind === "chat" && isDraftRef(t.ref))) return;
+      if (list.length === 0) {
+        tabs.set([{ kind: "chat", ref: "" }]);
         persist();
-        return;
+      } else {
+        replaceSlot(list, currentSlotIndex(list), { kind: "chat", ref: "" });
       }
-      // A draft and this session's tab both exist: the session's wins.
-      tabs.set(list.filter((t, i) => i !== draftIndex));
-      persist();
+      activeDraftRef.set("");
       return;
     }
-    const held = list.find((t) => ownsChat(t, ref));
-    if (!held) {
-      seatPreview({ kind: "chat", ref, file });
+    // The surface still reports a ref whose tab was just closed or replaced:
+    // hold off until the destination's open lands and reports its own.
+    if (closedShownRefs.has(real)) return;
+    const held = list.find((t) => ownsChat(t, real));
+    if (held) {
+      if (held.ref !== real) {
+        tabs.set(list.map((t) => (t === held ? { ...t, ref: real, file } : t)));
+        persist();
+      } else if (file && held.file !== file) {
+        tabs.set(list.map((t) => (t === held ? { ...t, file } : t)));
+        persist();
+      }
       return;
     }
-    if (held.ref !== ref) {
-      tabs.set(list.map((t) => (t === held ? { ...t, ref, file } : t)));
+    // The active draft tab started a real conversation: promote that exact tab in place.
+    const preferredDraft = activeDraftRef();
+    const draftIdx =
+      preferredDraft !== undefined
+        ? list.findIndex((t) => t.kind === "chat" && t.ref === preferredDraft)
+        : list.findIndex((t) => t.kind === "chat" && isDraftRef(t.ref) && tabId(t) === lastActiveId);
+    if (draftIdx >= 0) {
+      const next = [...list];
+      next[draftIdx] = { kind: "chat", ref: real, file };
+      tabs.set(next);
       persist();
-    } else if (file && held.file !== file) {
-      tabs.set(list.map((t) => (t === held ? { ...t, file } : t)));
-      persist();
+      activeDraftRef.set(undefined);
+      return;
     }
+    // A session opened directly (outside `openSessionTab`, e.g. subagent chip, Settings, harness):
+    // navigate inside the current tab rather than adding one on its own.
+    replaceSlot(list, currentSlotIndex(list), { kind: "chat", ref: real, file });
   });
-});
-
-/**
- * Work keeps a tab: the shown session running (a message was sent in it), a
- * session at work or waiting on the reader off screen, a document written in.
- */
-effect(() => {
-  const activeRef = currentView().name === "chat" ? currentChatRef() : undefined;
-  const runningHere = activeRef !== undefined && isRunning();
-  const worked = tabs().filter((t) => {
-    if (!t.preview) return false;
-    if (t.kind === "doc") return docAt(t.ref)?.dirty() === true;
-    // A live tab may still carry its daemon id while the session state has
-    // already reported the file. Match the conversation, not the temporary
-    // ref, so the prompt that keeps a preview cannot be lost during attach.
-    if (runningHere && ownsChat(t, activeRef!)) return true;
-    const status = chatTabSession(t)?.status;
-    return status === "working" || status === "blocked";
-  });
-  if (worked.length) {
-    untracked(() => worked.forEach((t) => keepTab(tabId(t))));
-  }
 });
 
 /** A `"daemon:<id>"` tab whose session gained a file takes the file as its ref (the conversation is the identity). */
@@ -310,12 +365,12 @@ effect(() => {
   const stored = untracked(storedOpenTabs);
   if (!stored?.length) return;
   untracked(() => {
-    const merged: OpenTab[] = stored.map((t) => ({ kind: t.kind === "doc" ? "doc" : "chat", ref: t.ref, file: t.file, preview: t.preview }));
-    // One preview seat: of several stored (or one stored and the boot's), the first stands.
-    let seat = false;
+    const merged: OpenTab[] = stored.map((t) => ({ kind: t.kind === "doc" ? "doc" : "chat", ref: t.ref, file: t.file }));
     for (const t of merged) {
-      if (t.preview && seat) t.preview = undefined;
-      seat ||= !!t.preview;
+      if (t.kind === "chat" && t.ref.startsWith(DRAFT_REF)) {
+        const n = Number(t.ref.slice(DRAFT_REF.length));
+        if (Number.isFinite(n) && n > draftSeq) draftSeq = n;
+      }
     }
     for (const t of tabs()) if (!merged.some((m) => tabId(m) === tabId(t))) merged.push(t);
     tabs.set(merged);
@@ -338,14 +393,14 @@ async function dropUnwrittenNotes() {
 
 /** The live daemon session behind a chat tab, when the daemon still knows it (status marks, the agent's logo). */
 export function chatTabSession(tab: OpenTab) {
-  if (tab.kind !== "chat") return undefined;
+  if (tab.kind !== "chat" || isDraftRef(tab.ref)) return undefined;
   const id = daemonRefId(tab.ref);
   return id ? daemonSessionOfId(id) : daemonSessionByFile(tab.ref);
 }
 
 /** A chat tab's label: the name its sidebar row shows — a daemon row's word for a nested or fileless session, else its file's listed title. */
 export function chatTabTitle(tab: OpenTab): string {
-  if (!tab.ref) return tr("New session", "新会话");
+  if (isDraftRef(tab.ref)) return tr("New session", "新会话");
   const id = daemonRefId(tab.ref);
   const ds = id ? daemonSessionOfId(id) : daemonSessionByFile(tab.ref);
   const file = id ? (ds?.file ?? tab.file) : tab.ref;
@@ -376,10 +431,14 @@ export function selectTab(tab: OpenTab) {
     showDoc(tab.ref);
     return;
   }
-  if (!tab.ref) {
-    newSession();
+  if (isDraftRef(tab.ref)) {
+    activeDraftRef.set(tab.ref);
+    showChat();
+    void newSession();
     return;
   }
+  activeDraftRef.set(undefined);
+  closedShownRefs.delete(tab.ref);
   const id = daemonRefId(tab.ref);
   if (id) {
     // A daemon ref that outlived its process still knows the file it resolved
@@ -389,6 +448,71 @@ export function selectTab(tab: OpenTab) {
     return;
   }
   void openSession(tab.ref);
+}
+
+/** Opens a saved session in the current tab (default) or a new tab (`newTab: true`: ⌘-click / middle-click). */
+export function openSessionTab(path: string, cwd?: string, options?: { newTab?: boolean; agentId?: string }) {
+  closedShownRefs.delete(path);
+  const hidden = liveChatRef();
+  if (hidden && hidden !== path && !tabs().some((t) => ownsChat(t, hidden))) banShownChatRef(hidden);
+  let result: ReturnType<typeof openSession>;
+  batch(() => {
+    placeTab({ kind: "chat", ref: path, file: path }, options?.newTab ? "new" : "replace");
+    activeDraftRef.set(undefined);
+    result = openSession(path, cwd, options?.agentId);
+  });
+  return result!;
+}
+
+/** Opens a daemon session in the current tab (default) or a new tab (`newTab: true`: ⌘-click / middle-click). */
+export function openDaemonSessionTab(sessionId: string, options?: { newTab?: boolean }) {
+  const ds = daemonSessionOfId(sessionId);
+  if (!ds) return;
+  const ref = ds.file ?? `${DAEMON_REF}${ds.id}`;
+  closedShownRefs.delete(ref);
+  if (ds.file) closedShownRefs.delete(ds.file);
+  const hidden = liveChatRef();
+  if (hidden && hidden !== ref && !tabs().some((t) => ownsChat(t, hidden))) banShownChatRef(hidden);
+  batch(() => {
+    placeTab({ kind: "chat", ref, ...(ds.file ? { file: ds.file } : {}) }, options?.newTab ? "new" : "replace");
+    activeDraftRef.set(undefined);
+    openDaemonSession(sessionId);
+  });
+}
+
+/**
+ * Starts a fresh empty session: in the current tab by default (⌘N, sidebar
+ * "New session"), or in a brand-new tab (`newTab: true`: TabBar `+`, ⌘T,
+ * ⌘-click).
+ */
+export function openNewSessionTab(options?: { newTab?: boolean; cwd?: string }) {
+  let result: ReturnType<typeof newSession> | ReturnType<typeof newSessionInWorkspace>;
+  batch(() => {
+    const list = tabs();
+    if (options?.newTab) {
+      const ref = nextDraftRef();
+      tabs.set([...list, { kind: "chat", ref }]);
+      persist();
+      activeDraftRef.set(ref);
+    } else {
+      const slot = currentSlotIndex(list);
+      const cur = slot >= 0 ? list[slot] : undefined;
+      if (cur && cur.kind === "chat" && isDraftRef(cur.ref)) {
+        activeDraftRef.set(cur.ref);
+      } else {
+        const ref = list.some((t) => t.kind === "chat" && t.ref === "") ? nextDraftRef() : "";
+        replaceSlot(list, slot, { kind: "chat", ref });
+        activeDraftRef.set(ref);
+      }
+    }
+    if (options?.cwd) {
+      result = newSessionInWorkspace(options.cwd);
+    } else {
+      showChat();
+      result = newSession();
+    }
+  });
+  return result!;
 }
 
 /** Cycles the strip by `delta` tabs (⌘⇧]'s). */
@@ -408,9 +532,7 @@ export function moveTab(id: string, index: number) {
   if (from < 0) return;
   const next = [...list];
   const [moved] = next.splice(from, 1);
-  // Placing a tab is a say on it: it stays.
-  const tab = moved.preview ? { ...moved, preview: undefined } : moved;
-  next.splice(Math.max(0, Math.min(index, next.length)), 0, tab);
+  next.splice(Math.max(0, Math.min(index, next.length)), 0, moved);
   tabs.set(next);
   persist();
 }
@@ -428,32 +550,35 @@ export function closeTab(id: string) {
   const tab = list[index];
   const wasActive = activeTabId() === id;
   const next = list.filter((t) => tabId(t) !== id);
-  tabs.set(next);
-  persist();
+  batch(() => {
+    tabs.set(next);
+    persist();
+    if (activeDraftRef() === tab.ref) activeDraftRef.set(undefined);
+    if (!wasActive) return;
+    if (tab.kind === "chat") banShownChatRef(tab.ref, tab.file);
+    const neighbor = next[Math.min(index, next.length - 1)];
+    if (neighbor) selectTab(neighbor);
+    else {
+      tabs.set([{ kind: "chat", ref: "" }]);
+      persist();
+      activeDraftRef.set("");
+      showChat();
+      void newSession();
+    }
+  });
   if (tab.kind === "doc") letDocGo(tab.ref);
-  if (!wasActive) return;
-  if (tab.kind === "chat" && tab.ref) {
-    // The surface still reports this ref until the neighbour's open lands.
-    closedShownRefs.add(tab.ref);
-    const d = daemonRefId(tab.ref);
-    const f = d ? (daemonSessionOfId(d)?.file ?? tab.file) : undefined;
-    if (f) closedShownRefs.add(f);
-  }
-  const neighbor = next[Math.min(index, next.length - 1)];
-  if (neighbor) selectTab(neighbor);
-  else newSession();
 }
 
 /**
- * A new document, open and kept: the file is made by its first words (one
- * nobody wrote in leaves nothing). A blank one already open is the new
- * document — asking twice does not make two.
+ * A new document tab: the file is made by its first words (one nobody wrote in
+ * leaves nothing). A blank one already open is the new document — asking twice
+ * does not make two.
  */
 export async function newDocTab() {
   setGroupCollapsed("docs", false);
   const blank = tabs().find((t) => t.kind === "doc" && isNote(t.ref) && docIsBlank(t.ref));
-  if (blank) return openDocTab(blank.ref);
-  openDocTab(await newDocPath());
+  if (blank) return openDocTab(blank.ref, { newTab: true });
+  openDocTab(await newDocPath(), { newTab: true });
 }
 
 /**
@@ -479,25 +604,26 @@ export async function draftToDoc() {
   draftOrigins.update((all) => ({ ...all, [path]: origin }));
   void refreshNotes();
   ensureDoc(path, { caret: "end" });
-  openDocTab(path);
+  openDocTab(path, { newTab: true });
 }
 
 /**
- * A Markdown file as a document tab. Asked for by name (a pick, a drop, New)
- * it is kept; `preview` is a look from the shelf, in the preview seat.
+ * A Markdown file as a document tab: navigates inside the current tab by
+ * default (sidebar click, palette), or opens a new tab (`newTab: true`:
+ * ⌘-click, New Document, ⌘E, drop, Open File, chat card).
  */
-export function openDocTab(path: string, options?: { preview?: boolean }) {
+export function openDocTab(path: string, options?: { newTab?: boolean }) {
   ensureDoc(path);
   const tab: OpenTab = { kind: "doc", ref: path };
-  if (options?.preview) seatPreview(tab);
-  else if (indexOf(tab) >= 0) keepTab(tabId(tab));
-  else insertTab(tab);
-  showDoc(path);
+  batch(() => {
+    placeTab(tab, options?.newTab ? "new" : "replace");
+    showDoc(path);
+  });
 }
 
 /** Opens a document named by something said earlier (a card on a sent message): it may have been deleted since. */
 export async function openDocIfThere(path: string) {
-  if (docAt(path) || (await fs.exists(path).catch(() => false))) openDocTab(path);
+  if (docAt(path) || (await fs.exists(path).catch(() => false))) openDocTab(path, { newTab: true });
   else toast("info", tr("That document is no longer there", "这篇文档已经不在了"));
 }
 
@@ -507,7 +633,7 @@ export async function pickDocTab() {
   if (!pick) return;
   try {
     const path = await pick(tr("Open a Markdown document", "打开一个 Markdown 文档"), ["md", "markdown", "mdown", "txt"]);
-    if (path) openDocTab(path);
+    if (path) openDocTab(path, { newTab: true });
   } catch (error) {
     if (error instanceof NoPickerError) {
       toast("warning", tr("No file picker found — install zenity or kdialog to choose files.", "找不到文件选择器——请安装 zenity 或 kdialog。"));
@@ -554,19 +680,21 @@ export async function saveDocAs(path: string) {
     const oldIdx = list.findIndex((t) => tabId(t) === oldId);
     const destIdx = list.findIndex((t) => tabId(t) === tabId(destTab));
     if (oldIdx >= 0) {
-      if (destIdx >= 0) {
-        tabs.set(list.filter((_, i) => i !== oldIdx));
-      } else {
-        const next = [...list];
-        next[oldIdx] = destTab;
-        tabs.set(next);
-      }
-      persist();
+      batch(() => {
+        if (destIdx >= 0) {
+          tabs.set(list.filter((_, i) => i !== oldIdx));
+        } else {
+          const next = [...list];
+          next[oldIdx] = destTab;
+          tabs.set(next);
+        }
+        persist();
+        ensureDoc(dest);
+        showDoc(dest);
+      });
       letDocGo(path);
-      ensureDoc(dest);
-      showDoc(dest);
     } else {
-      openDocTab(dest);
+      openDocTab(dest, { newTab: true });
     }
   }
   void refreshNotes();
@@ -605,7 +733,7 @@ function sessionTargetTitle(tab: OpenTab, current: boolean): string {
 /** True when a chat tab is still an unstarted blank session (Pi assigns a sessionFile at boot before any message). */
 function isUnstartedChatTab(tab: OpenTab, active: string): boolean {
   if (tab.kind !== "chat") return false;
-  if (!tab.ref) return true;
+  if (isDraftRef(tab.ref)) return true;
   if (ownsChat(tab, active)) {
     return transcriptRows().length === 0 && !(sessionState()?.messageCount) && !isRunning();
   }
@@ -628,7 +756,7 @@ export function docChatTargets(): DocChatTargets {
   const draftTab = list.find((t) => t.kind === "chat" && isUnstartedChatTab(t, active));
   const draftText = composerDraft().trim();
   const activeIsUnstarted =
-    active === "" || (transcriptRows().length === 0 && !(sessionState()?.messageCount) && !isRunning());
+    isDraftRef(active) || (transcriptRows().length === 0 && !(sessionState()?.messageCount) && !isRunning());
   const hasActiveDraft = Boolean(
     draftTab &&
       activeIsUnstarted &&
@@ -655,7 +783,9 @@ export function docDraftOrigin(path: string): { tab: OpenTab; label: string; isB
   if (origin === undefined) return undefined;
   const list = tabs();
   const active = currentChatRef();
-  const tab = origin === "" ? list.find((t) => t.kind === "chat" && !t.ref) : list.find((t) => ownsChat(t, origin));
+  const tab = isDraftRef(origin)
+    ? list.find((t) => t.kind === "chat" && t.ref === origin)
+    : list.find((t) => ownsChat(t, origin));
   if (!tab) return undefined;
   const isBlankDraft = isUnstartedChatTab(tab, active);
   const label = isBlankDraft ? "" : sessionTargetTitle(tab, ownsChat(tab, active));
@@ -689,7 +819,7 @@ async function readDocForChat(path: string, useSelection: boolean): Promise<{ te
   return { text, excerpt: false };
 }
 
-/** Starts a clean new session (or focuses the empty draft) with this document (or selection) attached. */
+/** Starts a clean new session tab (or focuses an empty draft tab) with this document (or selection) attached. */
 export async function addDocToNewSession(path: string, options?: { selection?: boolean }) {
   const passage = await readDocForChat(path, options?.selection !== false);
   if (!passage) return;
@@ -697,11 +827,16 @@ export async function addDocToNewSession(path: string, options?: { selection?: b
     toast("info", tr("Nothing written to add yet", "还没有写下可以添加的内容"));
     return;
   }
+  const targets = docChatTargets();
   attachDoc({ path, title: docTabTitle(path), text: passage.text, ...(passage.excerpt ? { excerpt: true } : {}) });
   void flushDoc(path);
-  keepTab(`doc:${path}`);
   clearDraftOrigin(path);
-  void newSession();
+  if (targets.draftTab && !targets.hasActiveDraft) {
+    selectTab(targets.draftTab);
+    showChat();
+  } else {
+    void openNewSessionTab({ newTab: true });
+  }
 }
 
 /** Switches to an explicit chat tab and attaches this document (or selection) to its composer. */
@@ -714,7 +849,6 @@ export async function addDocToTab(path: string, tab: OpenTab, options?: { select
   }
   attachDoc({ path, title: docTabTitle(path), text: passage.text, ...(passage.excerpt ? { excerpt: true } : {}) });
   void flushDoc(path);
-  keepTab(`doc:${path}`);
   clearDraftOrigin(path);
   selectTab(tab);
   showChat();
@@ -736,7 +870,6 @@ export async function attachDocToCurrentComposer(path: string): Promise<boolean>
   }
   attachDoc({ path, title: docTabTitle(path), text: passage.text });
   void flushDoc(path);
-  keepTab(`doc:${path}`);
   return true;
 }
 

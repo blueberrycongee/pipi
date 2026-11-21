@@ -15,7 +15,7 @@ import {
   untracked,
   View,
 } from "nsh";
-import type { AnimatedValue, ContextMenuEvent, GestureResponderEvent, JSX, MouseEvent, ScrollRef, ViewRef } from "nsh";
+import type { AnimatedValue, ContextMenuEvent, GestureResponderEvent, JSX, MouseEvent, PressEvent, ScrollRef, ViewRef } from "nsh";
 import { AlertDialog, Button as BaseButton, Collapsible } from "nsh/base";
 import { Haptics, isAvailable as hapticsAvailable } from "nsh/mobile";
 import { Menu, type MenuItem, titleBar } from "nsh/desktop";
@@ -54,10 +54,6 @@ import {
   isSessionRunning,
   isSessionUnread,
   leaveSettings,
-  newSession,
-  newSessionInWorkspace,
-  openDaemonSession,
-  openSession,
   openWorkspace,
   pendingSession,
   projectCwdOf,
@@ -76,7 +72,20 @@ import {
 } from "../store/app";
 import { backend } from "../store/backend";
 import { chooseDocsFolder, type NoteSummary, notes, revealDoc, revealDocsFolder } from "../store/docs";
-import { addDocToNewSession, addDocToTab, deleteNote, docChatTargets, docTabTitle, newDocTab, openDocTab, pickDocTab, saveDocAs } from "../store/tabs";
+import {
+  addDocToNewSession,
+  addDocToTab,
+  deleteNote,
+  docChatTargets,
+  docTabTitle,
+  newDocTab,
+  openDaemonSessionTab,
+  openDocTab,
+  openNewSessionTab,
+  openSessionTab,
+  pickDocTab,
+  saveDocAs,
+} from "../store/tabs";
 import {
   isGroupCollapsed,
   isSessionArchived,
@@ -118,6 +127,9 @@ const TRAILING_SLOT = "pointer-events-none absolute right-1 top-0.5 size-6 flex-
  * `platform.os` covers them headless, where `titleBar()` reports zeros.
  */
 const leftControls = () => platform.os === "macos" || titleBar().left > 0;
+/** True when the platform's primary modifier (⌘ on macOS, Ctrl elsewhere) was held on a press. */
+const isModPress = (e?: { modifiers?: { platform?: boolean; control?: boolean } }) =>
+  Boolean(platform.os === "macos" ? e?.modifiers?.platform : e?.modifiers?.control);
 const ROW_PRESS = `${PRESS} ${FOCUS_RING} hover:bg-sidebar-accent group-hover:bg-sidebar-accent active:bg-sidebar-accent`;
 /**
  * The pointer rests while rows slide under it — a draft row opening or closing
@@ -1189,7 +1201,7 @@ async function confirmDeleteDaemon(session: DaemonSession) {
 }
 
 async function renameFrom(session: SessionSummary, cwd: string) {
-  await openSession(session.path, cwd);
+  await openSessionTab(session.path, cwd);
   startRenaming();
 }
 
@@ -1208,7 +1220,8 @@ function projectLabel(cwd: string, all: readonly string[]): { name: string; pare
 function sessionMenuItems(session: SessionSummary, cwd: string): MenuItem[] {
   if (isSessionArchived(session.path)) {
     return [
-      { label: tr("Open", "打开"), onSelect: () => void openSession(session.path, cwd) },
+      { label: tr("Open", "打开"), onSelect: () => void openSessionTab(session.path, cwd) },
+      { label: tr("Open in New Tab", "在新标签页中打开"), onSelect: () => void openSessionTab(session.path, cwd, { newTab: true }) },
       {
         label: tr("Unarchive", "取消归档"),
         onSelect: () => {
@@ -1221,7 +1234,8 @@ function sessionMenuItems(session: SessionSummary, cwd: string): MenuItem[] {
     ];
   }
   return [
-    { label: tr("Open", "打开"), onSelect: () => void openSession(session.path, cwd) },
+    { label: tr("Open", "打开"), onSelect: () => void openSessionTab(session.path, cwd) },
+    { label: tr("Open in New Tab", "在新标签页中打开"), onSelect: () => void openSessionTab(session.path, cwd, { newTab: true }) },
     { label: tr("Rename…", "重命名…"), onSelect: () => void renameFrom(session, cwd) },
     {
       label: tr("Archive", "归档"),
@@ -1235,20 +1249,18 @@ function sessionMenuItems(session: SessionSummary, cwd: string): MenuItem[] {
   ];
 }
 
-function startNewSession() {
-  showChat();
-  void newSession();
+function startNewSession(newTab = false) {
+  void openNewSessionTab({ newTab });
 }
 
-function startNewSessionFromRecents() {
+function startNewSessionFromRecents(newTab = false) {
   setGroupCollapsed("recents", false);
   explicitDraftGroup = "recents";
   draftGroup.set("recents");
-  showChat();
-  void newSession();
+  void openNewSessionTab({ newTab });
 }
 
-function startNewSessionIn(cwd: string) {
+function startNewSessionIn(cwd: string, newTab = false) {
   if (isWorkspaceCollapsed(cwd)) {
     setGroupCollapsed("recents", false);
     explicitDraftGroup = "recents";
@@ -1257,7 +1269,7 @@ function startNewSessionIn(cwd: string) {
     explicitDraftGroup = "workspaces";
     draftGroup.set("workspaces");
   }
-  void newSessionInWorkspace(cwd);
+  void openNewSessionTab({ newTab, cwd });
 }
 
 /**
@@ -1556,13 +1568,24 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
   const engine = () => engineOf(shownAgentId());
   return (
     <View class={hoverGroup()}>
-      <BaseButton
-        selected={selected()}
-        onPress={() => {
+      <View
+        role="button"
+        accessibilityState={{ selected: selected() }}
+        onPress={(e: PressEvent) => {
           const target = shownCwd();
           draftGroup.set(props.group);
+          if (isModPress(e)) {
+            void openNewSessionTab({ newTab: true, cwd: target && target !== activeProjectPath() ? target : undefined });
+            return;
+          }
           showChat();
           if (target && target !== activeProjectPath()) void openWorkspace(target);
+        }}
+        onMouseUp={(e: MouseEvent) => {
+          if (e.button !== "middle") return;
+          const target = shownCwd();
+          draftGroup.set(props.group);
+          void openNewSessionTab({ newTab: true, cwd: target && target !== activeProjectPath() ? target : undefined });
         }}
         tooltip={tip(
           props.group === "recents" ? `${engine().name} · ${tildePath(shownCwd(), home)}` : engine().name,
@@ -1573,7 +1596,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
       >
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{shownTitle()}</Text>
-      </BaseButton>
+      </View>
       <View class={TRAILING_SLOT}>
         <Presence show={running()} testID="sidebar-draft-running">
           <Pip size={16} mood="work" />
@@ -1610,23 +1633,32 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
   /** The list a drag of this row belongs to; 已归档's rows do not move. */
   const dropList = () =>
     props.group === "workspaces" ? `ws:${props.cwd}` : props.group === "recents" ? "recents" : undefined;
+  const openRow = (newTab: boolean) => {
+    touchHeld = false;
+    disarmMouseDrag();
+    const path = props.session.path;
+    if (chosenGroups()[path] !== props.group) chosenGroups.update((all) => ({ ...all, [path]: props.group }));
+    void openSessionTab(props.session.path, props.cwd, { newTab });
+  };
   const content = (
     <>
-      <BaseButton
-        selected={selected()}
-        onPress={() => {
-          const path = props.session.path;
-          if (chosenGroups()[path] !== props.group) chosenGroups.update((all) => ({ ...all, [path]: props.group }));
-          void openSession(props.session.path, props.cwd);
+      <View
+        role="button"
+        accessibilityState={{ selected: selected() }}
+        onPress={(e: PressEvent) => openRow(isModPress(e))}
+        onPressDown={(e: PressEvent) => {
+          if (!isModPress(e) && dropList()) armMouseDrag({ list: dropList()!, id: props.session.path }, e.pagePosition.y);
         }}
-        onPressDown={() => dropList() && armMouseDrag({ list: dropList()!, id: props.session.path })}
         onPressUp={endMouseDrag}
+        onMouseUp={(e: MouseEvent) => {
+          if (e.button === "middle") openRow(true);
+        }}
         tooltip={tip(`${engine().name} · ${tildePath(props.cwd, home)}`, undefined, "right")}
         class={calm(sessionRowClass(Boolean(props.indent), running() || unread() || blocked() || failed(), true, 0, keepCue()))}
       >
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{titleOf(props.session)}</Text>
-      </BaseButton>
+      </View>
       <View class={keepCue() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`}>
         <Presence
           show={running() && !blocked()}
@@ -1720,22 +1752,31 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
   const archivable = () => file() !== undefined || !working();
   /** Only 最近's root rows drag: a nested row's place is its tree's, a 工作区 row's is the daemon's order. */
   const dropList = () => (props.group === "recents" && !nested() ? "recents" : undefined);
+  const openDaemonRow = (newTab: boolean) => {
+    touchHeld = false;
+    disarmMouseDrag();
+    const s = session();
+    const key = `daemon:${s.id}`;
+    if (chosenGroups()[key] !== props.group) chosenGroups.update((all) => ({ ...all, [key]: props.group }));
+    if (!isDaemonTaskSession(s) && !s.file) {
+      explicitDraftGroup = props.group;
+      draftGroup.set(props.group);
+    }
+    openDaemonSessionTab(s.id, { newTab });
+  };
   const content = (
     <>
-      <BaseButton
-        selected={selected()}
-        onPress={() => {
-          const s = session();
-          const key = `daemon:${s.id}`;
-          if (chosenGroups()[key] !== props.group) chosenGroups.update((all) => ({ ...all, [key]: props.group }));
-          if (!isDaemonTaskSession(s) && !s.file) {
-            explicitDraftGroup = props.group;
-            draftGroup.set(props.group);
-          }
-          openDaemonSession(s.id);
+      <View
+        role="button"
+        accessibilityState={{ selected: selected() }}
+        onPress={(e: PressEvent) => openDaemonRow(isModPress(e))}
+        onPressDown={(e: PressEvent) => {
+          if (!isModPress(e) && dropList()) armMouseDrag({ list: dropList()!, id: `daemon:${session().id}` }, e.pagePosition.y);
         }}
-        onPressDown={() => dropList() && armMouseDrag({ list: dropList()!, id: `daemon:${session().id}` })}
         onPressUp={endMouseDrag}
+        onMouseUp={(e: MouseEvent) => {
+          if (e.button === "middle") openDaemonRow(true);
+        }}
         tooltip={tip(
           `${engine().name} · ${tildePath(session().cwd, home)}${session().worktree?.branch ? ` · ${session().worktree!.branch}` : ""}${
             file() ? "" : ` · ${statusLabel(session().status)}`
@@ -1755,7 +1796,7 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
       >
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{daemonSessionTitle(session())}</Text>
-      </BaseButton>
+      </View>
       <View class={working() || !archivable() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`}>
         <Presence
           show={working() && !blocked()}
@@ -1844,7 +1885,8 @@ function statusLabel(status: DaemonSession["status"]) {
 function childMenuItems(session: DaemonSession): MenuItem[] {
   const working = session.status === "working" || session.status === "blocked";
   return [
-    { label: tr("Open", "打开"), onSelect: () => openDaemonSession(session.id) },
+    { label: tr("Open", "打开"), onSelect: () => openDaemonSessionTab(session.id) },
+    { label: tr("Open in New Tab", "在新标签页中打开"), onSelect: () => openDaemonSessionTab(session.id, { newTab: true }) },
     {
       label: tr("Stop session", "停止会话"),
       disabled: !working,
@@ -1981,8 +2023,8 @@ async function confirmDeleteNote(note: NoteSummary) {
 }
 
 /**
- * A document in the sidebar's quiet 文档 group: a press looks at it (the strip's
- * preview seat), writing in it keeps its tab, and hovering shows where the file lives.
+ * A document in the sidebar's quiet 文档 group: a click opens it in the current
+ * tab, ⌘-click or middle-click opens a new tab, and hovering shows where the file lives.
  */
 function NoteRow(props: { note: NoteSummary }) {
   const home = backend().home();
@@ -2000,6 +2042,7 @@ function NoteRow(props: { note: NoteSummary }) {
     return Menu.popup(
       [
         { label: tr("Open", "打开"), onSelect: () => openDocTab(props.note.path) },
+        { label: tr("Open in New Tab", "在新标签页中打开"), onSelect: () => openDocTab(props.note.path, { newTab: true }) },
         {
           label: targets.hasActiveDraft ? tr("Add to Current Draft", "添加到当前草稿") : tr("New Session with Document", "用新会话讨论"),
           onSelect: () =>
@@ -2020,9 +2063,13 @@ function NoteRow(props: { note: NoteSummary }) {
   };
   return (
     <View class={hoverGroup()} onContextMenu={menu}>
-      <BaseButton
-        selected={selected()}
-        onPress={() => openDocTab(props.note.path, { preview: true })}
+      <View
+        role="button"
+        accessibilityState={{ selected: selected() }}
+        onPress={(e: PressEvent) => openDocTab(props.note.path, { newTab: isModPress(e) })}
+        onMouseUp={(e: MouseEvent) => {
+          if (e.button === "middle") openDocTab(props.note.path, { newTab: true });
+        }}
         tooltip={tip(tildePath(props.note.path, home), undefined, "right")}
         class={calm(sessionRowClass(false, false, false))}
       >
@@ -2030,7 +2077,7 @@ function NoteRow(props: { note: NoteSummary }) {
           <Icon name="file" size={14} tone={selected() ? "foreground" : "muted-foreground"} />
         </View>
         <Text class={sessionTitleClass(selected())}>{docTabTitle(props.note.path)}</Text>
-      </BaseButton>
+      </View>
     </View>
   );
 }
@@ -2288,9 +2335,13 @@ export function Sidebar() {
         </If>
       </View>
       <View class={`shrink-0 flex-row items-center gap-1 pb-2 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
-        <BaseButton
+        <View
+          role="button"
           testID="sidebar-new-session"
-          onPress={startNewSession}
+          onPress={(e: PressEvent) => startNewSession(isModPress(e))}
+          onMouseUp={(e: MouseEvent) => {
+            if (e.button === "middle") startNewSession(true);
+          }}
           accessibilityLabel={tr("New session", "新会话")}
           tooltip={tip(tr("New session", "新会话"), "mod+n", "right")}
           class={`h-8 min-w-0 flex-1 flex-row items-center gap-1.5 rounded-md corner-squircle px-2.5 ${ROW_PRESS}`}
@@ -2299,7 +2350,7 @@ export function Sidebar() {
             <Icon name="pencil" size={14} tone="muted-foreground" />
           </View>
           <Text class="text-base text-sidebar-foreground">{tr("New session", "新会话")}</Text>
-        </BaseButton>
+        </View>
         <If when={!leftControls()}>
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
         </If>

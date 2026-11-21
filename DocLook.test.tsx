@@ -92,7 +92,7 @@ test("look", async () => {
   await app.keyboard.press("escape");
   await app.keyboard.press("backspace");
 
-  // A document looked at from Documents: the strip's preview seat, its name in italics.
+  // A document opened from Documents replaces the current tab cleanly (no italic preview seat).
   await app.press("id:sidebar-docs >> text:Tab strip brief");
   await app.wait(500);
   await app.screenshot(".nsh/shots/doc-note-preview.png");
@@ -106,7 +106,7 @@ test("look", async () => {
   await app.keyboard.press("right");
 
   // Taken explicitly to a new session: a card on the composer, the words still in the document.
-  await app.rightClick("id:tab-1");
+  await app.rightClick("id:tab-2");
   await app.chooseMenuItem("New Session with Document");
   await app.waitFor("id:composer-doc");
   await app.wait(600);

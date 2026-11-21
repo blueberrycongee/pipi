@@ -34,7 +34,6 @@ import {
   isRenaming,
   isRunning,
   leaveSettings,
-  newSession,
   pendingDialog,
   randomWallpaper,
   restartPi,
@@ -60,7 +59,7 @@ import {
   sidebarWidth,
 } from "../store/prefs";
 import { flushDocs, refreshNotes, revealDoc, syncDocs } from "../store/docs";
-import { activeTabId, closeTab, cycleTab, draftToDoc, newDocTab, openTabs, pickDocTab, saveDocAs } from "../store/tabs";
+import { activeTabId, closeTab, cycleTab, draftToDoc, newDocTab, openNewSessionTab, openTabs, pickDocTab, saveDocAs } from "../store/tabs";
 import { EASING } from "../ui/motion";
 import { SIDEBAR_GLASS, WALLPAPER_FROST } from "../ui/styles";
 import { isZoomOpen, ZoomLayer } from "../ui/Zoom";
@@ -199,7 +198,8 @@ function applicationMenu() {
     {
       label: tr("File", "文件"),
       submenu: [
-        { label: tr("New Session", "新建会话"), shortcut: "mod+n", onSelect: () => void newSession() },
+        { label: tr("New Tab", "新建标签页"), shortcut: "mod+t", onSelect: () => void openNewSessionTab({ newTab: true }) },
+        { label: tr("New Session", "新建会话"), shortcut: "mod+n", onSelect: () => void openNewSessionTab({ newTab: false }) },
         { label: tr("New Document", "新建文档"), shortcut: "mod+shift+n", onSelect: () => void newDocTab() },
         {
           label: tr("Continue Draft in a Document", "在文档中继续写"),
@@ -604,7 +604,8 @@ export function Shell() {
     });
   } else {
     keymap.bind({
-      "mod+n": () => void newSession(),
+      "mod+t": () => void openNewSessionTab({ newTab: true }),
+      "mod+n": () => void openNewSessionTab({ newTab: false }),
       "mod+shift+n": () => void newDocTab(),
       "mod+e": () => {
         if (currentView().name === "chat") void draftToDoc();

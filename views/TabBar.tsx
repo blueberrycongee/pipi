@@ -14,7 +14,6 @@ import {
   isSwitching,
   isCurrentSessionArchived,
   isRenaming,
-  newSession,
   openDaemonSession,
   openWorkspace,
   renameSession,
@@ -35,10 +34,11 @@ import {
   chatTabTitle,
   closeTab,
   docChatTargets,
-  keepTab,
+  isDraftRef,
   moveTab,
   newDocTab,
   openDocTab,
+  openNewSessionTab,
   openTabs,
   pickDocTab,
   saveDocAs,
@@ -337,8 +337,8 @@ export function TabBar() {
       const removed = before.filter((id) => !ids.includes(id));
       // A close with the pointer in the strip pins the pills' width, so each
       // next close lands under it; an open hands the room back at once.
-      if (removed.length && pointerInStrip) stuckW.set(wNow());
-      else if (added.length) stuckW.set(undefined);
+      if (ids.length < before.length && pointerInStrip) stuckW.set(wNow());
+      else if (ids.length > before.length) stuckW.set(undefined);
       // A reorder is the drag's own motion (its drop rebases the offsets); only membership flows here.
       if ((!added.length && !removed.length) || !stripSeeded || reduceMotion() || drag() || settle()) return;
       bornIds.clear();
@@ -707,14 +707,13 @@ export function TabBar() {
   function menuItems(tab: OpenTab): MenuItem[] {
     const id = tabId(tab);
     const items: MenuItem[] = [];
-    if (tab.kind === "chat" && activeTabId() === id && tab.ref) {
+    if (tab.kind === "chat" && activeTabId() === id && !isDraftRef(tab.ref)) {
       items.push({
         label: tr("Rename…", "重命名…"),
         disabled: sidecarPhase().name !== "ready",
         onSelect: () => startRenaming(),
       });
     }
-    if (tab.preview) items.push({ label: tr("Keep Open", "保持打开"), onSelect: () => keepTab(id) });
     items.push({ label: tr("Close Tab", "关闭标签页"), onSelect: () => closeTab(id) });
     if (openTabs().length > 1) {
       items.push({
@@ -944,7 +943,7 @@ export function TabBar() {
           session()?.agentId ? (
             <AgentLogo id={session()!.agentId} size={14} tone={active() ? "foreground" : "muted-foreground"} class="shrink-0" />
           ) : (
-            <Icon name={props.tab().ref ? "terminal" : "pencil"} size={13} tone={active() ? "foreground" : "subtle"} class="shrink-0" />
+            <Icon name={isDraftRef(props.tab().ref) ? "pencil" : "terminal"} size={13} tone={active() ? "foreground" : "subtle"} class="shrink-0" />
           )
         ) : (
           <Icon name="file" size={13} tone={active() ? "foreground" : "subtle"} class="shrink-0" />
@@ -955,7 +954,7 @@ export function TabBar() {
             <Text
               class={`mx-1.5 min-w-0 flex-1 truncate text-sm font-medium transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
                 active() ? "text-foreground" : "text-muted-foreground group-hover:text-foreground"
-              } ${props.tab().preview ? "italic" : ""}`}
+              }`}
             >
               {tabTitle(props.tab())}
             </Text>
@@ -982,10 +981,10 @@ export function TabBar() {
     );
   }
 
-  /** The "+" button's other surfaces, on a right press: the press itself is the common one — a new session, at once. */
+  /** The "+" button's other surfaces, on a right press: the press itself opens a new tab at once. */
   function newMenuItems(): MenuItem[] {
     return [
-      { label: tr("New Session", "新建会话"), shortcut: "mod+n", onSelect: () => void newSession() },
+      { label: tr("New Tab", "新建标签页"), shortcut: "mod+t", onSelect: () => void openNewSessionTab({ newTab: true }) },
       { label: tr("New Document", "新建文档"), shortcut: "mod+shift+n", onSelect: () => void newDocTab() },
       { type: "separator" },
       { label: tr("Open Markdown File…", "打开 Markdown 文件…"), onSelect: () => void pickDocTab() },
@@ -1029,13 +1028,13 @@ export function TabBar() {
       onFileDrop={(e) => {
         for (const uri of e.uris) {
           const path = uri.replace(/^file:\/\//, "");
-          if (/\.(md|markdown|mdown|txt)$/i.test(path)) openDocTab(decodeURIComponent(path));
+          if (/\.(md|markdown|mdown|txt)$/i.test(path)) openDocTab(decodeURIComponent(path), { newTab: true });
         }
       }}
     >
       <Presence show={!sidebarOpen()} scaleFrom={0.92} class="shrink-0 flex-row items-center gap-1">
         <IconButton icon="sidebar" label={tr("Show sidebar", "显示侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(true)} />
-        <IconButton icon="pencil" label={tr("New session", "新建会话")} shortcut="mod+n" onPress={() => void newSession()} />
+        <IconButton icon="pencil" label={tr("New session", "新建会话")} shortcut="mod+n" onPress={() => void openNewSessionTab({ newTab: false })} />
       </Presence>
       <Scroll
         ref={(ref) => {
@@ -1074,11 +1073,12 @@ export function TabBar() {
           onContextMenu={(e: ContextMenuEvent) => Menu.popup(newMenuItems(), e.pagePosition)}
         >
           <IconButton
+            testID="tab-new"
             icon="plus"
             size="sm"
-            label={tr("New session", "新建会话")}
-            shortcut="mod+n"
-            onPress={() => void newSession()}
+            label={tr("New tab", "新建标签页")}
+            shortcut="mod+t"
+            onPress={() => void openNewSessionTab({ newTab: true })}
             class="my-0.5 shrink-0"
           />
         </View>

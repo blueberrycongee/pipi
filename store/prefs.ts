@@ -62,12 +62,10 @@ export interface ArchivedSessionMeta {
 /** A surface the top tab strip held: a chat session, or a markdown document. */
 export interface StoredOpenTab {
   kind: "chat" | "doc";
-  /** chat: the conversation's session file ("daemon:<id>" while file-less, "" for an unstarted draft); doc: the file's path. */
+  /** chat: the conversation's session file ("daemon:<id>" while file-less, "" / "draft:<n>" for an unstarted draft); doc: the file's path. */
   ref: string;
   /** chat with a `"daemon:"` ref only: the `.jsonl` it resolved to once, for reopening after a daemon restart. */
   file?: string;
-  /** Only looked at so far (the strip's preview seat). */
-  preview?: boolean;
 }
 
 /** What the user last picked on one agent's pickers; every fresh session on that agent restores it. */
@@ -305,7 +303,6 @@ function normalizeOpenTabs(raw: unknown): StoredOpenTab[] {
       kind: t.kind,
       ref: t.ref,
       ...(typeof t.file === "string" && t.file ? { file: t.file } : {}),
-      ...(t.preview === true ? { preview: true } : {}),
     });
   }
   return out;

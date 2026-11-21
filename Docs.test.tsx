@@ -295,11 +295,9 @@ test("a document's tab menu sends it to a clean New Session or a named open sess
   const app = await launch({ dir });
   await app.waitFor("text:What are we building?");
 
-  // Open and keep an existing conversation so it stays on the strip beside a New Session.
+  // Open an existing conversation so it stays on the strip beside a New Document.
   await app.press(`${RECENT} >> text:Refactor the transcript reducer`);
   await app.waitFor("label:Conversation >> text:Refactor the transcript reducer");
-  await app.rightClick("id:tab-0");
-  await app.chooseMenuItem("Keep Open");
 
   await app.keyboard.press("mod+shift+n");
   await app.waitFor(EDITOR);

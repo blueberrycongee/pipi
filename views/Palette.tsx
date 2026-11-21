@@ -30,9 +30,6 @@ import {
   gitWorkspaceInfo,
   isCurrentSessionArchived,
   isPaletteOpen,
-  newSession,
-  openDaemonSession,
-  openSession,
   openWorkspace,
   projectCwdOf,
   randomWallpaper,
@@ -58,7 +55,7 @@ import {
 import { backend } from "../store/backend";
 import { docTabTitle, notes, revealDocsFolder } from "../store/docs";
 import { recentWorkspaces } from "../store/prefs";
-import { newDocTab, openDocTab, pickDocTab, saveDocAs } from "../store/tabs";
+import { newDocTab, openDaemonSessionTab, openDocTab, openNewSessionTab, openSessionTab, pickDocTab, saveDocAs } from "../store/tabs";
 import { Icon, type IconName } from "../ui/Icon";
 import { FloatingLayer } from "../ui/motion";
 import { runtimeModeIcon, runtimeModeText, thinkingText, tr } from "../lib/i18n";
@@ -79,7 +76,8 @@ export function Palette() {
     const workspaceGroup = tr("Workspace", "工作区");
     const permissionModes: RuntimeMode[] = ["approval-required", "auto-accept-edits", "full-access"];
     return [
-      { id: "new", label: tr("New Session", "新建会话"), group: sessionGroup, keywords: ["new session"], shortcut: "mod+n", icon: "pencil", run: () => void newSession() },
+      { id: "new-tab", label: tr("New Tab", "新建标签页"), group: sessionGroup, keywords: ["new tab", "标签页"], shortcut: "mod+t", icon: "plus", run: () => void openNewSessionTab({ newTab: true }) },
+      { id: "new", label: tr("New Session", "新建会话"), group: sessionGroup, keywords: ["new session"], shortcut: "mod+n", icon: "pencil", run: () => void openNewSessionTab({ newTab: false }) },
       { id: "new-doc", label: tr("New Document", "新建文档"), group: sessionGroup, keywords: ["new document", "note", "write", "文档", "笔记"], shortcut: "mod+shift+n", icon: "filePlus", run: () => void newDocTab() },
       { id: "rename", label: tr("Rename Session…", "重命名会话…"), group: sessionGroup, keywords: ["rename session"], icon: "pencil", run: startRenaming },
       { id: "duplicate", label: tr("Duplicate Session", "复制会话"), group: sessionGroup, keywords: ["duplicate session"], icon: "copy", run: () => void duplicateSession() },
@@ -233,7 +231,7 @@ export function Palette() {
             keywords: [folder, title, rawTitle, "session"],
             icon: "message",
             checked: cwd === activeProjectPath() && session.path === sessionState()?.sessionFile,
-            run: () => void openSession(session.path, cwd),
+            run: () => void openSessionTab(session.path, cwd),
           };
         }),
       // Document actions and every saved document in the configured documents folder.
@@ -296,7 +294,7 @@ export function Palette() {
             keywords: [folder, title, ds.title, "session"],
             icon: "message",
             checked: ds.id === currentDaemonId(),
-            run: () => openDaemonSession(ds.id),
+            run: () => openDaemonSessionTab(ds.id),
           };
         }),
       ...archivedSessionItems()
@@ -312,7 +310,7 @@ export function Palette() {
             keywords: [folder, title, "archived", "session", "已归档", "归档"],
             icon: "archive",
             checked: cwd === workspacePath() && session.path === sessionState()?.sessionFile,
-            run: () => void openSession(session.path, cwd),
+            run: () => void openSessionTab(session.path, cwd),
           };
         }),
     ];
