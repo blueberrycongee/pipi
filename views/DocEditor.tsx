@@ -107,10 +107,17 @@ interface SlashState {
  * paragraph stands 12 clear of the next, a heading opens a section with more
  * above it than below, and what is boxed (code, a table, a quote) keeps a
  * little more room than prose.
+ *
+ * Node classes resolve text attributes per-property, innermost first: a
+ * paragraph inside a wrapper leaves its size and tone unset so the wrapper's
+ * class fills them — the base face (`text-md` on `foreground`) lives on
+ * `content`, so a table cell's `sm`, a header cell's `xs` muted, and a
+ * blockquote's muted reach their inner paragraphs exactly as the
+ * transcript's table and quote read.
  */
 const editorClasses = computed(() => ({
   root: "flex-1",
-  content: "mx-auto w-full max-w-180 px-10",
+  content: `mx-auto w-full max-w-180 px-10 ${readingType()} text-foreground`,
   placeholder: "text-subtle",
   caret: "bg-brand",
   selection: "bg-brand/15 dark:bg-brand/25",
@@ -119,15 +126,15 @@ const editorClasses = computed(() => ({
   selectedNode: "rounded-lg corner-squircle ring-2 ring-ring",
   composition: "underline",
   taskCheckbox:
-    "mr-2 mt-2.5 size-4 rounded-xs corner-squircle border border-hairline-focus bg-background transition-all duration-150 ease-out-quint hover:border-brand/70 active:scale-90 motion-reduce:transition-none motion-reduce:active:scale-100 checked:border-brand checked:bg-brand",
-  listMarker: `${readingType()} text-subtle tabular-nums`,
+    "mr-2 mt-1 size-3.5 rounded-xs corner-squircle border border-hairline-focus bg-card transition-all duration-150 ease-out-quint hover:border-brand/70 active:scale-90 motion-reduce:transition-none motion-reduce:active:scale-100 checked:border-brand checked:bg-brand",
+  listMarker: `${readingType()} leading-relaxed text-subtle tabular-nums`,
   selectedCell: "bg-brand-soft",
   tableGrip: "rounded-full bg-hairline-hover transition-colors duration-100 hover:bg-brand",
   tableResizeHandle: "bg-brand/60",
   tableDropIndicator: "bg-brand",
   nodes: {
-    paragraph: `my-1.5 ${readingType()} leading-relaxed text-foreground`,
-    "heading[level=1]": `mb-2 mt-6 ${readingType("3xl")} font-semibold leading-tight tracking-tight text-foreground`,
+    paragraph: "my-1.5 leading-relaxed",
+    "heading[level=1]": `mb-2 mt-6 ${readingType("2xl")} font-semibold leading-tight tracking-tight text-foreground`,
     "heading[level=2]": `mb-1.5 mt-6 ${readingType("xl")} font-semibold leading-snug tracking-tight text-foreground`,
     "heading[level=3]": `mb-1 mt-5 ${readingType("lg")} font-semibold leading-snug text-foreground`,
     heading: `mb-1 mt-4 ${readingType()} font-semibold leading-snug text-foreground`,
@@ -138,18 +145,18 @@ const editorClasses = computed(() => ({
     listItem: "-my-1",
     taskItem: "-my-1",
     "taskItem[checked=true]": "-my-1 opacity-60",
-    blockquote: "my-2.5 border-l-2 border-hairline-focus pl-4",
-    codeBlock: `my-2.5 rounded-xl corner-squircle border border-border bg-sunken px-4 py-3.5 font-mono ${codeType()} leading-relaxed text-foreground`,
+    blockquote: "my-2.5 border-l-2 border-border pl-3.5 text-muted-foreground",
+    codeBlock: `my-2.5 rounded-xl corner-squircle border border-border bg-sunken p-3.5 font-mono ${codeType()} leading-relaxed text-foreground`,
     horizontalRule: "my-5 h-px bg-border",
     table: "my-2.5 w-full rounded-lg corner-squircle border border-border",
-    tableCell: "border border-border px-3 py-0.5",
-    tableHeader: "border border-border bg-muted/75 px-3 py-0.5 font-semibold",
+    tableCell: `border border-border px-3 py-1.5 ${readingType("sm")} leading-relaxed`,
+    tableHeader: `border border-border bg-muted px-3 py-1.5 ${readingType("xs")} font-semibold leading-relaxed text-muted-foreground`,
   },
   marks: {
     bold: "font-semibold",
     italic: "italic",
     strike: "text-muted-foreground line-through",
-    code: `rounded-sm corner-squircle bg-muted px-1.5 py-0.5 font-mono ${readingType("sm")} text-foreground`,
+    code: `rounded-sm corner-squircle bg-muted px-1 font-mono ${readingType("sm")} text-foreground`,
     link: "text-brand-text underline",
   },
 }));

@@ -1,8 +1,8 @@
 {
   "name": "pipi",
   "id": "dev.pipi.app",
-  "version": "0.2.21",
-  "build": 6,
+  "version": "0.2.22",
+  "build": 7,
   "icon": "icon.png",
   "theme": "theme.json",
   "updater": {

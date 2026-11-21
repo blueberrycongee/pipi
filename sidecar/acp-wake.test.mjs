@@ -1,9 +1,10 @@
 // Antigravity's idle wake, through the bridge on the scripted agent
-// (`dev/fake-acp.mjs` with `FAKE_ACP_AGY=1`, which does over ACP what agy 1.5.9
+// (`dev/fake-acp.mjs` with `FAKE_ACP_AGY=1`, which does over ACP what agy 1.5.13
 // does): a turn that ends "waiting for" a background job is woken when the job
-// ends, and agy runs the rest at once but sends it only ahead of the next
-// prompt. The bridge brings it in as a turn of its own — while idle, or before
-// the next prompt — once, and never inside the next prompt's answer.
+// ends, and agy runs the rest at once, streaming it live. The bridge shows it
+// as a turn of its own — no prompt opens it, a quiet stretch settles it — and
+// the frames agy still holds until a prompt land ahead of its echo, never
+// inside the new answer.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -73,7 +74,8 @@ function startBridge(t, fakeEnv) {
       };
       if (!check()) watchers.push(check);
     });
-  return { records, send, settles, prompt: (message) => send({ type: "prompt", message }) };
+  const write = (record) => child.stdin.write(`${JSON.stringify(record)}\n`);
+  return { records, send, write, settles, prompt: (message) => send({ type: "prompt", message }) };
 }
 
 /** The records of each run, from its `agent_start` to its `agent_settled`. */
@@ -101,7 +103,7 @@ const promptOf = (run) => run.find((r) => r.type === "message_start" && r.messag
 const toolEnds = (run) => run.filter((r) => r.type === "tool_execution_end").map((r) => [r.toolName, r.result.content[0].text, r.isError]);
 
 test("a turn agy runs while idle comes in on its own, once, as a turn no prompt opened", async (t) => {
-  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "300" });
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "300", PIPI_ACP_WAKE_QUIET_MS: "500" });
   assert.equal((await bridge.prompt("start a background job")).success, true);
   await bridge.settles(1);
   const firstRun = runs(bridge.records)[0];
@@ -115,7 +117,7 @@ test("a turn agy runs while idle comes in on its own, once, as a turn no prompt 
   assert.ok(catalog.models.some((m) => m.id === "deepseek-v4-flash"));
   assert.ok(!catalog.models.some((m) => m.id === "legacy-agy-model"));
 
-  // Nothing is sent: the watch sees the session move and brings the woken turn in.
+  // Nothing is sent: agy pushes the woken turn live and it settles on quiet.
   await bridge.settles(2);
   const wake = runs(bridge.records)[1];
   assert.equal(promptOf(wake), undefined, "no prompt opens it");
@@ -143,14 +145,20 @@ test("a turn agy runs while idle comes in on its own, once, as a turn no prompt 
   assert.equal(firstSavedBg?.background, undefined, "background flag clears once toolEnd lands");
 });
 
-test("a prompt sent before the watch looks catches the woken turn up first", async (t) => {
-  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "100" });
+test("a prompt sent while a wake turn is open queues behind it and drains", async (t) => {
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "100", PIPI_ACP_WAKE_QUIET_MS: "1500" });
   await bridge.prompt("start a background job");
   await bridge.settles(1);
-  // The job has ended, the first look is still seconds away.
-  await new Promise((resolve) => setTimeout(resolve, 400));
-  await bridge.prompt("hello");
-  await bridge.settles(3);
+  // The job's end pushes land, the wake turn opens; a prompt sent into it waits.
+  const deadline = Date.now() + 5000;
+  while (bridge.records.filter((r) => r.type === "agent_start").length < 2) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for the wake turn");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const sent = await bridge.prompt("hello");
+  assert.equal(sent.data?.disposition ?? sent.data, "queued");
+  // One `agent_settled` for the whole chain: the wake drains straight into the queued prompt.
+  await bridge.settles(2, 10_000);
   const [, wake, next] = runs(bridge.records);
   assert.equal(promptOf(wake), undefined);
   assert.equal(textOf(wake), "Job 1 finished: all good.");
@@ -159,7 +167,7 @@ test("a prompt sent before the watch looks catches the woken turn up first", asy
 });
 
 test("jobs that end apart wake it apart, and each wake is shown once", async (t) => {
-  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "1500" });
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "1500", PIPI_ACP_WAKE_QUIET_MS: "700" });
   await bridge.prompt("start a background job, twice");
   await bridge.settles(1);
   await bridge.settles(3, 12_000);
@@ -171,7 +179,7 @@ test("jobs that end apart wake it apart, and each wake is shown once", async (t)
 });
 
 test("trailing thoughts at the end of a wake turn are not re-emitted on the next wake", async (t) => {
-  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "1500" });
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "1500", PIPI_ACP_WAKE_QUIET_MS: "700" });
   await bridge.prompt("start a background job, twice, trail");
   await bridge.settles(1);
   await bridge.settles(3, 12_000);
@@ -182,8 +190,8 @@ test("trailing thoughts at the end of a wake turn are not re-emitted on the next
 });
 
 test("what still arrives ahead of a prompt's echo is kept out of its answer", async (t) => {
-  // The list never moves, so only the next prompt hands the woken turn over.
-  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "100", FAKE_ACP_QUIET_LIST: "1" });
+  // agy can still hold a wake's frames and flush them when the next prompt lands.
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "100", FAKE_ACP_HOLD: "1" });
   await bridge.prompt("start a background job");
   await bridge.settles(1);
   await new Promise((resolve) => setTimeout(resolve, 400));
@@ -201,7 +209,7 @@ test("what still arrives ahead of a prompt's echo is kept out of its answer", as
 });
 
 test("multi-step reactive wake streams as one continuous live run with isStreaming true", async (t) => {
-  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "900" });
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "900", PIPI_ACP_WAKE_QUIET_MS: "3500" });
   await bridge.prompt("start a background multistep job");
   await bridge.settles(1);
 
@@ -241,6 +249,23 @@ test("switching back to a saved session strips stale background flags", async (t
   const call = data.messages.find((m) => m.role === "assistant")?.content.find((b) => b.type === "toolCall");
   assert.equal(call?.name, "job 1");
   assert.equal(call?.background, undefined);
+});
+
+test("an interaction_ question reaches the user as a select, and the picked answer goes back", async (t) => {
+  const bridge = startBridge(t, {});
+  await bridge.prompt("ask me something");
+  const deadline = Date.now() + 5000;
+  let req;
+  while (!(req = bridge.records.find((r) => r.type === "extension_ui_request"))) {
+    if (Date.now() > deadline) throw new Error("timed out waiting for the question dialog");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(req.method, "select", "an interaction_ id is a question, never an auto-approval");
+  assert.deepEqual(req.options, ["Option A", "Option B"]);
+  bridge.write({ type: "extension_ui_response", id: req.id, value: "Option B" });
+  await bridge.settles(1);
+  const [run] = runs(bridge.records);
+  assert.equal(textOf(run), "You picked opt_b.", "the picked option's own id is what the agent gets");
 });
 
 test("changing sessions on Antigravity never sends session/close to tear down the worker", async (t) => {

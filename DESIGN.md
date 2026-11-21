@@ -254,7 +254,13 @@ stand 12 apart; a heading opens a section with more above it than below
 (24 over an h1 or h2, 20 over an h3, 4–8 under); a list's items sit 4 apart,
 as close as lines of one thought; what is boxed — code, a table, a quote —
 keeps 10, and a rule 20. Two paragraphs that cannot be told apart are one
-paragraph to the reader.
+paragraph to the reader. The face is the transcript's — `text-md` relaxed on
+`foreground`, inline code `sm` mono with no vertical pad, muted quotes on a
+hairline, sunken code cards, `sm` cells under an `xs` muted-semibold header —
+with the h1 lifted one step to the page-title `text-2xl` (`xl`, `lg`, `md`
+under it). Node classes resolve text attributes per-property, innermost
+first: `content` carries the base face and a paragraph pins only its margins,
+so a wrapper's size and tone reach its inner paragraphs.
 
 Under the page, one 44pt line on the column's own edges. Left, in `text-xs`
 `subtle`: how much is written and that it is kept ("328 字 · 自动保存", or the

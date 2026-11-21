@@ -57,7 +57,10 @@ const BUILTIN_ACP_PRESETS = {
   kimi: { binary: "kimi", args: ["acp"], envVar: "MOONSHOT_API_KEY" },
   qwen: { binary: "qwen", args: ["--acp"], envVar: "DASHSCOPE_API_KEY" },
   dsh: { binary: "dsh", args: ["--profile", "acp"], envVar: "DEEPSEEK_API_KEY" },
-  antigravity: { binary: "agy", fallbackBinaries: ["agy_acp_server"], args: ["acp", "--process-per-session"] },
+  // Plain `acp`: --process-per-session wedged requests when the front exited and
+  // a session worker inherited its pipes, and pipi already gives each session
+  // its own agy process, so the extra isolation only added failure modes.
+  antigravity: { binary: "agy", fallbackBinaries: ["agy_acp_server"], args: ["acp"] },
   hermes: { binary: "hermes", args: ["acp"] },
   kiro: { binary: "kiro-cli", fallbackBinaries: ["kiro"], args: ["acp"] },
   droid: { binary: "droid", args: ["acp"], envVar: "FACTORY_API_KEY" },
@@ -72,12 +75,31 @@ const BUILTIN_ENV_VARS = {
   ...Object.fromEntries(Object.entries(BUILTIN_ACP_PRESETS).filter(([, v]) => v.envVar).map(([k, v]) => [k, v.envVar])),
 };
 
+// Ambient Google/Gemini credentials would silently leak an account or profile
+// into a session the user configured differently (as T3 Code's adapter does) —
+// agy sessions run without them unless the key itself is pipi's configured one.
+const AGY_AMBIENT_ENV = [
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_CLOUD_PROJECT",
+  "GOOGLE_CLOUD_LOCATION",
+  "GOOGLE_CLOUD_QUOTA_PROJECT",
+  "GOOGLE_GENAI_USE_VERTEXAI",
+  "GEMINI_HOME",
+];
+
 function agentRuntimeEnv(extra = {}) {
   const envVar = config.customAgent?.envVar || BUILTIN_ENV_VARS[agentId];
-  return childEnv({
-    ...agentAuthEnv(agentId, envVar),
-    ...extra,
-  });
+  const auth = agentAuthEnv(agentId, envVar);
+  const env = childEnv({ ...auth, ...extra });
+  if (agentId === "antigravity") {
+    for (const key of AGY_AMBIENT_ENV) {
+      if (key === envVar || auth[key] !== undefined) continue;
+      delete env[key];
+    }
+  }
+  return env;
 }
 
 const AGENT_NAMES = {
@@ -518,7 +540,7 @@ function interruptActiveTurn() {
     // Politely interrupt the in-flight prompt; an agent that ignores
     // `session/cancel` is dropped by settleActiveTurn's stall timeout
     // (dropAcpPeer), and the next turn re-attaches via session/load.
-    if (acpStream || acpWakeActive) acpNotify("session/cancel", { sessionId: acpSessionId });
+    if (acpStream) acpNotify("session/cancel", { sessionId: acpSessionId });
   } else if (activeChild) {
     signalAgent("SIGTERM");
   }
@@ -646,9 +668,6 @@ async function runTurnLoop(initialText, initialImages = []) {
 async function runSingleTurn(promptText, images, turnEpoch, emitTurn) {
   isStreaming = true;
   abortRequested = false;
-  // What the agent did on its own since its last answer goes on screen ahead of
-  // this prompt — Antigravity would otherwise hand it over as this prompt's start.
-  if (driver === "acp") await acpWakeBeforePrompt();
   if (sessionEpoch !== turnEpoch) return "stale";
   if (abortRequested && !steerInterrupt) return "aborted";
   if (abortRequested && steerInterrupt) {
@@ -751,7 +770,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
   let sampled = false;
   const lastSample = new Set();
   let finished = false;
-  // What this turn said and called, in full: what a replay of it is measured against (`acpWokenSince`).
+  // What this turn said and called, in full — `seen()` answers with it.
   let saidText = "";
   let trailingThoughts = "";
   const calledTools = new Set();
@@ -1588,6 +1607,8 @@ let acpModelValues = undefined; // `${provider}/${modelId}` → opaque config-op
 let acpModelConfigCurrent = undefined; // last-known currentValue of the model select
 let acpEffortConfig = undefined; // advertised `reasoning_effort` select {id, values, hasProviderDefault, currentValue}
 let acpUsage = undefined; // last `usage_update` {used, size}
+let acpAgentInfo = undefined; // initialize's agentInfo {name, title, version}
+let acpAuthMethods = []; // initialize's authMethods — authenticate when required
 const acpRecentTools = new Map(); // toolCallId → {title, kind, rawInput} for permission enrichment
 // Last `session/update` the peer sent — the turn's own progress signal. Unlike
 // `acpLastOutAt` (every byte, probes included), only the session's traffic
@@ -1597,44 +1618,36 @@ let acpLastEventAt = 0;
 // ── Turns an agent runs on its own between prompts (Antigravity) ────────────
 //
 // An Antigravity turn can end on "waiting for" a background task or subagent.
-// When that finishes, agy wakes the agent and runs the rest of the work at once
-// — but sends none of it over ACP until the next `session/prompt`, where it
-// arrives ahead of that prompt's `user_message_chunk` echo (agy 1.5.9, with or
-// without `--process-per-session`). Left alone, the reader sees a turn that
-// stopped on "Waiting for …", and the next message they send opens with all of
-// it. Two things agy does do: `session/list` moves the session's `updatedAt`
-// when the woken turn runs, and `session/load` on the live peer replays the
-// whole conversation, the woken turn included, and drops what it was holding.
-// So between prompts the bridge watches the list (`acpWakePoll`) and, when the
-// session moves, replays it and brings in what is new as a turn of its own
-// (`acpCatchUp`) — before the next prompt, too (`acpWakeBeforePrompt`). What
-// still slips through ahead of an echo ends as its own message (`split`).
-let acpLazyWake = false; // the peer holds woken turns back until a prompt (Antigravity)
-// The watch after a turn: {epoch, acpId, text, toolIds, baseline, baselineStep, armedAt, timer}.
-// `text`/`toolIds` are what the turn since the last prompt is known to have said
-// and called — what a replay of it is measured against.
-let acpWake = undefined;
-let acpWakeRun = undefined; // a catch-up in flight: a prompt waits for it to land
-let acpWakeActive = false; // a live multi-step wake run is actively streaming
-let acpWakeSleepWake = undefined; // resolves the live wake loop's sleep immediately on abort/steer
-let acpReplay = undefined; // collects the replayed conversation during a catch-up's `session/load`
+// When that finishes, agy wakes the agent, runs the rest of the work, and
+// streams those `session/update`s over the live connection as they happen —
+// no polling, no `session/load` replay (verified on agy 1.5.13, plain `agy
+// acp`: the completed `tool_call_update` and the task's answer chunks arrive
+// seconds after `session/prompt` settles). So a content update arriving while
+// no turn is open simply opens a wake turn of its own here; a quiet stretch
+// ends it. Calls it leaves running carry on as background tools a later wake
+// (or turn) ends. What still slips through ahead of a prompt's echo — frames
+// agy held and flushes when the next `session/prompt` lands — ends as its own
+// message (`split`), never inside the new answer.
+let acpWakeTurn = undefined; // {epoch, stream} while an idle-time wake turn is open
+let acpWakeSleepWake = undefined; // resolves a wake sleep immediately on abort/steer
+let acpAttaching = false; // session/load|resume replay in flight: not live traffic
 // Calls a turn left running (background tasks), by id → {name, startedAt}: a
 // later turn, or a replay, says when they end — wherever in the conversation.
 const acpBackgroundTools = new Map();
-const ACP_WAKE_BG_MS = 1_000;
-const ACP_WAKE_FAST_MS = 2_000;
-const ACP_WAKE_SLOW_MS = 10_000;
-const ACP_WAKE_FAST_FOR_MS = 2 * 60_000;
-// With no call left running, a subagent's report or a timer can still wake it for a while.
-const ACP_WAKE_WATCH_MS = 30 * 60_000;
-const ACP_WAKE_SETTLE_MS = 280;
-const ACP_WAKE_BG_SETTLE_MS = 700;
-const ACP_WAKE_STREAM_POLL_MS = 450;
-const ACP_WAKE_STEP_WAIT_MS = 12_000;
-const ACP_WAKE_TX_WAIT_MS = 90_000;
-const ACP_WAKE_TOOL_WAIT_MS = 15 * 60_000;
+// A wake's updates arrive in bursts; this much quiet ends the turn. Anything
+// that arrives after it has closed simply opens the next one.
+const ACP_WAKE_QUIET_MS = Number(process.env.PIPI_ACP_WAKE_QUIET_MS) || 6_000;
 const ACP_CONTENT_UPDATES = new Set(["user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"]);
 const isFinalToolStatus = (status) => status === "completed" || status === "failed";
+
+/** Antigravity 1.4.2–1.4.5 scatter a run-workflow skill file into the workspace unless told not to. */
+function agyWritesRunWorkflowSkill(version) {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version || "").trim());
+  if (!m) return false;
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+  return cmp(v, [1, 4, 2]) >= 0 && cmp(v, [1, 4, 5]) <= 0;
+}
 
 /**
  * Reads Antigravity's local per-conversation `transcript.jsonl` tail when present
@@ -1645,7 +1658,7 @@ const isFinalToolStatus = (status) => status === "completed" || status === "fail
  * when no local transcript file exists (custom data dir, remote peer, or tests).
  */
 function agyTranscriptState(acpId) {
-  if (!acpLazyWake || !acpId || !/^[A-Za-z0-9_-]+$/.test(acpId)) return undefined;
+  if (!acpId || !/^[A-Za-z0-9_-]+$/.test(acpId)) return undefined;
   const root = process.env.ANTIGRAVITY_CLI_HOME
     ? path.resolve(process.env.ANTIGRAVITY_CLI_HOME)
     : path.join(os.homedir(), ".gemini", "antigravity-cli");
@@ -1723,72 +1736,102 @@ function clearStaleBackgroundTools(list = messages, onlyId = undefined) {
 let reportedBackgroundWatch = false;
 function syncBackgroundWatch() {
   if (!process.env.PIPI_SESSION_ID) return;
-  const active = Boolean(acpWake || acpBackgroundTools.size > 0);
+  const active = Boolean(acpWakeTurn || acpBackgroundTools.size > 0);
   if (active === reportedBackgroundWatch) return;
   reportedBackgroundWatch = active;
   emit({ type: "pipi_background_watch", active });
 }
 
-function forgetAcpWake() {
-  if (acpWake?.timer) clearTimeout(acpWake.timer);
-  acpWake = undefined;
-  acpWakeSleepWake?.();
+function clearAcpBackground() {
   acpBackgroundTools.clear();
   clearStaleBackgroundTools();
   syncBackgroundWatch();
 }
 
-/** Starts watching the session after a turn that ended well (`stream` is that turn's). */
-function armAcpWake(stream, acpId, epoch) {
-  if (acpWake?.timer) clearTimeout(acpWake.timer);
-  acpWake = undefined;
-  if (!acpLazyWake || sessionEpoch !== epoch) {
-    syncBackgroundWatch();
-    return;
-  }
-  const seen = stream.seen();
-  for (const [id, info] of seen.open) acpBackgroundTools.set(String(id), info);
-  const tx = agyTranscriptState(acpId);
-  const watch = {
-    epoch,
-    acpId,
-    text: seen.text,
-    toolIds: new Set(seen.toolIds.map(String)),
-    trailingThoughts: seen.trailingThoughts || "",
-    baseline: undefined,
-    baselineStep: tx?.stepIndex,
-    armedAt: Date.now(),
-    timer: undefined,
+/**
+ * Opens a turn for updates the agent runs on its own while idle — or returns the
+ * one already open. Registration as `turnPromise`/`activeSubTurn` mirrors a
+ * prompted turn exactly, so abort, steer and `agent_settled` all come from the
+ * machinery a prompt uses. The first content update of the burst lands right
+ * after `acpStream` attaches, so it is never missed.
+ */
+function ensureAcpWakeTurn() {
+  if (acpWakeTurn || isStreaming || acpStream || sessionChange || acpEnsurePromise || acpAttaching || !acpChild || !acpSessionId) return;
+  isStreaming = true;
+  const epoch = sessionEpoch;
+  let drainNext;
+  const wrapped = runAcpWakeTurn(epoch)
+    .then((next) => (drainNext = next))
+    .then(() => {
+      if (drainNext && sessionEpoch === epoch) return runTurnLoop(drainNext.text, drainNext.images);
+    })
+    .finally(() => {
+      if (turnPromise === wrapped) turnPromise = undefined;
+    });
+  turnPromise = wrapped;
+  void wrapped.catch(() => undefined);
+}
+
+/** A wake turn's body: hold it open through the burst, settle on a quiet stretch. */
+async function runAcpWakeTurn(epoch) {
+  const emitTurn = (record) => {
+    if (sessionEpoch === epoch) emit(record);
   };
-  acpWake = watch;
+  abortRequested = false;
+  emitTurn({ type: "agent_start" });
+  emitTurn({ type: "turn_start" });
+  const stream = makeTurnStreamHelper(epoch, { turnStart: true });
+  acpWakeTurn = { epoch, stream };
+  acpStream = stream;
   syncBackgroundWatch();
-  // Read where the session stands now, as close to the answer as can be: a move past it is a wake.
-  void acpUpdatedAt(acpId).then((at) => {
-    if (acpWake === watch && watch.baseline === undefined) watch.baseline = at;
+
+  const sub = (async () => {
+    for (;;) {
+      await acpWakeSleep(ACP_WAKE_QUIET_MS);
+      if (abortRequested || sessionEpoch !== epoch || !acpChild) break;
+      if (Date.now() - acpLastEventAt >= ACP_WAKE_QUIET_MS) break;
+    }
+  })();
+  activeSubTurn = sub.finally(() => {
+    if (activeSubTurn === sub) activeSubTurn = undefined;
   });
-  scheduleAcpWakePoll(watch);
-}
+  await activeSubTurn;
 
-function scheduleAcpWakePoll(watch) {
-  if (acpWake !== watch) return;
-  if (watch.timer) clearTimeout(watch.timer);
-  const age = Date.now() - watch.armedAt;
-  if (age > ACP_WAKE_WATCH_MS && acpBackgroundTools.size === 0) {
-    acpWake = undefined;
-    syncBackgroundWatch();
-    return;
+  const wasSteer = steerInterrupt;
+  const aborted = abortRequested && !wasSteer;
+  if (!aborted) {
+    // Calls the wake left running keep their background mark; the next burst ends them.
+    for (const [id, info] of stream.seen().open) acpBackgroundTools.set(String(id), info);
   }
-  const delay = acpBackgroundTools.size > 0 ? ACP_WAKE_BG_MS : age < ACP_WAKE_FAST_FOR_MS ? ACP_WAKE_FAST_MS : ACP_WAKE_SLOW_MS;
-  watch.timer = setTimeout(() => void acpWakePoll(watch), delay);
-  watch.timer.unref?.();
-}
+  stream.finish(aborted ? "aborted" : "stop", undefined, { keepOpenTools: !aborted });
+  if (aborted) clearStaleBackgroundTools();
+  acpWakeTurn = undefined;
+  if (acpStream === stream) acpStream = undefined;
+  emitTurn({ type: "agent_end", willRetry: false });
+  syncBackgroundWatch();
+  if (sessionEpoch === epoch) await saveExternalSession().catch(() => undefined);
+  await pushAcpModel();
+  await pushAcpMode();
+  await pushAcpEffort();
 
-const acpWakeStale = (watch) => acpWake !== watch || sessionEpoch !== watch.epoch || !acpChild || acpSessionId !== watch.acpId || acpReset;
-
-function acpHasMoved(watch, at, tx) {
-  if (tx && watch.baselineStep !== undefined && tx.stepIndex > watch.baselineStep) return true;
-  if (tx?.state === "working") return true;
-  return watch.baseline !== undefined && at !== undefined && at !== watch.baseline;
+  // Queued steering/follow-ups drain next — `agent_settled` means nothing waits.
+  const mayDrain = !abortRequested || wasSteer;
+  steerInterrupt = false;
+  let drainNext;
+  if (mayDrain && sessionEpoch === epoch && (queuedSteering.length > 0 || queuedFollowUp.length > 0)) {
+    drainNext = dequeueNextTurn();
+    emitTurn({
+      type: "queue_update",
+      steering: queuedSteering.map((q) => q.text),
+      followUp: queuedFollowUp.map((q) => q.text),
+    });
+  }
+  if (!drainNext && sessionEpoch === epoch) {
+    isStreaming = false;
+    abortRequested = false;
+    emitTurn({ type: "agent_settled", aborted });
+  }
+  return drainNext;
 }
 
 /** The session's `updatedAt` as `session/list` reports it; `undefined` when it cannot say. */
@@ -1806,391 +1849,7 @@ async function acpUpdatedAt(acpId, timeoutMs = 5_000) {
   return undefined;
 }
 
-async function acpWakePoll(watch) {
-  if (acpWake !== watch) return;
-  watch.timer = undefined;
-  if (acpWakeStale(watch)) {
-    if (acpWake === watch) {
-      acpWake = undefined;
-      syncBackgroundWatch();
-    }
-    return;
-  }
-  // A turn, a catch-up, or a handshake is the agent's business now: look again later.
-  if (!isStreaming && !acpWakeRun && !sessionChange && !acpEnsurePromise) {
-    const tx = agyTranscriptState(watch.acpId);
-    const at = await acpUpdatedAt(watch.acpId);
-    if (acpWake !== watch) return;
-    if (watch.baseline === undefined) watch.baseline = at;
-    if (watch.baselineStep === undefined && tx) watch.baselineStep = tx.stepIndex;
-    if (!isStreaming && acpHasMoved(watch, at, tx)) await acpCatchUp();
-  }
-  scheduleAcpWakePoll(watch);
-}
 
-/** Before a prompt: a session that moved since its last answer is caught up first. */
-async function acpWakeBeforePrompt() {
-  if (acpWakeRun) await acpWakeRun.catch(() => undefined);
-  const watch = acpWake;
-  if (!watch || acpWakeStale(watch)) return;
-  const tx = agyTranscriptState(watch.acpId);
-  if (watch.baseline === undefined && !tx) return;
-  const at = await acpUpdatedAt(watch.acpId, 2_000);
-  if (acpWake === watch && acpHasMoved(watch, at, tx)) await acpCatchUp();
-}
-
-function acpCatchUp() {
-  if (!acpWakeRun) {
-    acpWakeRun = catchUpAcpWake()
-      .catch(() => undefined)
-      .finally(() => {
-        acpWakeRun = undefined;
-      });
-  }
-  return acpWakeRun;
-}
-
-async function loadWakeSlice(watch, epoch, pushConfig = false) {
-  if (acpWakeStale(watch) || sessionEpoch !== epoch) return undefined;
-  const replay = [];
-  acpReplay = replay;
-  let sess;
-  try {
-    sess = await acpRequest("session/load", { sessionId: watch.acpId, cwd, mcpServers: acpMcpServers() }, 30_000);
-  } catch {
-    if (acpWake === watch) forgetAcpWake();
-    return undefined;
-  } finally {
-    if (acpReplay === replay) acpReplay = undefined;
-  }
-  if (sessionEpoch !== epoch || acpWake !== watch) return undefined;
-  const woke = acpWokenSince(replay, watch);
-  adoptSessionInfo(sess);
-  if (pushConfig) {
-    await pushAcpModel();
-    await pushAcpMode();
-    await pushAcpEffort();
-  }
-  return woke;
-}
-
-function applyAcpWokeSlice(woke, stream, watch, wakeOpenTools = undefined) {
-  let hasAnswerText = undefined;
-  for (const u of woke.ended) {
-    const id = String(u.toolCallId);
-    const known = wakeOpenTools?.get(id) || acpBackgroundTools.get(id);
-    stream.toolEnd(id, formatAcpToolContent(u.content, u.rawOutput), u.status === "failed", known);
-    wakeOpenTools?.delete(id);
-    acpBackgroundTools.delete(id);
-    hasAnswerText = false;
-  }
-  for (const item of woke.items) {
-    if (item.kind === "thinking") {
-      stream.thinkDelta(item.text);
-      watch.trailingThoughts = `${watch.trailingThoughts || ""}${item.text}`;
-    } else if (item.kind === "text") {
-      stream.textDelta(item.text);
-      watch.text += item.text;
-      watch.trailingThoughts = "";
-      hasAnswerText = true;
-    } else {
-      const u = item.update;
-      const name = u.title || u.kind || "tool";
-      stream.toolStart(item.id, name, acpToolArgs(u));
-      watch.toolIds.add(item.id);
-      watch.trailingThoughts = "";
-      hasAnswerText = false;
-      if (isFinalToolStatus(u.status)) {
-        stream.toolEnd(item.id, formatAcpToolContent(u.content, u.rawOutput), u.status === "failed");
-      } else {
-        const info = { name: normalizeToolName(name), startedAt: Date.now() };
-        wakeOpenTools?.set(item.id, info);
-        acpBackgroundTools.set(item.id, info);
-      }
-    }
-  }
-  syncBackgroundWatch();
-  return hasAnswerText;
-}
-
-async function catchUpAcpWake() {
-  const watch = acpWake;
-  if (!watch || acpWakeStale(watch)) return;
-  const epoch = sessionEpoch;
-  const woke = await loadWakeSlice(watch, epoch, true);
-  if (!woke || sessionEpoch !== epoch || acpWake !== watch) return;
-  const tx = agyTranscriptState(watch.acpId);
-  const at = await acpUpdatedAt(watch.acpId);
-  if (acpWake !== watch || sessionEpoch !== epoch) return;
-
-  if (!woke.items.length && !woke.ended.length) {
-    if (tx?.state !== "working") {
-      if (at !== undefined) watch.baseline = at;
-      if (tx) watch.baselineStep = tx.stepIndex;
-    }
-    return;
-  }
-
-  // When called synchronously inside `acpWakeBeforePrompt` (`isStreaming` is already owned
-  // by `runTurnLoop`), flush the pre-prompt wake as a single finished turn and hand control
-  // right back to the outgoing prompt.
-  if (isStreaming) {
-    emitAcpWakeSnapshot(woke, watch, epoch);
-    if (at !== undefined) watch.baseline = at;
-    if (tx) watch.baselineStep = tx.stepIndex;
-    return;
-  }
-
-  // Otherwise we caught an autonomous wake while idle: keep ONE continuous live run open
-  // (`isStreaming = true`) across all tool calls, thoughts, and answers until the wake settles,
-  // so the sidebar, stop button, and daemon status stay `"working"` and steps never fragment
-  // into separate `turnStart` headers.
-  await runLiveAcpWake(woke, at, tx, watch, epoch);
-}
-
-/** Emits a completed wake snapshot ahead of an outgoing prompt (`isStreaming` stays owned by caller). */
-function emitAcpWakeSnapshot(woke, watch, epoch) {
-  const emitTurn = (record) => {
-    if (sessionEpoch === epoch) emit(record);
-  };
-  emitTurn({ type: "agent_start" });
-  emitTurn({ type: "turn_start" });
-  const stream = makeTurnStreamHelper(epoch, { turnStart: true });
-  applyAcpWokeSlice(woke, stream, watch);
-  stream.finish("stop", undefined, { keepOpenTools: true });
-  emitTurn({ type: "agent_end", willRetry: false });
-  emitTurn({ type: "agent_settled", aborted: false });
-  if (sessionEpoch === epoch) void saveExternalSession().catch(() => undefined);
-}
-
-/** Streams a live multi-step reactive wake as a single active run until settled or interrupted. */
-async function runLiveAcpWake(firstWoke, initialAt, initialTx, watch, epoch) {
-  isStreaming = true;
-  abortRequested = false;
-  acpWakeActive = true;
-  const emitTurn = (record) => {
-    if (sessionEpoch === epoch) emit(record);
-  };
-
-  let drainNext = undefined;
-  const run = (async () => {
-    const wakeOpenTools = new Map();
-    let hasAnswerText = false;
-    let lastAt = initialAt;
-    let lastStep = initialTx?.stepIndex;
-    let lastActivityAt = Date.now();
-    let lastLoadAt = Date.now();
-
-    const sub = (async () => {
-      emitTurn({ type: "agent_start" });
-      emitTurn({ type: "turn_start" });
-      const stream = makeTurnStreamHelper(epoch, { turnStart: true });
-      const firstText = applyAcpWokeSlice(firstWoke, stream, watch, wakeOpenTools);
-      if (firstText !== undefined) hasAnswerText = firstText;
-
-      while (!abortRequested && sessionEpoch === epoch && !acpWakeStale(watch)) {
-        // When prose text has landed after all wake tools finished, pause briefly and verify
-        // via one final `session/load` so same-second RFC3339 chunks are never missed while
-        // fast single-step wakes still settle in ~280ms.
-        if (hasAnswerText && wakeOpenTools.size === 0) {
-          await acpWakeSleep(ACP_WAKE_SETTLE_MS);
-          if (abortRequested || sessionEpoch !== epoch || acpWakeStale(watch)) break;
-          const verify = await loadWakeSlice(watch, epoch, false);
-          lastLoadAt = Date.now();
-          if (!verify) break;
-          if (verify.items.length || verify.ended.length) {
-            const nextText = applyAcpWokeSlice(verify, stream, watch, wakeOpenTools);
-            if (nextText !== undefined) hasAnswerText = nextText;
-            lastActivityAt = Date.now();
-            lastAt = await acpUpdatedAt(watch.acpId);
-            lastStep = agyTranscriptState(watch.acpId)?.stepIndex ?? lastStep;
-            continue;
-          }
-          const txNow = agyTranscriptState(watch.acpId);
-          if (txNow?.state !== "working") break;
-        }
-
-        // If the wake turn itself started a new background tool and already wrote its "Waiting for…"
-        // prose, verify once after a short beat and settle with `keepOpenTools: true`.
-        if (hasAnswerText && wakeOpenTools.size > 0) {
-          await acpWakeSleep(ACP_WAKE_BG_SETTLE_MS);
-          if (abortRequested || sessionEpoch !== epoch || acpWakeStale(watch)) break;
-          const verify = await loadWakeSlice(watch, epoch, false);
-          lastLoadAt = Date.now();
-          if (!verify) break;
-          if (verify.items.length || verify.ended.length) {
-            const nextText = applyAcpWokeSlice(verify, stream, watch, wakeOpenTools);
-            if (nextText !== undefined) hasAnswerText = nextText;
-            lastActivityAt = Date.now();
-            continue;
-          }
-          const txNow = agyTranscriptState(watch.acpId);
-          if (txNow?.state !== "working") break;
-        }
-
-        // Mid-turn (`!hasAnswerText`): a tool is running or the model is planning the next step.
-        await acpWakeSleep(ACP_WAKE_STREAM_POLL_MS);
-        if (abortRequested || sessionEpoch !== epoch || acpWakeStale(watch)) break;
-
-        const txNow = agyTranscriptState(watch.acpId);
-        const atNow = await acpUpdatedAt(watch.acpId);
-        if (abortRequested || sessionEpoch !== epoch || acpWakeStale(watch)) break;
-
-        const moved =
-          (atNow !== undefined && atNow !== lastAt) ||
-          (txNow !== undefined && txNow.stepIndex !== lastStep) ||
-          Date.now() - lastLoadAt >= 1_200;
-
-        if (moved || txNow?.state === "settled") {
-          const nextWoke = await loadWakeSlice(watch, epoch, false);
-          lastLoadAt = Date.now();
-          lastAt = atNow ?? lastAt;
-          lastStep = txNow?.stepIndex ?? lastStep;
-          if (!nextWoke) break;
-          if (nextWoke.items.length || nextWoke.ended.length) {
-            const nextText = applyAcpWokeSlice(nextWoke, stream, watch, wakeOpenTools);
-            if (nextText !== undefined) hasAnswerText = nextText;
-            lastActivityAt = Date.now();
-            continue;
-          }
-          if (txNow?.state === "settled" && wakeOpenTools.size === 0) break;
-        }
-
-        const idleMs = Date.now() - lastActivityAt;
-        const limitMs =
-          wakeOpenTools.size > 0
-            ? ACP_WAKE_TOOL_WAIT_MS
-            : txNow?.state === "working"
-              ? ACP_WAKE_TX_WAIT_MS
-              : ACP_WAKE_STEP_WAIT_MS;
-        if (idleMs >= limitMs) break;
-      }
-
-      const wasSteer = steerInterrupt;
-      const aborted = abortRequested && !wasSteer;
-      stream.finish(aborted ? "aborted" : "stop", undefined, { keepOpenTools: !aborted });
-      if (aborted) clearStaleBackgroundTools();
-      emitTurn({ type: "agent_end", willRetry: false });
-      if (sessionEpoch === epoch) await saveExternalSession().catch(() => undefined);
-      await pushAcpModel();
-      await pushAcpMode();
-      await pushAcpEffort();
-      const settledAt = await acpUpdatedAt(watch.acpId);
-      const settledTx = agyTranscriptState(watch.acpId);
-      if (acpWake === watch) {
-        if (settledAt !== undefined) watch.baseline = settledAt;
-        if (settledTx) watch.baselineStep = settledTx.stepIndex;
-      }
-    })();
-
-    activeSubTurn = sub.finally(() => {
-      if (activeSubTurn === sub) activeSubTurn = undefined;
-    });
-    try {
-      await activeSubTurn;
-    } finally {
-      acpWakeActive = false;
-    }
-
-    const wasSteerInterrupt = steerInterrupt;
-    const finalAborted = abortRequested && !wasSteerInterrupt;
-    const mayDrain = !abortRequested || wasSteerInterrupt;
-    steerInterrupt = false;
-    if (mayDrain && sessionEpoch === epoch && (queuedSteering.length > 0 || queuedFollowUp.length > 0)) {
-      drainNext = dequeueNextTurn();
-      emitTurn({
-        type: "queue_update",
-        steering: queuedSteering.map((q) => q.text),
-        followUp: queuedFollowUp.map((q) => q.text),
-      });
-    }
-    if (!drainNext && sessionEpoch === epoch) {
-      isStreaming = false;
-      abortRequested = false;
-      emitTurn({ type: "agent_settled", aborted: finalAborted });
-    }
-  })();
-
-  const wrapped = run
-    .then(() => {
-      if (drainNext && sessionEpoch === epoch) return runTurnLoop(drainNext.text, drainNext.images);
-    })
-    .finally(() => {
-      if (turnPromise === wrapped) turnPromise = undefined;
-    });
-  turnPromise = wrapped;
-  await wrapped;
-}
-
-/**
- * What a replay holds that the bridge has not shown: the calls left running
- * that it shows ended (anywhere in it), and what comes after everything the
- * turn since the last prompt is known to have said and called. Text is matched
- * by length, not letter by letter: agy replays a message whole where it
- * streamed it in pieces. Thoughts before that point are not compared (a replay
- * may word them anew) and are left out; thoughts already emitted right after
- * the last text/tool are deduplicated via `trailingThoughts`.
- */
-function acpWokenSince(replay, known, running = acpBackgroundTools) {
-  const ended = new Map();
-  let start = 0;
-  replay.forEach((u, at) => {
-    const kind = u?.sessionUpdate;
-    if (kind === "user_message_chunk") start = at + 1;
-    if ((kind === "tool_call" || kind === "tool_call_update") && running.has(String(u.toolCallId)) && isFinalToolStatus(u.status)) {
-      ended.set(String(u.toolCallId), u);
-    }
-  });
-  const textOf = (c) => (typeof c === "string" ? c : c?.text || "");
-  const items = [];
-  const newTools = new Map(); // id → its item
-  const seenTools = new Set();
-  const knownThoughts = known.trailingThoughts || "";
-  let said = 0;
-  let skippedThoughts = 0;
-  const past = () => said >= known.text.length && [...known.toolIds].every((id) => seenTools.has(id));
-  for (const u of replay.slice(start)) {
-    const kind = u?.sessionUpdate;
-    if (kind === "agent_message_chunk") {
-      const text = textOf(u.content);
-      if (parseAcpRetryNotice(text)) continue;
-      if (past()) {
-        if (text) items.push({ kind: "text", text });
-        continue;
-      }
-      const over = said + text.length - known.text.length;
-      said += text.length;
-      if (over > 0 && [...known.toolIds].every((id) => seenTools.has(id))) items.push({ kind: "text", text: text.slice(text.length - over) });
-    } else if (kind === "agent_thought_chunk") {
-      const text = textOf(u.content);
-      if (!text || !past()) continue;
-      if (skippedThoughts >= knownThoughts.length) {
-        items.push({ kind: "thinking", text });
-        continue;
-      }
-      const over = skippedThoughts + text.length - knownThoughts.length;
-      skippedThoughts += text.length;
-      if (over > 0) items.push({ kind: "thinking", text: text.slice(text.length - over) });
-    } else if (kind === "tool_call" || kind === "tool_call_update") {
-      const id = String(u.toolCallId ?? "");
-      if (!id) continue;
-      if (known.toolIds.has(id)) {
-        seenTools.add(id);
-        continue;
-      }
-      const item = newTools.get(id);
-      if (item) {
-        Object.assign(item.update, Object.fromEntries(Object.entries(u).filter(([, v]) => v !== undefined)));
-      } else if (kind === "tool_call") {
-        const fresh = { kind: "tool", id, update: { ...u } };
-        newTools.set(id, fresh);
-        items.push(fresh);
-        ended.delete(id);
-      }
-    }
-  }
-  return { items, ended: [...ended.values()] };
-}
 
 /** A tool call's arguments as the transcript takes them, from an ACP `tool_call`. */
 function acpToolArgs(u) {
@@ -2468,16 +2127,35 @@ async function handleAcpPermission(msg) {
   const isEditOnly = ["edit", "write", "read", "search", "grep", "find", "ls"].includes(toolKind) || ["read", "write", "edit", "grep", "find", "ls"].includes(norm);
   const opts = msg.params?.options || [];
   const pick = (prefix) => opts.find((o) => o.kind === prefix) || opts.find((o) => o.kind?.startsWith(prefix));
+  // agy's fixed-choice questions ride the same channel with `interaction_*` ids:
+  // not approvals, and an answer is required even in full-access. Ask the user —
+  // never auto-pick an arbitrary option or fabricate an `allow` that is not there.
+  if (String(tc.toolCallId || "").startsWith("interaction_")) {
+    const uiId = `acp_ask_${msg.id}`;
+    const answer = await new Promise((resolve) => {
+      pendingUiRequests.set(uiId, resolve);
+      emit({ type: "extension_ui_request", id: uiId, method: "select", title, options: opts.map((o) => String(o.name || o.optionId)) });
+    });
+    const value = answer?.value;
+    const chosen = value === undefined ? undefined : opts.find((o) => o.optionId === value) || opts.find((o) => String(o.name || o.optionId) === value);
+    acpWrite({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: { outcome: chosen ? { outcome: "selected", optionId: chosen.optionId } : { outcome: "cancelled" } },
+    });
+    return;
+  }
   if (runtimeMode === "full-access" || (runtimeMode === "auto-accept-edits" && isEditOnly)) {
     const allowOpt = pick("allow_once") || pick("allow") || opts[0];
     acpWrite({ jsonrpc: "2.0", id: msg.id, result: { outcome: { outcome: "selected", optionId: allowOpt?.optionId || "allow" } } });
     return;
   }
   const uiId = `acp_perm_${msg.id}`;
-  const confirmed = await new Promise((resolve) => {
+  const answer = await new Promise((resolve) => {
     pendingUiRequests.set(uiId, resolve);
     emit({ type: "extension_ui_request", id: uiId, method: "confirm", title, message: JSON.stringify(rawInput ?? {}, null, 2).slice(0, 1200) });
   });
+  const confirmed = answer === true || answer?.confirmed === true;
   const chosen = confirmed ? pick("allow_once") || pick("allow") || opts[0] : pick("reject_once") || pick("reject") || opts.at(-1);
   acpWrite({
     jsonrpc: "2.0",
@@ -2511,14 +2189,15 @@ function handleAcpUpdate(u) {
   acpLastEventAt = Date.now();
   const kind = u.sessionUpdate || u.type;
   const textOf = (c) => (typeof c === "string" ? c : c?.text || "");
-  // A catch-up's replay is read as a whole once the load answers (`acpWokenSince`).
-  if (acpReplay && ACP_CONTENT_UPDATES.has(kind)) {
-    acpReplay.push(u);
-    return;
-  }
+  // A resume/load replay is history arriving at attach, not live traffic: enrich
+  // the permission table, open no turn, and let the update fall through below.
+  const replaying = acpAttaching && ACP_CONTENT_UPDATES.has(kind);
+  // Content while no turn is open is the agent working on its own (agy wakes a
+  // finished background task and streams it): open a wake turn for it.
+  if (!replaying && !acpStream && ACP_CONTENT_UPDATES.has(kind)) ensureAcpWakeTurn();
   if (kind === "user_message_chunk") {
     // agy echoes the prompt as it takes it: what came before the echo is a turn it ran while idle.
-    if (acpLazyWake) acpStream?.split();
+    if (!replaying) acpStream?.split();
   } else if (kind === "agent_thought_chunk") acpStream?.thinkDelta(textOf(u.content));
   else if (kind === "agent_message_chunk") {
     const text = textOf(u.content);
@@ -2547,7 +2226,7 @@ function handleAcpUpdate(u) {
     const known = usageBaseline?.thread === acpSessionId ? usageBaseline : undefined;
     const cost = acpCostPart(u.cost, known);
     if (cost) usageBaseline = { thread: acpSessionId, ...cost.total };
-    if (acpReplay) {
+    if (acpAttaching) {
       // A replay's usage is history, not new spend: refresh the marks, record nothing.
       return;
     }
@@ -2598,7 +2277,11 @@ function spawnAcp(bin) {
             if (waiter) {
               acpPending.delete(msg.id);
               if (waiter.timer) clearTimeout(waiter.timer);
-              if (msg.error) waiter.reject(new Error(msg.error.message || "ACP error"));
+              if (msg.error) {
+                const err = new Error(msg.error.message || "ACP error");
+                err.acpCode = msg.error.code;
+                waiter.reject(err);
+              }
               else waiter.resolve(msg.result);
             }
           } else if (msg.method === "session/update" && msg.params?.update) {
@@ -2620,7 +2303,8 @@ function spawnAcp(bin) {
     acpChild = undefined;
     acpSessionId = undefined;
     acpStream = undefined;
-    forgetAcpWake();
+    acpWakeTurn = undefined;
+    clearAcpBackground();
     if (activeChild === child) activeChild = undefined;
     const detail = cause instanceof Error ? cause.message : signal ? `killed with ${signal}` : `code ${cause}`;
     const stderr = acpStderrTail();
@@ -2649,7 +2333,8 @@ function dropAcpPeer(reason = "ACP agent reset") {
   acpChild = undefined;
   acpSessionId = undefined;
   acpStream = undefined;
-  forgetAcpWake();
+  acpWakeTurn = undefined;
+  clearAcpBackground();
   if (activeChild === child) activeChild = undefined;
   const stderr = acpStderrTail();
   const detail = stderr ? `${reason}:\n${stderr}` : reason;
@@ -2725,9 +2410,20 @@ async function negotiateAcpRound(bin, epoch) {
     spawnAcp(bin);
     let init;
     try {
+      // ACP v2: the agent answers the highest version it supports. Capabilities
+      // are honest — no client fs/terminal handlers exist, and `session.notices`
+      // is what v2 agents like agy push post-settle session updates through.
       init = await acpRequest(
         "initialize",
-        { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: "pipi", version: "0.1.0" } },
+        {
+          protocolVersion: 2,
+          clientCapabilities: {
+            fs: { readTextFile: false, writeTextFile: false },
+            terminal: false,
+            session: { notices: {} },
+          },
+          clientInfo: { name: "pipi", version: "0.1.0" },
+        },
         30_000,
       );
     } catch (err) {
@@ -2736,9 +2432,8 @@ async function negotiateAcpRound(bin, epoch) {
     }
     acpLoadSession = !!init?.agentCapabilities?.loadSession;
     acpSessionCaps = init?.agentCapabilities?.sessionCapabilities || undefined;
-    // Antigravity holds a turn it runs while idle back until the next prompt; a
-    // live `session/load` and `session/list` are what bring it in sooner.
-    acpLazyWake = (agentId === "antigravity" || /antigravity/i.test(String(init?.agentInfo?.name || ""))) && acpLoadSession && acpSessionCaps?.list !== undefined;
+    acpAgentInfo = init?.agentInfo || undefined;
+    acpAuthMethods = Array.isArray(init?.authMethods) ? init.authMethods : [];
     acpModes = undefined;
     acpModelConfigId = undefined;
     acpModeConfigId = undefined;
@@ -2747,10 +2442,11 @@ async function negotiateAcpRound(bin, epoch) {
   }
   if (acpReset || !acpSessionId) {
     // Release the previous session on this peer when the agent supports it —
-    // DeepSeek Harness keeps every session resident until `session/close`,
-    // whereas Antigravity's `--process-per-session` tears down the whole
-    // session worker (and any live subagents) on `session/close`.
-    if (acpReset && acpSessionId && acpSessionCaps?.close !== undefined && !acpLazyWake) {
+    // DeepSeek Harness keeps every session resident until `session/close`.
+    // Antigravity is the exception: closing tears the session down server-side
+    // (background tasks, resumability), and its sessions end with the process.
+    const agy = /antigravity/i.test(String(acpAgentInfo?.name || ""));
+    if (acpReset && acpSessionId && acpSessionCaps?.close !== undefined && !agy) {
       await acpRequest("session/close", { sessionId: acpSessionId }, 5_000).catch(() => undefined);
       acpSessionId = undefined;
     }
@@ -2762,7 +2458,7 @@ async function negotiateAcpRound(bin, epoch) {
     acpModeConfigId = undefined;
     acpSpecModels = false;
     acpRecentTools.clear();
-    forgetAcpWake();
+    clearAcpBackground();
     const mcpServers = acpMcpServers();
     const stale = () => sessionEpoch !== epoch;
     try {
@@ -2770,15 +2466,32 @@ async function negotiateAcpRound(bin, epoch) {
       if (nativeThreadId) {
         // ACP v1 `session/resume` (sessionCapabilities.resume) for DeepSeek Harness and
         // newer agents; the older `loadSession`/`session/load` draft for Devin & co.
-        if (acpSessionCaps?.resume !== undefined) {
-          sess = await acpRequest("session/resume", { sessionId: nativeThreadId, cwd, mcpServers }, 30_000).catch(() => undefined);
-        } else if (acpLoadSession) {
-          sess = await acpRequest("session/load", { sessionId: nativeThreadId, cwd, mcpServers }, 30_000).catch(() => undefined);
+        // A replayed conversation during attach is history, not live traffic.
+        acpAttaching = true;
+        try {
+          if (acpSessionCaps?.resume !== undefined) {
+            sess = await acpRequest("session/resume", { sessionId: nativeThreadId, cwd, mcpServers }, 30_000).catch(() => undefined);
+          } else if (acpLoadSession) {
+            sess = await acpRequest("session/load", { sessionId: nativeThreadId, cwd, mcpServers }, 30_000).catch(() => undefined);
+          }
+        } finally {
+          acpAttaching = false;
         }
       }
       let begun = false;
       if (!sess && !stale()) {
-        sess = await acpRequest("session/new", { cwd, mcpServers }, 30_000);
+        const newParams = { cwd, mcpServers };
+        // Antigravity's session `_meta`: 1.4.2–1.4.5 scatter a run-workflow skill
+        // file into the workspace unless the tool is disabled up front.
+        if (/antigravity/i.test(String(acpAgentInfo?.name || ""))) {
+          newParams._meta = { antigravity: { disabledTools: agyWritesRunWorkflowSkill(acpAgentInfo?.version) ? ["run_workflow"] : [] } };
+        }
+        sess = await acpRequest("session/new", newParams, 30_000).catch(async (err) => {
+          // AUTH_REQUIRED (-32000) or a text match: authenticate once, then retry.
+          if (!acpAuthMethods.length || !(err?.acpCode === -32000 || /auth/i.test(String(err?.message || "")))) throw err;
+          await acpRequest("authenticate", { methodId: acpAuthMethods[0].id }, 60_000);
+          return acpRequest("session/new", newParams, 30_000);
+        });
         begun = true;
       }
       if (stale()) {
@@ -2892,11 +2605,13 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
   try {
     const res = await acpPromptWatched(acpId, { sessionId: acpId, prompt: [{ type: "text", text: promptText }, ...images] });
     const stopReason = abortRequested ? "aborted" : ACP_STOP_REASONS[res?.stopReason] || "stop";
-    const mayWake = acpLazyWake && !abortRequested && res?.stopReason === "end_turn";
+    // Calls still open at the answer are background work — agy reports their end
+    // in a later wake burst, which finds them here by id.
+    const keepOpenTools = !abortRequested && stream.seen().open.length > 0;
+    if (keepOpenTools) for (const [id, info] of stream.seen().open) acpBackgroundTools.set(String(id), info);
     stream.usageSummary(acpPromptPart(res?.usage));
-    stream.finish(stopReason, undefined, { keepOpenTools: mayWake });
-    // The answer may be "waiting for" work still going on: watch for the agent to wake.
-    if (mayWake) armAcpWake(stream, acpId, turnEpoch);
+    stream.finish(stopReason, undefined, { keepOpenTools });
+    syncBackgroundWatch();
   } catch (err) {
     stream.finish(abortRequested ? "aborted" : "error", !abortRequested ? (err instanceof Error ? err.message : String(err)) || acpStderrTail() : undefined);
   } finally {
@@ -2985,8 +2700,9 @@ async function changeSession(apply) {
     if (turnPromise) {
       await settleActiveTurn(2500);
     }
-    if (acpWake || acpBackgroundTools.size > 0) {
-      forgetAcpWake();
+    if (acpWakeTurn || acpBackgroundTools.size > 0) {
+      acpWakeTurn = undefined;
+      clearAcpBackground();
       if (messagesDirty && sessionFile) {
         await saveExternalSession().catch(() => undefined);
       }
@@ -3246,7 +2962,7 @@ process.stdin.on("data", (chunk) => {
           const waiter = pendingUiRequests.get(parsed.id);
           if (waiter) {
             pendingUiRequests.delete(parsed.id);
-            waiter(!!parsed.confirmed);
+            waiter(parsed);
           }
         } else {
           Promise.resolve(handleCommand(parsed))

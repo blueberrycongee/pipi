@@ -97,12 +97,12 @@ const update = (sessionId, u) => {
 };
 
 // ── Antigravity's idle wake (`FAKE_ACP_AGY=1`) ──────────────────────────────
-// As agy 1.5.9 does over ACP: a prompt is echoed as `user_message_chunk`; a
+// As agy 1.5.13 does over ACP: a prompt is echoed as `user_message_chunk`; a
 // prompt containing "background" leaves a call running and answers "Waiting
 // for the job." — when the job ends (`FAKE_ACP_WAKE_MS` later) the agent runs
-// on by itself, but what it says is only kept (and `updatedAt` moves): it goes
-// out ahead of the next prompt's echo, or in a `session/load` replay of the
-// whole conversation (which drops what was held). "background twice" leaves
+// on by itself and STREAMS that work as ordinary `session/update`s: the
+// completed `tool_call_update`, thoughts, and answer chunks all arrive on the
+// live connection seconds after the prompt settled. "background twice" leaves
 // two jobs, the second ending later.
 const AGY = !!process.env.FAKE_ACP_AGY;
 const WAKE_MS = Number(process.env.FAKE_ACP_WAKE_MS || 400);
@@ -121,15 +121,20 @@ function record(sessionId, u) {
   s.history.push({ ...u });
 }
 
-/** What the agent does on its own while idle: kept, and held back from the wire. */
+/**
+ * What the agent does on its own while idle: pushed straight to the wire —
+ * unless `FAKE_ACP_HOLD=1` models the frames agy still holds and flushes ahead
+ * of the next prompt's echo.
+ */
 function idle(sessionId, u) {
   const s = sessions.get(sessionId);
   if (!s) return;
-  const before = s.updatedAt;
-  record(sessionId, u);
-  // `FAKE_ACP_QUIET_LIST=1`: the list does not show it — only the next prompt can.
-  if (process.env.FAKE_ACP_QUIET_LIST) s.updatedAt = before;
-  s.backlog.push(u);
+  if (process.env.FAKE_ACP_HOLD) {
+    record(sessionId, u);
+    s.backlog.push(u);
+    return;
+  }
+  update(sessionId, u);
 }
 
 function backgroundTurn(sessionId, text) {
@@ -175,7 +180,7 @@ function backgroundTurn(sessionId, text) {
   return "end_turn";
 }
 
-function requestPermission(sessionId, toolCallId) {
+function requestPermission(sessionId, toolCallId, options) {
   const id = clientReqId++;
   return new Promise((resolve) => {
     clientPending.set(id, resolve);
@@ -186,7 +191,7 @@ function requestPermission(sessionId, toolCallId) {
       params: {
         sessionId,
         toolCall: { toolCallId },
-        options: [
+        options: options || [
           { optionId: "allow", name: "Allow", kind: "allow_once" },
           { optionId: "reject", name: "Reject", kind: "reject_once" },
         ],
@@ -257,6 +262,17 @@ async function runTurn(sessionId, text) {
     return "end_turn";
   }
   if (AGY && /background/i.test(text)) return backgroundTurn(sessionId, text);
+  if (AGY && /ask me/i.test(text)) {
+    // agy's fixed-choice questions arrive as a permission request whose
+    // toolCallId starts `interaction_` — options are answers, not approvals.
+    const perm = await requestPermission(sessionId, `interaction_${seq++}`, [
+      { optionId: "opt_a", name: "Option A", kind: "other" },
+      { optionId: "opt_b", name: "Option B", kind: "other" },
+    ]);
+    const picked = perm?.outcome?.outcome === "selected" ? perm.outcome.optionId : "nothing (cancelled)";
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `You picked ${picked}.` } });
+    return "end_turn";
+  }
   const toolCallId = `tc_${seq++}`;
   const editTool = /edit/i.test(text);
   const toolName = editTool ? "edit" : "bash";
@@ -306,7 +322,7 @@ async function handle(msg) {
   switch (msg.method) {
     case "initialize":
       reply(msg.id, {
-        protocolVersion: 1,
+        protocolVersion: Math.min(Number(msg.params?.protocolVersion) || 1, AGY ? 2 : 1),
         agentCapabilities: { loadSession: AGY, sessionCapabilities: { resume: {}, list: {}, close: {}, ...(AGY ? { load: {} } : {}) } },
         agentInfo: AGY ? { name: "Antigravity ACP Server", title: "Fake agy", version: "0.0.0" } : { name: "fake-dsh", title: "Fake DSH", version: "0.0.0" },
       });
@@ -342,9 +358,8 @@ async function handle(msg) {
     case "session/load": {
       const s = sessions.get(p.sessionId);
       if (!AGY || !s) return replyErr(msg.id, -32602, "unknown session");
-      // agy replays the whole conversation, and what it held for the next prompt is spent.
+      // agy replays the whole conversation on attach.
       for (const u of s.history) sendUpdate(p.sessionId, u);
-      s.backlog = [];
       reply(msg.id, { sessionId: p.sessionId, configOptions: configOptions(s), models: LEGACY_MODELS });
       return;
     }
@@ -373,7 +388,7 @@ async function handle(msg) {
       if (inflightPrompt) return replyErr(msg.id, -32602, "prompt already in flight");
       const text = (p.prompt || []).map((c) => c?.text || "").join("\n");
       if (AGY) {
-        // What the agent did while idle goes out first, then the prompt's echo.
+        // Frames agy still holds go out ahead of the prompt's echo.
         for (const u of s.backlog.splice(0)) sendUpdate(p.sessionId, u);
         update(p.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text } });
       }
