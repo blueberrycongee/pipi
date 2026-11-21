@@ -1,6 +1,7 @@
 import { keymap, Text } from "nsh";
 import { Tooltip } from "nsh/base";
 import { GLASS_REGULAR } from "./styles";
+import { uiType } from "./typography";
 
 /**
  * The app's tooltip: what a control does, and its shortcut when it has one.
@@ -18,8 +19,8 @@ export function tip(label: string, shortcut?: string, placement: "top" | "bottom
       startingClass="opacity-0 scale-95"
       endingClass="opacity-0 scale-95"
     >
-      <Text class="text-xs text-popover-foreground">{label}</Text>
-      {shortcut ? <Text class="text-xs text-subtle">{keymap.label(shortcut)}</Text> : null}
+      <Text class={`${uiType("xs")} text-popover-foreground`}>{label}</Text>
+      {shortcut ? <Text class={`${uiType("xs")} text-subtle`}>{keymap.label(shortcut)}</Text> : null}
     </Tooltip>
   );
 }

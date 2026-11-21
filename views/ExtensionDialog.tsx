@@ -8,6 +8,7 @@ import { TextField } from "../ui/Controls";
 import { Icon, type IconName } from "../ui/Icon";
 import { FloatingLayer, keepLast, Reveal } from "../ui/motion";
 import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, POPUP, PRESS } from "../ui/styles";
+import { uiMinHeight, uiType } from "../ui/typography";
 
 const TOOL_ICONS: Record<string, IconName> = {
   bash: "terminal",
@@ -130,11 +131,11 @@ function ConfirmBody(props: { detail?: ConfirmDetail }) {
           <View selectable class="overflow-hidden rounded-lg corner-squircle border border-border bg-sunken">
             <Scroll class="max-h-36" contentClass="px-3 py-2">
               <If when={d().note}>
-                <Text class="pb-1 text-xs text-subtle">{d().note}</Text>
+                <Text class={`pb-1 ${uiType("xs")} text-subtle`}>{d().note}</Text>
               </If>
               <View class="flex-row items-start gap-1.5">
-                <Text class="font-mono text-xs leading-relaxed text-brand-text">$</Text>
-                <Text class="flex-1 font-mono text-xs leading-relaxed text-foreground">{d().command}</Text>
+                <Text class={`font-mono ${uiType("xs")} leading-relaxed text-brand-text`}>$</Text>
+                <Text class={`flex-1 font-mono ${uiType("xs")} leading-relaxed text-foreground`}>{d().command}</Text>
               </View>
             </Scroll>
           </View>
@@ -145,12 +146,12 @@ function ConfirmBody(props: { detail?: ConfirmDetail }) {
           <View selectable class="overflow-hidden rounded-lg corner-squircle border border-border bg-sunken">
             <View class={`flex-row items-center gap-1.5 px-3 py-1.5 ${d().preview ? "border-b border-border" : ""}`}>
               <Icon name="file" size={12} tone="subtle" />
-              <Text class="flex-1 truncate font-mono text-xs text-foreground">{d().path}</Text>
+              <Text class={`flex-1 truncate font-mono ${uiType("xs")} text-foreground`}>{d().path}</Text>
             </View>
             <If when={d().preview}>
               <Scroll class="max-h-32" contentClass="px-3 py-2">
                 <View>
-                  <Text class="font-mono text-xs leading-relaxed text-muted-foreground">{d().preview}</Text>
+                  <Text class={`font-mono ${uiType("xs")} leading-relaxed text-muted-foreground`}>{d().preview}</Text>
                 </View>
               </Scroll>
             </If>
@@ -162,7 +163,7 @@ function ConfirmBody(props: { detail?: ConfirmDetail }) {
           <View selectable class="overflow-hidden rounded-lg corner-squircle border border-border bg-sunken">
             <Scroll class="max-h-36" contentClass="px-3 py-2">
               <View>
-                <Text class="font-mono text-xs leading-relaxed text-muted-foreground">{d().text}</Text>
+                <Text class={`font-mono ${uiType("xs")} leading-relaxed text-muted-foreground`}>{d().text}</Text>
               </View>
             </Scroll>
           </View>
@@ -173,7 +174,7 @@ function ConfirmBody(props: { detail?: ConfirmDetail }) {
           <View selectable>
             <Scroll class="max-h-32">
               <View>
-                <Text class="text-sm leading-relaxed text-muted-foreground">{d().text}</Text>
+                <Text class={`${uiType("sm")} leading-relaxed text-muted-foreground`}>{d().text}</Text>
               </View>
             </Scroll>
           </View>
@@ -233,14 +234,14 @@ export function ExtensionPrompt() {
               <View class="gap-2.5">
                 <View class="flex-row items-center gap-2">
                   <Icon name={info().icon} size={15} tone={info().isPermission ? "brand-text" : "muted-foreground"} />
-                  <Text class="min-w-0 flex-1 truncate text-base font-semibold text-foreground" role="header">
+                  <Text class={`min-w-0 flex-1 truncate ${uiType("base")} font-semibold text-foreground`} role="header">
                     {info().heading}
                   </Text>
                   <If when={info().badge}>
-                    <Text class="shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 text-2xs text-muted-foreground">{info().badge}</Text>
+                    <Text class={`shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 ${uiType("2xs")} text-muted-foreground`}>{info().badge}</Text>
                   </If>
                   <If when={pendingDialogCount() > 1}>
-                    <Text class="shrink-0 tabular-nums text-xs text-subtle">{`1 / ${pendingDialogCount()}`}</Text>
+                    <Text class={`shrink-0 tabular-nums ${uiType("xs")} text-subtle`}>{`1 / ${pendingDialogCount()}`}</Text>
                   </If>
                   <View class="shrink-0 flex-row items-center gap-1.5 pl-1">
                     <Button
@@ -268,11 +269,11 @@ export function ExtensionPrompt() {
             <View class="gap-2">
               <View class="flex-row items-center gap-2">
                 <Icon name="info" size={15} tone="brand-text" />
-                <Text class="min-w-0 flex-1 truncate text-base font-semibold text-foreground" role="header">
+                <Text class={`min-w-0 flex-1 truncate ${uiType("base")} font-semibold text-foreground`} role="header">
                   {dialog().title}
                 </Text>
                 <If when={pendingDialogCount() > 1}>
-                  <Text class="shrink-0 tabular-nums text-xs text-subtle">{`1 / ${pendingDialogCount()}`}</Text>
+                  <Text class={`shrink-0 tabular-nums ${uiType("xs")} text-subtle`}>{`1 / ${pendingDialogCount()}`}</Text>
                 </If>
                 <Button label={tr("Cancel", "取消")} size="sm" variant="ghost" shortcut="escape" onPress={cancelPendingDialog} />
               </View>
@@ -282,9 +283,9 @@ export function ExtensionPrompt() {
                     {(option) => (
                       <BaseButton
                         onPress={() => answerDialog(dialog().id, { value: option() })}
-                        class={`min-h-8 flex-row items-center rounded-md corner-squircle px-2.5 py-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent focus:bg-accent active:bg-accent`}
+                        class={`${uiMinHeight(32)} flex-row items-center rounded-md corner-squircle px-2.5 py-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent focus:bg-accent active:bg-accent`}
                       >
-                        <Text class="text-base text-foreground">{option()}</Text>
+                        <Text class={`${uiType("base")} text-foreground`}>{option()}</Text>
                       </BaseButton>
                     )}
                   </Each>
@@ -299,11 +300,11 @@ export function ExtensionPrompt() {
             <View class="gap-2.5">
               <View class="flex-row items-center gap-2">
                 <Icon name="pencil" size={14} tone="brand-text" />
-                <Text class="min-w-0 flex-1 truncate text-base font-semibold text-foreground" role="header">
+                <Text class={`min-w-0 flex-1 truncate ${uiType("base")} font-semibold text-foreground`} role="header">
                   {dialog().title}
                 </Text>
                 <If when={pendingDialogCount() > 1}>
-                  <Text class="shrink-0 tabular-nums text-xs text-subtle">{`1 / ${pendingDialogCount()}`}</Text>
+                  <Text class={`shrink-0 tabular-nums ${uiType("xs")} text-subtle`}>{`1 / ${pendingDialogCount()}`}</Text>
                 </If>
               </View>
               <View class="flex-row items-center gap-2">
@@ -363,7 +364,7 @@ export function ExtensionDialog() {
               <View class="gap-4">
                 <View class="flex-row items-center gap-2">
                   <Icon name={info().icon} tone={info().isPermission ? "brand-text" : "muted-foreground"} />
-                  <Text class="flex-1 text-lg font-semibold text-foreground" role="header">
+                  <Text class={`flex-1 ${uiType("lg")} font-semibold text-foreground`} role="header">
                     {info().heading}
                   </Text>
                 </View>
@@ -388,14 +389,14 @@ export function ExtensionDialog() {
         <If when={of("select")}>
           {(dialog) => (
             <View class="gap-3">
-              <Text class="text-lg font-semibold text-foreground" role="header">
+              <Text class={`${uiType("lg")} font-semibold text-foreground`} role="header">
                 {dialog().title}
               </Text>
               <View class="-mx-2 gap-0.5">
                 <Each of={dialog().options} key="index">
                   {(option) => (
-                    <BaseButton onPress={() => answerDialog(dialog().id, { value: option() })} class={`min-h-8 flex-row items-center rounded-md corner-squircle px-2 py-1.5 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}>
-                      <Text class="text-base text-foreground">{option()}</Text>
+                    <BaseButton onPress={() => answerDialog(dialog().id, { value: option() })} class={`${uiMinHeight(32)} flex-row items-center rounded-md corner-squircle px-2 py-1.5 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}>
+                      <Text class={`${uiType("base")} text-foreground`}>{option()}</Text>
                     </BaseButton>
                   )}
                 </Each>
@@ -406,7 +407,7 @@ export function ExtensionDialog() {
         <If when={of("input")}>
           {(dialog) => (
             <View class="gap-4">
-              <Text class="text-lg font-semibold text-foreground" role="header">
+              <Text class={`${uiType("lg")} font-semibold text-foreground`} role="header">
                 {dialog().title}
               </Text>
               <TextField value={text()} onChange={(value) => text.set(value)} onSubmit={submit} placeholder={dialog().placeholder} label={dialog().title} autoFocus />
@@ -420,7 +421,7 @@ export function ExtensionDialog() {
         <If when={of("editor")}>
           {(dialog) => (
             <View class="gap-4">
-              <Text class="text-lg font-semibold text-foreground" role="header">
+              <Text class={`${uiType("lg")} font-semibold text-foreground`} role="header">
                 {dialog().title}
               </Text>
               <Input
@@ -430,7 +431,7 @@ export function ExtensionDialog() {
                 value={text()}
                 onChange={({ value }) => text.set(value)}
                 accessibilityLabel={dialog().title}
-                class={`h-56 rounded-lg corner-squircle p-2.5 font-mono text-sm text-foreground caret-brand ${FIELD_SURFACE}`}
+                class={`h-56 rounded-lg corner-squircle p-2.5 font-mono ${uiType("sm")} text-foreground caret-brand ${FIELD_SURFACE}`}
               />
               <View class="flex-row justify-end gap-2">
                 <Button label={tr("Cancel", "取消")} size="lg" onPress={cancelPendingDialog} />

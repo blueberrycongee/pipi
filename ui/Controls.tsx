@@ -3,6 +3,7 @@ import type { InputRef, JSX } from "nsh";
 import { Input, Switch as BaseSwitch, Tab, Tabs } from "nsh/base";
 import { LayerActive } from "./Reveal";
 import { FIELD_SURFACE, FOCUS_RING, PRESS, PRESS_SCALE } from "./styles";
+import { uiHeight, uiMinHeight, uiType } from "./typography";
 
 /** An on/off control. */
 export function Switch(props: { checked: boolean; onChange: (checked: boolean) => void; label: string; disabled?: boolean }) {
@@ -44,7 +45,7 @@ export function Segmented<T extends string>(props: {
               onPress={() => {
                 if (props.value !== option().value) props.onChange(option().value);
               }}
-              class={`h-6 ${props.fullWidth ? "min-w-0 flex-1" : "shrink-0"} items-center justify-center rounded-md corner-squircle px-2.5 text-sm text-muted-foreground transition-colors duration-150 ${FOCUS_RING} hover:text-foreground selected:text-foreground`}
+              class={`${uiHeight(24)} ${props.fullWidth ? "min-w-0 flex-1" : "shrink-0"} items-center justify-center rounded-md corner-squircle px-2.5 ${uiType("sm")} text-muted-foreground transition-colors duration-150 ${FOCUS_RING} hover:text-foreground selected:text-foreground`}
             >
               <Text class={props.fullWidth ? "truncate" : ""}>{option().label}</Text>
             </Tab>
@@ -109,11 +110,11 @@ export function TextField(props: {
         autoCorrect={false}
         autoCapitalize="none"
         accessibilityLabel={props.label}
-        class={`h-8 w-full rounded-lg corner-squircle px-2.5 text-base text-foreground caret-brand ${FIELD_SURFACE} ${props.mono ? "font-mono text-sm" : ""} ${props.inputClass ?? ""}`}
+        class={`${uiHeight(32)} w-full rounded-lg corner-squircle px-2.5 ${props.mono ? `font-mono ${uiType("sm")}` : uiType("base")} text-foreground caret-brand ${FIELD_SURFACE} ${props.inputClass ?? ""}`}
       />
       <If when={props.placeholder !== undefined && props.value.length === 0 && !composing()}>
         <View class={`pointer-events-none absolute inset-y-0 right-2.5 min-w-0 justify-center ${props.hintClass ?? "left-2.5"}`}>
-          <Text class={`truncate text-subtle ${props.mono ? "font-mono text-sm" : "text-base"}`}>{props.placeholder}</Text>
+          <Text class={`truncate text-subtle ${props.mono ? `font-mono ${uiType("sm")}` : uiType("base")}`}>{props.placeholder}</Text>
         </View>
       </If>
     </View>
@@ -123,10 +124,10 @@ export function TextField(props: {
 /** A settings row: what it is and what it does on the left, its control on the right. */
 export function SettingRow(props: { title: string; description?: string; children?: JSX.Element }) {
   return (
-    <View class="min-h-11 flex-row items-center justify-between gap-4 py-2.5">
+    <View class={`${uiMinHeight(44)} flex-row items-center justify-between gap-4 py-2.5`}>
       <View class="min-w-0 flex-1 gap-0.5">
-        <Text class="text-base text-foreground">{props.title}</Text>
-        {props.description ? <Text class="text-sm leading-relaxed text-muted-foreground">{props.description}</Text> : null}
+        <Text class={`${uiType("base")} text-foreground`}>{props.title}</Text>
+        {props.description ? <Text class={`${uiType("sm")} leading-relaxed text-muted-foreground`}>{props.description}</Text> : null}
       </View>
       {props.children}
     </View>
@@ -138,7 +139,7 @@ export function SettingGroup(props: { title?: string; children?: JSX.Element }) 
   return (
     <View class="gap-1.5">
       {props.title ? (
-        <Text class="px-1 text-sm text-muted-foreground" role="header">
+        <Text class={`px-1 ${uiType("sm")} text-muted-foreground`} role="header">
           {props.title}
         </Text>
       ) : null}

@@ -34,8 +34,13 @@ const ICONS = {
   pencil: { stroke: "M10.25 3.25l2.5 2.5L5.5 13H3v-2.5z" },
   copy: { stroke: "M6.5 6.5h6.25v6.25H6.5zM3.25 9.5V3.25H9.5" },
   terminal: { stroke: "M2.5 3.5h11v9h-11zM5 6.5l2 1.5-2 1.5M8.75 10h2.25" },
-  /** The thinking face: a raised brow and a hand at the chin. */
-  thinking: { stroke: "M5.2 11.6a5.5 5.5 0 1 1 5.3 1.3M6.2 6.5v.1M10.3 6.5v.1M9.4 4.2l1.8.4M2.5 13.5h3.2l2.6-3.3h1.5" },
+  /** The thinking face: raised left brow, quizzical glance, pensive mouth, and a sculpted hand cradling the chin. */
+  thinking: {
+    stroke: "M3.05 6.75A5.55 5.55 0 1 1 12.39 10.91",
+    detail:
+      "M5.25 4.3q1.15-.95 2.25-.15M9.5 5.15q.95-.15 1.9-.34M7.6 9q.9-.04 1.72-.38M4.1 9c.36-.1.7.14.78.52l.3 1.53h3.95c.46 0 .8.34.8.78 0 .44-.34.78-.8.78H7.35c.14.22.18.48.12.78-.12.56-.6.94-1.22.94H4.7c-1.05 0-1.88-.76-1.88-1.82 0-.68.26-1.68.72-2.85.15-.36.31-.58.56-.66z",
+    fill: "M6.15 5.64a.72.86 0 1 1 0 1.72a.72.86 0 0 1 0-1.72zM10.05 5.86a.72.86 0 1 1 0 1.72a.72.86 0 0 1 0-1.72z",
+  },
   file: { stroke: "M4 2.5h5l3 3v8H4zM9 2.5v3h3" },
   fileEdit: { stroke: "M8.5 2.5H4v11h4M8.5 2.5l3.5 3.5v1.5M9.5 13.5l.4-2 3.1-3.1 1.6 1.6-3.1 3.1z" },
   filePlus: { stroke: "M4 2.5h5l3 3v8H4zM9 2.5v3h3M8 8v3.5M6.25 9.75h3.5" },
@@ -86,7 +91,10 @@ const ICONS = {
   shieldLock: { stroke: "M8 2.25l4.75 2v3.5c0 3-2 5.2-4.75 6-2.75-.8-4.75-3-4.75-6v-3.5zM6.6 8.3V7.15a1.4 1.4 0 0 1 2.8 0V8.3M6.2 8.3h3.6v3.3H6.2z" },
   shieldHalf: { stroke: "M8 2.25l4.75 2v3.5c0 3-2 5.2-4.75 6-2.75-.8-4.75-3-4.75-6v-3.5zM8 2.25v11.5" },
   shieldBolt: { stroke: "M8 2.25l4.75 2v3.5c0 3-2 5.2-4.75 6-2.75-.8-4.75-3-4.75-6v-3.5zM8.7 4.3L5.6 8.6h2.1l-.3 3.2 3.1-4.4H8.4z" },
-} as const satisfies Record<string, { stroke: string; pad?: number } | { fill: string; pad?: number }>;
+} as const satisfies Record<
+  string,
+  ({ stroke: string; detail?: string; fill?: string } | { fill: string }) & { pad?: number }
+>;
 
 export type IconName = keyof typeof ICONS;
 
@@ -96,13 +104,12 @@ export type Tone = Extract<
   "foreground" | "muted-foreground" | "subtle" | "brand" | "brand-text" | "brand-foreground" | "destructive" | "success" | "warning"
 >;
 
-const paths = new Map<IconName, Path2D>();
-const path = (name: IconName) => {
-  let made = paths.get(name);
+const paths = new Map<string, Path2D>();
+const path = (d: string) => {
+  let made = paths.get(d);
   if (!made) {
-    const icon = ICONS[name];
-    made = new Path2D("stroke" in icon ? icon.stroke : icon.fill);
-    paths.set(name, made);
+    made = new Path2D(d);
+    paths.set(d, made);
   }
   return made;
 };
@@ -115,23 +122,28 @@ export function Icon(props: { name: IconName; size?: number; tone?: Tone; class?
       style={{ width: props.size ?? 16, height: props.size ?? 16 }}
       accessibilityElementsHidden
       draw={(cx, { width }) => {
-        const name = props.name;
+        const icon = ICONS[props.name];
         const color = token(props.tone ?? "muted-foreground");
         cx.scale(width / 16, width / 16);
-        const pad = "pad" in ICONS[name] ? Number(ICONS[name].pad) : 0;
+        const pad = "pad" in icon ? Number(icon.pad) : 0;
         if (pad) {
           cx.translate(pad, pad);
           cx.scale((16 - pad * 2) / 16, (16 - pad * 2) / 16);
         }
-        if ("stroke" in ICONS[name]) {
+        if ("stroke" in icon) {
           cx.strokeStyle = color;
           cx.lineWidth = 1.5;
           cx.lineCap = "round";
           cx.lineJoin = "round";
-          cx.stroke(path(name));
-        } else {
+          cx.stroke(path(icon.stroke));
+          if ("detail" in icon && icon.detail) {
+            cx.lineWidth = 1.15;
+            cx.stroke(path(icon.detail));
+          }
+        }
+        if ("fill" in icon && icon.fill) {
           cx.fillStyle = color;
-          cx.fill(path(name));
+          cx.fill(path(icon.fill));
         }
       }}
     />

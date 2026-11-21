@@ -60,6 +60,7 @@ import { Icon, type IconName } from "../ui/Icon";
 import { FloatingLayer } from "../ui/motion";
 import { runtimeModeIcon, runtimeModeText, thinkingText, tr } from "../lib/i18n";
 import { PRESS } from "../ui/styles";
+import { uiHeight, uiIconSize, uiType } from "../ui/typography";
 
 interface Action extends CommandItem {
   icon: IconName;
@@ -336,20 +337,20 @@ export function Palette() {
           byId().get(id)?.run();
         }}
         class="overflow-hidden"
-        searchBarClass="h-12 flex-row items-center gap-2.5 border-b border-border px-4"
+        searchBarClass={`${uiHeight(48)} flex-row items-center gap-2.5 border-b border-border px-4`}
         searchPrefix={<Icon name="search" tone="subtle" />}
-        searchClass="flex-1 text-md text-foreground caret-brand placeholder:text-subtle"
+        searchClass={`flex-1 ${uiType("md")} text-foreground caret-brand placeholder:text-subtle`}
         listClass="max-h-96 p-1.5"
-        groupClass="px-2.5 pb-1 pt-2.5 text-xs font-medium text-subtle"
+        groupClass={`px-2.5 pb-1 pt-2.5 ${uiType("xs")} font-medium text-subtle`}
         separatorClass="mx-1 my-1 h-px bg-border"
-        itemClass={`group h-9 flex-row items-center rounded-lg corner-squircle px-2.5 ${PRESS} focus:bg-accent`}
-        empty={<Text class="py-10 text-center text-sm text-muted-foreground">{tr("Nothing matches.", "无匹配结果。")}</Text>}
+        itemClass={`group ${uiHeight(36)} flex-row items-center rounded-lg corner-squircle px-2.5 ${PRESS} focus:bg-accent`}
+        empty={<Text class={`py-10 text-center ${uiType("sm")} text-muted-foreground`}>{tr("Nothing matches.", "无匹配结果。")}</Text>}
         renderItem={(entry) => (
           <View class="flex-1 flex-row items-center gap-2.5">
-            <Icon name={byId().get(entry.id)?.icon ?? "dot"} tone="muted-foreground" />
-            <Text class="flex-1 truncate text-base text-foreground">{entry.label}</Text>
+            <Icon name={byId().get(entry.id)?.icon ?? "dot"} size={uiIconSize(16)} tone="muted-foreground" />
+            <Text class={`flex-1 truncate ${uiType("base")} text-foreground`}>{entry.label}</Text>
             {entry.checked ? <Icon name="check" size={14} tone="brand-text" /> : null}
-            {entry.shortcutLabel ? <Text class="text-xs text-subtle">{entry.shortcutLabel}</Text> : null}
+            {entry.shortcutLabel ? <Text class={`${uiType("xs")} text-subtle`}>{entry.shortcutLabel}</Text> : null}
           </View>
         )}
       />

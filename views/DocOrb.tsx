@@ -56,6 +56,7 @@ import {
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
+import { uiHeight, uiMinHeight, uiRowHeight, uiType } from "../ui/typography";
 import { ProseBlock, proseRows } from "./Prose";
 
 const ORB_SIZE = 46;
@@ -672,7 +673,7 @@ export function DocUpdatePill(props: { doc: MarkdownDoc }) {
               hovered = false;
               if (untracked(current)) scheduleAutoDismiss(UPDATE_PILL_LINGER_MS);
             }}
-            class={`h-8 flex-row items-center gap-2 rounded-full border-[0.5px] border-hairline bg-popover/85 pl-3 pr-1.5 shadow-popover dark:bg-popover/80 ${current() ? "" : "pointer-events-none"}`}
+            class={`${uiHeight(32)} flex-row items-center gap-2 rounded-full border-[0.5px] border-hairline bg-popover/85 pl-3 pr-1.5 shadow-popover dark:bg-popover/80 ${current() ? "" : "pointer-events-none"}`}
             style={{
               ...GLASS_REGULAR,
               opacity,
@@ -680,16 +681,16 @@ export function DocUpdatePill(props: { doc: MarkdownDoc }) {
             }}
           >
             <Icon name="sparkle" size={13} tone="brand-text" class="shrink-0" />
-            <Text class="text-xs font-medium tabular-nums text-foreground">{label()}</Text>
+            <Text class={`${uiType("xs")} font-medium tabular-nums text-foreground`}>{label()}</Text>
             <If when={!props.doc.readOnly()}>
               <View class="h-3.5 w-px bg-border" />
               <BaseButton
                 testID="doc-update-undo"
                 onPress={() => void undoDoc(props.doc.path)}
                 tooltip={tip(tr("Undo update", "撤销更新"), "mod+z", "bottom")}
-                class={`h-6 flex-row items-center rounded-full px-2 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
+                class={`${uiHeight(24)} flex-row items-center rounded-full px-2 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
               >
-                <Text class="text-xs font-medium text-brand-text">{tr("Undo", "撤销")}</Text>
+                <Text class={`${uiType("xs")} font-medium text-brand-text`}>{tr("Undo", "撤销")}</Text>
               </BaseButton>
             </If>
             <BaseButton
@@ -770,7 +771,7 @@ function ReplySkeleton(props: { label: () => string }) {
       <View class="flex-row items-center gap-2" style={{ opacity: breath }}>
         <Icon name="sparkle" size={13} tone="brand-text" class="shrink-0" />
         <View class="min-w-0 flex-1">
-          <RollingText text={props.label} class="text-xs font-medium text-muted-foreground" />
+          <RollingText text={props.label} class={`${uiType("xs")} font-medium text-muted-foreground`} />
         </View>
       </View>
       <View class="gap-2 pl-5">
@@ -820,16 +821,16 @@ function TurnProcessPill(props: {
     <View class="gap-1">
       <BaseButton
         onPress={() => open.update((v) => !v)}
-        class={`h-6 self-start flex-row items-center gap-1.5 rounded-md corner-squircle px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
+        class={`${uiHeight(24)} self-start flex-row items-center gap-1.5 rounded-md corner-squircle px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
       >
         <Icon name={open() ? "chevronDown" : "chevronRight"} size={11} tone="subtle" />
-        <Text class="truncate text-xs text-muted-foreground">{summary()}</Text>
+        <Text class={`truncate ${uiType("xs")} text-muted-foreground`}>{summary()}</Text>
       </BaseButton>
       <Reveal open={open()}>
         <View class="ml-2 gap-1.5 border-l border-border pl-2.5 py-1">
           <Each of={props.thinking} key={(t) => t.id}>
             {(t) => (
-              <Text class="text-xs leading-relaxed text-subtle">
+              <Text class={`${uiType("xs")} leading-relaxed text-subtle`}>
                 {t().redacted ? tr("Redacted reasoning", "已隐藏思考过程") : reasoningPreview(t().text, 220)}
               </Text>
             )}
@@ -845,9 +846,9 @@ function TurnProcessPill(props: {
                     tone={t().status === "error" ? "destructive" : "subtle"}
                     class="shrink-0"
                   />
-                  <Text class="text-xs font-medium text-muted-foreground">{info().verb}</Text>
+                  <Text class={`${uiType("xs")} font-medium text-muted-foreground`}>{info().verb}</Text>
                   <If when={Boolean(info().target)}>
-                    <Text class="min-w-0 flex-1 truncate font-mono text-xs text-subtle">{info().target}</Text>
+                    <Text class={`min-w-0 flex-1 truncate font-mono ${uiType("xs")} text-subtle`}>{info().target}</Text>
                   </If>
                 </View>
               );
@@ -867,12 +868,12 @@ function InlineApproval(props: { dialog: ExtensionUiDialog; onAnswer: (id: strin
     <View class="gap-2 rounded-xl corner-squircle border border-border bg-muted/60 p-2.5">
       <View class="flex-row items-center gap-1.5">
         <Icon name="clock" size={13} tone="warning" class="shrink-0" />
-        <Text class="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
+        <Text class={`min-w-0 flex-1 truncate ${uiType("xs")} font-medium text-foreground`}>
           {props.dialog.title || tr("Approval needed", "需要确认")}
         </Text>
       </View>
       <If when={Boolean(message())}>
-        <Text class="max-h-20 font-mono text-2xs leading-relaxed text-muted-foreground">{message()}</Text>
+        <Text class={`max-h-20 font-mono ${uiType("2xs")} leading-relaxed text-muted-foreground`}>{message()}</Text>
       </If>
       <If
         when={props.dialog.method === "confirm"}
@@ -883,9 +884,9 @@ function InlineApproval(props: { dialog: ExtensionUiDialog; onAnswer: (id: strin
                 {(opt) => (
                   <BaseButton
                     onPress={() => props.onAnswer(props.dialog.id, { value: opt() })}
-                    class={`h-7 items-center justify-center rounded-md corner-squircle border border-hairline bg-secondary px-2.5 ${PRESS} ${PRESS_SCALE} hover:bg-accent`}
+                    class={`${uiHeight(28)} items-center justify-center rounded-md corner-squircle border border-hairline bg-secondary px-2.5 ${PRESS} ${PRESS_SCALE} hover:bg-accent`}
                   >
-                    <Text class="text-xs font-medium text-foreground">{opt()}</Text>
+                    <Text class={`${uiType("xs")} font-medium text-foreground`}>{opt()}</Text>
                   </BaseButton>
                 )}
               </Each>
@@ -896,15 +897,15 @@ function InlineApproval(props: { dialog: ExtensionUiDialog; onAnswer: (id: strin
         <View class="flex-row items-center justify-end gap-1.5">
           <BaseButton
             onPress={() => props.onAnswer(props.dialog.id, { confirmed: false })}
-            class={`h-7 items-center justify-center rounded-md corner-squircle border border-hairline bg-secondary px-2.5 ${PRESS} ${PRESS_SCALE} hover:bg-accent`}
+            class={`${uiHeight(28)} items-center justify-center rounded-md corner-squircle border border-hairline bg-secondary px-2.5 ${PRESS} ${PRESS_SCALE} hover:bg-accent`}
           >
-            <Text class="text-xs font-medium text-muted-foreground">{tr("Decline", "拒绝")}</Text>
+            <Text class={`${uiType("xs")} font-medium text-muted-foreground`}>{tr("Decline", "拒绝")}</Text>
           </BaseButton>
           <BaseButton
             onPress={() => props.onAnswer(props.dialog.id, { confirmed: true })}
-            class={`h-7 items-center justify-center rounded-md corner-squircle bg-primary px-3 ${PRESS} ${PRESS_SCALE} hover:bg-primary/90`}
+            class={`${uiHeight(28)} items-center justify-center rounded-md corner-squircle bg-primary px-3 ${PRESS} ${PRESS_SCALE} hover:bg-primary/90`}
           >
-            <Text class="text-xs font-medium text-brand-foreground">{tr("Allow", "允许")}</Text>
+            <Text class={`${uiType("xs")} font-medium text-brand-foreground`}>{tr("Allow", "允许")}</Text>
           </BaseButton>
         </View>
       </If>
@@ -940,10 +941,10 @@ function ReplyActions(props: {
             onPress={() => {
               if (applyDocEdit(props.doc.path, "replace", props.text, props.selection)) props.onApplied();
             }}
-            class={`h-6 flex-row items-center gap-1 rounded-md corner-squircle bg-brand-soft px-2 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-brand/20`}
+            class={`${uiHeight(24)} flex-row items-center gap-1 rounded-md corner-squircle bg-brand-soft px-2 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-brand/20`}
           >
             <Icon name="fileEdit" size={12} tone="brand-text" />
-            <Text class="text-xs font-medium text-brand-text">{tr("Replace selection", "替换选中")}</Text>
+            <Text class={`${uiType("xs")} font-medium text-brand-text`}>{tr("Replace selection", "替换选中")}</Text>
           </BaseButton>
         </If>
         <BaseButton
@@ -951,28 +952,28 @@ function ReplyActions(props: {
           onPress={() => {
             if (applyDocEdit(props.doc.path, "insert", props.text)) props.onApplied();
           }}
-          class={`h-6 flex-row items-center gap-1 rounded-md corner-squircle border-[0.5px] border-hairline bg-secondary/80 px-2 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
+          class={`${uiHeight(24)} flex-row items-center gap-1 rounded-md corner-squircle border-[0.5px] border-hairline bg-secondary/80 px-2 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
         >
           <Icon name="plus" size={12} tone="foreground" />
-          <Text class="text-xs font-medium text-foreground">{tr("Insert", "插入")}</Text>
+          <Text class={`${uiType("xs")} font-medium text-foreground`}>{tr("Insert", "插入")}</Text>
         </BaseButton>
         <BaseButton
           testID="doc-orb-append"
           onPress={() => {
             if (applyDocEdit(props.doc.path, "append", props.text)) props.onApplied();
           }}
-          class={`h-6 flex-row items-center gap-1 rounded-md corner-squircle px-2 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
+          class={`${uiHeight(24)} flex-row items-center gap-1 rounded-md corner-squircle px-2 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
         >
-          <Text class="text-xs text-muted-foreground">{tr("Append", "追加末尾")}</Text>
+          <Text class={`${uiType("xs")} text-muted-foreground`}>{tr("Append", "追加末尾")}</Text>
         </BaseButton>
       </If>
       <BaseButton
         testID="doc-orb-copy"
         onPress={copy}
-        class={`h-6 flex-row items-center gap-1 rounded-md corner-squircle px-2 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
+        class={`${uiHeight(24)} flex-row items-center gap-1 rounded-md corner-squircle px-2 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
       >
         <Icon name={copied() ? "check" : "copy"} size={12} tone={copied() ? "success" : "muted-foreground"} />
-        <Text class={`text-xs ${copied() ? "text-success" : "text-muted-foreground"}`}>
+        <Text class={`${uiType("xs")} ${copied() ? "text-success" : "text-muted-foreground"}`}>
           {copied() ? tr("Copied", "已复制") : tr("Copy", "复制")}
         </Text>
       </BaseButton>
@@ -1194,12 +1195,12 @@ function DocReplyCard(props: {
         }}
       >
         {/* Header: stable agent identity (live step is said once inside the body) */}
-        <View class="h-9 flex-row items-center gap-2 border-b border-border pl-3 pr-1.5">
+        <View class={`${uiHeight(36)} flex-row items-center gap-2 border-b border-border pl-3 pr-1.5`}>
           <AgentLogo id={props.assistant.agentId()} size={14} tone="foreground" class="shrink-0" />
-          <Text class="min-w-0 shrink truncate text-xs font-medium text-foreground">{headerTitle()}</Text>
+          <Text class={`min-w-0 shrink truncate ${uiType("xs")} font-medium text-foreground`}>{headerTitle()}</Text>
           <If when={Boolean(liveElapsed())}>
             <View style={{ opacity: breath }}>
-              <Text class="shrink-0 text-xs tabular-nums text-subtle">{liveElapsed()}</Text>
+              <Text class={`shrink-0 ${uiType("xs")} tabular-nums text-subtle`}>{liveElapsed()}</Text>
             </View>
           </If>
           <View class="flex-1" />
@@ -1273,11 +1274,11 @@ function DocReplyCard(props: {
                   <If when={Boolean(turn().userText)}>
                     <View class="items-end">
                       <View class="max-w-[86%] gap-1 rounded-2xl corner-squircle bg-secondary px-3 py-1.5">
-                        <Text class="text-sm leading-snug text-secondary-foreground">{turn().userText}</Text>
+                        <Text class={`${uiType("sm")} leading-snug text-secondary-foreground`}>{turn().userText}</Text>
                         <If when={turn().userExcerpt}>
                           <View class="flex-row items-center gap-1">
                             <Icon name="file" size={10} tone="subtle" />
-                            <Text class="text-2xs text-subtle">{tr("Selection", "选中内容")}</Text>
+                            <Text class={`${uiType("2xs")} text-subtle`}>{tr("Selection", "选中内容")}</Text>
                           </View>
                         </If>
                       </View>
@@ -1320,9 +1321,9 @@ function DocReplyCard(props: {
                           class="mt-0.5 shrink-0"
                         />
                         <View class="min-w-0 flex-1 gap-0.5">
-                          <Text class="text-xs font-medium text-foreground">{n().title}</Text>
+                          <Text class={`${uiType("xs")} font-medium text-foreground`}>{n().title}</Text>
                           <If when={Boolean(n().text)}>
-                            <Text class="text-xs text-muted-foreground">{n().text}</Text>
+                            <Text class={`${uiType("xs")} text-muted-foreground`}>{n().text}</Text>
                           </If>
                         </View>
                       </View>
@@ -1333,16 +1334,16 @@ function DocReplyCard(props: {
                     <View class="flex-row items-center justify-between gap-2 rounded-xl corner-squircle border border-success/25 bg-success/10 px-2.5 py-1.5">
                       <View class="flex-row items-center gap-1.5">
                         <Icon name="check" size={12} tone="success" />
-                        <Text class="text-xs font-medium text-foreground">
+                        <Text class={`${uiType("xs")} font-medium text-foreground`}>
                           {tr("Document updated directly", "已自动同步到文档")}
                         </Text>
                       </View>
                       <If when={!props.doc.readOnly()}>
                         <BaseButton
                           onPress={() => void undoDoc(props.doc.path)}
-                          class={`h-5 items-center justify-center rounded px-1.5 ${PRESS} hover:bg-accent`}
+                          class={`${uiHeight(20, { min: 20 })} items-center justify-center rounded px-1.5 ${PRESS} hover:bg-accent`}
                         >
-                          <Text class="text-xs font-medium text-brand-text">{tr("Undo", "撤销")}</Text>
+                          <Text class={`${uiType("xs")} font-medium text-brand-text`}>{tr("Undo", "撤销")}</Text>
                         </BaseButton>
                       </If>
                     </View>
@@ -1425,7 +1426,7 @@ function DocAgentPicker(props: {
                   props.onChosen();
                   void props.assistant.chooseAgent(agent().id);
                 }}
-                class={`min-h-9 flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+                class={`${uiMinHeight(36)} flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
               >
                 <AgentLogo
                   id={agent().id}
@@ -1435,14 +1436,14 @@ function DocAgentPicker(props: {
                 />
                 <View class="min-w-0 flex-1">
                   <View class="min-w-0 flex-row items-center gap-1.5">
-                    <Text class={`shrink truncate text-base ${agent().available ? "text-foreground" : "text-muted-foreground"}`}>
+                    <Text class={`shrink truncate ${uiType("base")} ${agent().available ? "text-foreground" : "text-muted-foreground"}`}>
                       {agent().name}
                     </Text>
                     <If when={meta().versionBadge}>
-                      {(v) => <Text class="shrink-0 font-mono text-2xs text-subtle">{v()}</Text>}
+                      {(v) => <Text class={`shrink-0 font-mono ${uiType("2xs")} text-subtle`}>{v()}</Text>}
                     </If>
                   </View>
-                  <Text class="truncate text-xs text-subtle">{meta().statusLabel}</Text>
+                  <Text class={`truncate ${uiType("xs")} text-subtle`}>{meta().statusLabel}</Text>
                 </View>
                 <View class="w-4 shrink-0 items-center">
                   {selected() ? <Icon name="check" size={14} tone="brand-text" /> : null}
@@ -1523,16 +1524,16 @@ function DocModelPicker(props: {
             props.onChosen();
             if (model) void props.assistant.chooseModel(model);
           }}
-          searchBarClass="h-10 flex-row items-center gap-2 border-b border-border px-3"
+          searchBarClass={`${uiHeight(40)} flex-row items-center gap-2 border-b border-border px-3`}
           searchPrefix={<Icon name="search" size={14} tone="subtle" />}
-          searchClass="flex-1 text-base text-foreground caret-brand placeholder:text-subtle"
+          searchClass={`flex-1 ${uiType("base")} text-foreground caret-brand placeholder:text-subtle`}
           listClass="max-h-72 p-1"
-          groupClass="px-2 pb-1 pt-2 text-xs font-medium text-subtle"
+          groupClass={`px-2 pb-1 pt-2 ${uiType("xs")} font-medium text-subtle`}
           separatorClass="mx-1 my-1 h-px bg-border"
-          itemClass={`group h-8 flex-row items-center rounded-md corner-squircle px-2 ${PRESS} focus:bg-accent`}
+          itemClass={`group ${uiHeight(32)} flex-row items-center rounded-md corner-squircle px-2 ${PRESS} focus:bg-accent`}
           empty={
             <View class="items-center gap-3 px-6 py-8">
-              <Text class="text-center text-sm text-muted-foreground">
+              <Text class={`text-center ${uiType("sm")} text-muted-foreground`}>
                 {props.assistant.loadingCatalog()
                   ? tr("Loading models…", "正在加载模型…")
                   : props.assistant.availableModels().length
@@ -1545,9 +1546,9 @@ function DocModelPicker(props: {
                     props.onOpenChange(false);
                     showAgentSettings(props.assistant.agentId());
                   }}
-                  class={`h-7 justify-center rounded-md corner-squircle bg-secondary px-2.5 ${PRESS} hover:bg-secondary/80`}
+                  class={`${uiHeight(28)} justify-center rounded-md corner-squircle bg-secondary px-2.5 ${PRESS} hover:bg-secondary/80`}
                 >
-                  <Text class="text-base font-medium text-secondary-foreground">
+                  <Text class={`${uiType("base")} font-medium text-secondary-foreground`}>
                     {tr(`Configure ${props.assistant.agentName()}`, `配置 ${props.assistant.agentName()}`)}
                   </Text>
                 </BaseButton>
@@ -1556,7 +1557,7 @@ function DocModelPicker(props: {
           }
           renderItem={(entry) => (
             <View class="flex-1 flex-row items-center gap-2">
-              <Text class="shrink truncate text-base text-foreground">{entry.label}</Text>
+              <Text class={`shrink truncate ${uiType("base")} text-foreground`}>{entry.label}</Text>
               {byKey().get(entry.id)?.reasoning ? <Icon name="sparkle" size={12} tone="subtle" /> : null}
               <View class="flex-1" />
               <View class="w-4 items-center">{entry.checked ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
@@ -1593,7 +1594,7 @@ function DocThinkingPicker(props: {
         trigger={<Chip testID="doc-orb-thinking" label={thinkingText(level()).label} class="shrink-0 text-subtle" />}
       >
         <View testID="doc-orb-thinking-menu">
-          <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
+          <Text class={`px-2 pb-1 pt-1.5 ${uiType("xs")} font-medium text-subtle`} role="header">
             {tr("Thinking", "思考深度")}
           </Text>
           <Each of={levels()}>
@@ -1605,10 +1606,10 @@ function DocThinkingPicker(props: {
                   props.onChosen();
                   void props.assistant.chooseThinkingLevel(option());
                 }}
-                class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+                class={`${uiHeight(32)} flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
               >
-                <Text class="text-base text-foreground">{thinkingText(option()).label}</Text>
-                <Text class="flex-1 truncate text-xs text-subtle">{thinkingText(option()).hint}</Text>
+                <Text class={`${uiType("base")} text-foreground`}>{thinkingText(option()).label}</Text>
+                <Text class={`flex-1 truncate ${uiType("xs")} text-subtle`}>{thinkingText(option()).hint}</Text>
                 <View class="w-4 items-center">{option() === level() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
               </BaseButton>
             )}
@@ -1652,7 +1653,7 @@ function DocPermissionPicker(props: {
       }
     >
       <View testID="doc-orb-permission-menu">
-        <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
+        <Text class={`px-2 pb-1 pt-1.5 ${uiType("xs")} font-medium text-subtle`} role="header">
           {tr("Permissions", "运行权限")}
         </Text>
         <Each of={RUNTIME_MODES}>
@@ -1669,12 +1670,12 @@ function DocPermissionPicker(props: {
                   props.onChosen();
                   void props.assistant.chooseRuntimeMode(option());
                 }}
-                class={`min-h-9 flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent disabled:opacity-45`}
+                class={`${uiMinHeight(36)} flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent disabled:opacity-45`}
               >
                 <Icon name={runtimeModeIcon(option())} size={15} tone={option() === mode() ? "foreground" : "muted-foreground"} />
                 <View class="min-w-0 flex-1">
-                  <Text class="truncate text-base text-foreground">{runtimeModeText(option()).label}</Text>
-                  <Text class="truncate text-xs text-subtle">{runtimeModeText(option()).hint}</Text>
+                  <Text class={`truncate ${uiType("base")} text-foreground`}>{runtimeModeText(option()).label}</Text>
+                  <Text class={`truncate ${uiType("xs")} text-subtle`}>{runtimeModeText(option()).hint}</Text>
                 </View>
                 <View class="w-4 shrink-0 items-center">{option() === mode() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
               </BaseButton>
@@ -2258,7 +2259,7 @@ export function DocFloatingOrb(props: {
                         class="h-5.5 flex-row items-center gap-1 rounded-full bg-brand-soft pl-2 pr-1"
                       >
                         <Icon name="sparkle" size={11} tone="brand-text" />
-                        <Text class="text-2xs font-medium text-brand-text">
+                        <Text class={`${uiType("2xs")} font-medium text-brand-text`}>
                           {tr(
                             `${activeSelection()!.words} ${activeSelection()!.words === 1 ? "word" : "words"} selected`,
                             `已选 ${activeSelection()!.words} 字`,
@@ -2315,8 +2316,8 @@ export function DocFloatingOrb(props: {
                       autoCapitalize="none"
                       autoCorrect={false}
                       accessibilityLabel={tr("Document AI prompt", "文档 AI 输入框")}
-                      class="text-base text-foreground caret-brand"
-                      style={{ height: inputH() }}
+                      class={`${uiType("base")} text-foreground caret-brand`}
+                      style={{ height: Math.max(inputH(), uiRowHeight(INPUT_MIN_H)) }}
                     />
                     <If when={showPlaceholder()}>
                       <View
@@ -2324,7 +2325,7 @@ export function DocFloatingOrb(props: {
                           activeSelection()?.text ? "top-1.5" : "top-3"
                         }`}
                       >
-                        <Text class="truncate text-base text-subtle">{placeholderText()}</Text>
+                        <Text class={`truncate ${uiType("base")} text-subtle`}>{placeholderText()}</Text>
                       </View>
                     </If>
                   </View>

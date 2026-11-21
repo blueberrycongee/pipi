@@ -159,12 +159,14 @@ density: 13pt is the interface size, 14pt the reading size.
 | `text-xl` | 17 / 24 | h1 in replies |
 | `text-2xl` | 20 / 26 | Page and stage titles (semibold, tight) |
 
-Settings → General → Font size keeps two independent choices in 1pt steps:
+Settings → General → Font size keeps three independent choices in 1pt steps:
+interface (11–16pt, default 13) for the sidebar, tab strip, menus, settings and
+controls — with single-line row heights, tab pill bounds and line heights
+scaling on a 2pt grid so nothing clips inside the 44pt title bar or sidebar —
 body text (12–22pt, default 14) for messages, drafts and documents, and code
 (10–20pt, default 11) for code blocks and expanded tool output. Headings,
-inline code and line heights follow the surrounding prose; controls, captions
-and navigation keep their interface scale. Both choices have one live preview
-and one reset to the defaults.
+inline code and line heights follow their surrounding role. All three choices
+share one live preview and one reset to the defaults.
 
 Weights: regular, `font-medium` for names and selected things,
 `font-semibold` for titles. Numbers that change use `tabular-nums`.

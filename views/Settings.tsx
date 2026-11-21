@@ -116,6 +116,7 @@ import {
   language,
   FONT_SIZES,
   type FontRole,
+  uiSize,
   readingSize,
   codeSize,
   setFontSize,
@@ -149,7 +150,7 @@ import { Icon, type IconName } from "../ui/Icon";
 import { animateNextLayout, delayedFade, FloatingLayer, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, ViewDeck } from "../ui/motion";
 import { FOCUS_RING, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { readingType, codeType } from "../ui/typography";
+import { readingType, codeType, uiHeight, uiIconSize, uiMinHeight, uiType } from "../ui/typography";
 import { CroppedWallpaperSurface, openWallpaperAdjust } from "./Wallpaper";
 
 const SECTIONS: { id: SettingsSection; label: () => string; icon: IconName }[] = [
@@ -171,16 +172,16 @@ function Page(props: { title: string; lead?: string; action?: JSX.Element; back?
           <View class="min-w-0 flex-1 gap-1">
             <If when={props.back}>
               {(back) => (
-                <BaseButton testID="settings-back" onPress={() => back().onPress()} class={`-ml-1.5 mb-1 h-6 flex-row items-center gap-1 self-start rounded-md corner-squircle px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
+                <BaseButton testID="settings-back" onPress={() => back().onPress()} class={`-ml-1.5 mb-1 ${uiHeight(24)} flex-row items-center gap-1 self-start rounded-md corner-squircle px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
                   <Icon name="arrowLeft" size={12} tone="muted-foreground" />
-                  <Text class="text-sm text-muted-foreground">{back().label}</Text>
+                  <Text class={`${uiType("sm")} text-muted-foreground`}>{back().label}</Text>
                 </BaseButton>
               )}
             </If>
-            <Text class="text-xl font-semibold tracking-tight text-foreground" role="header">
+            <Text class={`${uiType("xl")} font-semibold tracking-tight text-foreground`} role="header">
               {props.title}
             </Text>
-            {props.lead ? <Text class="text-sm leading-relaxed text-muted-foreground">{props.lead}</Text> : null}
+            {props.lead ? <Text class={`${uiType("sm")} leading-relaxed text-muted-foreground`}>{props.lead}</Text> : null}
           </View>
           {props.action}
         </View>
@@ -196,7 +197,7 @@ function Page(props: { title: string; lead?: string; action?: JSX.Element; back?
 function Value(props: { text: string; fullText?: string }) {
   return (
     <View selectable class="min-w-0 max-w-72 shrink" tooltip={props.fullText && props.fullText !== props.text ? tip(props.fullText) : undefined}>
-      <Text class="truncate font-mono text-xs text-muted-foreground">{props.text}</Text>
+      <Text class={`truncate font-mono ${uiType("xs")} text-muted-foreground`}>{props.text}</Text>
     </View>
   );
 }
@@ -250,8 +251,8 @@ function ProviderRow(props: { provider: ProviderInfo; agentName: string; live: b
       <View class="min-h-7 flex-row items-center gap-3">
         <View class={`size-2 shrink-0 rounded-full ${link().connected ? "bg-success" : "bg-input"}`} />
         <View class="min-w-0 flex-1 gap-0.5">
-          <Text class="truncate text-base text-foreground">{props.provider.name}</Text>
-          <Text class="truncate text-xs text-subtle">
+          <Text class={`truncate ${uiType("base")} text-foreground`}>{props.provider.name}</Text>
+          <Text class={`truncate ${uiType("xs")} text-subtle`}>
             {link().connected ? (props.live ? `${link().via} · ${tr(`${count()} ${count() === 1 ? "model" : "models"}`, `${count()} 个模型`)}` : link().via) : link().via || props.provider.env}
           </Text>
         </View>
@@ -282,15 +283,15 @@ function ProviderRow(props: { provider: ProviderInfo; agentName: string; live: b
             <Button label={tr("Cancel", "取消")} variant="ghost" size="lg" onPress={() => (key.set(""), props.onEdit(false))} />
           </View>
           <View class="flex-row items-center gap-3">
-            <Text class="min-w-0 flex-1 text-xs text-subtle">
+            <Text class={`min-w-0 flex-1 ${uiType("xs")} text-subtle`}>
               {props.live
                 ? tr(`Stored in ${store()}. ${props.agentName} restarts to load the new key.`, `保存在 ${store()}，保存后 ${props.agentName} 将重启加载。`)
                 : tr(`Stored in ${store()}. ${props.agentName} loads it the next time it starts.`, `保存在 ${store()}，${props.agentName} 下次启动时加载。`)}
             </Text>
             <If when={props.provider.keysUrl}>
               {(url) => (
-                <BaseButton onPress={() => void openUrl(url())} role="link" class={`h-6 shrink-0 flex-row items-center gap-1 rounded-md corner-squircle px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
-                  <Text class="text-xs text-brand-text">{tr("Get a key", "获取密钥")}</Text>
+                <BaseButton onPress={() => void openUrl(url())} role="link" class={`${uiHeight(24)} shrink-0 flex-row items-center gap-1 rounded-md corner-squircle px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
+                  <Text class={`${uiType("xs")} text-brand-text`}>{tr("Get a key", "获取密钥")}</Text>
                   <Icon name="external" size={12} tone="brand-text" />
                 </BaseButton>
               )}
@@ -450,32 +451,32 @@ function AgentHarnessRow(props: { agent: AgentHarnessStatus; editing: boolean; o
         <AgentLogo id={props.agent.id} size={18} tone={props.agent.available ? "foreground" : "muted-foreground"} status={props.agent.available ? "ready" : "off"} />
         <View class="min-w-0 flex-1 gap-0.5">
           <View class="min-w-0 flex-row items-center gap-1.5">
-            <Text class="shrink truncate text-base font-medium text-foreground">{props.agent.name}</Text>
-            <Text class="shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 font-mono text-2xs text-subtle">{protocolLabel()}</Text>
+            <Text class={`shrink truncate ${uiType("base")} font-medium text-foreground`}>{props.agent.name}</Text>
+            <Text class={`shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 font-mono ${uiType("2xs")} text-subtle`}>{protocolLabel()}</Text>
             <If when={meta().versionBadge}>
-              {(v) => <Text class="shrink-0 font-mono text-xs text-subtle">{v()}</Text>}
+              {(v) => <Text class={`shrink-0 font-mono ${uiType("xs")} text-subtle`}>{v()}</Text>}
             </If>
             <If when={active()}>
-              <Text class="shrink-0 rounded-sm corner-squircle bg-secondary px-1.5 py-0.5 text-2xs font-medium text-secondary-foreground">{tr("Active", "当前")}</Text>
+              <Text class={`shrink-0 rounded-sm corner-squircle bg-secondary px-1.5 py-0.5 ${uiType("2xs")} font-medium text-secondary-foreground`}>{tr("Active", "当前")}</Text>
             </If>
             <If when={props.agent.hasApiKey || storedKeySaved()}>
-              <Text class="shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 text-2xs text-subtle">{tr("Key", "已配密钥")}</Text>
+              <Text class={`shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 ${uiType("2xs")} text-subtle`}>{tr("Key", "已配密钥")}</Text>
             </If>
             <If when={hasOverride()}>
-              <Text class="shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 text-2xs text-subtle">{tr("Custom", "已定制")}</Text>
+              <Text class={`shrink-0 rounded-sm corner-squircle bg-muted px-1.5 py-0.5 ${uiType("2xs")} text-subtle`}>{tr("Custom", "已定制")}</Text>
             </If>
           </View>
-          <Text class="truncate text-xs text-muted-foreground">{desc()}</Text>
+          <Text class={`truncate ${uiType("xs")} text-muted-foreground`}>{desc()}</Text>
           <View class="min-w-0 flex-row items-center gap-1.5">
-            <Text class={`shrink-0 text-xs ${props.agent.available ? "text-subtle" : "text-muted-foreground"}`}>{meta().statusLabel}</Text>
+            <Text class={`shrink-0 ${uiType("xs")} ${props.agent.available ? "text-subtle" : "text-muted-foreground"}`}>{meta().statusLabel}</Text>
             <If when={meta().displayPath}>
               {(shortPath) => (
                 <View
                   class="min-w-0 flex-1 flex-row items-center gap-1.5"
                   tooltip={meta().fullPath && meta().fullPath !== shortPath() ? tip(meta().fullPath!) : undefined}
                 >
-                  <Text class="shrink-0 text-xs text-subtle">·</Text>
-                  <Text class="shrink truncate font-mono text-xs text-subtle">{shortPath()}</Text>
+                  <Text class={`shrink-0 ${uiType("xs")} text-subtle`}>·</Text>
+                  <Text class={`shrink truncate font-mono ${uiType("xs")} text-subtle`}>{shortPath()}</Text>
                 </View>
               )}
             </If>
@@ -523,7 +524,7 @@ function AgentHarnessRow(props: { agent: AgentHarnessStatus; editing: boolean; o
             {(cmd) => (
               <View class="flex-row items-center gap-2 rounded-lg corner-squircle border border-border bg-sunken px-3 py-2">
                 <Icon name="terminal" size={14} tone="subtle" />
-                <Text class="min-w-0 flex-1 truncate font-mono text-xs text-foreground">{cmd()}</Text>
+                <Text class={`min-w-0 flex-1 truncate font-mono ${uiType("xs")} text-foreground`}>{cmd()}</Text>
                 <Button label={tr("Copy Install", "复制安装命令")} size="sm" icon="copy" onPress={() => void copyText(cmd())} />
               </View>
             )}
@@ -581,8 +582,8 @@ function AgentHarnessRow(props: { agent: AgentHarnessStatus; editing: boolean; o
             />
             <If when={props.agent.docsUrl}>
               {(url) => (
-                <BaseButton onPress={() => void openUrl(url())} role="link" class={`h-8 shrink-0 flex-row items-center gap-1 rounded-md corner-squircle px-2 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
-                  <Text class="text-xs text-brand-text">{tr("Docs", "文档")}</Text>
+                <BaseButton onPress={() => void openUrl(url())} role="link" class={`${uiHeight(32)} shrink-0 flex-row items-center gap-1 rounded-md corner-squircle px-2 ${PRESS} ${FOCUS_RING} hover:bg-accent`}>
+                  <Text class={`${uiType("xs")} text-brand-text`}>{tr("Docs", "文档")}</Text>
                   <Icon name="external" size={12} tone="brand-text" />
                 </BaseButton>
               )}
@@ -718,7 +719,7 @@ function AgentsPage(props: { focus?: string }) {
         </Each>
         <If when={filteredAgents().length === 0}>
           <View class="items-center py-6">
-            <Text class="text-sm text-subtle">{tr("No matching agent harnesses.", "没有匹配的智能体引擎。")}</Text>
+            <Text class={`${uiType("sm")} text-subtle`}>{tr("No matching agent harnesses.", "没有匹配的智能体引擎。")}</Text>
           </View>
         </If>
       </SettingGroup>
@@ -740,7 +741,7 @@ function AgentsPage(props: { focus?: string }) {
             <Rule />
             <View class="gap-2.5 py-2.5">
               <View class="flex-row items-center justify-between gap-2">
-                <Text class="text-xs font-medium text-subtle">{tr("Launch distribution", "运行方式")}</Text>
+                <Text class={`${uiType("xs")} font-medium text-subtle`}>{tr("Launch distribution", "运行方式")}</Text>
                 <Segmented
                   label={tr("ACP distribution", "ACP 运行方式")}
                   value={customDist()}
@@ -1041,14 +1042,14 @@ function wallpaperPauseModeLabel(mode: WallpaperPauseMode) {
 }
 
 function FontSizeRow(props: { role: FontRole; title: string; description: string }) {
-  const size = props.role === "reading" ? readingSize : codeSize;
+  const size = props.role === "ui" ? uiSize : props.role === "reading" ? readingSize : codeSize;
   const limits = FONT_SIZES[props.role];
   return (
     <SettingRow title={props.title} description={props.description}>
       <View class="flex-row items-center rounded-lg corner-squircle bg-card p-0.5">
         <IconButton icon="minus" size="sm" label={tr(`Decrease ${props.title.toLowerCase()} size`, `减小${props.title}字号`)}
           disabled={size() <= limits.min} onPress={() => setFontSize(props.role, size() - 1)} />
-        <Text class="w-11 text-center text-sm tabular-nums text-foreground">{`${size()} pt`}</Text>
+        <Text class={`min-w-12 text-center ${uiType("sm")} tabular-nums text-foreground`}>{`${size()} pt`}</Text>
         <IconButton icon="plus" size="sm" label={tr(`Increase ${props.title.toLowerCase()} size`, `增大${props.title}字号`)}
           disabled={size() >= limits.max} onPress={() => setFontSize(props.role, size() + 1)} />
       </View>
@@ -1070,17 +1071,20 @@ function General() {
         </SettingRow>
       </SettingGroup>
       <SettingGroup title={tr("Font size", "字号")}>
+        <FontSizeRow role="ui" title={tr("Interface", "界面")} description={tr("Sidebar, tabs, menus and controls", "侧边栏、标签栏、菜单与控件")} />
+        <Rule />
         <FontSizeRow role="reading" title={tr("Body text", "正文")} description={tr("Messages, drafts and documents", "消息、输入框与文档")} />
         <Rule />
         <FontSizeRow role="code" title={tr("Code", "代码")} description={tr("Code blocks and tool output", "代码块与工具输出")} />
         <Rule />
         <View class="flex-row items-center justify-between gap-4 py-3">
           <View class="min-w-0 flex-1 gap-1">
+            <Text class={`${uiType("base")} font-medium text-muted-foreground`}>{tr("Sidebar & tab label", "侧边栏与标签标题")}</Text>
             <Text class={`${readingType()} text-foreground`}>{tr("A preview of your text.", "这是一行正文预览。")}</Text>
             <Text class={`${codeType()} font-mono text-muted-foreground`}>git diff --stat</Text>
           </View>
           <Button size="sm" variant="ghost" label={tr("Reset sizes", "恢复默认字号")}
-            disabled={readingSize() === FONT_SIZES.reading.default && codeSize() === FONT_SIZES.code.default}
+            disabled={uiSize() === FONT_SIZES.ui.default && readingSize() === FONT_SIZES.reading.default && codeSize() === FONT_SIZES.code.default}
             onPress={resetFontSizes} />
         </View>
       </SettingGroup>
@@ -1381,7 +1385,7 @@ function General() {
         <View class="gap-3 px-3 py-3">
           {(["cat", "dog"] as const).map((species) => (
             <View class="gap-1">
-              <Text class="px-1 text-2xs text-subtle">{species === "cat" ? tr("Cats", "猫") : tr("Dogs", "狗")}</Text>
+              <Text class={`px-1 ${uiType("2xs")} text-subtle`}>{species === "cat" ? tr("Cats", "猫") : tr("Dogs", "狗")}</Text>
               <View class="flex-row flex-wrap gap-2">
                 {COAT_IDS.filter((id) => COATS[id].species === species).map((id) => {
                   const name = () => tr(COATS[id].name.en, COATS[id].name.zh);
@@ -1395,7 +1399,7 @@ function General() {
                       class={`w-19 items-center gap-1.5 rounded-lg corner-squircle border py-2.5 ${PRESS} ${FOCUS_RING} ${chosen() ? "border-brand bg-brand-soft" : "border-transparent hover:bg-accent"}`}
                     >
                       <Pip size={40} coat={id} mood={chosen() ? "happy" : "idle"} still={!chosen()} />
-                      <Text class={`text-xs ${chosen() ? "font-medium text-foreground" : "text-muted-foreground"}`}>{name()}</Text>
+                      <Text class={`${uiType("xs")} ${chosen() ? "font-medium text-foreground" : "text-muted-foreground"}`}>{name()}</Text>
                     </BaseButton>
                   );
                 })}
@@ -1565,9 +1569,9 @@ function ArchivePage() {
                     updateAutoArchiveDays(days());
                     daysMenuOpen.set(false);
                   }}
-                  class={`h-8 flex-row items-center justify-between rounded-lg corner-squircle px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-accent selected:bg-accent`}
+                  class={`${uiHeight(32)} flex-row items-center justify-between rounded-lg corner-squircle px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-accent selected:bg-accent`}
                 >
-                  <Text class="text-base text-foreground">{autoArchiveLabel(days())}</Text>
+                  <Text class={`${uiType("base")} text-foreground`}>{autoArchiveLabel(days())}</Text>
                   <If when={autoArchiveDays() === days()}>
                     <Icon name="check" size={14} tone="brand-text" />
                   </If>
@@ -1610,7 +1614,7 @@ function ArchivePage() {
                 <Chip
                   label={selectedWorkspaceLabel()}
                   icon="folder"
-                  class="h-8 bg-secondary px-2.5 text-secondary-foreground"
+                  class={`${uiHeight(32)} bg-secondary px-2.5 text-secondary-foreground`}
                   trailing={<Icon name="chevronDown" size={12} tone="subtle" />}
                 />
               }
@@ -1623,9 +1627,9 @@ function ArchivePage() {
                       workspaceFilter.set(opt().value);
                       wsMenuOpen.set(false);
                     }}
-                    class={`h-8 flex-row items-center justify-between gap-2 rounded-lg corner-squircle px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-accent selected:bg-accent`}
+                    class={`${uiHeight(32)} flex-row items-center justify-between gap-2 rounded-lg corner-squircle px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-accent selected:bg-accent`}
                   >
-                    <Text class="min-w-0 flex-1 truncate text-base text-foreground">{opt().label}</Text>
+                    <Text class={`min-w-0 flex-1 truncate ${uiType("base")} text-foreground`}>{opt().label}</Text>
                     <If when={workspaceFilter() === opt().value}>
                       <Icon name="check" size={14} tone="brand-text" />
                     </If>
@@ -1643,11 +1647,11 @@ function ArchivePage() {
           <If when={sessionsReady()}>
             <SettingGroup>
               <View class="items-center gap-1 py-8">
-                <Text class="text-base font-medium text-foreground">
+                <Text class={`${uiType("base")} font-medium text-foreground`}>
                   {noMatches() ? tr("No matching archived items", "没有匹配的归档内容") : tr("No archived conversations", "暂无已归档的对话")}
                 </Text>
                 <If when={!noMatches()}>
-                  <Text class="text-center text-sm text-muted-foreground">
+                  <Text class={`text-center ${uiType("sm")} text-muted-foreground`}>
                     {tr("Conversations hidden from the sidebar can also be restored here.", "从侧边栏隐藏的对话也可在这里恢复。")}
                   </Text>
                 </If>
@@ -1662,10 +1666,10 @@ function ArchivePage() {
               <View class="gap-1.5">
                 <View class="flex-row items-center justify-between px-1">
                   <View class="min-w-0 flex-1 flex-row items-center gap-1.5">
-                    <Icon name="folder" size={14} tone="muted-foreground" />
-                    <Text class="truncate text-sm font-medium text-muted-foreground">{group().projectName}</Text>
+                    <Icon name="folder" size={uiIconSize(14)} tone="muted-foreground" />
+                    <Text class={`truncate ${uiType("sm")} font-medium text-muted-foreground`}>{group().projectName}</Text>
                   </View>
-                  <Text class="text-xs tabular-nums text-subtle">{String(group().items.length)}</Text>
+                  <Text class={`${uiType("xs")} tabular-nums text-subtle`}>{String(group().items.length)}</Text>
                 </View>
                 <View class="overflow-hidden rounded-xl corner-squircle bg-muted/50 px-4">
                   <Each of={group().items} key={(item) => item.id}>
@@ -1676,15 +1680,15 @@ function ArchivePage() {
                           <If when={index() > 0}>
                             <Rule />
                           </If>
-                          <View class="min-h-11 flex-row items-center justify-between gap-3 py-2">
+                          <View class={`${uiMinHeight(44)} flex-row items-center justify-between gap-3 py-2`}>
                             <BaseButton
                               onPress={() => void openSession(entry().session.path, entry().cwd)}
                               tooltip={tip(tr("Open conversation", "打开对话"))}
                               class={`min-w-0 flex-1 flex-row items-center gap-2.5 rounded-lg corner-squircle px-1.5 py-1 -ml-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
                             >
-                              <AgentLogo id={entry().session.agentId ?? "pi"} size={15} tone="muted-foreground" />
-                              <Text class="min-w-0 flex-1 truncate text-base text-foreground">{title()}</Text>
-                              <Text class="shrink-0 text-xs tabular-nums text-subtle">
+                              <AgentLogo id={entry().session.agentId ?? "pi"} size={uiIconSize(15)} tone="muted-foreground" />
+                              <Text class={`min-w-0 flex-1 truncate ${uiType("base")} text-foreground`}>{title()}</Text>
+                              <Text class={`shrink-0 ${uiType("xs")} tabular-nums text-subtle`}>
                                 {relativeTime(entry().session.modified, Date.now(), activeLanguage())}
                               </Text>
                             </BaseButton>
@@ -1765,13 +1769,13 @@ function Usage() {
     >
       <If when={!usageReady() && empty()}>
         <View class="py-2" style={{ opacity: delayedFade() }}>
-          <Text class="text-sm text-muted-foreground">{tr("Reading saved sessions…", "正在读取已保存会话的用量…")}</Text>
+          <Text class={`${uiType("sm")} text-muted-foreground`}>{tr("Reading saved sessions…", "正在读取已保存会话的用量…")}</Text>
         </View>
       </If>
       <If when={usageReady() && empty()}>
         <View class="gap-1 py-2">
-          <Text class="text-base text-foreground">{tr("No usage reported yet", "还没有上报的用量")}</Text>
-          <Text class="text-sm text-muted-foreground">
+          <Text class={`${uiType("base")} text-foreground`}>{tr("No usage reported yet", "还没有上报的用量")}</Text>
+          <Text class={`${uiType("sm")} text-muted-foreground`}>
             {tr(
               "Figures appear here once an agent that reports its token use has run a turn.",
               "上报 token 用量的智能体跑过一轮后，数字会出现在这里。",
@@ -1830,9 +1834,9 @@ function Usage() {
                 </Each>
               </View>
               <View class="flex-row items-center justify-between">
-                <Text class="text-2xs text-subtle">{trailingDays()[0]?.day ?? ""}</Text>
+                <Text class={`${uiType("2xs")} text-subtle`}>{trailingDays()[0]?.day ?? ""}</Text>
                 <View class="flex-row items-center gap-1.5">
-                  <Text class="text-2xs text-subtle">{tr("today", "今天")}</Text>
+                  <Text class={`${uiType("2xs")} text-subtle`}>{tr("today", "今天")}</Text>
                   <IconButton icon="refresh" size="sm" label={tr("Re-scan saved sessions", "重新扫描已保存会话")} onPress={() => void refreshUsageStats()} />
                 </View>
               </View>
@@ -1852,8 +1856,8 @@ function Usage() {
                   <View class="flex-row items-center justify-between gap-4">
                     <View class="min-w-0 flex-1 flex-row items-center gap-2">
                       <AgentLogo id={agent().agentId} size={16} tone="muted-foreground" />
-                      <Text class="text-base text-foreground">{agentName(agent().agentId)}</Text>
-                      <Text class="shrink truncate text-sm text-muted-foreground">
+                      <Text class={`${uiType("base")} text-foreground`}>{agentName(agent().agentId)}</Text>
+                      <Text class={`shrink truncate ${uiType("sm")} text-muted-foreground`}>
                         {tr(`${agent().sessions} sessions · ${agent().messages} messages`, `${agent().sessions} 个会话 · ${agent().messages} 条消息`)}
                       </Text>
                     </View>
@@ -1869,7 +1873,7 @@ function Usage() {
         </SettingGroup>
       </If>
       <If when={silent().length > 0}>
-        <Text class="text-sm text-subtle">
+        <Text class={`${uiType("sm")} text-subtle`}>
           {tr(
             `Not counted: ${silentSessions()} sessions from ${silentNames()}. The agent reported no usage for them, or they were saved before pipi recorded it.`,
             `未计入：${silentNames()} 的 ${silentSessions()} 个会话。智能体没有为它们上报用量，或保存于 pipi 开始记录用量之前。`,
@@ -2062,10 +2066,10 @@ function About() {
       <View class="items-center gap-5 rounded-xl corner-squircle border border-border bg-card px-6 py-10">
         <Pip size={88} />
         <View class="items-center gap-1">
-          <Text class="text-xl font-semibold tracking-tight text-foreground">pipi</Text>
-          <Text class="text-sm text-muted-foreground">{tr(`Version ${manifest.version}`, `版本 ${manifest.version}`)}</Text>
+          <Text class={`${uiType("xl")} font-semibold tracking-tight text-foreground`}>pipi</Text>
+          <Text class={`${uiType("sm")} text-muted-foreground`}>{tr(`Version ${manifest.version}`, `版本 ${manifest.version}`)}</Text>
         </View>
-        <Text class="max-w-100 text-center text-sm text-muted-foreground">
+        <Text class={`max-w-100 text-center ${uiType("sm")} text-muted-foreground`}>
           {tr(
             "This is pipi, a little ghost. pipi thinks when the agent thinks, bobs and wags while it works, and jumps when a run ends well. Pick its coat in General — cats and dogs.",
             "这是 pipi，一只小幽灵。智能体思考时它思考，工作时它飘动摇尾，运行圆满结束时它会欢快跃起。可在“常规”里给它换毛色——猫狗都有。",
@@ -2097,9 +2101,9 @@ function About() {
 /** The section nav inside the settings panel: the same sections whichever agent is active. */
 function SettingsNav(props: { section: SettingsSection }) {
   return (
-    <View class="w-44 shrink-0 border-r border-border">
+    <View class={`${uiSize() >= 15 ? "w-48" : "w-44"} shrink-0 border-r border-border`}>
       <View class="min-h-0 flex-1 gap-0.5 p-2">
-        <Text class="px-2.5 pb-2 pt-2 text-xs font-medium text-subtle" role="header">
+        <Text class={`px-2.5 pb-2 pt-2 ${uiType("xs")} font-medium text-subtle`} role="header">
           {tr("Settings", "设置")}
         </Text>
         <Tabs class="gap-0.5" indicatorClass="inset-x-0 rounded-lg corner-squircle bg-accent">
@@ -2111,10 +2115,10 @@ function SettingsNav(props: { section: SettingsSection }) {
                   testID={`settings-nav-${item().id}`}
                   selected={active()}
                   onPress={() => showSettings(item().id)}
-                  class={`h-8 flex-row items-center gap-2 rounded-lg corner-squircle px-2.5 transition-colors duration-150 ${FOCUS_RING} ${active() ? "" : "hover:bg-accent/60"}`}
+                  class={`${uiHeight(32)} flex-row items-center gap-2 rounded-lg corner-squircle px-2.5 transition-colors duration-150 ${FOCUS_RING} ${active() ? "" : "hover:bg-accent/60"}`}
                 >
-                  <Icon name={item().icon} tone={active() ? "foreground" : "muted-foreground"} />
-                  <Text class={`shrink truncate text-base transition-colors duration-150 ${active() ? "font-medium text-foreground" : "text-muted-foreground"}`}>
+                  <Icon name={item().icon} size={uiIconSize(16)} tone={active() ? "foreground" : "muted-foreground"} />
+                  <Text class={`shrink truncate ${uiType("base")} transition-colors duration-150 ${active() ? "font-medium text-foreground" : "text-muted-foreground"}`}>
                     {item().label()}
                   </Text>
                 </Tab>

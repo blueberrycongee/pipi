@@ -106,6 +106,7 @@ import { Icon, type IconName } from "../ui/Icon";
 import { animateNextLayout, delayedFade, EASING, Presence, Reveal } from "../ui/motion";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, WALLPAPER_FROST } from "../ui/styles";
 import { tip } from "../ui/Tip";
+import { uiHeight, uiIconSize, uiRowHeight, uiType } from "../ui/typography";
 
 /** A row inside an expanded workspace folder: a saved session. */
 type FolderItem = { id: string; session?: SessionSummary; child?: DaemonSession };
@@ -119,8 +120,10 @@ type RecentItem = { id: string; session?: SessionSummary; child?: DaemonSession;
 const RECENT_LIMIT = 100;
 const REPO_URL = "https://github.com/blueberrycongee/pipi";
 const ICON_SLOT = "size-5 shrink-0 items-center justify-center";
-/** Trailing 24pt slot (`right-1` inside `px-2`) centered on the sidebar's 24pt right axis. */
-const TRAILING_SLOT = "pointer-events-none absolute right-1 top-0.5 size-6 flex-row items-center justify-center";
+/** Trailing 24pt slot (`right-1` inside `px-2`) centered vertically on the row's dynamic height. */
+const TRAILING_SLOT = "pointer-events-none absolute right-1 size-6 flex-row items-center justify-center";
+const rowTrailingTop = () => Math.round((uiRowHeight(28) - 24) / 2);
+const groupActionTop = () => Math.round((uiRowHeight(24) - 24) / 2);
 /**
  * Window controls stand at the sidebar strip's left end (macOS's traffic
  * lights; a Linux layout can place them there too — `titleBar().left`).
@@ -1305,11 +1308,11 @@ function GroupHeading(props: {
               : tr(`Collapse ${props.label}`, `收起 ${props.label}`)
         }
         hitSlop={{ bottom: 6 }}
-        class={`h-6 w-full min-w-0 flex-row items-center gap-1 rounded-md corner-squircle pl-2.5 ${props.action ? "pr-8" : "pr-2.5"} ${calm(ROW_PRESS)}`}
+        class={`${uiHeight(24)} w-full min-w-0 flex-row items-center gap-1 rounded-md corner-squircle pl-2.5 ${props.action ? "pr-8" : "pr-2.5"} ${calm(ROW_PRESS)}`}
       >
-        <Text class="shrink-0 truncate text-sm text-subtle">{props.label}</Text>
+        <Text class={`shrink-0 truncate ${uiType("sm")} text-subtle`}>{props.label}</Text>
         <If when={collapsed() && props.count > 0}>
-          <Text class="text-xs tabular-nums text-subtle">{String(props.count)}</Text>
+          <Text class={`${uiType("xs")} tabular-nums text-subtle`}>{String(props.count)}</Text>
         </If>
         <If when={props.count > 0}>
           <View
@@ -1331,7 +1334,8 @@ function GroupHeading(props: {
             shortcut={action().shortcut}
             tipPlacement="right"
             onPress={() => action().onPress()}
-            class={`absolute right-1 top-0 transition-opacity ${actionReveal()}`}
+            class={`absolute right-1 transition-opacity ${actionReveal()}`}
+            style={{ top: groupActionTop() }}
           />
         )}
       </If>
@@ -1430,20 +1434,20 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
           accessibilityLabel={collapsed() ? tr(`Expand ${label().name}`, `展开 ${label().name}`) : tr(`Collapse ${label().name}`, `收起 ${label().name}`)}
           hitSlop={props.first ? undefined : { top: 4 }}
           tooltip={tip(tildePath(props.cwd, home), undefined, "right")}
-          class={`h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle pl-2.5 pr-8 ${calm(ROW_PRESS)}`}
+          class={`${uiHeight(28)} w-full min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle pl-2.5 pr-8 ${calm(ROW_PRESS)}`}
         >
           <View class={ICON_SLOT}>
-            <Icon name={collapsed() ? "folder" : "folderOpen"} size={14} tone={active() ? "foreground" : "muted-foreground"} />
+            <Icon name={collapsed() ? "folder" : "folderOpen"} size={uiIconSize(14)} tone={active() ? "foreground" : "muted-foreground"} />
           </View>
           <Text
-            class={`shrink truncate text-base ${
+            class={`shrink truncate ${uiType("base")} ${
               active() ? "font-semibold text-sidebar-foreground" : "font-medium text-muted-foreground group-hover:text-sidebar-foreground"
             }`}
           >
             {label().name}
           </Text>
           <If when={label().parent}>
-            {(p) => <Text class="shrink truncate text-xs text-subtle">{p()}</Text>}
+            {(p) => <Text class={`shrink truncate ${uiType("xs")} text-subtle`}>{p()}</Text>}
           </If>
           <View
             class={`shrink-0 transition-all duration-200 ease-out-quint motion-reduce:transition-none ${
@@ -1453,7 +1457,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
             <Icon name="chevronRight" size={12} tone="subtle" />
           </View>
         </BaseButton>
-        <View class={`${TRAILING_SLOT} transition-opacity group-hover:opacity-0`}>
+        <View class={`${TRAILING_SLOT} transition-opacity group-hover:opacity-0`} style={{ top: rowTrailingTop() }}>
           <If when={startingHere()}>
             <View class="absolute inset-0 items-center justify-center">
               <FadeIn>
@@ -1479,7 +1483,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
           </Presence>
           <If when={!startingHere() && !collapsedRunning() && !collapsedUnread() && collapsed() && sessions().length > 0}>
             <View class="absolute inset-0 items-center justify-center">
-              <Text class="text-xs tabular-nums text-subtle">{String(sessions().length)}</Text>
+              <Text class={`${uiType("xs")} tabular-nums text-subtle`}>{String(sessions().length)}</Text>
             </View>
           </If>
         </View>
@@ -1490,7 +1494,8 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
           tipPlacement="right"
           hitSlop={{ top: 2, bottom: 2 }}
           onPress={() => startNewSessionIn(props.cwd)}
-          class={`absolute right-1 top-0.5 transition-opacity ${inert(HOVER_REVEAL)}`}
+          class={`absolute right-1 transition-opacity ${inert(HOVER_REVEAL)}`}
+          style={{ top: rowTrailingTop() }}
         />
       </DropRow>
     </View>
@@ -1505,7 +1510,7 @@ const sessionRowClass = (
   depth = 0,
   keepTrailingOnHover = false,
 ) =>
-  `h-7 w-full min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle ${
+  `${uiHeight(28)} w-full min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle ${
     depth >= 3 ? "pl-16" : depth === 2 ? "pl-14" : depth === 1 ? "pl-12" : indent ? "pl-8" : "pl-2.5"
   } ${
     reserveTrailing && reserveHoverAction && keepTrailingOnHover
@@ -1522,7 +1527,7 @@ const sessionTitleClass = (selected: boolean) =>
   // animate gracefully with a generic `transition`, which makes the text width drift during
   // the 150ms window and shifts the truncation point — the visible "shake". Colour still
   // fades smoothly while the weight snaps at the moment of the click instead.
-  `min-w-0 flex-1 truncate text-base transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${selected ? "font-medium text-sidebar-foreground" : "text-muted-foreground group-hover:text-sidebar-foreground"}`;
+  `min-w-0 flex-1 truncate ${uiType("base")} transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${selected ? "font-medium text-sidebar-foreground" : "text-muted-foreground group-hover:text-sidebar-foreground"}`;
 
 /** Fades its content in after the shared patience delay, so a state that ends sooner (a quick restart) never shows at all. */
 function FadeIn(props: { children: JSX.Element }) {
@@ -1544,7 +1549,7 @@ function EngineMark(props: { id: string; available: boolean }) {
   });
   return (
     <View class={ICON_SLOT} style={{ opacity, transform: [{ scale }] }}>
-      <AgentLogo id={props.id} size={14} tone="muted-foreground" status={props.available ? "ready" : "off"} />
+      <AgentLogo id={props.id} size={uiIconSize(14)} tone="muted-foreground" status={props.available ? "ready" : "off"} />
     </View>
   );
 }
@@ -1597,7 +1602,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{shownTitle()}</Text>
       </View>
-      <View class={TRAILING_SLOT}>
+      <View class={TRAILING_SLOT} style={{ top: rowTrailingTop() }}>
         <Presence show={running()} testID="sidebar-draft-running">
           <Pip size={16} mood="work" />
         </Presence>
@@ -1659,7 +1664,7 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{titleOf(props.session)}</Text>
       </View>
-      <View class={keepCue() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`}>
+      <View class={keepCue() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`} style={{ top: rowTrailingTop() }}>
         <Presence
           show={running() && !blocked()}
           testID="sidebar-session-running"
@@ -1703,7 +1708,8 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           if (archived()) unarchiveSession(props.session.path);
           else void archiveSession(props.session.path, props.cwd);
         }}
-        class={`absolute ${keepCue() ? "right-7" : "right-1"} top-0.5 transition-opacity ${inert(HOVER_REVEAL)}`}
+        class={`absolute ${keepCue() ? "right-7" : "right-1"} transition-opacity ${inert(HOVER_REVEAL)}`}
+        style={{ top: rowTrailingTop() }}
       />
     </>
   );
@@ -1797,7 +1803,7 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
         <EngineMark id={engine().id} available={engine().available} />
         <Text class={sessionTitleClass(selected())}>{daemonSessionTitle(session())}</Text>
       </View>
-      <View class={working() || !archivable() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`}>
+      <View class={working() || !archivable() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`} style={{ top: rowTrailingTop() }}>
         <Presence
           show={working() && !blocked()}
           testID="sidebar-child-running"
@@ -1841,7 +1847,8 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
             animateSidebarList();
             void archiveDaemonSession(session().id);
           }}
-          class={`absolute ${working() ? "right-7" : "right-1"} top-0.5 transition-opacity ${inert(HOVER_REVEAL)}`}
+          class={`absolute ${working() ? "right-7" : "right-1"} transition-opacity ${inert(HOVER_REVEAL)}`}
+          style={{ top: rowTrailingTop() }}
         />
       </If>
     </>
@@ -2074,7 +2081,7 @@ function NoteRow(props: { note: NoteSummary }) {
         class={calm(sessionRowClass(false, false, false))}
       >
         <View class={ICON_SLOT}>
-          <Icon name="file" size={14} tone={selected() ? "foreground" : "muted-foreground"} />
+          <Icon name="file" size={uiIconSize(14)} tone={selected() ? "foreground" : "muted-foreground"} />
         </View>
         <Text class={sessionTitleClass(selected())}>{docTabTitle(props.note.path)}</Text>
       </View>
@@ -2224,9 +2231,9 @@ function SidebarTree() {
                     recentsExpanded.update((on) => !on);
                   }}
                   accessibilityLabel={recentsExpanded() ? tr("Show less", "收起") : tr("Show more", "展开更多")}
-                  class={`h-7 w-full min-w-0 flex-row items-center rounded-md corner-squircle pl-8 pr-2.5 ${ROW_PRESS}`}
+                  class={`${uiHeight(28)} w-full min-w-0 flex-row items-center rounded-md corner-squircle pl-8 pr-2.5 ${ROW_PRESS}`}
                 >
-                  <Text class="truncate text-sm text-subtle">{recentsExpanded() ? tr("Show less", "收起") : tr("Show more", "展开更多")}</Text>
+                  <Text class={`truncate ${uiType("sm")} text-subtle`}>{recentsExpanded() ? tr("Show less", "收起") : tr("Show more", "展开更多")}</Text>
                 </BaseButton>
               </If>
             </View>
@@ -2275,7 +2282,7 @@ function SidebarTree() {
       </Scroll>
       <Presence show={singleEmpty()} class="pointer-events-none absolute inset-0 items-center justify-center gap-3 px-6">
         <Pip size={40} mood="sleep" still />
-        <Text class="text-center text-sm text-subtle">
+        <Text class={`text-center ${uiType("sm")} text-subtle`}>
           {tr("No sessions here yet.", "此文件夹暂无会话。")}
         </Text>
       </Presence>
@@ -2344,12 +2351,12 @@ export function Sidebar() {
           }}
           accessibilityLabel={tr("New session", "新会话")}
           tooltip={tip(tr("New session", "新会话"), "mod+n", "right")}
-          class={`h-8 min-w-0 flex-1 flex-row items-center gap-1.5 rounded-md corner-squircle px-2.5 ${ROW_PRESS}`}
+          class={`${uiHeight(32)} min-w-0 flex-1 flex-row items-center gap-1.5 rounded-md corner-squircle px-2.5 ${ROW_PRESS}`}
         >
           <View class={ICON_SLOT}>
-            <Icon name="pencil" size={14} tone="muted-foreground" />
+            <Icon name="pencil" size={uiIconSize(14)} tone="muted-foreground" />
           </View>
-          <Text class="text-base text-sidebar-foreground">{tr("New session", "新会话")}</Text>
+          <Text class={`${uiType("base")} text-sidebar-foreground`}>{tr("New session", "新会话")}</Text>
         </View>
         <If when={!leftControls()}>
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />

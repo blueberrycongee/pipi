@@ -8,6 +8,7 @@ import { Chip } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import { popupHiddenStyle, popupLeavingStyle, popupStyle, Presence } from "../ui/motion";
 import { POPUP, PRESS } from "../ui/styles";
+import { uiHeight, uiType } from "../ui/typography";
 
 const modelKey = (model: { provider: string; id: string }) => `${model.provider}/${model.id}`;
 
@@ -43,28 +44,28 @@ export function ModelList(props: { onChosen: () => void; class?: string }) {
         if (model) void chooseModel(model);
       }}
       class={props.class}
-      searchBarClass="h-10 flex-row items-center gap-2 border-b border-border px-3"
+      searchBarClass={`${uiHeight(40)} flex-row items-center gap-2 border-b border-border px-3`}
       searchPrefix={<Icon name="search" size={14} tone="subtle" />}
-      searchClass="flex-1 text-base text-foreground caret-brand placeholder:text-subtle"
+      searchClass={`flex-1 ${uiType("base")} text-foreground caret-brand placeholder:text-subtle`}
       listClass="max-h-80 p-1"
-      groupClass="px-2 pb-1 pt-2 text-xs font-medium text-subtle"
+      groupClass={`px-2 pb-1 pt-2 ${uiType("xs")} font-medium text-subtle`}
       separatorClass="mx-1 my-1 h-px bg-border"
-      itemClass={`group h-8 flex-row items-center rounded-md corner-squircle px-2 ${PRESS} focus:bg-accent`}
+      itemClass={`group ${uiHeight(32)} flex-row items-center rounded-md corner-squircle px-2 ${PRESS} focus:bg-accent`}
       empty={
         <View class="items-center gap-3 px-6 py-8">
-          <Text class="text-center text-sm text-muted-foreground">{availableModels().length
+          <Text class={`text-center ${uiType("sm")} text-muted-foreground`}>{availableModels().length
             ? tr(`No models match “${query()}”.`, `没有与“${query()}”匹配的模型。`)
             : tr("Connect a provider to see its models here.", "连接服务商后即可在此查看其模型。")}</Text>
           <If when={!availableModels().length}>
-            <BaseButton onPress={() => (props.onChosen(), showAgentSettings())} class={`h-7 justify-center rounded-md corner-squircle bg-secondary px-2.5 ${PRESS} hover:bg-secondary/80`}>
-              <Text class="text-base font-medium text-secondary-foreground">{tr(`Configure ${activeAgent().name}`, `配置 ${activeAgent().name}`)}</Text>
+            <BaseButton onPress={() => (props.onChosen(), showAgentSettings())} class={`${uiHeight(28)} justify-center rounded-md corner-squircle bg-secondary px-2.5 ${PRESS} hover:bg-secondary/80`}>
+              <Text class={`${uiType("base")} font-medium text-secondary-foreground`}>{tr(`Configure ${activeAgent().name}`, `配置 ${activeAgent().name}`)}</Text>
             </BaseButton>
           </If>
         </View>
       }
       renderItem={(entry) => (
         <View class="flex-1 flex-row items-center gap-2">
-          <Text class="shrink truncate text-base text-foreground">{entry.label}</Text>
+          <Text class={`shrink truncate ${uiType("base")} text-foreground`}>{entry.label}</Text>
           {byKey().get(entry.id)?.reasoning ? <Icon name="sparkle" size={12} tone="subtle" /> : null}
           <View class="flex-1" />
           <View class="w-4 items-center">{entry.checked ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
@@ -145,7 +146,7 @@ export function ThinkingPicker(props: { onOpen?: () => void }) {
         popupEndingStyle={popupLeavingStyle("top", "start")}
         trigger={<Chip label={thinkingText(level()).label} class="text-subtle" />}
       >
-        <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
+        <Text class={`px-2 pb-1 pt-1.5 ${uiType("xs")} font-medium text-subtle`} role="header">
           {tr("Thinking", "思考深度")}
         </Text>
         <Each of={thinkingLevels()}>
@@ -157,10 +158,10 @@ export function ThinkingPicker(props: { onOpen?: () => void }) {
                 void chooseThinkingLevel(option());
                 focusComposer();
               }}
-              class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+              class={`${uiHeight(32)} flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
             >
-              <Text class="text-base text-foreground">{thinkingText(option()).label}</Text>
-              <Text class="flex-1 truncate text-xs text-subtle">{thinkingText(option()).hint}</Text>
+              <Text class={`${uiType("base")} text-foreground`}>{thinkingText(option()).label}</Text>
+              <Text class={`flex-1 truncate ${uiType("xs")} text-subtle`}>{thinkingText(option()).hint}</Text>
               <View class="w-4 items-center">{option() === level() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
             </BaseButton>
           )}

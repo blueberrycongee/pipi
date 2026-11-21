@@ -26,6 +26,7 @@ import {
 /** What pipi remembers between launches, kept in the app's own storage. */
 export type Appearance = "system" | "light" | "dark";
 export const FONT_SIZES = {
+  ui: { min: 11, default: 13, max: 16 },
   reading: { min: 12, default: 14, max: 22 },
   code: { min: 10, default: 11, max: 20 },
 } as const;
@@ -183,7 +184,7 @@ const DEFAULTS: Prefs = {
   autoArchiveDays: 0,
   openTabs: [],
   appearance: "system",
-  fontSizes: { reading: FONT_SIZES.reading.default, code: FONT_SIZES.code.default },
+  fontSizes: { ui: FONT_SIZES.ui.default, reading: FONT_SIZES.reading.default, code: FONT_SIZES.code.default },
   pipCoat: "ghost",
   language: "system",
   sidebarOpen: true,
@@ -348,6 +349,7 @@ export async function loadPrefs() {
         ...DEFAULTS,
         ...parsed,
         fontSizes: {
+          ui: normalizeSize("ui", parsed.fontSizes?.ui),
           reading: normalizeSize("reading", parsed.fontSizes?.reading),
           code: normalizeSize("code", parsed.fontSizes?.code),
         },
@@ -456,6 +458,7 @@ export function setOpenTabs(tabs: StoredOpenTab[]) {
   change({ openTabs: tabs });
 }
 
+export const uiSize = computed(() => prefs().fontSizes.ui);
 export const readingSize = computed(() => prefs().fontSizes.reading);
 export const codeSize = computed(() => prefs().fontSizes.code);
 export function setFontSize(role: FontRole, value: number) {

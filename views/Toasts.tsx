@@ -6,6 +6,7 @@ import { IconButton } from "../ui/Button";
 import { Icon, type IconName, type Tone } from "../ui/Icon";
 import { EASING, Reveal } from "../ui/motion";
 import { FOCUS_RING, POPUP_TOAST, PRESS } from "../ui/styles";
+import { uiHeight, uiType } from "../ui/typography";
 
 const LOOK: Record<Toast["tone"], { icon: IconName; tone: Tone }> = {
   info: { icon: "info", tone: "muted-foreground" },
@@ -55,7 +56,7 @@ function ToastCard(props: { toast: Toast; leaving: boolean }) {
           <View class="shrink-0">
             <Icon name={icon()} tone={LOOK[props.toast.tone].tone} />
           </View>
-          <Text class="min-w-0 shrink truncate text-sm text-popover-foreground">{props.toast.text}</Text>
+          <Text class={`min-w-0 shrink truncate ${uiType("sm")} text-popover-foreground`}>{props.toast.text}</Text>
           <If when={props.toast.action}>
             {(act) => (
               <BaseButton
@@ -64,9 +65,9 @@ function ToastCard(props: { toast: Toast; leaving: boolean }) {
                   dismissToast(props.toast.id);
                   fn();
                 }}
-                class={`h-6 shrink-0 flex-row items-center rounded-md corner-squircle bg-secondary px-2 ${PRESS} ${FOCUS_RING} hover:bg-secondary/80 active:bg-secondary/70`}
+                class={`${uiHeight(24)} shrink-0 flex-row items-center rounded-md corner-squircle bg-secondary px-2 ${PRESS} ${FOCUS_RING} hover:bg-secondary/80 active:bg-secondary/70`}
               >
-                <Text class="text-xs font-medium text-secondary-foreground">{act().label}</Text>
+                <Text class={`${uiType("xs")} font-medium text-secondary-foreground`}>{act().label}</Text>
               </BaseButton>
             )}
           </If>

@@ -8,6 +8,7 @@ import { Button, IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { BREATH_MS, EASING, Presence, SPRING } from "../ui/motion";
 import { POPUP } from "../ui/styles";
+import { uiRowHeight, uiType } from "../ui/typography";
 import { proseClasses } from "./Prose";
 
 /**
@@ -32,7 +33,7 @@ const SEAT_INSET = 8;
 /** The lead-in at the track's start, so a resting Pip is not kissing the corner. */
 const LEAD_INSET = 6;
 const BLOCK_BOTTOM = TRACK_H + PIP_H + 2;
-const SCENE_H = BLOCK_BOTTOM + 24 + 9;
+const sceneHeight = () => BLOCK_BOTTOM + uiRowHeight(24) + 9;
 /** The beat of the jump at which Pip's head tops out and strikes the block. */
 const BONK_MS = 310;
 
@@ -45,18 +46,21 @@ const fmtBytes = (n: number) =>
 const NOTES_LIMIT = 140;
 
 /** The notes' typography: the card's scale — small, muted, headings only set off by weight. */
-const notesClasses = computed(() => ({
-  ...proseClasses(),
-  root: "gap-1.5 text-xs leading-4 text-muted-foreground",
-  heading1: "text-xs",
-  heading2: "text-xs",
-  heading3: "text-xs",
-  heading4: "text-xs",
-  heading5: "text-xs",
-  heading6: "text-xs",
-  code: "rounded-sm corner-squircle bg-muted px-1 text-foreground",
-  tableCell: "px-3 py-1.5 text-xs",
-}));
+const notesClasses = computed(() => {
+  const xs = uiType("xs");
+  return {
+    ...proseClasses(),
+    root: `gap-1.5 ${xs} text-muted-foreground`,
+    heading1: xs,
+    heading2: xs,
+    heading3: xs,
+    heading4: xs,
+    heading5: xs,
+    heading6: xs,
+    code: "rounded-sm corner-squircle bg-muted px-1 text-foreground",
+    tableCell: `px-3 py-1.5 ${xs}`,
+  };
+});
 
 function shortNotes(notes: string | null | undefined): string {
   if (!notes) return "";
@@ -290,8 +294,8 @@ export function UpdateCard() {
           {/* Head: the version line, and the way to put the card off while it may wait. */}
           <View class="flex-row items-start justify-between gap-2">
             <View class="min-w-0 flex-1 gap-0.5">
-              <Text class="shrink text-sm font-medium text-foreground">{title()}</Text>
-              <Text class="text-xs text-muted-foreground">{subtitle()}</Text>
+              <Text class={`shrink ${uiType("sm")} font-medium text-foreground`}>{title()}</Text>
+              <Text class={`${uiType("xs")} text-muted-foreground`}>{subtitle()}</Text>
             </View>
             <If when={dismissable()}>
               <IconButton icon="x" size="sm" label={tr("Dismiss", "关闭")} onPress={dismissAppUpdate} />
@@ -311,7 +315,7 @@ export function UpdateCard() {
 
           {/* The stage: the track is the card's whole foot, flush with its bottom
               edge; the block sits over the track's right end and Pip walks it. */}
-          <View class="relative -mx-4" style={{ height: SCENE_H }}>
+          <View class="relative -mx-4" style={{ height: sceneHeight() }}>
             <View class="absolute inset-x-0 bottom-0 h-1.5 bg-input" />
             <If when={indeterminate()}>
               <View

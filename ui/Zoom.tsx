@@ -3,6 +3,7 @@ import type { JSX } from "nsh";
 import { tr } from "../lib/i18n";
 import { IconButton } from "./Button";
 import { FloatingLayer, keepLast } from "./Reveal";
+import { uiType } from "./typography";
 
 /**
  * The window's one zoom layer: content that wants more room than its place in
@@ -51,7 +52,7 @@ export function ZoomLayer() {
       <View class="min-h-0 w-full">
         <View class="flex-row items-center justify-end gap-3 pl-4 pr-2.5 pt-2.5">
           <If when={shown()?.title}>
-            {(title) => <Text class="min-w-0 flex-1 truncate text-sm font-medium text-muted-foreground">{title()}</Text>}
+            {(title) => <Text class={`min-w-0 flex-1 truncate ${uiType("sm")} font-medium text-muted-foreground`}>{title()}</Text>}
           </If>
           <IconButton icon="x" size="sm" label={tr("Close preview", "关闭预览")} onPress={closeZoom} />
         </View>

@@ -43,7 +43,7 @@ import { addDocToNewSession, addDocToTab, docChatTargets, docDraftOrigin, openTa
 import { Icon, type IconName } from "../ui/Icon";
 import { type DeckPane, DURATION, EASING, keepLast, LayerActive, ViewDeck } from "../ui/motion";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
-import { readingType, codeType } from "../ui/typography";
+import { readingType, codeType, uiHeight, uiRowHeight, uiType } from "../ui/typography";
 import { tip } from "../ui/Tip";
 import {
   createDocOrbPointerBridge,
@@ -162,14 +162,15 @@ const editorClasses = computed(() => ({
 }));
 
 const SLASH_MENU_W = 240;
-const SLASH_ROW_H = 32;
+const slashRowH = () => uiRowHeight(32);
 const SLASH_SEP_H = 9;
 const EDGE_MASK_STEPS = 6;
 const smoothStep = (t: number) => t * t * (3 - 2 * t);
 
 function slashRowY(index: number, grouped: boolean): number {
-  if (!grouped) return index * SLASH_ROW_H;
-  return index * SLASH_ROW_H + (index >= 3 ? SLASH_SEP_H : 0) + (index >= 6 ? SLASH_SEP_H : 0);
+  const rowH = slashRowH();
+  if (!grouped) return index * rowH;
+  return index * rowH + (index >= 3 ? SLASH_SEP_H : 0) + (index >= 6 ? SLASH_SEP_H : 0);
 }
 
 /** Soft scroll edge fade matched to the current background token. */
@@ -285,7 +286,7 @@ function SlashMenu(props: {
       <PopIn placement="bottom">
         <View testID="doc-slash-menu" class={`relative p-1 ${POPUP}`} style={{ width: SLASH_MENU_W, ...GLASS_REGULAR }}>
           <View
-            class="pointer-events-none absolute inset-x-1 top-1 h-8 rounded-md corner-squircle bg-accent"
+            class={`pointer-events-none absolute inset-x-1 top-1 ${uiHeight(32)} rounded-md corner-squircle bg-accent`}
             style={{ transform: [{ translateY: pillY }] }}
           />
           <Each of={props.items()} key={(item) => item.id}>
@@ -303,13 +304,13 @@ function SlashMenu(props: {
                       if (props.index() !== at()) props.onHover(at());
                     }}
                     selected={active()}
-                    class="h-8 flex-row items-center gap-2 rounded-md corner-squircle px-1.5"
+                    class={`${uiHeight(32)} flex-row items-center gap-2 rounded-md corner-squircle px-1.5`}
                   >
                     <View class="size-6 shrink-0 items-center justify-center rounded-md corner-squircle bg-muted/60">
                       <If
                         when={item().icon}
                         else={
-                          <Text class={`text-2xs font-semibold ${active() ? "text-foreground" : "text-muted-foreground"}`}>
+                          <Text class={`${uiType("2xs")} font-semibold ${active() ? "text-foreground" : "text-muted-foreground"}`}>
                             {item().glyph ?? ""}
                           </Text>
                         }
@@ -317,8 +318,8 @@ function SlashMenu(props: {
                         {(iconName) => <Icon name={iconName()} size={13} tone={active() ? "foreground" : "muted-foreground"} />}
                       </If>
                     </View>
-                    <Text class="flex-1 text-sm text-foreground">{item().label()}</Text>
-                    <Text class={`font-mono text-2xs ${active() ? "text-muted-foreground" : "text-subtle"}`}>{item().hint}</Text>
+                    <Text class={`flex-1 ${uiType("sm")} text-foreground`}>{item().label()}</Text>
+                    <Text class={`font-mono ${uiType("2xs")} ${active() ? "text-muted-foreground" : "text-subtle"}`}>{item().hint}</Text>
                   </BaseButton>
                 </>
               );
@@ -350,10 +351,10 @@ function BubbleButton(props: {
       accessibilityLabel={props.title}
       selected={on()}
       tooltip={tip(props.title, props.shortcut, "top")}
-      class={`group h-7 min-w-7 items-center justify-center rounded-md corner-squircle px-1.5 transition-colors duration-100 ease-out-quint active:scale-[0.94] motion-reduce:transition-none motion-reduce:active:scale-100 ${on() ? "bg-brand-soft" : "hover:bg-accent"}`}
+      class={`group ${uiHeight(28)} min-w-7 items-center justify-center rounded-md corner-squircle px-1.5 transition-colors duration-100 ease-out-quint active:scale-[0.94] motion-reduce:transition-none motion-reduce:active:scale-100 ${on() ? "bg-brand-soft" : "hover:bg-accent"}`}
     >
       <Text
-        class={`text-sm transition-colors duration-100 ${props.class ?? ""} ${on() ? "text-brand-text" : "text-muted-foreground group-hover:text-foreground"}`}
+        class={`${uiType("sm")} transition-colors duration-100 ${props.class ?? ""} ${on() ? "text-brand-text" : "text-muted-foreground group-hover:text-foreground"}`}
       >
         {props.label}
       </Text>
@@ -737,20 +738,20 @@ function Editor(props: {
                       testID="doc-bubble-quick-ai"
                       onPress={() => ensureDocAssistant(props.doc.path).requestFocus(readLiveSelection())}
                       tooltip={tip(tr("Edit or ask inline with Pip", "在文档中直接唤起 AI 处理"), "mod+j", "top")}
-                      class="group h-7 flex-row items-center gap-1 rounded-md corner-squircle px-2 transition-colors duration-100 ease-out-quint hover:bg-brand-soft active:scale-[0.96] motion-reduce:transition-none motion-reduce:active:scale-100"
+                      class={`group ${uiHeight(28)} flex-row items-center gap-1 rounded-md corner-squircle px-2 transition-colors duration-100 ease-out-quint hover:bg-brand-soft active:scale-[0.96] motion-reduce:transition-none motion-reduce:active:scale-100`}
                     >
                       <Icon name="sparkle" size={13} tone="brand-text" />
-                      <Text class="text-sm font-medium text-brand-text">{tr("Pip", "Pip")}</Text>
+                      <Text class={`${uiType("sm")} font-medium text-brand-text`}>{tr("Pip", "Pip")}</Text>
                     </BaseButton>
                     {/* Explicit session choice for the selected passage — never a mystery target. */}
                     <BaseButton
                       testID="doc-bubble-add"
                       onPress={() => openSelectionMenu(props.doc.path)}
                       tooltip={tip(tr("Ask AI about selection", "针对选中内容向 AI 提问"), undefined, "top")}
-                      class="group h-7 flex-row items-center gap-1 rounded-md corner-squircle px-2 transition-colors duration-100 ease-out-quint hover:bg-accent active:scale-[0.96] motion-reduce:transition-none motion-reduce:active:scale-100"
+                      class={`group ${uiHeight(28)} flex-row items-center gap-1 rounded-md corner-squircle px-2 transition-colors duration-100 ease-out-quint hover:bg-accent active:scale-[0.96] motion-reduce:transition-none motion-reduce:active:scale-100`}
                     >
                       <Icon name="message" size={13} tone="muted-foreground" />
-                      <Text class="text-sm font-medium text-muted-foreground transition-colors duration-100 group-hover:text-foreground">
+                      <Text class={`${uiType("sm")} font-medium text-muted-foreground transition-colors duration-100 group-hover:text-foreground`}>
                         {tr("Ask AI", "问 AI")}
                       </Text>
                       <Icon name="chevronDown" size={11} tone="subtle" />
@@ -892,7 +893,7 @@ function DocFoot(props: { doc: MarkdownDoc; picked: () => boolean; pickedWords: 
             <If when={props.doc.readOnly()}>
               <Icon name="eye" size={13} tone="subtle" class="shrink-0" />
             </If>
-            <Text testID="doc-status" class="min-w-0 shrink truncate text-xs tabular-nums text-subtle">
+            <Text testID="doc-status" class={`min-w-0 shrink truncate ${uiType("xs")} tabular-nums text-subtle`}>
               {status()}
             </Text>
           </BaseButton>
@@ -903,10 +904,10 @@ function DocFoot(props: { doc: MarkdownDoc; picked: () => boolean; pickedWords: 
               testID="doc-return-origin"
               onPress={() => void returnDraftDocToOrigin(props.doc.path)}
               disabled={disabled()}
-              class={`h-7 shrink-0 flex-row items-center gap-1.5 rounded-md corner-squircle border-[0.5px] border-hairline bg-secondary px-2.5 text-sm text-secondary-foreground hover:border-hairline-hover hover:bg-secondary/80 active:bg-secondary/70 disabled:opacity-40 disabled:hover:border-hairline disabled:hover:bg-secondary ${PRESS} ${PRESS_SCALE} ${FOCUS_RING}`}
+              class={`${uiHeight(28)} shrink-0 flex-row items-center gap-1.5 rounded-md corner-squircle border-[0.5px] border-hairline bg-secondary px-2.5 ${uiType("sm")} text-secondary-foreground hover:border-hairline-hover hover:bg-secondary/80 active:bg-secondary/70 disabled:opacity-40 disabled:hover:border-hairline disabled:hover:bg-secondary ${PRESS} ${PRESS_SCALE} ${FOCUS_RING}`}
             >
               <Icon name="arrowLeft" size={13} tone="foreground" />
-              <Text class="max-w-52 truncate text-sm font-medium text-secondary-foreground">
+              <Text class={`max-w-52 truncate ${uiType("sm")} font-medium text-secondary-foreground`}>
                 {src().isBlankDraft ? tr("Back to Composer", "回到输入框") : tr(`Back to “${src().label}”`, `回到「${src().label}」`)}
               </Text>
             </BaseButton>

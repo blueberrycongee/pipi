@@ -24,8 +24,8 @@ import {
   wallpaper,
 } from "../store/app";
 import { docTabTitle, revealDoc } from "../store/docs";
-import { stripTabWidth, TAB_GAP, TAB_MAX_W } from "../lib/strip-width";
-import { prefsReady, setSidebarOpen, sidebarOpen } from "../store/prefs";
+import { stripTabWidth, TAB_GAP, tabWidthBounds } from "../lib/strip-width";
+import { prefsReady, setSidebarOpen, sidebarOpen, uiSize } from "../store/prefs";
 import {
   activeTabId,
   addDocToNewSession,
@@ -52,6 +52,7 @@ import { Icon } from "../ui/Icon";
 import { DURATION, EASING, Presence } from "../ui/motion";
 import { FIELD_SURFACE, GLASS_REGULAR, HEADER_GLASS, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
+import { uiHeight, uiIconSize, uiScale, uiType } from "../ui/typography";
 
 /** How fast the pills take a new width — a new tab's squeeze, a freed strip's growth. */
 const W_TWEEN_MS = 180;
@@ -244,7 +245,7 @@ export function TabBar() {
   // The width tweens on `wNow`; the places a membership change takes ride the
   // flow spring.
   const stripW = signal(0);
-  const wNow = signal(TAB_MAX_W);
+  const wNow = signal(tabWidthBounds(untracked(uiScale)).max);
   /** The width a close pinned the pills at while the pointer stays in the strip. */
   const stuckW = signal<number | undefined>(undefined);
   let pointerInStrip = false;
@@ -254,7 +255,7 @@ export function TabBar() {
 
   /** The width the pills aim at: a close's pin never grows them, and never holds them past a narrower fit. */
   function targetW() {
-    const room = stripTabWidth(stripW(), openTabs().length);
+    const room = stripTabWidth(stripW(), openTabs().length, uiScale());
     const stuck = stuckW();
     return stuck === undefined ? room : Math.min(stuck, room);
   }
@@ -777,7 +778,7 @@ export function TabBar() {
           scrollbar={false}
           accessibilityLabel={tr("Session name", "会话名称")}
           placeholder={tr("Name this session", "为会话命名")}
-          class={`h-6 min-w-0 flex-1 rounded corner-squircle px-1.5 text-sm font-medium text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
+          class={`${uiHeight(24, { max: 28 })} min-w-0 flex-1 rounded corner-squircle px-1.5 ${uiType("sm")} font-medium text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
         />
         <If when={anchor()}>
           {(field) => <Overlay anchor={field()} onPressOutside={commit} onCancel={cancelRenaming} />}
@@ -863,7 +864,7 @@ export function TabBar() {
         role="tab"
         accessibilityLabel={tabTitle(props.tab())}
         accessibilityState={{ selected: active() }}
-        class="group relative h-7 shrink-0 flex-row items-center rounded-md corner-squircle pl-2 pr-1"
+        class={`group relative ${uiHeight(28, { max: 34 })} shrink-0 flex-row items-center rounded-md corner-squircle pl-2 pr-1`}
         style={{ width: wNow(), ...liveStyle() }}
         onPressDown={(e) => {
           draggedId = null;
@@ -941,18 +942,18 @@ export function TabBar() {
         />
         {props.tab().kind === "chat" ? (
           session()?.agentId ? (
-            <AgentLogo id={session()!.agentId} size={14} tone={active() ? "foreground" : "muted-foreground"} class="shrink-0" />
+            <AgentLogo id={session()!.agentId} size={uiIconSize(14)} tone={active() ? "foreground" : "muted-foreground"} class="shrink-0" />
           ) : (
-            <Icon name={isDraftRef(props.tab().ref) ? "pencil" : "terminal"} size={13} tone={active() ? "foreground" : "subtle"} class="shrink-0" />
+            <Icon name={isDraftRef(props.tab().ref) ? "pencil" : "terminal"} size={uiIconSize(13)} tone={active() ? "foreground" : "subtle"} class="shrink-0" />
           )
         ) : (
-          <Icon name="file" size={13} tone={active() ? "foreground" : "subtle"} class="shrink-0" />
+          <Icon name="file" size={uiIconSize(13)} tone={active() ? "foreground" : "subtle"} class="shrink-0" />
         )}
         <If
           when={renaming()}
           else={
             <Text
-              class={`mx-1.5 min-w-0 flex-1 truncate text-sm font-medium transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
+              class={`mx-1.5 min-w-0 flex-1 truncate ${uiType("sm")} font-medium transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
                 active() ? "text-foreground" : "text-muted-foreground group-hover:text-foreground"
               }`}
             >
@@ -963,7 +964,7 @@ export function TabBar() {
           <RenameField />
         </If>
         {/* Trailing slot: status mark at rest, the close control over it on hover (or always on the active tab). */}
-        <View class="relative size-4 shrink-0 items-center justify-center">
+        <View class={`relative ${uiSize() >= 15 ? "size-5" : "size-4"} shrink-0 items-center justify-center`}>
           {/* A document carries no mark: it is saved as it is written, and a dot that came and went with every pause would say otherwise. */}
           {props.tab().kind === "chat" ? <StatusMark session={session} /> : null}
           <BaseButton
@@ -1092,10 +1093,10 @@ export function TabBar() {
                 <BaseButton
                   onPress={() => openDaemonSession(up().id)}
                   tooltip={tip(tr(`Back to ${up().title}`, `回到 ${up().title}`))}
-                  class={`h-6 max-w-44 shrink-0 flex-row items-center gap-1 rounded-md corner-squircle bg-muted px-1.5 ${PRESS} hover:bg-accent`}
+                  class={`${uiHeight(24, { max: 30 })} max-w-44 shrink-0 flex-row items-center gap-1 rounded-md corner-squircle bg-muted px-1.5 ${PRESS} hover:bg-accent`}
                 >
                   <Icon name="arrowLeft" size={12} tone="subtle" />
-                  <Text class="shrink truncate text-2xs text-muted-foreground">{up().title}</Text>
+                  <Text class={`shrink truncate ${uiType("2xs")} text-muted-foreground`}>{up().title}</Text>
                 </BaseButton>
               )}
             </If>
@@ -1116,10 +1117,10 @@ export function TabBar() {
                 <BaseButton
                   onPress={() => void openWorkspace(wt().path)}
                   tooltip={tip(tr(`Open worktree ${wt().path}`, `打开工作树目录 ${wt().path}`))}
-                  class={`h-6 max-w-36 shrink-0 flex-row items-center gap-1 rounded-md corner-squircle bg-muted px-1.5 ${PRESS} hover:bg-accent`}
+                  class={`${uiHeight(24, { max: 30 })} max-w-36 shrink-0 flex-row items-center gap-1 rounded-md corner-squircle bg-muted px-1.5 ${PRESS} hover:bg-accent`}
                 >
                   <Icon name="fork" size={11} tone="subtle" />
-                  <Text class="shrink truncate font-mono text-2xs text-muted-foreground">{wt().branch}</Text>
+                  <Text class={`shrink truncate font-mono ${uiType("2xs")} text-muted-foreground`}>{wt().branch}</Text>
                 </BaseButton>
               )}
             </If>

@@ -45,7 +45,7 @@ import { Icon, type IconName } from "../ui/Icon";
 import { EASING, enter, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, SPRING } from "../ui/motion";
 import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { readingType } from "../ui/typography";
+import { readingType, uiHeight, uiMinHeight, uiType } from "../ui/typography";
 import { AgentPicker, PermissionPicker } from "./AgentPicker";
 import { ExtensionPrompt } from "./ExtensionDialog";
 import { ModelPicker, ThinkingPicker } from "./ModelPicker";
@@ -286,8 +286,8 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
       >
         <Scroll ref={list} class="max-h-69" contentClass="p-1">
           <If when={shown()?.unmatched === true}>
-            <View class="h-8 flex-row items-center px-2">
-              <Text class="min-w-0 flex-1 truncate text-sm text-muted-foreground">
+            <View class={`${uiHeight(32)} flex-row items-center px-2`}>
+              <Text class={`min-w-0 flex-1 truncate ${uiType("sm")} text-muted-foreground`}>
                 {tr(`No command by that name. Enter sends it to ${activeAgent().name} as written.`, `没有这个命令，回车将原样发给 ${activeAgent().name}。`)}
               </Text>
             </View>
@@ -302,15 +302,15 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
                 onMouseMove={() => {
                   if (props.menu.selected() !== index()) props.menu.selected.set(index());
                 }}
-                class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS}`}
+                class={`${uiHeight(32)} flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS}`}
                 classList={{ "bg-accent": index() === props.menu.selected() }}
               >
-                <Text class="shrink-0 font-mono text-sm text-foreground">{row().title}</Text>
+                <Text class={`shrink-0 font-mono ${uiType("sm")} text-foreground`}>{row().title}</Text>
                 <If when={Boolean(row().hint)}>
-                  <Text class="shrink-0 font-mono text-sm text-subtle">{row().hint ?? ""}</Text>
+                  <Text class={`shrink-0 font-mono ${uiType("sm")} text-subtle`}>{row().hint ?? ""}</Text>
                 </If>
-                <Text class="min-w-0 flex-1 truncate text-sm text-muted-foreground">{row().description ?? ""}</Text>
-                <Text class="shrink-0 text-xs text-subtle">{row().tag ?? ""}</Text>
+                <Text class={`min-w-0 flex-1 truncate ${uiType("sm")} text-muted-foreground`}>{row().description ?? ""}</Text>
+                <Text class={`shrink-0 ${uiType("xs")} text-subtle`}>{row().tag ?? ""}</Text>
               </View>
             )}
           </Each>
@@ -490,13 +490,13 @@ function DocMentionMenu(props: {
                       onMouseMove={() => {
                         if (props.menu.selected() !== index()) props.menu.selected.set(index());
                       }}
-                      class={`h-8 flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS}`}
+                      class={`${uiHeight(32)} flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS}`}
                       classList={{ "bg-accent": index() === props.menu.selected() }}
                     >
                       <Icon name="file" size={14} tone="muted-foreground" class="shrink-0" />
-                      <Text class="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{row().title}</Text>
+                      <Text class={`min-w-0 flex-1 truncate ${uiType("sm")} font-medium text-foreground`}>{row().title}</Text>
                       <If when={row().open}>
-                        <Text class="shrink-0 text-xs text-subtle">{tr("Open", "已打开")}</Text>
+                        <Text class={`shrink-0 ${uiType("xs")} text-subtle`}>{tr("Open", "已打开")}</Text>
                       </If>
                     </View>
                   )}
@@ -519,7 +519,7 @@ function DocMentionMenu(props: {
 function DocCard(props: { doc: DocRef }) {
   const title = () => docAt(props.doc.path)?.title() ?? props.doc.title;
   return (
-    <View testID="composer-doc" class="group relative h-14 w-52 shrink-0" style={enter("zoomIn")}>
+    <View testID="composer-doc" class={`group relative ${uiHeight(56)} w-52 shrink-0`} style={enter("zoomIn")}>
       <BaseButton
         onPress={() => openDocTab(props.doc.path, { newTab: true })}
         accessibilityLabel={title()}
@@ -530,8 +530,8 @@ function DocCard(props: { doc: DocRef }) {
           <Icon name="file" size={16} tone={props.doc.excerpt ? "brand-text" : "muted-foreground"} />
         </View>
         <View class="min-w-0 flex-1">
-          <Text class="truncate text-sm font-medium text-foreground">{title()}</Text>
-          <Text class="truncate text-xs text-subtle">{props.doc.excerpt ? tr("Selection", "选中的内容") : tr("Document", "文档")}</Text>
+          <Text class={`truncate ${uiType("sm")} font-medium text-foreground`}>{title()}</Text>
+          <Text class={`truncate ${uiType("xs")} text-subtle`}>{props.doc.excerpt ? tr("Selection", "选中的内容") : tr("Document", "文档")}</Text>
         </View>
       </BaseButton>
       <BaseButton
@@ -612,7 +612,7 @@ function ExtensionLines(props: { below: boolean }) {
     <Reveal open={lines().length > 0}>
       <View class="px-3 py-1">
         <Each of={shown() ?? []} key="index">
-          {(line) => <Text class="font-mono text-xs text-muted-foreground">{line()}</Text>}
+          {(line) => <Text class={`font-mono ${uiType("xs")} text-muted-foreground`}>{line()}</Text>}
         </Each>
       </View>
     </Reveal>
@@ -1076,7 +1076,7 @@ export function Composer() {
           popupEndingStyle={popupLeavingStyle("top", "end")}
           trigger={<View class="pointer-events-none absolute bottom-0 right-0 top-0 w-10" />}
         >
-          <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
+          <Text class={`px-2 pb-1 pt-1.5 ${uiType("xs")} font-medium text-subtle`} role="header">
             {tr("Send", "发送")}
           </Text>
           <Each of={SEND_MODES}>
@@ -1086,12 +1086,12 @@ export function Composer() {
                 <BaseButton
                   selected={mode() === sendMode()}
                   onPress={() => pickSendMode(mode())}
-                  class={`min-h-9 flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+                  class={`${uiMinHeight(36)} flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
                 >
                   <Icon name={meta().icon} size={15} tone={mode() === sendMode() ? "foreground" : "muted-foreground"} />
                   <View class="min-w-0 flex-1">
-                    <Text class="truncate text-base text-foreground">{meta().label}</Text>
-                    <Text class="truncate text-xs text-subtle">{meta().hint}</Text>
+                    <Text class={`truncate ${uiType("base")} text-foreground`}>{meta().label}</Text>
+                    <Text class={`truncate ${uiType("xs")} text-subtle`}>{meta().hint}</Text>
                   </View>
                   <View class="w-4 shrink-0 items-center">{mode() === sendMode() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
                 </BaseButton>
@@ -1101,7 +1101,7 @@ export function Composer() {
         </Popover>
       </View>
       <Reveal open={Boolean(statusLine())}>
-        <Text class="w-full max-w-190 self-center truncate px-3 pt-2 text-center text-xs text-subtle">{shownStatus()}</Text>
+        <Text class={`w-full max-w-190 self-center truncate px-3 pt-2 text-center ${uiType("xs")} text-subtle`}>{shownStatus()}</Text>
       </Reveal>
     </View>
   );

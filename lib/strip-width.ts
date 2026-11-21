@@ -15,9 +15,19 @@ export const TAB_GAP = 4;
 const STRIP_PAD = 8;
 const PLUS_W = 24;
 
-/** `count` pills' even share of `viewport` points, floored at TAB_MIN_W, capped at TAB_MAX_W. */
-export function stripTabWidth(viewport: number, count: number) {
-  if (viewport <= 0 || count <= 0) return TAB_MAX_W;
+/** Pill width bounds scaled gently upward when interface text grows above the default 13pt. */
+export function tabWidthBounds(scale = 1) {
+  const grow = scale > 1 ? scale : 1;
+  return {
+    min: Math.round(TAB_MIN_W * grow),
+    max: Math.round(TAB_MAX_W * grow),
+  };
+}
+
+/** `count` pills' even share of `viewport` points, floored at `min`, capped at `max`. */
+export function stripTabWidth(viewport: number, count: number, scale = 1) {
+  const { min, max } = tabWidthBounds(scale);
+  if (viewport <= 0 || count <= 0) return max;
   const fit = Math.floor((viewport - STRIP_PAD - count * TAB_GAP - PLUS_W) / count);
-  return Math.min(TAB_MAX_W, Math.max(TAB_MIN_W, fit));
+  return Math.min(max, Math.max(min, fit));
 }

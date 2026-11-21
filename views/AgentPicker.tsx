@@ -27,6 +27,7 @@ import { Switch } from "../ui/Controls";
 import { Icon } from "../ui/Icon";
 import { FloatingLayer, popupHiddenStyle, popupLeavingStyle, popupStyle } from "../ui/motion";
 import { FIELD_SURFACE, POPUP, PRESS } from "../ui/styles";
+import { uiHeight, uiMinHeight, uiType } from "../ui/typography";
 
 const RUNTIME_MODES: readonly RuntimeMode[] = ["approval-required", "auto-accept-edits", "full-access"];
 
@@ -75,17 +76,17 @@ export function AgentPicker(props: { onOpen?: () => void }) {
                   close();
                   void switchAgentHarness(agent().id);
                 }}
-                class={`min-h-9 flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+                class={`${uiMinHeight(36)} flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
               >
                 <AgentLogo id={agent().id} size={18} tone={agent().available ? "foreground" : "muted-foreground"} status={agent().available ? "ready" : "off"} />
                 <View class="min-w-0 flex-1">
                   <View class="min-w-0 flex-row items-center gap-1.5">
-                    <Text class={`shrink truncate text-base ${agent().available ? "text-foreground" : "text-muted-foreground"}`}>{agent().name}</Text>
+                    <Text class={`shrink truncate ${uiType("base")} ${agent().available ? "text-foreground" : "text-muted-foreground"}`}>{agent().name}</Text>
                     <If when={meta().versionBadge}>
-                      {(v) => <Text class="shrink-0 font-mono text-2xs text-subtle">{v()}</Text>}
+                      {(v) => <Text class={`shrink-0 font-mono ${uiType("2xs")} text-subtle`}>{v()}</Text>}
                     </If>
                   </View>
-                  <Text class="truncate text-xs text-subtle">{meta().statusLabel}</Text>
+                  <Text class={`truncate ${uiType("xs")} text-subtle`}>{meta().statusLabel}</Text>
                 </View>
                 <View class="w-4 shrink-0 items-center">{agent().id === activeAgentId() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
               </BaseButton>
@@ -120,7 +121,7 @@ export function PermissionPicker(props: { onOpen?: () => void }) {
       popupEndingStyle={popupLeavingStyle("top", "end")}
       trigger={<Chip icon={runtimeModeIcon(mode())} iconOnly label={`${runtimeModeText(mode()).label} — ${runtimeModeText(mode()).hint}`} tipText={`${runtimeModeText(mode()).label} — ${runtimeModeText(mode()).hint}`} />}
     >
-      <Text class="px-2 pb-1 pt-1.5 text-xs font-medium text-subtle" role="header">
+      <Text class={`px-2 pb-1 pt-1.5 ${uiType("xs")} font-medium text-subtle`} role="header">
         {tr("Permissions", "运行权限")}
       </Text>
       <Each of={RUNTIME_MODES}>
@@ -137,12 +138,12 @@ export function PermissionPicker(props: { onOpen?: () => void }) {
                 void changeRuntimeMode(option());
                 focusComposer();
               }}
-              class={`min-h-9 flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent disabled:opacity-45`}
+              class={`${uiMinHeight(36)} flex-row items-center gap-2 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent disabled:opacity-45`}
             >
               <Icon name={runtimeModeIcon(option())} size={15} tone={option() === mode() ? "foreground" : "muted-foreground"} />
               <View class="min-w-0 flex-1">
-                <Text class="truncate text-base text-foreground">{runtimeModeText(option()).label}</Text>
-                <Text class="truncate text-xs text-subtle">{runtimeModeText(option()).hint}</Text>
+                <Text class={`truncate ${uiType("base")} text-foreground`}>{runtimeModeText(option()).label}</Text>
+                <Text class={`truncate ${uiType("xs")} text-subtle`}>{runtimeModeText(option()).hint}</Text>
               </View>
               <View class="w-4 shrink-0 items-center">{option() === mode() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
             </BaseButton>
@@ -202,10 +203,10 @@ export function CompareDialog() {
       <View class="gap-4 p-5">
         <View class="flex-row items-start justify-between gap-3">
           <View class="min-w-0 flex-1 gap-0.5">
-            <Text class="text-lg font-semibold text-foreground" role="header">
+            <Text class={`${uiType("lg")} font-semibold text-foreground`} role="header">
               {tr("Compare Agents", "智能体并行对比")}
             </Text>
-            <Text class="text-sm text-muted-foreground">
+            <Text class={`${uiType("sm")} text-muted-foreground`}>
               {tr(
                 "Run the same task in several sessions at once — each its own agent — then compare the answers side by side.",
                 "把同一个任务交给多个智能体分别开新会话并行处理，再对比各自的回答。",
@@ -224,11 +225,11 @@ export function CompareDialog() {
             onChange={({ value }) => taskPrompt.set(value)}
             onCompositionChange={({ composing: now }) => composing.set(now)}
             accessibilityLabel={tr("Comparison task", "对比任务描述")}
-            class={`min-h-22 rounded-xl corner-squircle p-3 text-base text-foreground caret-brand ${FIELD_SURFACE}`}
+            class={`min-h-22 rounded-xl corner-squircle p-3 ${uiType("base")} text-foreground caret-brand ${FIELD_SURFACE}`}
           />
           <If when={taskPrompt().length === 0 && !composing()}>
             <View class="pointer-events-none absolute left-3 right-3 top-3">
-              <Text class="text-base text-subtle">
+              <Text class={`${uiType("base")} text-subtle`}>
                 {composerDraft().trim()
                   ? tr(`Using composer draft: "${composerDraft().trim().slice(0, 56)}…"`, `将使用输入框草稿：「${composerDraft().trim().slice(0, 48)}…」`)
                   : tr("Describe the task, files, and goal…", "描述要交给智能体执行的任务、目标与约束…")}
@@ -238,7 +239,7 @@ export function CompareDialog() {
         </View>
 
         <View class="gap-2">
-          <Text class="text-xs font-medium text-subtle">{tr("Agents to run side by side", "并行运行的编码智能体")}</Text>
+          <Text class={`${uiType("xs")} font-medium text-subtle`}>{tr("Agents to run side by side", "并行运行的编码智能体")}</Text>
           <View class="flex-row flex-wrap gap-2">
             <Each of={installed()} key={(a) => a.id}>
               {(agent) => {
@@ -247,10 +248,10 @@ export function CompareDialog() {
                   <BaseButton
                     selected={on()}
                     onPress={() => toggleParallel(agent().id)}
-                    class={`h-8 shrink-0 flex-row items-center gap-2 rounded-lg corner-squircle border px-3 ${PRESS} ${on() ? "border-brand bg-accent" : "border-border bg-card hover:bg-accent/50"}`}
+                    class={`${uiHeight(32)} shrink-0 flex-row items-center gap-2 rounded-lg corner-squircle border px-3 ${PRESS} ${on() ? "border-brand bg-accent" : "border-border bg-card hover:bg-accent/50"}`}
                   >
                     <Icon name={on() ? "check" : "agents"} size={14} tone={on() ? "brand-text" : "muted-foreground"} />
-                    <Text class="text-sm font-medium text-foreground">{agent().name}</Text>
+                    <Text class={`${uiType("sm")} font-medium text-foreground`}>{agent().name}</Text>
                   </BaseButton>
                 );
               }}
@@ -261,8 +262,8 @@ export function CompareDialog() {
         <If when={gitWorkspaceInfo().isGitRepo}>
           <View class="flex-row items-center justify-between gap-3 rounded-xl corner-squircle border border-border bg-card px-3.5 py-2.5">
             <View class="min-w-0 flex-1 gap-0.5">
-              <Text class="text-sm font-medium text-foreground">{tr("Isolate in Git worktrees", "Git 工作树分支隔离")}</Text>
-              <Text class="text-xs text-subtle">
+              <Text class={`${uiType("sm")} font-medium text-foreground`}>{tr("Isolate in Git worktrees", "Git 工作树分支隔离")}</Text>
+              <Text class={`${uiType("xs")} text-subtle`}>
                 {tr("Each agent works on its own pipi/* branch without touching your working tree.", "每个智能体在独立的 pipi/* 分支工作树上修改，互不干扰当前工作区。")}
               </Text>
             </View>

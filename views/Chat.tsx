@@ -50,6 +50,7 @@ import { DURATION, EASING, enterStagger, keepLast, markRowsSeen, popupHiddenStyl
 import { RollingText } from "../ui/RollingText";
 import { tip } from "../ui/Tip";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
+import { uiHeight, uiMinHeight, uiType } from "../ui/typography";
 import { Composer } from "./Composer";
 import { hasInlinePrompt } from "./ExtensionDialog";
 import { proseRows } from "./Prose";
@@ -192,9 +193,9 @@ function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void; sai
             <Pip size={22} mood={pipMood()} />
           </View>
           <Presence show={label() !== ""} scaleFrom={1} duration={160} class="min-w-0 shrink flex-row items-center gap-2.5">
-            <RollingText text={() => shownLabel() ?? ""} class="min-w-0 shrink truncate text-sm text-muted-foreground" />
+            <RollingText text={() => shownLabel() ?? ""} class={`min-w-0 shrink truncate ${uiType("sm")} text-muted-foreground`} />
             <If when={reason()}>
-              <Text class="min-w-0 flex-1 truncate text-xs text-subtle">{reason()}</Text>
+              <Text class={`min-w-0 flex-1 truncate ${uiType("xs")} text-subtle`}>{reason()}</Text>
             </If>
           </Presence>
         </View>
@@ -220,11 +221,11 @@ function Stage(props: { title: string | (() => string); detail?: string; size?: 
   );
   const words = (
     <View class="max-w-110 items-center gap-1.5" style={enterStagger(1)}>
-      <Text class="text-center text-2xl font-semibold tracking-tight text-foreground" role="header">
+      <Text class={`text-center ${uiType("2xl")} font-semibold tracking-tight text-foreground`} role="header">
         {titleText()}
       </Text>
       <If when={props.detail}>
-        <Text class="text-center text-sm text-subtle">{props.detail}</Text>
+        <Text class={`text-center ${uiType("sm")} text-subtle`}>{props.detail}</Text>
       </If>
     </View>
   );
@@ -317,13 +318,13 @@ function WelcomeProject(props: { onActiveChange?: (active: boolean) => void }) {
         <BaseButton
           accessibilityLabel={tr("Project this session works in", "会话所在项目")}
           tooltip={open() || closing() ? undefined : tip(tildePath(current(), home))}
-          class={`h-7 flex-row items-center gap-1.5 ${PRESS} ${FOCUS_RING} ${
+          class={`${uiHeight(28)} flex-row items-center gap-1.5 ${PRESS} ${FOCUS_RING} ${
             // Over a wallpaper the words cannot stand on the picture: they get the composer's glass, as a capsule.
             wallpaper() ? "rounded-full border-[0.5px] border-hairline bg-card/65 pl-3 pr-2.5 hover:bg-card/85 dark:bg-card/58 dark:hover:bg-card/75" : "rounded-md corner-squircle px-1.5 hover:bg-accent"
           }`}
           style={wallpaper() ? GLASS_REGULAR : undefined}
         >
-          <Text class={`max-w-80 truncate text-sm text-muted-foreground ${wallpaper() ? "" : "underline"}`}>{`${activeAgent().name} · ${tildePath(current(), home)}`}</Text>
+          <Text class={`max-w-80 truncate ${uiType("sm")} text-muted-foreground ${wallpaper() ? "" : "underline"}`}>{`${activeAgent().name} · ${tildePath(current(), home)}`}</Text>
           <Icon name="chevronDown" size={12} tone="subtle" />
         </BaseButton>
       }
@@ -334,12 +335,12 @@ function WelcomeProject(props: { onActiveChange?: (active: boolean) => void }) {
             <BaseButton
               selected={cwd() === shownCurrent()}
               onPress={() => pick(cwd())}
-              class={`min-h-9 flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+              class={`${uiMinHeight(36)} flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
             >
               <Icon name={cwd() === shownCurrent() ? "folderOpen" : "folder"} size={15} tone={cwd() === shownCurrent() ? "foreground" : "muted-foreground"} />
               <View class="min-w-0 flex-1">
-                <Text class={`truncate text-base ${cwd() === shownCurrent() ? "text-foreground" : "text-muted-foreground"}`}>{basename(cwd())}</Text>
-                <Text class="truncate text-xs text-subtle">{tildePath(cwd(), home)}</Text>
+                <Text class={`truncate ${uiType("base")} ${cwd() === shownCurrent() ? "text-foreground" : "text-muted-foreground"}`}>{basename(cwd())}</Text>
+                <Text class={`truncate ${uiType("xs")} text-subtle`}>{tildePath(cwd(), home)}</Text>
               </View>
               <View class="w-4 shrink-0 items-center">{cwd() === shownCurrent() ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
             </BaseButton>
@@ -349,10 +350,10 @@ function WelcomeProject(props: { onActiveChange?: (active: boolean) => void }) {
       <View class="mx-1 h-px bg-border" />
       <BaseButton
         onPress={() => closeAndRun(() => void chooseWorkspace())}
-        class={`mt-1 min-h-9 flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+        class={`mt-1 ${uiMinHeight(36)} flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
       >
         <Icon name="folderPlus" size={15} tone="muted-foreground" />
-        <Text class="flex-1 truncate text-base text-foreground">{tr("Add Project Folder…", "添加项目文件夹…")}</Text>
+        <Text class={`flex-1 truncate ${uiType("base")} text-foreground`}>{tr("Add Project Folder…", "添加项目文件夹…")}</Text>
       </BaseButton>
     </Popover>
   );
@@ -396,7 +397,7 @@ function HeroStage(props: { mode: () => "welcome" | "starting"; fading?: () => b
         </View>
       </If>
       <If when={props.mode() === "starting" && slow()}>
-        <Text class="max-w-110 text-center text-xs text-subtle">
+        <Text class={`max-w-110 text-center ${uiType("xs")} text-subtle`}>
           {tr(
             "Taking longer than usual — you can restart the agent or start a fresh session.",
             "响应时间较长，你可以重启智能体或开启新会话。",
@@ -416,7 +417,7 @@ function Connect() {
   return (
     <Stage title={tr("Connect a model to begin", "连接模型以开始使用")} detail={tr(`${agentName()} has no models configured yet.`, `${agentName()} 尚未配置可用模型。`)}>
       <Button label={tr(`Configure ${agentName()}`, `配置 ${agentName()}`)} variant="primary" size="lg" icon="plug" onPress={() => showAgentSettings()} />
-      <Text class="max-w-110 text-center text-xs text-subtle">
+      <Text class={`max-w-110 text-center ${uiType("xs")} text-subtle`}>
         {tr("Environment keys and installed CLIs are detected automatically.", "环境变量密钥与本机已安装的智能体会自动识别。")}
       </Text>
     </Stage>
@@ -433,7 +434,7 @@ function Waking(props: { around?: boolean }) {
   return (
     <Stage around={props.around} title={tr(`Waking ${agentName()}…`, `正在唤醒 ${agentName()}…`)} size={80}>
       <If when={slow()}>
-        <Text class="max-w-110 text-center text-xs text-subtle">
+        <Text class={`max-w-110 text-center ${uiType("xs")} text-subtle`}>
           {tr(
             "Taking longer than usual — you can restart the agent or start a fresh session.",
             "响应时间较长，你可以重启智能体或开启新会话。",
@@ -498,7 +499,7 @@ function Failure(props: { title: string; detail: string }) {
   return (
     <Stage title={props.title} size={80}>
       <View class="max-h-48 w-full max-w-130 overflow-hidden rounded-lg corner-squircle border border-border bg-sunken p-3" selectable>
-        <Text class="font-mono text-xs leading-relaxed text-muted-foreground">{props.detail}</Text>
+        <Text class={`font-mono ${uiType("xs")} leading-relaxed text-muted-foreground`}>{props.detail}</Text>
       </View>
       <View class="flex-row flex-wrap justify-center gap-2">
         <Button label={tr(`Restart ${agentName()}`, `重启 ${agentName()}`)} variant="primary" size="lg" icon="refresh" onPress={() => void restartPi()} />
@@ -677,10 +678,10 @@ function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: 
         <BaseButton
           onPress={props.onPress}
           accessibilityLabel={tr("Scroll to bottom", "滚动到底部")}
-          class={`pointer-events-auto h-7 flex-row items-center gap-1.5 rounded-full px-3 ${POPUP} ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-muted/80 active:bg-muted`}
+          class={`pointer-events-auto ${uiHeight(28)} flex-row items-center gap-1.5 rounded-full px-3 ${POPUP} ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-muted/80 active:bg-muted`}
           style={GLASS_REGULAR}
         >
-          <Text class="text-xs font-medium text-foreground">{tr("Jump to latest", "回到最新")}</Text>
+          <Text class={`${uiType("xs")} font-medium text-foreground`}>{tr("Jump to latest", "回到最新")}</Text>
           <View class="rotate-180">
             <Icon name="arrowUp" size={12} tone="muted-foreground" />
           </View>
@@ -716,18 +717,18 @@ function PromptJumpPill(props: {
           onPress={props.onPress}
           accessibilityLabel={below() ? tr("Forward to the last prompt", "前往最后一条提问") : tr("Back to the prompt", "回到上一条提问")}
           tooltip={tip(tr("Back to the prompt that produced this", "回到产生此内容的提问"), undefined, "left")}
-          class={`pointer-events-auto h-7 max-w-44 flex-row items-center gap-1.5 rounded-2xl rounded-br-md px-3 ${POPUP} ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-muted/80 active:bg-muted`}
+          class={`pointer-events-auto ${uiHeight(28)} max-w-44 flex-row items-center gap-1.5 rounded-2xl rounded-br-md px-3 ${POPUP} ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-muted/80 active:bg-muted`}
           style={GLASS_REGULAR}
         >
           <View class={below() ? "rotate-180" : undefined}>
             <Icon name="arrowUp" size={12} tone="muted-foreground" />
           </View>
           <If when={text()}>
-            <Text class="min-w-0 shrink truncate text-xs text-foreground">{text()}</Text>
+            <Text class={`min-w-0 shrink truncate ${uiType("xs")} text-foreground`}>{text()}</Text>
           </If>
           <If when={!text() && images() > 0}>
             <Icon name="image" size={12} tone="muted-foreground" />
-            <Text class="text-xs text-foreground">{tr(images() === 1 ? "1 image" : `${images()} images`, `${images()} 张图片`)}</Text>
+            <Text class={`${uiType("xs")} text-foreground`}>{tr(images() === 1 ? "1 image" : `${images()} images`, `${images()} 张图片`)}</Text>
           </If>
         </BaseButton>
       </Presence>

@@ -30,7 +30,7 @@ import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from 
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { readingType, codeType } from "../ui/typography";
+import { readingType, codeType, uiHeight, uiType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
 import { clearProseState, proseClasses, ProseBlock, proseVeilUntil, type ProseRow } from "./Prose";
 
@@ -579,7 +579,7 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
               class={`group -mx-1 select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle px-1 py-0.5 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
             >
               <Icon name="file" size={14} tone="muted-foreground" />
-              <Text class="shrink truncate text-xs text-muted-foreground transition-colors duration-100 group-hover:text-foreground">
+              <Text class={`shrink truncate ${uiType("xs")} text-muted-foreground transition-colors duration-100 group-hover:text-foreground`}>
                 {(doc().excerpt ? "" : titleLine(doc().text, true)) || docTabTitle(doc().path)}
                 {doc().excerpt ? tr(" · selection", " · 选中的内容") : ""}
               </Text>
@@ -589,7 +589,7 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
         <If when={props.row.images > 0}>
           <View class="select-none flex-row items-center gap-1.5">
             <Icon name="image" size={14} tone="muted-foreground" />
-            <Text class="text-xs text-muted-foreground">
+            <Text class={`${uiType("xs")} text-muted-foreground`}>
               {tr(props.row.images === 1 ? "1 image" : `${props.row.images} images`, `${props.row.images} 张图片`)}
             </Text>
           </View>
@@ -620,7 +620,7 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
             tooltip={tip(followsUp() ? tr("Follow-up: sent when the run is done", "追问：本轮结束后发送") : tr("Steering: sent at the run's next step", "引导：在本轮的下一步发送"))}
           >
             <Icon name={followsUp() ? "queue" : "steer"} size={12} tone="subtle" />
-            <Text class="text-xs text-subtle">{tr("Queued", "排队中")}</Text>
+            <Text class={`${uiType("xs")} text-subtle`}>{tr("Queued", "排队中")}</Text>
           </View>
           <IconButton
             icon="pencil"
@@ -741,7 +741,7 @@ function Disclosure(props: {
       role="button"
       onPress={props.onPress}
       accessibilityState={{ expanded: props.open }}
-      class={`group -mx-2 ${props.compact ? "h-6.5" : "h-7"} select-none flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} active:scale-[0.995] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-accent active:bg-accent`}
+      class={`group -mx-2 ${props.compact ? uiHeight(26) : uiHeight(28)} select-none flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} active:scale-[0.995] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-accent active:bg-accent`}
     >
       {props.children}
       <View
@@ -767,13 +767,13 @@ function ProcessLine(props: { open: boolean; onPress?: () => void; children?: JS
   return (
     <If
       when={props.onPress}
-      else={<View class="h-7 min-w-0 max-w-full select-none flex-row items-center gap-1.5">{props.children}</View>}
+      else={<View class={`${uiHeight(28)} min-w-0 max-w-full select-none flex-row items-center gap-1.5`}>{props.children}</View>}
     >
       <View
         role="button"
         onPress={props.onPress}
         accessibilityState={{ expanded: props.open }}
-        class={`group h-7 min-w-0 max-w-full select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle ${FOCUS_RING}`}
+        class={`group ${uiHeight(28)} min-w-0 max-w-full select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle ${FOCUS_RING}`}
       >
         {props.children}
         <View
@@ -857,10 +857,10 @@ function DiffBadge(props: { stats?: DiffStats }) {
       {(stats) => (
         <View class="shrink-0 flex-row items-center gap-1">
           <If when={stats().added > 0}>
-            <Text class="font-mono text-2xs font-medium tabular-nums text-success">{`+${stats().added}`}</Text>
+            <Text class={`font-mono ${uiType("2xs")} font-medium tabular-nums text-success`}>{`+${stats().added}`}</Text>
           </If>
           <If when={stats().removed > 0}>
-            <Text class="font-mono text-2xs font-medium tabular-nums text-destructive">{`-${stats().removed}`}</Text>
+            <Text class={`font-mono ${uiType("2xs")} font-medium tabular-nums text-destructive`}>{`-${stats().removed}`}</Text>
           </If>
         </View>
       )}
@@ -874,7 +874,7 @@ function ThinkingRow(props: { row: Extract<Row, { kind: "thinking" }>; defaultOp
   const open = () => isOpen(props.row.id, fallback());
   const label = () => thinkingLabel(props.row, activeLanguage());
   const hasBody = () => Boolean(props.row.text.trim());
-  const text = () => `min-w-0 shrink truncate ${props.compact ? "text-sm" : "text-md"} text-subtle`;
+  const text = () => `min-w-0 shrink truncate ${props.compact ? uiType("sm") : uiType("md")} text-subtle`;
 
   // Among a run's steps it reads as the tool calls beside it do: a glyph, then the words.
   if (props.compact) {
@@ -882,7 +882,7 @@ function ThinkingRow(props: { row: Extract<Row, { kind: "thinking" }>; defaultOp
       <Collapsible open={open() && hasBody()} reveal content={<ReasoningBody text={props.row.text} />}>
         <Disclosure open={open() && hasBody()} compact onPress={() => hasBody() && toggle(props.row.id, fallback())}>
           <LeadGlyph id={props.row.id} running={props.row.streaming} error={false} icon="thinking" />
-          <RollingText id={() => props.row.id} text={label} class="min-w-0 shrink truncate text-sm text-muted-foreground" />
+          <RollingText id={() => props.row.id} text={label} class={`min-w-0 shrink truncate ${uiType("sm")} text-muted-foreground`} />
         </Disclosure>
       </Collapsible>
     );
@@ -923,7 +923,7 @@ function Output(props: { text: string; command?: string; tone?: "error"; insetCl
           </If>
         </View>
         <If when={shown().hidden > 0}>
-          <Text class="pt-2 text-xs text-subtle">{tr(`${shown().hidden} more lines not shown`, `另有 ${shown().hidden} 行未显示`)}</Text>
+          <Text class={`pt-2 ${uiType("xs")} text-subtle`}>{tr(`${shown().hidden} more lines not shown`, `另有 ${shown().hidden} 行未显示`)}</Text>
         </If>
       </Scroll>
     </View>
@@ -1002,19 +1002,19 @@ function ToolCallRow(props: { row: ToolRow; compact?: boolean }) {
             <RollingText
               id={() => props.row.id}
               text={() => desc().verb}
-              class={`shrink-0 text-sm ${props.row.status === "error" ? "font-medium text-destructive" : "text-muted-foreground"}`}
+              class={`shrink-0 ${uiType("sm")} ${props.row.status === "error" ? "font-medium text-destructive" : "text-muted-foreground"}`}
             />
             <If when={desc().target}>
               <Text
                 class={`min-w-0 shrink truncate ${
-                  desc().monoTarget ? "font-mono text-xs text-foreground" : "text-sm text-foreground"
+                  desc().monoTarget ? `font-mono ${uiType("xs")} text-foreground` : `${uiType("sm")} text-foreground`
                 }`}
               >
                 {desc().target}
               </Text>
             </If>
             <If when={desc().meta}>
-              <Text class="shrink-0 truncate text-xs text-subtle">{desc().meta}</Text>
+              <Text class={`shrink-0 truncate ${uiType("xs")} text-subtle`}>{desc().meta}</Text>
             </If>
             <DiffBadge stats={desc().diffStats} />
           </Disclosure>
@@ -1086,7 +1086,7 @@ function ActivityView(props: { row: ActivityRow }) {
     >
       <View class="flex-row items-center gap-1">
         <ProcessLine open={open() && hasBody()} onPress={hasBody() ? () => toggle(props.row.id, false) : undefined}>
-          <RollingText id={() => props.row.id} text={title} class="min-w-0 shrink truncate text-md text-subtle" style={{ opacity: breathOpacity }} />
+          <RollingText id={() => props.row.id} text={title} class={`min-w-0 shrink truncate ${uiType("md")} text-subtle`} style={{ opacity: breathOpacity }} />
         </ProcessLine>
         <If when={onlySession()}>
           {(sid) => (
@@ -1155,17 +1155,17 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
         <RollingText
           id={() => props.row.id}
           text={() => describeTurn(props.row, activeLanguage())}
-          class="shrink-0 text-md text-subtle"
+          class={`shrink-0 ${uiType("md")} text-subtle`}
           style={{ opacity: breathOpacity }}
         />
         <If when={elapsed() !== undefined && (elapsed() ?? 0) >= 1000}>
-          <Text class="shrink-0 text-md tabular-nums text-subtle">{runningFor(elapsed() ?? 0)}</Text>
+          <Text class={`shrink-0 ${uiType("md")} tabular-nums text-subtle`}>{runningFor(elapsed() ?? 0)}</Text>
         </If>
         <Presence show={Boolean(preview())} scaleFrom={0.97} class="min-w-0 shrink flex-row items-center gap-1.5">
           <If when={!props.row.running}>
-            <Text class="shrink-0 text-md text-subtle">·</Text>
+            <Text class={`shrink-0 ${uiType("md")} text-subtle`}>·</Text>
           </If>
-          <RollingText id={() => `${props.row.id}:preview`} text={() => shownPreview() ?? ""} class="min-w-0 shrink truncate text-md text-subtle" />
+          <RollingText id={() => `${props.row.id}:preview`} text={() => shownPreview() ?? ""} class={`min-w-0 shrink truncate ${uiType("md")} text-subtle`} />
         </Presence>
       </ProcessLine>
     </View>
@@ -1191,11 +1191,11 @@ function BashRow(props: { row: Extract<Row, { kind: "bash" }> }) {
         <RollingText
           id={() => props.row.id}
           text={() => (running() ? tr("Running", "正在运行") : tr("Ran", "运行"))}
-          class="shrink-0 text-sm text-muted-foreground"
+          class={`shrink-0 ${uiType("sm")} text-muted-foreground`}
         />
-        <Text class="min-w-0 shrink truncate font-mono text-xs text-foreground">{props.row.command}</Text>
+        <Text class={`min-w-0 shrink truncate font-mono ${uiType("xs")} text-foreground`}>{props.row.command}</Text>
         <If when={note()}>
-          <Text class="shrink-0 text-xs tabular-nums text-subtle">{note()}</Text>
+          <Text class={`shrink-0 ${uiType("xs")} tabular-nums text-subtle`}>{note()}</Text>
         </If>
       </Disclosure>
     </Collapsible>
@@ -1210,9 +1210,9 @@ function NoticeRow(props: { row: Extract<Row, { kind: "notice" }> }) {
         <Icon name={props.row.tone === "info" ? "info" : "alert"} tone={tone()} />
       </View>
       <View class="flex-1 gap-0.5">
-        <Text class="text-base font-medium text-foreground">{props.row.title}</Text>
+        <Text class={`${uiType("base")} font-medium text-foreground`}>{props.row.title}</Text>
         <If when={props.row.text}>
-          <Text class="text-sm text-muted-foreground">{props.row.text}</Text>
+          <Text class={`${uiType("sm")} text-muted-foreground`}>{props.row.text}</Text>
         </If>
       </View>
     </View>
@@ -1234,10 +1234,10 @@ function SummaryRow(props: { row: Extract<Row, { kind: "summary" }> }) {
         </View>
       }
     >
-      <View role="button" onPress={() => toggle(props.row.id, false)} accessibilityState={{ expanded: open() }} class={`h-7 select-none flex-row items-center gap-3 rounded-md corner-squircle ${FOCUS_RING}`}>
+      <View role="button" onPress={() => toggle(props.row.id, false)} accessibilityState={{ expanded: open() }} class={`${uiHeight(28)} select-none flex-row items-center gap-3 rounded-md corner-squircle ${FOCUS_RING}`}>
         <View class="h-px flex-1 bg-border" />
         <Icon name="compact" size={14} tone="subtle" />
-        <Text class="text-xs text-muted-foreground">{props.row.title}</Text>
+        <Text class={`${uiType("xs")} text-muted-foreground`}>{props.row.title}</Text>
         <View class="h-px flex-1 bg-border" />
       </View>
     </Collapsible>
@@ -1268,11 +1268,11 @@ function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
         onPress={() => toggle(props.row.id, false)}
         accessibilityState={{ expanded: open() }}
         accessibilityLabel={label()}
-        class={`h-7 select-none flex-row items-center gap-3 rounded-md corner-squircle ${FOCUS_RING}`}
+        class={`${uiHeight(28)} select-none flex-row items-center gap-3 rounded-md corner-squircle ${FOCUS_RING}`}
       >
         <View class="h-px flex-1 bg-border" />
         <Icon name="agents" size={14} tone="brand-text" />
-        <Text class="max-w-96 truncate text-xs text-muted-foreground">{label()}</Text>
+        <Text class={`max-w-96 truncate ${uiType("xs")} text-muted-foreground`}>{label()}</Text>
         <If when={props.row.status === "blocked"}>
           <View class="size-1.5 rounded-full bg-warning" />
         </If>

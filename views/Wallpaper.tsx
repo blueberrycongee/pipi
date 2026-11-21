@@ -61,6 +61,7 @@ import {
 import { Button, IconButton } from "../ui/Button";
 import { EASING, FloatingLayer } from "../ui/motion";
 import { GLASS_REGULAR, HEADER_GLASS, PAGE_GLASS, WALLPAPER_FROST } from "../ui/styles";
+import { uiType } from "../ui/typography";
 
 // ---------------------------------------------------------------------------
 // Global interactive wallpaper state (cursor parallax, shader ripples, video surge)
@@ -730,10 +731,10 @@ export function WallpaperAdjustDialog() {
         {/* Header */}
         <View class="flex-row items-start justify-between gap-3">
           <View class="min-w-0 flex-1 gap-1">
-            <Text class="text-md font-semibold text-foreground">
+            <Text class={`${uiType("md")} font-semibold text-foreground`}>
               {tr("Adjust wallpaper", "调整壁纸")}
             </Text>
-            <Text class="text-xs leading-relaxed text-muted-foreground">
+            <Text class={`${uiType("xs")} leading-relaxed text-muted-foreground`}>
               {tr(
                 "Drag the image to reposition it, or zoom in to frame a detail.",
                 "拖动图片以调整构图位置，或缩放以聚焦局部细节。",
@@ -809,7 +810,7 @@ export function WallpaperAdjustDialog() {
 
               {/* Corner hint pill */}
               <View class="pointer-events-none absolute bottom-2.5 left-2.5 flex-row items-center gap-1.5 rounded-md corner-squircle border border-border bg-popover/85 px-2.5 py-1">
-                <Text class="text-2xs font-medium text-foreground">
+                <Text class={`${uiType("2xs")} font-medium text-foreground`}>
                   {tr("Drag to reposition", "拖动以调整位置")}
                 </Text>
               </View>
@@ -819,7 +820,7 @@ export function WallpaperAdjustDialog() {
 
         {/* Zoom Controls Row */}
         <View class="flex-row items-center gap-2.5">
-          <Text class="w-11 text-xs font-medium text-muted-foreground">
+          <Text class={`w-11 ${uiType("xs")} font-medium text-muted-foreground`}>
             {tr("Zoom", "缩放")}
           </Text>
 
@@ -862,7 +863,7 @@ export function WallpaperAdjustDialog() {
             onPress={() => applyZoom(draft().zoom + ZOOM_STEP)}
           />
 
-          <Text class="w-11 text-right font-mono text-xs text-muted-foreground">
+          <Text class={`w-11 text-right font-mono ${uiType("xs")} text-muted-foreground`}>
             {zoomPercent()}
           </Text>
         </View>
