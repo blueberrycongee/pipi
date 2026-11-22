@@ -534,13 +534,18 @@ function signalAgent(signal) {
 function interruptActiveTurn() {
   abortRequested = true;
   acpWakeSleepWake?.();
+  bumpAcpDeferred();
   for (const [, resolve] of pendingUiRequests) resolve(false);
   pendingUiRequests.clear();
   if (driver === "acp") {
+    // Antigravity's `session/cancel` kills running background commands and
+    // subagents: when steering after the prompt already settled (held open on
+    // background work or in a wake turn), leave the background work alive.
+    const preserveAgyWork = steerInterrupt && isAntigravityAcp() && Boolean(acpDeferred?.promptSettled);
     // Politely interrupt the in-flight prompt; an agent that ignores
     // `session/cancel` is dropped by settleActiveTurn's stall timeout
     // (dropAcpPeer), and the next turn re-attaches via session/load.
-    if (acpStream) acpNotify("session/cancel", { sessionId: acpSessionId });
+    if (acpStream && !preserveAgyWork) acpNotify("session/cancel", { sessionId: acpSessionId });
   } else if (activeChild) {
     signalAgent("SIGTERM");
   }
@@ -921,8 +926,11 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       trailingThoughts = "";
       emitTurn({ type: "message_update", usage: zeroUsage, assistantMessageEvent: { type: "text_delta", contentIndex: textIdx, delta } });
     },
-    toolStart(id, rawName, args) {
-      if (openTools.has(id)) return;
+    toolStart(id, rawName, args, meta = undefined) {
+      if (openTools.has(id)) {
+        if (meta) api.toolMeta(id, meta);
+        return;
+      }
       clearRetry(true);
       openMsg();
       closeThink();
@@ -934,10 +942,37 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       blocks.push(tc);
       blockIdx.push(idx);
       calledTools.add(id);
-      openTools.set(id, { name, startedAt: Date.now() });
+      openTools.set(id, {
+        name,
+        startedAt: Date.now(),
+        ...(meta
+          ? {
+              kind: meta.kind,
+              title: meta.title,
+              rawInput: meta.rawInput,
+              startedAfterPromptSettled: !!meta.startedAfterPromptSettled,
+            }
+          : {}),
+      });
       emitTurn({ type: "message_update", usage: zeroUsage, assistantMessageEvent: { type: "toolcall_start", contentIndex: idx, id, toolName: name } });
       emitTurn({ type: "message_update", usage: zeroUsage, assistantMessageEvent: { type: "toolcall_end", contentIndex: idx, toolCall: tc } });
       emitTurn({ type: "tool_execution_start", toolCallId: id, toolName: name, args: args || {} });
+    },
+    toolMeta(id, patch) {
+      const info = openTools.get(id);
+      if (!info || !patch) return;
+      if (patch.kind !== undefined) info.kind = patch.kind;
+      if (patch.title !== undefined) info.title = patch.title;
+      if (patch.rawInput !== undefined) info.rawInput = patch.rawInput;
+    },
+    /** True when the open assistant message ends on non-empty prose (a completed reply before a wake). */
+    hasTrailingText() {
+      if (textIdx !== undefined && textBuf.trim().length > 0) return true;
+      if (textIdx === undefined && blocks.length > 0) {
+        const last = blocks[blocks.length - 1];
+        return last?.type === "text" && typeof last.text === "string" && last.text.trim().length > 0;
+      }
+      return false;
     },
     /** `known`: the call's `{name, startedAt}` when an earlier turn started it (a background task finishing now). */
     toolEnd(id, outputText, isError, known = undefined) {
@@ -959,30 +994,51 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       return { text: saidText, toolIds: [...calledTools], open: [...openTools], trailingThoughts };
     },
     /**
+     * Closes the assistant message so far as a completed reply without ending
+     * the turn or dropping open background tools — so a pre-wake reply stays
+     * visible and distinct when background wakes follow in the same run.
+     */
+    checkpoint({ keepOpenTools = true, startNextTurn = true } = {}) {
+      if (!msgOpen) {
+        if (startNextTurn) startTurn = true;
+        return false;
+      }
+      closeThink();
+      closeText();
+      const usage = toUsage(usageParts.splice(0));
+      const content = blocks
+        .splice(0)
+        .map((b) => (keepOpenTools && b.type === "toolCall" && openTools.has(b.id) ? { ...b, background: true } : b));
+      const assistantMsg = {
+        role: "assistant",
+        content,
+        provider: currentModel.provider,
+        model: currentModel.id,
+        usage,
+        stopReason: "stop",
+        ...(startTurn ? { turnStart: true } : {}),
+        timestamp: Date.now(),
+      };
+      if (sessionEpoch === turnEpoch) {
+        messages.push(assistantMsg);
+        addInto(sessionUsage, fromUsage(usage));
+        void saveExternalSession().catch(() => undefined);
+      }
+      emitTurn({ type: "message_end", message: assistantMsg });
+      msgOpen = false;
+      nextIdx = 0;
+      blockIdx.splice(0);
+      startTurn = !!startNextTurn;
+      return true;
+    },
+    /**
      * Ends the assistant message so far without ending the turn, and forgets it
      * as this turn's: Antigravity sends a turn it ran on its own while idle
      * ahead of the next prompt's echo — that is the turn before, not this one.
      */
     split() {
       if (msgOpen) {
-        closeThink();
-        closeText();
-        const assistantMsg = {
-          role: "assistant",
-          content: blocks.splice(0),
-          provider: currentModel.provider,
-          model: currentModel.id,
-          usage: zeroUsage,
-          stopReason: "stop",
-          ...(startTurn ? { turnStart: true } : {}),
-          timestamp: Date.now(),
-        };
-        if (sessionEpoch === turnEpoch) messages.push(assistantMsg);
-        emitTurn({ type: "message_end", message: assistantMsg });
-        msgOpen = false;
-        nextIdx = 0;
-        blockIdx.splice(0);
-        startTurn = true;
+        api.checkpoint({ keepOpenTools: true, startNextTurn: true });
       }
       saidText = "";
       trailingThoughts = "";
@@ -1615,38 +1671,296 @@ const acpRecentTools = new Map(); // toolCallId → {title, kind, rawInput} for 
 // resets the stall clock.
 let acpLastEventAt = 0;
 
-// ── Turns an agent runs on its own between prompts (Antigravity) ────────────
+// ── Deferred finalization & autonomous wakes (Antigravity / ACP) ────────────
 //
-// An Antigravity turn can end on "waiting for" a background task or subagent.
-// When that finishes, agy wakes the agent, runs the rest of the work, and
-// streams those `session/update`s over the live connection as they happen —
-// no polling, no `session/load` replay (verified on agy 1.5.13, plain `agy
-// acp`: the completed `tool_call_update` and the task's answer chunks arrive
-// seconds after `session/prompt` settles). So a content update arriving while
-// no turn is open simply opens a wake turn of its own here; a quiet stretch
-// ends it. Calls it leaves running carry on as background tools a later wake
-// (or turn) ends. What still slips through ahead of a prompt's echo — frames
-// agy held and flushes when the next `session/prompt` lands — ends as its own
-// message (`split`), never inside the new answer.
-let acpWakeTurn = undefined; // {epoch, stream} while an idle-time wake turn is open
-let acpWakeSleepWake = undefined; // resolves a wake sleep immediately on abort/steer
+// An Antigravity `session/prompt` returns `end_turn` as soon as it pauses to
+// wait on a background command (`run_command` past `WaitMsBeforeAsync`), a
+// scheduled wake (`schedule`), or a detached subagent (`invoke_subagent`).
+// Settling the turn right then makes the UI look stopped/idle and drops or
+// fragments the wake reply when Gemini thinks or runs tools longer than a
+// short quiet timeout. Instead — following T3 Code's Antigravity ACP adapter —
+// the bridge holds the turn open while background work is still running:
+//   - Non-daemon `execute` commands, `schedule` calls, pending permission /
+//     question requests, active detached subagents, and unread high-priority
+//     inbox wakes (`hasPendingReply`) all defer finalization.
+//   - Pre-wake replies are checkpointed as completed visible messages before
+//     waiting so they stay visible and distinct when wakes follow in the run.
+//   - Every Antigravity reply ends with `usage_update`: while a wake reply is
+//     open (`replyOpen`), the quiet limit is 2 minutes (never 6s); once
+//     `usage_update` arrives and no background work remains, a 3s debounce
+//     re-checks `hasPendingReply` before settling.
+//   - Daemons (`IsDaemon: true`) settle immediately and still wake via
+//     `ensureAcpWakeTurn` (using the same `usage_update` + 2-minute machinery)
+//     if they ever exit later.
+//   - Steering on agy >= 1.5.0 sends `session/prompt` without `session/cancel`
+//     so running background commands and subagents are never killed; only Stop
+//     (`abort`) sends `session/cancel`.
+let acpWakeTurn = undefined; // {epoch, stream} while a post-settle wake turn is open
+let acpDeferred = undefined; // active deferred-finalization / wake state for the live turn
+let acpWakeSleepWake = undefined; // resolves an active sleep immediately on abort
 let acpAttaching = false; // session/load|resume replay in flight: not live traffic
-// Calls a turn left running (background tasks), by id → {name, startedAt}: a
-// later turn, or a replay, says when they end — wherever in the conversation.
+// Calls a turn left running (daemons, or tools surviving a steer), by id → {name, startedAt, ...}:
+// a later turn or wake says when they end — wherever in the conversation.
 const acpBackgroundTools = new Map();
-// A wake's updates arrive in bursts; this much quiet ends the turn. Anything
-// that arrives after it has closed simply opens the next one.
+// Post-`usage_update` debounce once no deferred background work remains.
+const ACP_DEFERRED_FINALIZE_DEBOUNCE_MS = Number(process.env.PIPI_ACP_DEFERRED_FINALIZE_MS) || 3_000;
+// Max silence while an open Antigravity wake reply has not yet emitted its closing `usage_update`.
+const ACP_OPEN_REPLY_QUIET_LIMIT_MS = Number(process.env.PIPI_ACP_OPEN_REPLY_QUIET_MS) || 2 * 60_000;
+// Poll cadence while waiting exclusively on detached subagents (which report via parent inbox).
+const ACP_SUBAGENT_POLL_MS = Number(process.env.PIPI_ACP_SUBAGENT_POLL_MS) || 1_000;
+// Quiet fallback for non-Antigravity post-settle wake turns.
 const ACP_WAKE_QUIET_MS = Number(process.env.PIPI_ACP_WAKE_QUIET_MS) || 6_000;
 const ACP_CONTENT_UPDATES = new Set(["user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"]);
 const isFinalToolStatus = (status) => status === "completed" || status === "failed";
 
+const ANTIGRAVITY_SCHEDULE_TITLES = new Set(["Run schedule", "Running schedule"]);
+const ANTIGRAVITY_SUBAGENT_TITLES = new Set([
+  "Running start_subagent",
+  "Run start_subagent?",
+  "Running invoke_subagent",
+  "Run invoke_subagent?",
+  "Run invoke_subagent",
+]);
+const AGY_NATIVE_ID = /^[A-Za-z0-9_-]{1,64}$/;
+const AGY_MAX_STEP_BYTES = 1024 * 1024;
+const AGY_MAX_MESSAGE_FILES = 256;
+const AGY_MAX_DETACHED_CHILDREN = 64;
+const AGY_HIGH_PRIORITY = "MESSAGE_PRIORITY_HIGH";
+const AGY_LOW_PRIORITY = "MESSAGE_PRIORITY_LOW";
+
+function parseSemver(version) {
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version || "").trim());
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : undefined;
+}
+
+function cmpSemver(a, b) {
+  return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+}
+
+function isAntigravityAcp() {
+  return driver === "acp" && (agentId === "antigravity" || /antigravity/i.test(String(acpAgentInfo?.name || "")));
+}
+
+/** `agy acp` >= 1.5.0 treats a `session/prompt` sent mid-turn as a steer without killing subagents/commands. */
+function agySteersWithPrompt() {
+  if (!isAntigravityAcp()) return false;
+  const v = parseSemver(acpAgentInfo?.version);
+  return v !== undefined && cmpSemver(v, [1, 5, 0]) >= 0;
+}
+
 /** Antigravity 1.4.2–1.4.5 scatter a run-workflow skill file into the workspace unless told not to. */
 function agyWritesRunWorkflowSkill(version) {
-  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version || "").trim());
-  if (!m) return false;
-  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
-  const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
-  return cmp(v, [1, 4, 2]) >= 0 && cmp(v, [1, 4, 5]) <= 0;
+  const v = parseSemver(version);
+  return v !== undefined && cmpSemver(v, [1, 4, 2]) >= 0 && cmpSemver(v, [1, 4, 5]) <= 0;
+}
+
+function isDaemonToolInput(rawInput) {
+  return Boolean(rawInput && typeof rawInput === "object" && rawInput.IsDaemon === true);
+}
+
+/**
+ * Antigravity keeps non-daemon shell commands and scheduled wakes running after
+ * `session/prompt` returns `end_turn`, replying by itself when they finish.
+ * A daemon (`IsDaemon: true`) may run indefinitely, so it does not hold the turn.
+ */
+function antigravityToolOutlivesPrompt(info) {
+  if (!info) return false;
+  if (isDaemonToolInput(info.rawInput)) return false;
+  if (info.startedAfterPromptSettled) return true;
+  if (info.title && ANTIGRAVITY_SCHEDULE_TITLES.has(info.title)) return true;
+  return info.kind === "execute";
+}
+
+function isAntigravitySubagentLaunch(u) {
+  const title = typeof u?.title === "string" ? u.title : "";
+  if (!ANTIGRAVITY_SUBAGENT_TITLES.has(title)) return false;
+  if (u.kind !== undefined && u.kind !== "other") return false;
+  return u._meta?.is_mcp_tool_call !== true;
+}
+
+function agyHomeRoot() {
+  const raw = process.env.ANTIGRAVITY_CLI_HOME
+    ? path.resolve(process.env.ANTIGRAVITY_CLI_HOME)
+    : path.join(os.homedir(), ".gemini", "antigravity-cli");
+  try {
+    return fs.realpathSync(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Verifies every path segment below `root` exists, has the expected type, and is not a symlink. */
+function agyManagedPathSync(root, segments, kind) {
+  let current = root;
+  let info;
+  try {
+    for (let i = 0; i < segments.length; i++) {
+      current = path.join(current, segments[i]);
+      info = fs.lstatSync(current);
+      const expectFile = kind === "file" && i === segments.length - 1;
+      if (info.isSymbolicLink() || (expectFile ? !info.isFile() : !info.isDirectory())) return undefined;
+    }
+    if (!info) return undefined;
+    return fs.realpathSync(current) === current ? { path: current, info } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function agyHasUnreadHighPriorityInbox(root, acpId) {
+  const dirSegs = ["brain", acpId, ".system_generated", "messages"];
+  const inbox = agyManagedPathSync(root, dirSegs, "directory");
+  if (!inbox) return false;
+  let entries;
+  try {
+    entries = fs.readdirSync(inbox.path);
+  } catch {
+    return false;
+  }
+  const messageNames = entries.filter((name) => name.endsWith(".json") && name !== "read.json");
+  if (!messageNames.length || messageNames.length > AGY_MAX_MESSAGE_FILES) return false;
+  let readReceipts = {};
+  if (entries.includes("read.json")) {
+    const receiptFile = agyManagedPathSync(root, [...dirSegs, "read.json"], "file");
+    if (!receiptFile || receiptFile.info.size > AGY_MAX_STEP_BYTES) return false;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(receiptFile.path, "utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+      readReceipts = parsed;
+    } catch {
+      return false;
+    }
+  }
+  for (const name of messageNames) {
+    const fileId = name.slice(0, -5);
+    if (readReceipts[fileId] === true) continue;
+    const file = agyManagedPathSync(root, [...dirSegs, name], "file");
+    if (!file || file.info.size > AGY_MAX_STEP_BYTES) continue;
+    try {
+      const msg = JSON.parse(fs.readFileSync(file.path, "utf8"));
+      if (!msg || typeof msg !== "object") continue;
+      if (typeof msg.id === "string" && readReceipts[msg.id] === true) continue;
+      if (msg.priority === AGY_HIGH_PRIORITY) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function agyLastTranscriptStep(root, acpId) {
+  const file = agyManagedPathSync(root, ["brain", acpId, ".system_generated", "logs", "transcript.jsonl"], "file");
+  if (!file) return undefined;
+  let fd;
+  try {
+    fd = fs.openSync(file.path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size <= 0) return undefined;
+    for (const byteCap of [64 * 1024, 256 * 1024]) {
+      const start = Math.max(0, stat.size - byteCap);
+      const buf = Buffer.allocUnsafe(stat.size - start);
+      const bytesRead = fs.readSync(fd, buf, 0, buf.length, start);
+      let end = bytesRead;
+      while (end > 0 && (buf[end - 1] === 0x0a || buf[end - 1] === 0x0d)) end -= 1;
+      if (end === 0) {
+        if (start === 0) return undefined;
+        continue;
+      }
+      const trimmed = buf.subarray(0, end);
+      const lastNl = trimmed.lastIndexOf(0x0a);
+      if (lastNl === -1 && start > 0) continue;
+      const line = trimmed.toString("utf8", lastNl + 1);
+      const step = JSON.parse(line);
+      return step && typeof step === "object" ? step : undefined;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+  }
+}
+
+/**
+ * True when `agy` has a high-priority wake queued in the session's inbox or
+ * already dequeued as the trailing `SYSTEM_MESSAGE` step in `transcript.jsonl`
+ * with no `PLANNER_RESPONSE` yet. Fails closed when records are missing,
+ * symlinked, or unreadable.
+ */
+function agyHasPendingReply(acpId) {
+  if (!acpId || !AGY_NATIVE_ID.test(acpId)) return false;
+  const root = agyHomeRoot();
+  if (!root) return false;
+  if (agyHasUnreadHighPriorityInbox(root, acpId)) return true;
+  const lastStep = agyLastTranscriptStep(root, acpId);
+  if (!lastStep || lastStep.type !== "SYSTEM_MESSAGE") return false;
+  const content = typeof lastStep.content === "string" ? lastStep.content : undefined;
+  return content === undefined || content.includes(`priority=${AGY_HIGH_PRIORITY}`) || !content.includes(`priority=${AGY_LOW_PRIORITY}`);
+}
+
+function agyReadInboxSync(root, conversationId) {
+  const dirSegs = ["brain", conversationId, ".system_generated", "messages"];
+  const inbox = agyManagedPathSync(root, dirSegs, "directory");
+  if (!inbox) return [];
+  const names = fs.readdirSync(inbox.path).filter((n) => n.endsWith(".json") && n !== "read.json");
+  if (names.length > AGY_MAX_MESSAGE_FILES) throw new Error("Too many messages");
+  return names.map((name) => {
+    const file = agyManagedPathSync(root, [...dirSegs, name], "file");
+    if (!file || file.info.size > AGY_MAX_STEP_BYTES) throw new Error("Unreadable");
+    return JSON.parse(fs.readFileSync(file.path, "utf8"));
+  });
+}
+
+/**
+ * agy 1.5 detached subagents outlive their `invoke_subagent` tool call (which
+ * completes immediately on launch). A child is done once it sends a message to
+ * the parent's inbox or its record is marked killed. Returns the launching tool
+ * call ids of children still at work; fails closed (`[]`).
+ */
+function agyChildrenAtWork(acpId, toolCallIds) {
+  if (!toolCallIds.length || !acpId || !AGY_NATIVE_ID.test(acpId)) return [];
+  const root = agyHomeRoot();
+  if (!root) return [];
+  try {
+    const subDir = agyManagedPathSync(root, ["brain", acpId, ".system_generated", "subagents"], "directory");
+    if (!subDir) return [];
+    const childIds = fs
+      .readdirSync(subDir.path)
+      .filter((n) => n.endsWith(".json") && AGY_NATIVE_ID.test(n.slice(0, -5)))
+      .map((n) => n.slice(0, -5));
+    if (!childIds.length || childIds.length > AGY_MAX_DETACHED_CHILDREN) return [];
+    const wanted = new Set(toolCallIds);
+    const reported = new Set(agyReadInboxSync(root, acpId).map((m) => m?.sender).filter(Boolean));
+    const atWork = [];
+    for (const childId of childIds) {
+      if (reported.has(childId)) continue;
+      const subFile = agyManagedPathSync(root, ["brain", acpId, ".system_generated", "subagents", `${childId}.json`], "file");
+      if (subFile && subFile.info.size <= AGY_MAX_STEP_BYTES) {
+        try {
+          const rec = JSON.parse(fs.readFileSync(subFile.path, "utf8"));
+          if (rec?.state === "SUBAGENT_STATE_KILLED") continue;
+        } catch {}
+      }
+      for (const msg of agyReadInboxSync(root, childId)) {
+        const tool = msg?.sourceMetadata?.tool;
+        const call = tool?.toolCall;
+        if (
+          msg?.sender === acpId &&
+          (tool?.conversationId === undefined || tool.conversationId === acpId) &&
+          call?.name === "invoke_subagent" &&
+          typeof call?.id === "string" &&
+          wanted.has(call.id)
+        ) {
+          atWork.push(call.id);
+        }
+      }
+    }
+    return atWork;
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -1658,10 +1972,9 @@ function agyWritesRunWorkflowSkill(version) {
  * when no local transcript file exists (custom data dir, remote peer, or tests).
  */
 function agyTranscriptState(acpId) {
-  if (!acpId || !/^[A-Za-z0-9_-]+$/.test(acpId)) return undefined;
-  const root = process.env.ANTIGRAVITY_CLI_HOME
-    ? path.resolve(process.env.ANTIGRAVITY_CLI_HOME)
-    : path.join(os.homedir(), ".gemini", "antigravity-cli");
+  if (!acpId || !AGY_NATIVE_ID.test(acpId)) return undefined;
+  const root = agyHomeRoot();
+  if (!root) return undefined;
   const file = path.join(root, "brain", acpId, ".system_generated", "logs", "transcript.jsonl");
   let fd;
   try {
@@ -1717,6 +2030,98 @@ function acpWakeSleep(ms) {
   });
 }
 
+function bumpAcpDeferred() {
+  if (!acpDeferred) return;
+  acpDeferred.generation += 1;
+  acpDeferred.bump?.();
+}
+
+function acpDeferredSleep(ms, state) {
+  if (abortRequested || steerInterrupt || state.peerDead || sessionEpoch !== state.epoch || !acpChild) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let timer;
+    const wake = () => {
+      if (timer) clearTimeout(timer);
+      if (state.bump === wake) state.bump = undefined;
+      resolve();
+    };
+    if (ms > 0) {
+      timer = setTimeout(wake, ms);
+      timer.unref?.();
+    }
+    state.bump = wake;
+  });
+}
+
+function hasAcpOutlivingTools(state) {
+  const check = (info) => (isAntigravityAcp() ? antigravityToolOutlivesPrompt(info) : !isDaemonToolInput(info?.rawInput));
+  for (const [, info] of state.stream.seen().open) {
+    if (check(info)) return true;
+  }
+  for (const info of acpBackgroundTools.values()) {
+    if (check(info)) return true;
+  }
+  return false;
+}
+
+function hasAcpDeferredWork(state) {
+  if (pendingUiRequests.size > 0) return true;
+  if (hasAcpOutlivingTools(state)) return true;
+  if (isAntigravityAcp() && state.subagentIds.size > 0 && agyChildrenAtWork(state.acpId, [...state.subagentIds]).length > 0) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Holds a settled-prompt (or post-settle wake) turn open while background
+ * commands, scheduled wakes, detached subagents, pending permission dialogs,
+ * or in-flight wake replies (`replyOpen`, awaiting `usage_update`) are still
+ * active. Mirrors T3 Code's `scheduleDeferredFinalize` + `hasPendingReply`.
+ */
+async function waitAcpDeferred(state) {
+  for (;;) {
+    if (abortRequested || steerInterrupt || sessionEpoch !== state.epoch) return;
+    if (state.peerDead || !acpChild) {
+      throw new Error(state.peerDeadMessage || "ACP agent exited while background work was running");
+    }
+    if (pendingUiRequests.size > 0 || hasAcpOutlivingTools(state)) {
+      await acpDeferredSleep(0, state);
+      continue;
+    }
+    if (isAntigravityAcp() && state.subagentIds.size > 0 && agyChildrenAtWork(state.acpId, [...state.subagentIds]).length > 0) {
+      await acpDeferredSleep(ACP_SUBAGENT_POLL_MS, state);
+      continue;
+    }
+    const agy = isAntigravityAcp();
+    const replyOpen = agy ? state.replyOpen : false;
+    const waitMs = agy
+      ? replyOpen
+        ? ACP_OPEN_REPLY_QUIET_LIMIT_MS
+        : ACP_DEFERRED_FINALIZE_DEBOUNCE_MS
+      : ACP_WAKE_QUIET_MS;
+    const gen = state.generation;
+    await acpDeferredSleep(waitMs, state);
+    if (abortRequested || steerInterrupt || sessionEpoch !== state.epoch) return;
+    if (state.peerDead || !acpChild) {
+      throw new Error(state.peerDeadMessage || "ACP agent exited while background work was running");
+    }
+    if (state.generation !== gen) continue;
+    if (hasAcpDeferredWork(state)) continue;
+    if (agy && !replyOpen && agyHasPendingReply(state.acpId)) {
+      // Another background command finished while reply 1 was streaming and its
+      // wake sits unread in the inbox / trailing SYSTEM_MESSAGE: keep reply 1
+      // visible and wait up to the open-reply quiet limit for reply 2.
+      state.replyOpen = true;
+      if (state.stream.hasTrailingText()) state.stream.checkpoint({ keepOpenTools: true });
+      continue;
+    }
+    return;
+  }
+}
+
 function clearStaleBackgroundTools(list = messages, onlyId = undefined) {
   let cleared = false;
   for (const msg of list) {
@@ -1736,7 +2141,7 @@ function clearStaleBackgroundTools(list = messages, onlyId = undefined) {
 let reportedBackgroundWatch = false;
 function syncBackgroundWatch() {
   if (!process.env.PIPI_SESSION_ID) return;
-  const active = Boolean(acpWakeTurn || acpBackgroundTools.size > 0);
+  const active = Boolean(acpWakeTurn || acpDeferred?.promptSettled || acpBackgroundTools.size > 0);
   if (active === reportedBackgroundWatch) return;
   reportedBackgroundWatch = active;
   emit({ type: "pipi_background_watch", active });
@@ -1772,7 +2177,7 @@ function ensureAcpWakeTurn() {
   void wrapped.catch(() => undefined);
 }
 
-/** A wake turn's body: hold it open through the burst, settle on a quiet stretch. */
+/** A post-settle wake turn's body (e.g. a daemon exiting or detached permission request). */
 async function runAcpWakeTurn(epoch) {
   const emitTurn = (record) => {
     if (sessionEpoch === epoch) emit(record);
@@ -1781,17 +2186,29 @@ async function runAcpWakeTurn(epoch) {
   emitTurn({ type: "agent_start" });
   emitTurn({ type: "turn_start" });
   const stream = makeTurnStreamHelper(epoch, { turnStart: true });
+  const deferred = {
+    epoch,
+    acpId: acpSessionId,
+    stream,
+    promptSettled: true,
+    replyOpen: true,
+    generation: 0,
+    promptSeq: 0,
+    subagentIds: new Set(),
+    peerDead: false,
+    peerDeadMessage: undefined,
+    bump: undefined,
+    onSteer: undefined,
+  };
   acpWakeTurn = { epoch, stream };
+  acpDeferred = deferred;
   acpStream = stream;
   syncBackgroundWatch();
 
-  const sub = (async () => {
-    for (;;) {
-      await acpWakeSleep(ACP_WAKE_QUIET_MS);
-      if (abortRequested || sessionEpoch !== epoch || !acpChild) break;
-      if (Date.now() - acpLastEventAt >= ACP_WAKE_QUIET_MS) break;
-    }
-  })();
+  let wakeError;
+  const sub = waitAcpDeferred(deferred).catch((err) => {
+    wakeError = err;
+  });
   activeSubTurn = sub.finally(() => {
     if (activeSubTurn === sub) activeSubTurn = undefined;
   });
@@ -1799,13 +2216,19 @@ async function runAcpWakeTurn(epoch) {
 
   const wasSteer = steerInterrupt;
   const aborted = abortRequested && !wasSteer;
-  if (!aborted) {
+  const errored = !aborted && !wasSteer && Boolean(wakeError);
+  if (!aborted && !errored) {
     // Calls the wake left running keep their background mark; the next burst ends them.
     for (const [id, info] of stream.seen().open) acpBackgroundTools.set(String(id), info);
   }
-  stream.finish(aborted ? "aborted" : "stop", undefined, { keepOpenTools: !aborted });
-  if (aborted) clearStaleBackgroundTools();
+  stream.finish(
+    aborted ? "aborted" : errored ? "error" : "stop",
+    errored ? (wakeError instanceof Error ? wakeError.message : String(wakeError)) : undefined,
+    { keepOpenTools: !aborted && !errored },
+  );
+  if (aborted || errored) clearAcpBackground();
   acpWakeTurn = undefined;
+  if (acpDeferred === deferred) acpDeferred = undefined;
   if (acpStream === stream) acpStream = undefined;
   emitTurn({ type: "agent_end", willRetry: false });
   syncBackgroundWatch();
@@ -2116,6 +2539,9 @@ async function pushAcpMode() {
 
 /** Forwards an ACP `session/request_permission` to pipi's native confirm dialog (or auto-answers). */
 async function handleAcpPermission(msg) {
+  // A detached permission/question request after prompt settlement opens a wake
+  // turn first (T3's `wakeOnDetachedRequest`) so the prompt and its reply run live.
+  if (!acpAttaching && !acpStream && isAntigravityAcp()) ensureAcpWakeTurn();
   // Agents may send a partial `toolCall` — DeepSeek Harness only carries `toolCallId`,
   // so enrich from the `tool_call` update that preceded the request.
   const tc = msg.params?.toolCall || {};
@@ -2127,6 +2553,12 @@ async function handleAcpPermission(msg) {
   const isEditOnly = ["edit", "write", "read", "search", "grep", "find", "ls"].includes(toolKind) || ["read", "write", "edit", "grep", "find", "ls"].includes(norm);
   const opts = msg.params?.options || [];
   const pick = (prefix) => opts.find((o) => o.kind === prefix) || opts.find((o) => o.kind?.startsWith(prefix));
+  const resumeReplyAfterAnswer = () => {
+    if (acpDeferred && isAntigravityAcp()) {
+      acpDeferred.replyOpen = true;
+      bumpAcpDeferred();
+    }
+  };
   // agy's fixed-choice questions ride the same channel with `interaction_*` ids:
   // not approvals, and an answer is required even in full-access. Ask the user —
   // never auto-pick an arbitrary option or fabricate an `allow` that is not there.
@@ -2134,6 +2566,7 @@ async function handleAcpPermission(msg) {
     const uiId = `acp_ask_${msg.id}`;
     const answer = await new Promise((resolve) => {
       pendingUiRequests.set(uiId, resolve);
+      bumpAcpDeferred();
       emit({ type: "extension_ui_request", id: uiId, method: "select", title, options: opts.map((o) => String(o.name || o.optionId)) });
     });
     const value = answer?.value;
@@ -2143,16 +2576,19 @@ async function handleAcpPermission(msg) {
       id: msg.id,
       result: { outcome: chosen ? { outcome: "selected", optionId: chosen.optionId } : { outcome: "cancelled" } },
     });
+    resumeReplyAfterAnswer();
     return;
   }
   if (runtimeMode === "full-access" || (runtimeMode === "auto-accept-edits" && isEditOnly)) {
     const allowOpt = pick("allow_once") || pick("allow") || opts[0];
     acpWrite({ jsonrpc: "2.0", id: msg.id, result: { outcome: { outcome: "selected", optionId: allowOpt?.optionId || "allow" } } });
+    resumeReplyAfterAnswer();
     return;
   }
   const uiId = `acp_perm_${msg.id}`;
   const answer = await new Promise((resolve) => {
     pendingUiRequests.set(uiId, resolve);
+    bumpAcpDeferred();
     emit({ type: "extension_ui_request", id: uiId, method: "confirm", title, message: JSON.stringify(rawInput ?? {}, null, 2).slice(0, 1200) });
   });
   const confirmed = answer === true || answer?.confirmed === true;
@@ -2162,6 +2598,7 @@ async function handleAcpPermission(msg) {
     id: msg.id,
     result: { outcome: chosen ? { outcome: "selected", optionId: chosen.optionId } : { outcome: "cancelled" } },
   });
+  resumeReplyAfterAnswer();
 }
 
 /**
@@ -2185,39 +2622,91 @@ function parseAcpRetryNotice(text) {
   return { attempt, maxAttempts: Number.isFinite(maxAttempts) && maxAttempts > 0 ? maxAttempts : 0, errorMessage };
 }
 
-function handleAcpUpdate(u) {
-  acpLastEventAt = Date.now();
+function handleAcpUpdate(u, params = undefined) {
   const kind = u.sessionUpdate || u.type;
   const textOf = (c) => (typeof c === "string" ? c : c?.text || "");
-  // A resume/load replay is history arriving at attach, not live traffic: enrich
-  // the permission table, open no turn, and let the update fall through below.
-  const replaying = acpAttaching && ACP_CONTENT_UPDATES.has(kind);
+  // A resume/load replay (or late frame carrying `_meta.isReplay: true`) is
+  // history arriving at attach, not live traffic: never open a wake turn or
+  // mutate live deferred state.
+  const isReplay = acpAttaching || params?._meta?.isReplay === true || u?._meta?.isReplay === true;
+  if (!isReplay) acpLastEventAt = Date.now();
+  const replaying = isReplay && ACP_CONTENT_UPDATES.has(kind);
   // Content while no turn is open is the agent working on its own (agy wakes a
-  // finished background task and streams it): open a wake turn for it.
+  // finished daemon/timer and streams it): open a wake turn for it.
   if (!replaying && !acpStream && ACP_CONTENT_UPDATES.has(kind)) ensureAcpWakeTurn();
   if (kind === "user_message_chunk") {
     // agy echoes the prompt as it takes it: what came before the echo is a turn it ran while idle.
     if (!replaying) acpStream?.split();
-  } else if (kind === "agent_thought_chunk") acpStream?.thinkDelta(textOf(u.content));
-  else if (kind === "agent_message_chunk") {
-    const text = textOf(u.content);
-    const retry = parseAcpRetryNotice(text);
-    if (retry) acpStream?.retry(retry.attempt, retry.maxAttempts, retry.errorMessage);
-    else acpStream?.textDelta(text);
-  }
-  else if (kind === "tool_call") {
+  } else if (kind === "agent_thought_chunk") {
+    if (!replaying) {
+      acpStream?.thinkDelta(textOf(u.content));
+      if (acpDeferred) {
+        acpDeferred.replyOpen = true;
+        bumpAcpDeferred();
+      }
+    }
+  } else if (kind === "agent_message_chunk") {
+    if (!replaying) {
+      const text = textOf(u.content);
+      const retry = parseAcpRetryNotice(text);
+      if (retry) acpStream?.retry(retry.attempt, retry.maxAttempts, retry.errorMessage);
+      else acpStream?.textDelta(text);
+      if (acpDeferred) {
+        acpDeferred.replyOpen = true;
+        bumpAcpDeferred();
+      }
+    }
+  } else if (kind === "tool_call") {
     const id = String(u.toolCallId ?? `t_${Date.now()}`);
     acpRecentTools.set(id, { title: u.title || u.kind || "tool", kind: u.kind, rawInput: u.rawInput });
-    acpStream?.toolStart(id, u.title || u.kind || "tool", acpToolArgs(u));
-  } else if (kind === "tool_call_update") {
-    const known = u.toolCallId !== undefined ? acpRecentTools.get(String(u.toolCallId)) : undefined;
-    if (known && (u.title || u.rawInput !== undefined)) {
-      acpRecentTools.set(String(u.toolCallId), { title: u.title || known.title, kind: u.kind || known.kind, rawInput: u.rawInput !== undefined ? u.rawInput : known.rawInput });
+    if (!replaying) {
+      acpStream?.toolStart(id, u.title || u.kind || "tool", acpToolArgs(u), {
+        kind: u.kind,
+        title: u.title,
+        rawInput: u.rawInput,
+        startedAfterPromptSettled: Boolean(acpDeferred?.promptSettled),
+      });
+      if (acpDeferred && isAntigravityAcp() && isAntigravitySubagentLaunch(u)) {
+        acpDeferred.subagentIds.add(id);
+      }
+      if (isFinalToolStatus(u.status)) {
+        acpStream?.toolEnd(id, formatAcpToolContent(u.content, u.rawOutput), u.status === "failed", acpBackgroundTools.get(id));
+        if (acpStream) acpBackgroundTools.delete(id);
+      }
+      if (acpDeferred) {
+        acpDeferred.replyOpen = true;
+        bumpAcpDeferred();
+      }
     }
-    if (isFinalToolStatus(u.status)) {
-      const id = String(u.toolCallId);
-      acpStream?.toolEnd(u.toolCallId, formatAcpToolContent(u.content, u.rawOutput), u.status === "failed", acpBackgroundTools.get(id));
-      if (acpStream) acpBackgroundTools.delete(id);
+  } else if (kind === "tool_call_update") {
+    const id = String(u.toolCallId);
+    const known = u.toolCallId !== undefined ? acpRecentTools.get(id) : undefined;
+    if (known && (u.title || u.kind !== undefined || u.rawInput !== undefined)) {
+      acpRecentTools.set(id, {
+        title: u.title || known.title,
+        kind: u.kind !== undefined ? u.kind : known.kind,
+        rawInput: u.rawInput !== undefined ? u.rawInput : known.rawInput,
+      });
+    }
+    if (!replaying) {
+      acpStream?.toolMeta?.(id, {
+        ...(u.kind !== undefined ? { kind: u.kind } : {}),
+        ...(u.title !== undefined ? { title: u.title } : {}),
+        ...(u.rawInput !== undefined ? { rawInput: u.rawInput } : {}),
+      });
+      if (acpDeferred && isAntigravityAcp() && isAntigravitySubagentLaunch({ ...known, ...u })) {
+        acpDeferred.subagentIds.add(id);
+      }
+      if (isFinalToolStatus(u.status)) {
+        acpStream?.toolEnd(u.toolCallId, formatAcpToolContent(u.content, u.rawOutput), u.status === "failed", acpBackgroundTools.get(id));
+        if (acpStream) acpBackgroundTools.delete(id);
+      }
+      if (acpDeferred) {
+        // A completed background tool wakes the model; hold the reply open until
+        // the model streams its response and closes it with `usage_update`.
+        acpDeferred.replyOpen = true;
+        bumpAcpDeferred();
+      }
     }
   } else if (kind === "usage_update") {
     acpUsage = { used: Number(u.used ?? 0), size: Number(u.size ?? 0) };
@@ -2226,7 +2715,7 @@ function handleAcpUpdate(u) {
     const known = usageBaseline?.thread === acpSessionId ? usageBaseline : undefined;
     const cost = acpCostPart(u.cost, known);
     if (cost) usageBaseline = { thread: acpSessionId, ...cost.total };
-    if (acpAttaching) {
+    if (isReplay) {
       // A replay's usage is history, not new spend: refresh the marks, record nothing.
       return;
     }
@@ -2235,6 +2724,16 @@ function handleAcpUpdate(u) {
       // Between prompts there is no turn to put it on: it is the session's all the same.
       if (known && acpStream) acpStream.usage(cost.part);
       else if (known && !isBlank(cost.part)) recordUsageEntry(toUsage([cost.part]), "late");
+    }
+    if (acpDeferred && isAntigravityAcp()) {
+      acpDeferred.replyOpen = false;
+      // When a reply finishes while another background tool is still running,
+      // checkpoint the reply now so it stays visible as a distinct answer when
+      // the later wake streams in the same run.
+      if (acpDeferred.promptSettled && acpDeferred.stream.hasTrailingText() && hasAcpDeferredWork(acpDeferred)) {
+        acpDeferred.stream.checkpoint({ keepOpenTools: true });
+      }
+      bumpAcpDeferred();
     }
   } else if (kind === "config_option_update") {
     adoptConfigOptions(u.configOptions);
@@ -2285,7 +2784,7 @@ function spawnAcp(bin) {
               else waiter.resolve(msg.result);
             }
           } else if (msg.method === "session/update" && msg.params?.update) {
-            handleAcpUpdate(msg.params.update);
+            handleAcpUpdate(msg.params.update, msg.params);
           } else if (msg.method === "session/request_permission" && msg.id !== undefined) {
             void handleAcpPermission(msg);
           } else if (msg.id !== undefined && typeof msg.method === "string") {
@@ -2304,11 +2803,16 @@ function spawnAcp(bin) {
     acpSessionId = undefined;
     acpStream = undefined;
     acpWakeTurn = undefined;
-    clearAcpBackground();
     if (activeChild === child) activeChild = undefined;
     const detail = cause instanceof Error ? cause.message : signal ? `killed with ${signal}` : `code ${cause}`;
     const stderr = acpStderrTail();
     const message = `ACP agent exited (${detail})${stderr ? `:\n${stderr}` : ""}`;
+    if (acpDeferred) {
+      acpDeferred.peerDead = true;
+      acpDeferred.peerDeadMessage = message;
+      bumpAcpDeferred();
+    }
+    clearAcpBackground();
     for (const [, w] of acpPending) {
       if (w.timer) clearTimeout(w.timer);
       w.reject(new Error(message));
@@ -2334,10 +2838,15 @@ function dropAcpPeer(reason = "ACP agent reset") {
   acpSessionId = undefined;
   acpStream = undefined;
   acpWakeTurn = undefined;
-  clearAcpBackground();
   if (activeChild === child) activeChild = undefined;
   const stderr = acpStderrTail();
   const detail = stderr ? `${reason}:\n${stderr}` : reason;
+  if (acpDeferred) {
+    acpDeferred.peerDead = true;
+    acpDeferred.peerDeadMessage = detail;
+    bumpAcpDeferred();
+  }
+  clearAcpBackground();
   for (const [, w] of acpPending) {
     if (w.timer) clearTimeout(w.timer);
     w.reject(new Error(detail));
@@ -2556,20 +3065,36 @@ async function acpProbeAlive() {
 }
 
 /** Awaits a `session/prompt`, dropping a peer that goes silent or stops making progress. */
-async function acpPromptWatched(acpId, params) {
+async function acpPromptWatched(acpId, params, isSuperseded = () => false) {
   const prompt = acpRequest("session/prompt", params, 0);
   let markAt = undefined; // the session's `updatedAt` as session/list last reported it
   let markStep = undefined; // Antigravity's transcript step at the last look
   let markEvent = acpLastEventAt; // session traffic the turn has produced so far
   let quietSince = Date.now();
   for (;;) {
-    const outcome = await Promise.race([prompt.then(() => "done", () => "done"), acpWakeSleep(ACP_TURN_SILENCE_MS).then(() => "waited")]);
-    if (outcome === "done" || abortRequested) return prompt;
+    let timer;
+    const outcome = await Promise.race([
+      prompt.then(() => "done", () => "done"),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve("waited"), ACP_TURN_SILENCE_MS);
+        timer.unref?.();
+        const prev = acpWakeSleepWake;
+        const wake = () => {
+          clearTimeout(timer);
+          if (acpWakeSleepWake === wake) acpWakeSleepWake = prev;
+          resolve("woken");
+        };
+        acpWakeSleepWake = wake;
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (outcome === "done" || abortRequested || isSuperseded()) return prompt;
     if (pendingUiRequests.size > 0 || Date.now() - acpLastOutAt < ACP_TURN_SILENCE_MS) continue;
     if (!(await acpProbeAlive())) {
       dropAcpPeer("ACP agent stopped responding mid-turn");
       return prompt;
     }
+    if (abortRequested || isSuperseded()) return prompt;
     const at = await acpUpdatedAt(acpId, ACP_TURN_PROBE_MS);
     const step = agyTranscriptState(acpId)?.stepIndex;
     if (at !== markAt || step !== markStep || acpLastEventAt !== markEvent) {
@@ -2600,22 +3125,136 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
     }
     return;
   }
+  const emitTurn = (record) => {
+    if (sessionEpoch === turnEpoch) emit(record);
+  };
   const stream = makeTurnStreamHelper(turnEpoch);
+  const deferred = {
+    epoch: turnEpoch,
+    acpId,
+    stream,
+    promptSettled: false,
+    replyOpen: false,
+    generation: 0,
+    promptSeq: 0,
+    subagentIds: new Set(),
+    peerDead: false,
+    peerDeadMessage: undefined,
+    bump: undefined,
+    onSteer: undefined,
+  };
+  acpDeferred = deferred;
   acpStream = stream;
   try {
-    const res = await acpPromptWatched(acpId, { sessionId: acpId, prompt: [{ type: "text", text: promptText }, ...images] });
+    let res;
+    let activeSeq = ++deferred.promptSeq;
+    let currentPrompt = acpPromptWatched(
+      acpId,
+      { sessionId: acpId, prompt: [{ type: "text", text: promptText }, ...images] },
+      () => deferred.promptSeq !== activeSeq,
+    );
+    let steerWake;
+    let steerPromise = new Promise((resolve) => {
+      steerWake = resolve;
+    });
+    const notifySteer = () => {
+      const wake = steerWake;
+      steerPromise = new Promise((resolve) => {
+        steerWake = resolve;
+      });
+      wake?.();
+    };
+    if (agySteersWithPrompt()) {
+      deferred.onSteer = notifySteer;
+    }
+    for (;;) {
+      const step = await Promise.race([
+        currentPrompt.then(
+          (result) => ({ kind: "done", result }),
+          (err) => ({ kind: "err", err }),
+        ),
+        steerPromise.then(() => ({ kind: "steer" })),
+      ]);
+      if (step.kind === "steer") {
+        if (abortRequested || sessionEpoch !== turnEpoch || !acpChild) continue;
+        const nextSteer = dequeueNextTurn();
+        if (!nextSteer) continue;
+        emitTurn({
+          type: "queue_update",
+          steering: queuedSteering.map((q) => q.text),
+          followUp: queuedFollowUp.map((q) => q.text),
+        });
+        const supersededPrompt = currentPrompt;
+        void supersededPrompt.then(
+          (r) => {
+            if (sessionEpoch === turnEpoch) stream.usageSummary(acpPromptPart(r?.usage));
+          },
+          () => undefined,
+        );
+        stream.checkpoint({ keepOpenTools: true, startNextTurn: true });
+        const steerUserMsg = {
+          role: "user",
+          content: [{ type: "text", text: nextSteer.text }, ...nextSteer.images],
+          timestamp: Date.now(),
+        };
+        if (sessionEpoch === turnEpoch) {
+          messages.push(steerUserMsg);
+          void saveExternalSession().catch(() => undefined);
+        }
+        emitTurn({ type: "message_start", message: steerUserMsg });
+        emitTurn({ type: "message_end", message: steerUserMsg });
+        activeSeq = ++deferred.promptSeq;
+        deferred.replyOpen = true;
+        currentPrompt = acpPromptWatched(
+          acpId,
+          { sessionId: acpId, prompt: [{ type: "text", text: nextSteer.text }, ...nextSteer.images] },
+          () => deferred.promptSeq !== activeSeq,
+        );
+        continue;
+      }
+      if (step.kind === "err") throw step.err;
+      res = step.result;
+      break;
+    }
+    deferred.onSteer = undefined;
     const stopReason = abortRequested ? "aborted" : ACP_STOP_REASONS[res?.stopReason] || "stop";
-    // Calls still open at the answer are background work — agy reports their end
-    // in a later wake burst, which finds them here by id.
-    const keepOpenTools = !abortRequested && stream.seen().open.length > 0;
-    if (keepOpenTools) for (const [id, info] of stream.seen().open) acpBackgroundTools.set(String(id), info);
     stream.usageSummary(acpPromptPart(res?.usage));
-    stream.finish(stopReason, undefined, { keepOpenTools });
+
+    // Antigravity returns `end_turn` while background commands, scheduled wakes,
+    // detached subagents, or unread inbox wakes are still pending. Hold the turn
+    // open until they finish and their follow-up replies settle.
+    if (isAntigravityAcp() && !abortRequested && stopReason === "stop") {
+      deferred.promptSettled = true;
+      const deferredWork = hasAcpDeferredWork(deferred);
+      const pendingReply = !deferredWork && agyHasPendingReply(acpId);
+      if (deferredWork || pendingReply) {
+        if (stream.hasTrailingText()) {
+          stream.checkpoint({ keepOpenTools: true, startNextTurn: true });
+        }
+        if (pendingReply) deferred.replyOpen = true;
+        syncBackgroundWatch();
+        await waitAcpDeferred(deferred);
+      }
+    }
+
+    const wasSteer = steerInterrupt;
+    const aborted = abortRequested && !wasSteer;
+    const finalStop = aborted ? "aborted" : stopReason;
+    // Calls still open at the answer (daemons, or commands surviving a steer)
+    // stay tracked so a later wake or turn can finish them by id.
+    const keepOpenTools = !aborted && stream.seen().open.length > 0;
+    if (keepOpenTools) for (const [id, info] of stream.seen().open) acpBackgroundTools.set(String(id), info);
+    stream.finish(finalStop, undefined, { keepOpenTools });
+    if (aborted) clearAcpBackground();
     syncBackgroundWatch();
   } catch (err) {
-    stream.finish(abortRequested ? "aborted" : "error", !abortRequested ? (err instanceof Error ? err.message : String(err)) || acpStderrTail() : undefined);
+    const aborted = abortRequested && !steerInterrupt;
+    clearAcpBackground();
+    stream.finish(aborted ? "aborted" : "error", !aborted ? (err instanceof Error ? err.message : String(err)) || acpStderrTail() : undefined);
   } finally {
+    if (acpDeferred === deferred) acpDeferred = undefined;
     if (acpStream === stream) acpStream = undefined;
+    syncBackgroundWatch();
   }
 }
 
@@ -2808,6 +3447,13 @@ async function handleCommand(cmd) {
           // Where the conversation survives a restart, a steer interrupts the
           // in-flight turn now and re-runs on the resumed thread — instead of
           // waiting for the turn to end like a prioritized follow-up.
+          // On Antigravity >= 1.5.0, steering sends `session/prompt` directly
+          // without `session/cancel` so running commands/subagents stay alive.
+          if (acpDeferred?.onSteer) {
+            emit({ type: "queue_update", steering: queuedSteering.map((q) => q.text), followUp: queuedFollowUp.map((q) => q.text) });
+            acpDeferred.onSteer();
+            return { disposition: "queued" };
+          }
           if (canSteerRestart()) {
             steerInterrupt = true;
             void settleCurrentSubTurn(10_000);

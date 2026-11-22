@@ -138,6 +138,74 @@ function idle(sessionId, u) {
 }
 
 function backgroundTurn(sessionId, text) {
+  if (/crash/i.test(text)) {
+    const job1 = `bg_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: job1, title: "job 1", kind: "execute", status: "in_progress", rawInput: { CommandLine: "job 1", WaitMsBeforeAsync: 10000 } });
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Waiting for the job." } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 9000, size: 1048576 });
+    setTimeout(() => process.exit(1), WAKE_MS);
+    return "end_turn";
+  }
+  if (/schedule/i.test(text)) {
+    const sched = `sched_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: sched, title: "Run schedule", kind: "other", status: "in_progress", rawInput: { DurationSeconds: 30, Prompt: "Continue." } });
+    setTimeout(() => {
+      idle(sessionId, { sessionUpdate: "tool_call_update", toolCallId: sched, status: "completed", content: [{ type: "content", content: { type: "text", text: "timer fired" } }] });
+      idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Schedule fired: DONE." } });
+      idle(sessionId, { sessionUpdate: "usage_update", used: 9400, size: 1048576 });
+    }, WAKE_MS);
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Waiting for the schedule." } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 9000, size: 1048576 });
+    return "end_turn";
+  }
+  if (/subagent/i.test(text)) {
+    const callId = `call_sub_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: callId, title: "Run invoke_subagent", kind: "other", status: "completed", rawInput: { TypeName: "research", Role: "Researcher", Prompt: "Check files" } });
+    const home = process.env.ANTIGRAVITY_CLI_HOME;
+    if (home) {
+      const childId = `child-${seq++}`;
+      const subDir = `${home}/brain/${sessionId}/.system_generated/subagents`;
+      const childInbox = `${home}/brain/${childId}/.system_generated/messages`;
+      const parentInbox = `${home}/brain/${sessionId}/.system_generated/messages`;
+      fs.mkdirSync(subDir, { recursive: true });
+      fs.mkdirSync(childInbox, { recursive: true });
+      fs.writeFileSync(`${subDir}/${childId}.json`, JSON.stringify({ conversationId: childId, state: "SUBAGENT_STATE_RUNNING" }));
+      fs.writeFileSync(`${childInbox}/launch.json`, JSON.stringify({ sender: sessionId, sourceMetadata: { tool: { toolCall: { id: callId, name: "invoke_subagent" } } } }));
+      setTimeout(() => {
+        fs.mkdirSync(parentInbox, { recursive: true });
+        fs.writeFileSync(`${parentInbox}/report.json`, JSON.stringify({ id: "report", sender: childId, priority: "MESSAGE_PRIORITY_HIGH" }));
+        fs.writeFileSync(`${parentInbox}/read.json`, JSON.stringify({ report: true }));
+        idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Subagent finished." } });
+        idle(sessionId, { sessionUpdate: "usage_update", used: 9500, size: 1048576 });
+      }, WAKE_MS);
+    }
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Subagent launched; waiting." } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 9000, size: 1048576 });
+    return "end_turn";
+  }
+  if (/pending-inbox/i.test(text)) {
+    const job1 = `bg_${seq++}`;
+    const home = process.env.ANTIGRAVITY_CLI_HOME;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: job1, title: "job 1", kind: "execute", status: "in_progress", rawInput: { CommandLine: "job 1", WaitMsBeforeAsync: 10000 } });
+    // Command finishes BEFORE end_turn, leaving an unread high-priority wake in the inbox.
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: job1, status: "completed", content: [{ type: "content", content: { type: "text", text: "job 1 done" } }] });
+    if (home) {
+      const inbox = `${home}/brain/${sessionId}/.system_generated/messages`;
+      const logs = `${home}/brain/${sessionId}/.system_generated/logs`;
+      fs.mkdirSync(inbox, { recursive: true });
+      fs.mkdirSync(logs, { recursive: true });
+      fs.writeFileSync(`${inbox}/msg-1.json`, JSON.stringify({ id: "msg-1", priority: "MESSAGE_PRIORITY_HIGH", sender: `${sessionId}/task-1` }));
+      setTimeout(() => {
+        fs.writeFileSync(`${inbox}/read.json`, JSON.stringify({ "msg-1": true }));
+        fs.writeFileSync(`${logs}/transcript.jsonl`, `${JSON.stringify({ step_index: 2, type: "PLANNER_RESPONSE", status: "DONE", content: "Mix finished." })}\n`);
+        idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Mix finished." } });
+        idle(sessionId, { sessionUpdate: "usage_update", used: 9600, size: 1048576 });
+      }, WAKE_MS);
+    }
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Waiting for the job." } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 9000, size: 1048576 });
+    return "end_turn";
+  }
   if (/multistep/i.test(text)) {
     const job1 = `bg_${seq++}`;
     const step2 = `bg_${seq++}`;
@@ -156,27 +224,44 @@ function backgroundTurn(sessionId, text) {
     setTimeout(() => {
       idle(sessionId, { sessionUpdate: "tool_call_update", toolCallId: step3, status: "completed", content: [{ type: "content", content: { type: "text", text: "clean" } }] });
       idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Multi-step wake complete." } });
+      idle(sessionId, { sessionUpdate: "usage_update", used: 9800, size: 1048576 });
     }, WAKE_MS * 3);
     update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Waiting for " } });
     update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "the job." } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 9000, size: 1048576 });
     return "end_turn";
   }
+  const isDaemon = /daemon/i.test(text);
   const jobs = /twice/i.test(text) ? 2 : 1;
+  const thinkDelay = Number(process.env.FAKE_ACP_THINK_MS || 0);
   for (let job = 1; job <= jobs; job++) {
     const toolCallId = `bg_${seq++}`;
-    update(sessionId, { sessionUpdate: "tool_call", toolCallId, title: `job ${job}`, kind: "execute", status: "in_progress", rawInput: { command: `job ${job}` } });
+    update(sessionId, {
+      sessionUpdate: "tool_call",
+      toolCallId,
+      title: `job ${job}`,
+      kind: "execute",
+      status: "in_progress",
+      rawInput: isDaemon ? { CommandLine: `serve ${job}`, IsDaemon: true } : { command: `job ${job}` },
+    });
     setTimeout(() => {
       idle(sessionId, { sessionUpdate: "tool_call_update", toolCallId, status: "completed", content: [{ type: "content", content: { type: "text", text: `job ${job} done` } }] });
-      idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `Job ${job} is back.` } });
-      idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Job ${job} finished: ` } });
-      idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "all good." } });
-      if (/trail/i.test(text) && job === 1) {
-        idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Trailing idle thought." } });
-      }
+      const emitReply = () => {
+        idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `Job ${job} is back.` } });
+        idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Job ${job} finished: ` } });
+        idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "all good." } });
+        if (/trail/i.test(text) && job === 1) {
+          idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Trailing idle thought." } });
+        }
+        idle(sessionId, { sessionUpdate: "usage_update", used: 9200 + job * 100, size: 1048576 });
+      };
+      if (thinkDelay > 0) setTimeout(emitReply, thinkDelay);
+      else emitReply();
     }, WAKE_MS * job);
   }
   update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Waiting for " } });
   update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "the job." } });
+  update(sessionId, { sessionUpdate: "usage_update", used: 9000, size: 1048576 });
   return "end_turn";
 }
 
@@ -324,7 +409,7 @@ async function handle(msg) {
       reply(msg.id, {
         protocolVersion: Math.min(Number(msg.params?.protocolVersion) || 1, AGY ? 2 : 1),
         agentCapabilities: { loadSession: AGY, sessionCapabilities: { resume: {}, list: {}, close: {}, ...(AGY ? { load: {} } : {}) } },
-        agentInfo: AGY ? { name: "Antigravity ACP Server", title: "Fake agy", version: "0.0.0" } : { name: "fake-dsh", title: "Fake DSH", version: "0.0.0" },
+        agentInfo: AGY ? { name: "Antigravity ACP Server", title: "Fake agy", version: process.env.FAKE_ACP_VERSION || "1.5.14" } : { name: "fake-dsh", title: "Fake DSH", version: "0.0.0" },
       });
       return;
     case "session/new": {
@@ -385,8 +470,17 @@ async function handle(msg) {
     case "session/prompt": {
       const s = sessions.get(p.sessionId);
       if (!s) return replyErr(msg.id, -32602, "unknown session");
-      if (inflightPrompt) return replyErr(msg.id, -32602, "prompt already in flight");
       const text = (p.prompt || []).map((c) => c?.text || "").join("\n");
+      if (inflightPrompt) {
+        if (AGY) {
+          // agy >= 1.5.0 treats a prompt arriving mid-turn as a steer: resolve the
+          // earlier prompt `end_turn` and continue under the new one without cancelling.
+          reply(inflightPrompt.id, { stopReason: "end_turn" });
+          inflightPrompt = undefined;
+        } else {
+          return replyErr(msg.id, -32602, "prompt already in flight");
+        }
+      }
       if (AGY) {
         // Frames agy still holds go out ahead of the prompt's echo.
         for (const u of s.backlog.splice(0)) sendUpdate(p.sessionId, u);
