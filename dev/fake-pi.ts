@@ -216,7 +216,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     let isStreaming = false;
     /** Calls made so far: each has an id of its own, as an engine's do. */
     let calls = 0;
-    const queued = { steering: [] as string[], followUp: [] as string[] };
+    const queued = { steering: [] as { text: string; images?: ImageContent[] }[], followUp: [] as { text: string; images?: ImageContent[] }[] };
+    const queueTexts = () => ({ steering: queued.steering.map((q) => q.text), followUp: queued.followUp.map((q) => q.text) });
     let isCompacting = false;
     const snapshotState = (): SessionState => ({
       model: currentModel,
@@ -251,7 +252,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     /** One run: thinking, a tool call that "executes", then streamed prose. */
     const uiWaiters = new Map<string, (response: Record<string, unknown>) => void>();
 
-    const dequeueNextBatch = (): string[] => {
+    const dequeueNextBatch = (): { text: string; images?: ImageContent[] }[] => {
       if (queued.steering.length > 0) {
         return steeringMode === "all" ? queued.steering.splice(0) : [queued.steering.shift()!];
       }
@@ -280,13 +281,13 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       while (!aborted) {
         const batch = dequeueNextBatch();
         if (batch.length === 0) break;
-        emit({ type: "queue_update", steering: [...queued.steering], followUp: [...queued.followUp] });
+        emit({ type: "queue_update", ...queueTexts() });
         await step({ type: "agent_start" });
         await step({ type: "turn_start" });
-        for (const text of batch) {
+        for (const item of batch) {
           if (aborted) break;
           bumpListedSession();
-          const queuedUser: AgentMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+          const queuedUser: AgentMessage = { role: "user", content: [{ type: "text", text: item.text }, ...(item.images ?? [])], timestamp: Date.now() };
           await step({ type: "message_start", message: queuedUser });
           await step({ type: "message_end", message: queuedUser });
           recordMessage(queuedUser);
@@ -338,10 +339,10 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       };
       /** A message sent into the run goes in between the agent's own, as Pi delivers it: after the calls of the one before. */
       const steer = async () => {
-        const text = queued.steering.shift();
-        if (text === undefined || aborted) return;
-        emit({ type: "queue_update", steering: queued.steering, followUp: queued.followUp });
-        const steered: AgentMessage = { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+        const next = queued.steering.shift();
+        if (next === undefined || aborted) return;
+        emit({ type: "queue_update", ...queueTexts() });
+        const steered: AgentMessage = { role: "user", content: [{ type: "text", text: next.text }, ...(next.images ?? [])], timestamp: Date.now() };
         await step({ type: "message_start", message: steered });
         await step({ type: "message_end", message: steered });
         file(steered);
@@ -781,8 +782,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           if (msgText.includes("refuse")) throw new Error("No API key found for the selected model.");
           if (isStreaming) {
             const bucket = command.streamingBehavior === "steer" ? queued.steering : queued.followUp;
-            bucket.push(msgText);
-            emit({ type: "queue_update", steering: queued.steering, followUp: queued.followUp });
+            bucket.push({ text: msgText, images: command.images as ImageContent[] | undefined });
+            emit({ type: "queue_update", ...queueTexts() });
             return { disposition: "queued" };
           }
           void run(msgText, command.images as ImageContent[] | undefined);
@@ -800,7 +801,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           cancelRetry?.();
           return undefined;
         case "clear_queue": {
-          const cleared = { steering: [...queued.steering], followUp: [...queued.followUp] };
+          const cleared = queueTexts();
           queued.steering.length = 0;
           queued.followUp.length = 0;
           emit({ type: "queue_update", steering: [], followUp: [] });

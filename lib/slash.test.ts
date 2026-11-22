@@ -66,6 +66,8 @@ test("finds a command's argument values by value, then by what they are called",
 
 test("parses a finished line into a command and what follows it", () => {
   expect(parseSlashLine("/new")).toEqual({ name: "new", args: "" });
+  expect(parseSlashLine("/new ")).toEqual({ name: "new", args: "" });
+  expect(parseSlashLine("/security-review ")).toEqual({ name: "security-review", args: "" });
   expect(parseSlashLine("  /compact keep the plan ")).toEqual({ name: "compact", args: "keep the plan" });
   expect(parseSlashLine("/delegate claude review\nthe diff")).toEqual({ name: "delegate", args: "claude review\nthe diff" });
   expect(parseSlashLine("/Users/pip/notes.txt explain")).toBe(undefined);

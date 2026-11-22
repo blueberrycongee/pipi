@@ -806,7 +806,6 @@ const appCommands = computed<ComposerCommand[]>(() => {
     ...(onPi ? [own("export", tr("Export the session as HTML", "导出为 HTML"), ["html", "导出"])] : []),
     own("delegate", tr("Hand a task to another agent", "把任务委派给另一个智能体"), ["subagent", "委派", "子智能体"], {
       argumentHint: tr("<agent> <task>", "<智能体> <任务>"),
-      needsArguments: true,
       options: agents()
         .filter((agent) => agent.available)
         .map((agent) => ({ value: agent.id, description: agent.name })),
@@ -3162,7 +3161,7 @@ export async function send(mode: "steer" | "followUp" = "steer") {
       // through its revival — takes the bubble now: the send reads as waiting
       // there rather than as nothing, and the landing carries it across.
       const stageIn = ahead?.transcript === transcript || (revival && !heading()) ? transcript : undefined;
-      const preStagedId = stageIn?.stageUser(text, images.length);
+      const preStagedId = stageIn?.stageUser(text, images);
       batch(() => {
         draft.set("");
         attachments.set([]);
@@ -3303,7 +3302,7 @@ async function dispatchPrompt(
       runTranscript.keepStaged(stagedId);
     } else {
       if (preStaged) preStaged.transcript.dropStagedUser(preStaged.id);
-      stagedId = runTranscript.stageUser(text, images.length, queued);
+      stagedId = runTranscript.stageUser(text, images, queued);
     }
     if (stagedId) queuedSends.set(stagedId, { held: runTranscript, wire: wirePrompt, images, mode, ...(handoff ? { handoff } : {}) });
     if (runTranscript === transcript) flush();

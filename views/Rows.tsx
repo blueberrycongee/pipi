@@ -1,11 +1,13 @@
-import { cleanup, createAnimatedValue, effect, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
+import { cleanup, createAnimatedValue, effect, Image, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
 import type { JSX, ViewRef } from "nsh";
 import { Collapsible, TextView } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { clip } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
 import { type DocPart, splitDocMessage } from "../lib/doc-wire";
+import { fitImageBox, imageSizeFromBase64 } from "../lib/image-size";
 import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
+import type { ImageContent } from "../pi/protocol";
 import { type Row, type ToolRow, withoutHandoff, withoutImageNotes } from "../pi/transcript";
 import {
   type ActivityRow,
@@ -30,6 +32,7 @@ import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from 
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
+import { openZoom } from "../ui/Zoom";
 import { readingType, codeType, uiHeight, uiType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
 import { clearProseState, proseClasses, ProseBlock, proseVeilUntil, type ProseRow } from "./Prose";
@@ -450,6 +453,106 @@ export function enterConversation(key: number) {
  */
 const userLineCounts = signal<Record<string, number>>({});
 
+const ZOOM_IMAGE_BOUNDS = {
+  maxWidth: 880,
+  maxHeight: 520,
+  fallback: { width: 640, height: 420 },
+  upscale: false,
+};
+
+function zoomUserImage(image: ImageContent, title?: string) {
+  const src = `data:${image.mimeType};base64,${image.data}`;
+  const box = fitImageBox(imageSizeFromBase64(image), ZOOM_IMAGE_BOUNDS);
+  openZoom({
+    title,
+    render: () => (
+      <View class="w-full items-center justify-center">
+        <Image
+          src={src}
+          style={{ width: box.width, height: box.height, objectFit: "contain" }}
+          class="rounded-lg corner-squircle"
+          accessibilityLabel={title ?? tr("Image preview", "图片预览")}
+        />
+      </View>
+    ),
+  });
+}
+
+function UserImages(props: {
+  images: readonly ImageContent[];
+  missing: number;
+  onContextMenu: (e: { pagePosition: { x: number; y: number } }) => void;
+}) {
+  const totalCount = () => props.images.length + props.missing;
+
+  return (
+    <If
+      when={props.images.length > 0}
+      else={
+        <View
+          testID="message-image-fallback"
+          onContextMenu={props.onContextMenu}
+          class="select-none flex-row items-center gap-1.5 rounded-xl corner-squircle border-[0.5px] border-hairline bg-secondary/70 px-2.5 py-1.5"
+        >
+          <Icon name="image" size={14} tone="muted-foreground" />
+          <Text class={`${uiType("xs")} text-muted-foreground`}>
+            {tr(props.missing === 1 ? "1 image" : `${props.missing} images`, `${props.missing} 张图片`)}
+          </Text>
+        </View>
+      }
+    >
+      <View class="max-w-full flex-row flex-wrap justify-end gap-1.5" onContextMenu={props.onContextMenu}>
+        <Each of={props.images} key="index">
+          {(image, index) => (
+            <View
+              testID="message-image"
+              role="button"
+              onPress={() =>
+                zoomUserImage(
+                  image(),
+                  totalCount() > 1
+                    ? tr(`Image ${index() + 1} of ${totalCount()}`, `图片 ${index() + 1} / ${totalCount()}`)
+                    : undefined,
+                )
+              }
+              onContextMenu={props.onContextMenu}
+              accessibilityLabel={
+                totalCount() > 1
+                  ? tr(`Preview image ${index() + 1}`, `预览第 ${index() + 1} 张图片`)
+                  : tr("Preview image", "预览图片")
+              }
+              tooltip={tip(tr("Preview image", "预览图片"))}
+              class={`relative size-18 shrink-0 overflow-hidden rounded-xl corner-squircle bg-secondary ${PRESS} ${PRESS_SCALE} ${FOCUS_RING}`}
+            >
+              <Image
+                src={`data:${image().mimeType};base64,${image().data}`}
+                class="size-full"
+                style={{ objectFit: "cover" }}
+                accessibilityLabel={
+                  totalCount() > 1
+                    ? tr(`Sent image ${index() + 1}`, `已发送的图片 ${index() + 1}`)
+                    : tr("Sent image", "已发送的图片")
+                }
+              />
+              {/* The edge is drawn over the pixels, so a white screenshot still has one. */}
+              <View class="pointer-events-none absolute inset-0 rounded-xl corner-squircle border-[0.5px] border-hairline-hover" />
+            </View>
+          )}
+        </Each>
+        <If when={props.missing > 0}>
+          <View
+            testID="message-image-fallback"
+            class="size-18 shrink-0 select-none items-center justify-center gap-1 rounded-xl corner-squircle border-[0.5px] border-hairline bg-secondary/70"
+          >
+            <Icon name="image" size={16} tone="muted-foreground" />
+            <Text class={`${uiType("xs")} text-muted-foreground`}>+{props.missing}</Text>
+          </View>
+        </If>
+      </View>
+    </If>
+  );
+}
+
 function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   // The fork command names a message by its place among the user's messages on screen.
   const ordinal = () =>
@@ -523,90 +626,95 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
     }
   });
 
+  const imageBlocks = () => props.row.imageBlocks ?? [];
+  const missingImages = () => Math.max(0, props.row.images - imageBlocks().length);
+  const hasImages = () => imageBlocks().length > 0 || missingImages() > 0;
+  const hasBubble = () => Boolean(said()) || parts().docs.length > 0;
+
+  const contextMenu = (e: { pagePosition: { x: number; y: number } }) =>
+    Menu.popup(
+      [
+        ...(props.row.text ? [{ label: tr("Copy", "复制"), onSelect: () => void copyText(props.row.text) }] : []),
+        // There is nothing in the session to fork at until the agent takes the message.
+        ...(queued()
+          ? [
+              { label: tr("Edit", "编辑"), onSelect: () => recallQueuedRow(props.row, true) },
+              { label: tr("Remove From Queue", "从队列中移除"), onSelect: () => recallQueuedRow(props.row, false) },
+            ]
+          : [{ label: tr("Fork From Here", "从此处创建分支"), onSelect: () => void forkFrom(ordinal()) }]),
+      ],
+      e.pagePosition,
+    );
+
   return (
     <View ref={(node: ViewRef) => hostNode.set(node)} class="group items-end">
-      <View
-        class="max-w-[70%] gap-1.5 rounded-2xl rounded-br-md corner-squircle bg-secondary px-3.5 py-2.5"
-        style={{ opacity: bubbleOpacity }}
-        selectable
-        onContextMenu={(e) =>
-          Menu.popup(
-            [
-              { label: tr("Copy", "复制"), onSelect: () => void copyText(props.row.text) },
-              // There is nothing in the session to fork at until the agent takes the message.
-              ...(queued()
-                ? [
-                    { label: tr("Edit", "编辑"), onSelect: () => recallQueuedRow(props.row, true) },
-                    { label: tr("Remove From Queue", "从队列中移除"), onSelect: () => recallQueuedRow(props.row, false) },
-                  ]
-                : [{ label: tr("Fork From Here", "从此处创建分支"), onSelect: () => void forkFrom(ordinal()) }]),
-            ],
-            e.pagePosition,
-          )
-        }
-      >
-        <If when={said()}>
-          {/* While folded the whole message takes the press; while open it is plain selectable text again. */}
-          <View
-            role={folded() ? "button" : undefined}
-            onPress={folded() ? fold : undefined}
-            accessibilityState={folded() ? { expanded: false } : undefined}
-          >
-            <Text
-              class={`${readingType()} text-secondary-foreground ${folded() ? "line-clamp-6" : ""}`}
-              style={folded() ? { maskImage: "linear-gradient(to bottom, black 64%, transparent 94%)" } : undefined}
-              onTextLayout={(e) => {
-                const n = e.lines.length;
-                // Fewer lines than the text's own breaks (or a zero-height headless stub box) is not a real layout pass.
-                if (n < hardBreakLines(said()) || (n === 1 && (e.lines[0]?.bounds.size.height ?? 0) === 0)) return;
-                if (folded() && n >= USER_FOLD_LINES) return;
-                const key = measureKey();
-                if (n !== userLineCounts()[key]) userLineCounts.update((all) => ({ ...all, [key]: n }));
-              }}
-            >
-              {said()}
-            </Text>
-          </View>
+      <View class="max-w-[70%] items-end gap-1.5" style={{ opacity: bubbleOpacity }}>
+        <If when={hasImages()}>
+          <UserImages images={imageBlocks()} missing={missingImages()} onContextMenu={contextMenu} />
         </If>
-        {/* A document that rode on the message is named, not printed: its words are in the document, a press away. */}
-        <Each of={parts().docs} key="index">
-          {(doc) => (
-            <View
-              testID="message-doc"
-              role="button"
-              onPress={() => void openDocIfThere(doc().path)}
-              tooltip={tip(tr("Open the document", "打开文档"))}
-              class={`group -mx-1 select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle px-1 py-0.5 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
-            >
-              <Icon name="file" size={14} tone="muted-foreground" />
-              <Text class={`shrink truncate ${uiType("xs")} text-muted-foreground transition-colors duration-100 group-hover:text-foreground`}>
-                {(doc().excerpt ? "" : titleLine(doc().text, true)) || docTabTitle(doc().path)}
-                {doc().excerpt ? tr(" · selection", " · 选中的内容") : ""}
-              </Text>
-            </View>
-          )}
-        </Each>
-        <If when={props.row.images > 0}>
-          <View class="select-none flex-row items-center gap-1.5">
-            <Icon name="image" size={14} tone="muted-foreground" />
-            <Text class={`${uiType("xs")} text-muted-foreground`}>
-              {tr(props.row.images === 1 ? "1 image" : `${props.row.images} images`, `${props.row.images} 张图片`)}
-            </Text>
-          </View>
-        </If>
-        <If when={foldable()}>
+        <If when={hasBubble()}>
           <View
-            role="button"
-            onPress={fold}
-            accessibilityState={{ expanded: open() }}
-            accessibilityLabel={open() ? tr("Collapse message", "收起消息") : tr("Expand message", "展开消息")}
-            class={`-mx-1 -mb-1 h-5 select-none items-center justify-center rounded-md corner-squircle ${PRESS} ${FOCUS_RING}`}
+            testID="message-bubble"
+            class="max-w-full gap-1.5 rounded-2xl rounded-br-md corner-squircle bg-secondary px-3.5 py-2.5"
+            selectable
+            onContextMenu={contextMenu}
           >
-            <View
-              class={`transition-transform duration-200 ease-out-quint motion-reduce:transition-none ${open() ? "rotate-180" : ""}`}
-            >
-              <Icon name="chevronDown" size={12} tone="muted-foreground" />
-            </View>
+            <If when={said()}>
+              {/* While folded the whole message takes the press; while open it is plain selectable text again. */}
+              <View
+                role={folded() ? "button" : undefined}
+                onPress={folded() ? fold : undefined}
+                accessibilityState={folded() ? { expanded: false } : undefined}
+              >
+                <Text
+                  class={`${readingType()} text-secondary-foreground ${folded() ? "line-clamp-6" : ""}`}
+                  style={folded() ? { maskImage: "linear-gradient(to bottom, black 64%, transparent 94%)" } : undefined}
+                  onTextLayout={(e) => {
+                    const n = e.lines.length;
+                    // Fewer lines than the text's own breaks (or a zero-height headless stub box) is not a real layout pass.
+                    if (n < hardBreakLines(said()) || (n === 1 && (e.lines[0]?.bounds.size.height ?? 0) === 0)) return;
+                    if (folded() && n >= USER_FOLD_LINES) return;
+                    const key = measureKey();
+                    if (n !== userLineCounts()[key]) userLineCounts.update((all) => ({ ...all, [key]: n }));
+                  }}
+                >
+                  {said()}
+                </Text>
+              </View>
+            </If>
+            {/* A document that rode on the message is named, not printed: its words are in the document, a press away. */}
+            <Each of={parts().docs} key="index">
+              {(doc) => (
+                <View
+                  testID="message-doc"
+                  role="button"
+                  onPress={() => void openDocIfThere(doc().path)}
+                  tooltip={tip(tr("Open the document", "打开文档"))}
+                  class={`group -mx-1 select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle px-1 py-0.5 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
+                >
+                  <Icon name="file" size={14} tone="muted-foreground" />
+                  <Text class={`shrink truncate ${uiType("xs")} text-muted-foreground transition-colors duration-100 group-hover:text-foreground`}>
+                    {(doc().excerpt ? "" : titleLine(doc().text, true)) || docTabTitle(doc().path)}
+                    {doc().excerpt ? tr(" · selection", " · 选中的内容") : ""}
+                  </Text>
+                </View>
+              )}
+            </Each>
+            <If when={foldable()}>
+              <View
+                role="button"
+                onPress={fold}
+                accessibilityState={{ expanded: open() }}
+                accessibilityLabel={open() ? tr("Collapse message", "收起消息") : tr("Expand message", "展开消息")}
+                class={`-mx-1 -mb-1 h-5 select-none items-center justify-center rounded-md corner-squircle ${PRESS} ${FOCUS_RING}`}
+              >
+                <View
+                  class={`transition-transform duration-200 ease-out-quint motion-reduce:transition-none ${open() ? "rotate-180" : ""}`}
+                >
+                  <Icon name="chevronDown" size={12} tone="muted-foreground" />
+                </View>
+              </View>
+            </If>
           </View>
         </If>
       </View>

@@ -183,6 +183,103 @@ function backgroundTurn(sessionId, text) {
     update(sessionId, { sessionUpdate: "usage_update", used: 9000, size: 1048576 });
     return "end_turn";
   }
+  if (/swarm-wait/i.test(text)) {
+    const postId = `call_post_${seq++}`;
+    const waitId = `call_swait_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: postId, title: "Run post_message", kind: "other", status: "in_progress", rawInput: { text: "@fixer go" } });
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: waitId, title: "Run swarm_wait", kind: "other", status: "in_progress", rawInput: { since: 5 } });
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: postId, status: "completed", content: [{ type: "content", content: { type: "text", text: "" } }] });
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: waitId, status: "completed", content: [{ type: "content", content: { type: "text", text: "" } }] });
+    update(sessionId, { sessionUpdate: "usage_update", used: 9100, size: 1048576 });
+    if (/chain/i.test(text)) {
+      setTimeout(() => {
+        const readId = `call_read_${seq++}`;
+        const wait2 = `call_swait_${seq++}`;
+        idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Worker 1 done; dispatching verifier." } });
+        idle(sessionId, { sessionUpdate: "tool_call", toolCallId: readId, title: "Run read_board", kind: "other", status: "completed", rawInput: { since: 5 } });
+        idle(sessionId, { sessionUpdate: "tool_call", toolCallId: wait2, title: "Run swarm_wait", kind: "other", status: "completed", rawInput: { since: 6 } });
+        idle(sessionId, { sessionUpdate: "usage_update", used: 9300, size: 1048576 });
+      }, WAKE_MS);
+      setTimeout(() => {
+        idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Verifier passed." } });
+        idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Swarm chain finished: verified." } });
+        idle(sessionId, { sessionUpdate: "usage_update", used: 9600, size: 1048576 });
+      }, WAKE_MS * 2 + 250);
+    } else if (!/never/i.test(text)) {
+      setTimeout(() => {
+        const readId = `call_read_${seq++}`;
+        idle(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Reading board result." } });
+        idle(sessionId, { sessionUpdate: "tool_call", toolCallId: readId, title: "Run read_board", kind: "other", status: "completed", rawInput: { since: 5 } });
+        idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Swarm finished: all tests green." } });
+        idle(sessionId, { sessionUpdate: "usage_update", used: 9500, size: 1048576 });
+      }, WAKE_MS);
+    }
+    return "end_turn";
+  }
+  if (/swarm-immediate/i.test(text)) {
+    const waitId = `call_swait_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: waitId, title: "Run swarm_wait", kind: "other", status: "completed", rawInput: { since: 5 } });
+    update(sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Board already has a new post." } });
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Board already updated." } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 9200, size: 1048576 });
+    return "end_turn";
+  }
+  if (/swarm-killed/i.test(text)) {
+    const waitId = `call_swait_${seq++}`;
+    const home = process.env.ANTIGRAVITY_CLI_HOME;
+    if (home) {
+      const workerId = `worker-${seq++}`;
+      const subDir = `${home}/brain/${sessionId}/.system_generated/subagents`;
+      fs.mkdirSync(subDir, { recursive: true });
+      const workerFile = `${subDir}/${workerId}.json`;
+      fs.writeFileSync(
+        workerFile,
+        JSON.stringify({ conversationId: workerId, subagentDescriptor: { typeName: "worker", role: "Swarm Worker (fixer)" }, state: "SUBAGENT_STATE_ALIVE" }),
+      );
+      setTimeout(() => {
+        fs.writeFileSync(
+          workerFile,
+          JSON.stringify({ conversationId: workerId, subagentDescriptor: { typeName: "worker", role: "Swarm Worker (fixer)" }, state: "SUBAGENT_STATE_KILLED" }),
+        );
+      }, WAKE_MS);
+    }
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: waitId, title: "Run swarm_wait", kind: "other", status: "completed", rawInput: { since: 5 } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 9100, size: 1048576 });
+    return "end_turn";
+  }
+  if (/swarm-async/i.test(text)) {
+    const addId = `call_swarm_${seq++}`;
+    const home = process.env.ANTIGRAVITY_CLI_HOME;
+    if (home) {
+      const workerId = `worker-${seq++}`;
+      const monitorId = `monitor-${seq++}`;
+      const subDir = `${home}/brain/${sessionId}/.system_generated/subagents`;
+      const workerLogs = `${home}/brain/${workerId}/.system_generated/logs`;
+      const monitorLogs = `${home}/brain/${monitorId}/.system_generated/logs`;
+      fs.mkdirSync(subDir, { recursive: true });
+      fs.mkdirSync(workerLogs, { recursive: true });
+      fs.mkdirSync(monitorLogs, { recursive: true });
+      const workerFile = `${subDir}/${workerId}.json`;
+      fs.writeFileSync(
+        workerFile,
+        JSON.stringify({ conversationId: workerId, subagentDescriptor: { typeName: "worker", role: "Swarm Worker (fixer)" }, state: "SUBAGENT_STATE_ALIVE" }),
+      );
+      fs.writeFileSync(
+        `${subDir}/${monitorId}.json`,
+        JSON.stringify({ conversationId: monitorId, subagentDescriptor: { typeName: "worker", role: "Swarm Worker (monitor)" }, state: "SUBAGENT_STATE_ALIVE" }),
+      );
+      // Monitor is parked in swarm_wait; fixer is actively mid-turn.
+      fs.writeFileSync(`${monitorLogs}/transcript.jsonl`, `${JSON.stringify({ step_index: 1, type: "GENERIC", status: "DONE", content: "Waiting for a message that calls on you by name." })}\n`);
+      fs.writeFileSync(`${workerLogs}/transcript.jsonl`, `${JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", status: "DONE", tool_calls: [{ name: "run_command" }] })}\n`);
+      setTimeout(() => {
+        fs.writeFileSync(`${workerLogs}/transcript.jsonl`, `${JSON.stringify({ step_index: 2, type: "GENERIC", status: "DONE", content: "Waiting for a message that calls on you by name." })}\n`);
+      }, WAKE_MS);
+    }
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: addId, title: "Run swarm", kind: "other", status: "completed", rawInput: { action: "add", name: "fixer", brief: "Fix it" } });
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Swarm started." } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 9100, size: 1048576 });
+    return "end_turn";
+  }
   if (/pending-inbox/i.test(text)) {
     const job1 = `bg_${seq++}`;
     const home = process.env.ANTIGRAVITY_CLI_HOME;

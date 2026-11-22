@@ -317,7 +317,11 @@ tray, ahead of the images (56 high, 208 wide: a file tile, its name, "Document"
 or "Selection"); a press goes back to the document, ✕ on hover removes it, and
 the field's hint says the rule — words are what to do with it, none sends it as
 it is. In the sent bubble it is named, not printed: a `text-xs` line with the
-file mark under the words, like the images line, and a press opens it.
+file mark under the words, and a press opens it. Sent images sit right above
+the bubble as uniform compact `72pt` squircle preview tiles (`rounded-xl`,
+co-designed with the bubble's `secondary` surface; pressing opens the full
+aspect-ratio zoom layer), keeping the bubble for words alone — and omitting
+it when only images were sent.
 
 The composer's own door to a document is an `expand` mark at the field's top
 right, there from the draft's third line on (⌘E): a draft that long is
@@ -556,9 +560,9 @@ need it.
   an engine's command of such a name is not offered: it would change the
   engine behind the conversation on screen. A row says what the command takes
   and whose it is; a name nothing answers to gets one line saying so, since
-  the line then goes to the engine as written. Choosing a row (Enter, a
-  press) runs it; Tab fills it in so arguments can follow; a command whose name
-  alone does nothing (`/delegate`) is filled in either way, and offers what its
+  the line then goes to the engine as written. Choosing a row (Enter, Tab, or a
+  press) confirms it into the draft so arguments can follow (or a second Enter
+  sends it); a command with argument options (`/delegate`) then offers what its
   first argument may be. Escape closes the menu before it does anything else,
   and leaves the draft. There is one mark: it follows the arrow keys, and the
   pointer once it moves. What the menu lists is what `send` runs — a name pipi
@@ -570,7 +574,7 @@ need it.
 
 | Row | Look |
 |---|---|
-| User | Right-aligned bubble, `secondary`, max 70%; a message laid out past six lines folds to a preview that fades into a chevron at the bubble's foot — the press opens it, the chevron folds it back |
+| User | Right-aligned `secondary` bubble for text (max 70%), with real image previews right above it (no empty bubble for image-only messages; pressing opens the zoom layer); a message laid out past six lines folds to a preview that fades into a chevron at the bubble's foot — the press opens it, the chevron folds it back |
 | Reply | Unboxed Markdown, selectable; newly arrived text dissolves in through an opacity veil (`RowVeil`) |
 | Thinking | One line ("Thought for 4s" / "Thinking…"), collapsed by default; opens to quiet prose on a hairline |
 | Tool call | One line: status mark, **verb**, target (mono for paths/commands), meta, diff badge; opens to sunken output or a diff |

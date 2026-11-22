@@ -13,8 +13,6 @@ export interface ComposerCommand {
   source: SlashCommand["source"] | "app";
   /** What follows the name, as the menu shows it: `<agent> <task>`, `[instructions]`. */
   argumentHint?: string;
-  /** The name alone does nothing: choosing it fills it in instead of running it. */
-  needsArguments?: boolean;
   /**
    * Other names it answers to: what an engine's own tool calls the same action
    * (`/clear` for `/new`). Typed in full they run it, and they are its names as

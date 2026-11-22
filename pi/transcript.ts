@@ -11,7 +11,7 @@ import type { AgentMessage, AssistantMessage, AssistantMessageEvent, ImageConten
  */
 export type Row =
   /** `queued`: staged behind the agent's queue — on screen, but not sent into the run yet. */
-  | { kind: "user"; id: string; text: string; images: number; queued?: boolean }
+  | { kind: "user"; id: string; text: string; images: number; imageBlocks?: ImageContent[]; queued?: boolean }
   | ({ kind: "text"; id: string; text: string; streaming: boolean; /** The prose of a message that called no tools: the turn's answer. Known once the message ended. */ final?: boolean } & TurnStamp)
   | ({ kind: "thinking"; id: string; text: string; streaming: boolean; redacted: boolean; durationMs?: number } & TurnStamp)
   | ToolRow
@@ -104,7 +104,12 @@ export function sameVisualRow(a: Row, b: Row): boolean {
   switch (a.kind) {
     case "user": {
       const bu = b as Extract<Row, { kind: "user" }>;
-      return a.text === bu.text && a.images === bu.images && Boolean(a.queued) === Boolean(bu.queued);
+      return (
+        a.text === bu.text &&
+        a.images === bu.images &&
+        (a.imageBlocks?.length ?? 0) === (bu.imageBlocks?.length ?? 0) &&
+        Boolean(a.queued) === Boolean(bu.queued)
+      );
     }
     case "text": {
       const bt = b as Extract<Row, { kind: "text" }>;
@@ -238,6 +243,11 @@ const textOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
 
 const imagesOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
   typeof content === "string" ? 0 : (content ?? []).filter((block) => block.type === "image").length;
+
+const imageBlocksOf = (content: string | (TextContent | ImageContent)[] | undefined): ImageContent[] =>
+  typeof content === "string"
+    ? []
+    : (content ?? []).filter((block): block is ImageContent => block.type === "image" && typeof block.data === "string" && block.data.length > 0);
 
 /** One `<pipi-message from="s_x" title="…" agent="…" status="…">…</pipi-message>` envelope the daemon delivers. */
 const PIPPI_MESSAGE = /<pipi-message from="([^"]*)" title="([^"]*)" agent="([^"]*)" status="([^"]*)">([\s\S]*?)<\/pipi-message>/g;
@@ -884,11 +894,27 @@ export class Transcript {
   }
 
   /** Stages an outgoing user message so its bubble appears on send, ahead of the agent's echo. */
-  stageUser(rawText: string, images = 0, queued = false): string | undefined {
+  stageUser(rawText: string, images: number | readonly ImageContent[] = 0, queued = false): string | undefined {
     const text = withoutHandoff(withoutImageNotes(rawText));
-    if ((!text && !images) || (!images && pippiDeliveries(text))) return undefined;
+    const imageCount = typeof images === "number" ? images : images.length;
+    const imageBlocks =
+      typeof images === "number"
+        ? []
+        : images.filter((block): block is ImageContent => block.type === "image" && typeof block.data === "string" && block.data.length > 0);
+    if ((!text && !imageCount) || (!imageCount && pippiDeliveries(text))) return undefined;
     const id = this.#id("u");
-    this.#staged.push({ row: { kind: "user", id, text, images, ...(queued ? { queued } : {}) }, t0: Date.now(), queued });
+    this.#staged.push({
+      row: {
+        kind: "user",
+        id,
+        text,
+        images: imageCount,
+        ...(imageBlocks.length ? { imageBlocks } : {}),
+        ...(queued ? { queued } : {}),
+      },
+      t0: Date.now(),
+      queued,
+    });
     this.version++;
     return id;
   }
@@ -1573,16 +1599,25 @@ export class Transcript {
       case "user": {
         const text = withoutHandoff(withoutImageNotes(textOf(message.content)));
         const images = imagesOf(message.content);
+        const imageBlocks = imageBlocksOf(message.content);
         const deliveries = images ? undefined : pippiDeliveries(text);
         if (deliveries) {
           for (const item of deliveries) this.#push({ kind: "delivery", id: this.#id("d"), ...item });
           this.#turnStart = this.#now();
         } else if (text || images) {
           const staged = this.#clock === undefined ? this.#takeStaged(text, images) : undefined;
+          const keptImages = imageBlocks.length ? imageBlocks : staged?.row.imageBlocks;
+          const sameStagedImages = (staged?.row.imageBlocks?.length ?? 0) === (keptImages?.length ?? 0);
           const row: Row =
-            staged && staged.row.text === text && staged.row.images === images && !staged.row.queued
+            staged && staged.row.text === text && staged.row.images === images && sameStagedImages && !staged.row.queued
               ? staged.row
-              : { kind: "user", id: staged ? staged.row.id : this.#id("u"), text, images };
+              : {
+                  kind: "user",
+                  id: staged ? staged.row.id : this.#id("u"),
+                  text,
+                  images,
+                  ...(keptImages?.length ? { imageBlocks: keptImages } : {}),
+                };
           this.#push(row);
           this.#turnStart = staged?.t0 ?? this.#now();
         } else {

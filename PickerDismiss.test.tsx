@@ -25,6 +25,9 @@ test("the sidebar closes the model picker", async () => {
   const app = await launch();
   await app.waitFor("text:Here is the plan.");
   await app.type(MESSAGE, "/model");
+  await app.waitFor(MENU);
+  await app.submit(MESSAGE);
+  await app.waitUntil(() => app.value(MESSAGE) === "/model ");
   await app.submit(MESSAGE);
   await app.waitFor("text:Search models");
   await app.press("text:Workspaces");

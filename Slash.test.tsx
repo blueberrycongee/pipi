@@ -1,8 +1,9 @@
 // The composer's slash menu, as a user meets it: `/` lists what can be run
-// here, Enter runs the marked command, Tab fills it in for arguments, Escape
-// closes the menu. pipi is a shell over many engines: its own commands are the
-// same on each, an engine's own are listed under its name, and a name the
-// shell owns is the shell's whatever the engine calls its own.
+// here, Enter and Tab confirm the marked command into the draft (a second
+// Enter sends it), and Escape closes the menu. pipi is a shell over many
+// engines: its own commands are the same on each, an engine's own are listed
+// under its name, and a name the shell owns is the shell's whatever the engine
+// calls its own.
 //
 //   nsh test Slash.test.tsx
 import { expect, open, test } from "nsh/test";
@@ -40,7 +41,7 @@ test("a slash lists pipi's own commands, then the agent's, and none of the plumb
   await closed(app);
 });
 
-test("Enter runs the marked command; Tab fills it in for its arguments", async () => {
+test("Enter and Tab confirm the marked command; a second Enter sends it", async () => {
   const app = await launch();
   await app.waitFor("text:What are we building?");
 
@@ -50,13 +51,17 @@ test("Enter runs the marked command; Tab fills it in for its arguments", async (
   expect(draft(app)).toBe("/fix-tests ");
   await closed(app);
 
-  // One Enter sends an agent's command: no second press on a line that was already complete.
+  // First Enter confirms the highlighted command into the draft without sending; second Enter sends it.
   await app.clear(MESSAGE);
   await app.type(MESSAGE, "/fix");
   await app.waitFor(MENU);
   await app.submit(MESSAGE);
-  await app.waitUntil(() => draft(app) === "");
+  expect(draft(app)).toBe("/fix-tests ");
   await closed(app);
+  expect(app.texts()).not.toContain("/fix-tests");
+
+  await app.submit(MESSAGE);
+  await app.waitUntil(() => draft(app) === "");
   await app.waitFor("text:/fix-tests");
 });
 
@@ -65,6 +70,11 @@ test("pipi's commands run in the app and are never sent to the agent", async () 
   await app.waitFor("text:Here is the plan.");
 
   await app.type(MESSAGE, "/settings");
+  await app.waitFor(MENU);
+  await app.submit(MESSAGE);
+  expect(draft(app)).toBe("/settings ");
+  await closed(app);
+  expect(app.count("id:settings-nav-agents")).toBe(0);
   await app.submit(MESSAGE);
   await app.waitFor("id:settings-nav-agents");
   expect(draft(app)).toBe("");
@@ -72,14 +82,22 @@ test("pipi's commands run in the app and are never sent to the agent", async () 
   await app.waitUntil(() => app.count("id:settings-nav-agents") === 0);
 
   await app.type(MESSAGE, "/model");
+  await app.waitFor(MENU);
+  await app.submit(MESSAGE);
+  expect(draft(app)).toBe("/model ");
+  await closed(app);
+  expect(app.count("text:Search models")).toBe(0);
   await app.submit(MESSAGE);
   await app.waitFor("text:Search models");
   await app.keyboard.press("escape");
   await app.waitUntil(() => app.count("text:Search models") === 0);
 
-  // Arguments follow a Tab; what a command takes is used, not sent as a message.
+  // Arguments follow Enter confirmation too; what a command takes is used, not sent as a message.
   await app.type(MESSAGE, "/name");
-  await app.keyboard.press("tab");
+  await app.waitFor(MENU);
+  await app.submit(MESSAGE);
+  expect(draft(app)).toBe("/name ");
+  await closed(app);
   await app.type(MESSAGE, "Release plan");
   await app.submit(MESSAGE);
   await app.waitFor("text:Release plan");
@@ -89,6 +107,9 @@ test("pipi's commands run in the app and are never sent to the agent", async () 
   await app.type(MESSAGE, "/clear");
   await app.waitFor(MENU);
   expect(listed(app)).toEqual(["/new"]);
+  await app.submit(MESSAGE);
+  expect(draft(app)).toBe("/new ");
+  await closed(app);
   await app.submit(MESSAGE);
   await app.waitFor("text:What are we building?");
   expect(app.texts()).not.toContain("/clear");
@@ -125,13 +146,22 @@ test("during a run, Escape closes the menu and the run goes on", async () => {
   await app.waitFor("label:Stop");
 });
 
-test("a press on a row chooses it", async () => {
+test("a press on a row confirms it into the draft", async () => {
   const app = await launch();
   await app.waitFor("text:What are we building?");
+  await app.type(MESSAGE, "/fix");
+  await app.waitFor(MENU);
+  await app.press("text:/fix-tests");
+  expect(draft(app)).toBe("/fix-tests ");
+  await closed(app);
+  expect(app.texts()).not.toContain("/fix-tests");
+
+  await app.clear(MESSAGE);
   await app.type(MESSAGE, "/del");
   await app.waitFor(MENU);
   await app.press("text:/delegate");
   expect(draft(app)).toBe("/delegate ");
+  await app.waitFor("text:Claude Code");
 });
 
 test("the arrow keys go around the whole list, and the pointer moves the same mark", async () => {
@@ -165,7 +195,7 @@ test("/delegate waits for its arguments and offers the agents it can name", asyn
   await app.waitFor("text:What are we building?");
   await app.type(MESSAGE, "/del");
   await app.waitFor(MENU);
-  // Its name alone does nothing: Enter fills it in rather than sending it.
+  // Confirming `/delegate` transitions straight into its agent options.
   await app.submit(MESSAGE);
   expect(draft(app)).toBe("/delegate ");
   await app.waitFor("text:Claude Code");
@@ -185,8 +215,50 @@ test("the slash key under a Chinese input method opens the menu, and Chinese fin
   expect(app.texts()).toContain("<智能体> <任务>");
   await app.type("label:消息", "压缩");
   expect(listed(app)).toEqual(["/compact"]);
-  await app.keyboard.press("tab");
+  await app.submit("label:消息");
   expect(app.value("label:消息")).toBe("/compact ");
+  await app.waitUntil(() => app.count("label:命令") === 0);
+
+  await app.clear("label:消息");
+  await app.type("label:消息", "、新建");
+  await app.waitFor("label:命令");
+  expect(listed(app)).toEqual(["/new"]);
+  await app.keyboard.press("tab");
+  expect(app.value("label:消息")).toBe("/new ");
+  await app.waitUntil(() => app.count("label:命令") === 0);
+});
+
+test("Enter during IME composition does not confirm or send; ending composition or choosing a row resumes submits", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+
+  await app.type(MESSAGE, "/fix");
+  await app.waitFor(MENU);
+  await app.compose(MESSAGE, "xiu");
+  await app.keyboard.press("enter");
+  await app.keyboard.press("mod+enter");
+  expect(draft(app)).toBe("/fix");
+  expect(app.count(MENU)).toBe(1);
+
+  await app.compose(MESSAGE, "");
+  await app.submit(MESSAGE);
+  expect(draft(app)).toBe("/fix-tests ");
+  await closed(app);
+  expect(app.texts()).not.toContain("/fix-tests");
+
+  await app.submit(MESSAGE);
+  await app.waitUntil(() => draft(app) === "");
+  await app.waitFor("text:/fix-tests");
+
+  // Confirming a menu row mid-composition clears composing so the next submit still runs.
+  await app.type(MESSAGE, "/settings");
+  await app.waitFor(MENU);
+  await app.compose(MESSAGE, "she");
+  await app.press("text:/settings");
+  expect(draft(app)).toBe("/settings ");
+  await closed(app);
+  await app.keyboard.press("mod+enter");
+  await app.waitFor("id:settings-nav-agents");
 });
 
 test("another agent lists its own commands, and only what pipi can do on it", async () => {
@@ -204,6 +276,9 @@ test("another agent lists its own commands, and only what pipi can do on it", as
   expect(app.texts()).toContain("[path]");
   expect(app.texts().filter((text) => text === "Claude Code").length).toBeGreaterThan(0);
   await app.type(MESSAGE, "sec");
+  await app.submit(MESSAGE);
+  expect(draft(app)).toBe("/security-review ");
+  await closed(app);
   await app.submit(MESSAGE);
   await app.waitUntil(() => draft(app) === "");
   await app.waitFor("text:/security-review");
@@ -232,6 +307,10 @@ test("a command nothing here answers to says so, and goes to the agent as writte
   // Escape puts the line away like the rest of the menu.
   await app.keyboard.press("escape");
   await closed(app);
+  // Typing an unmatched command again and pressing Enter directly sends it as written.
+  await app.clear(MESSAGE);
+  await app.type(MESSAGE, "/review-pr");
+  await app.waitFor("text:No command by that name. Enter sends it to Pi as written.");
   await app.submit(MESSAGE);
   await app.waitUntil(() => draft(app) === "");
   await app.waitFor("text:/review-pr");

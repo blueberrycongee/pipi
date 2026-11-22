@@ -89,21 +89,20 @@ interface SlashRow {
   description?: string;
   /** Whose command it is. */
   tag?: string;
-  /** The draft Tab leaves: the row filled in, the caret where the next word goes. */
+  /** The draft confirming the row leaves: the row filled in, the caret where the next word goes. */
   completion: string;
-  /** The line choosing the row sends. Without one, choosing fills the row in as Tab does: there is more to say first. */
-  runs?: string;
 }
 
 /**
  * The slash menu's state: what the draft finds, which row is marked, and the
- * keys that are the menu's while it shows. Choosing a row (Enter, a press)
- * runs it; Tab fills it in so arguments can follow; Escape closes the menu and
- * leaves the draft, which then sends as written. The commands are the shell's
- * own and the active engine's (`slashCommands`), so the list changes with the
- * agent and the shell's part of it does not.
+ * keys that are the menu's while it shows. Choosing a row (Enter, Tab, or a
+ * press) confirms it into the draft so arguments can follow — or a second
+ * Enter sends it; Escape closes the menu and leaves the draft, which then
+ * sends as written. The commands are the shell's own and the active engine's
+ * (`slashCommands`), so the list changes with the agent and the shell's part
+ * of it does not.
  */
-function useSlashMenu() {
+function useSlashMenu(onComplete: (row: SlashRow) => void) {
   const selected = signal(0);
   /** Ticks when an arrow key moves the mark: the list scrolls after the keys, not after the pointer. */
   const keyed = signal(0, { equals: false });
@@ -122,7 +121,6 @@ function useSlashMenu() {
         description: command.description,
         tag: commandSourceLabel(command.source, agentName),
         completion: `/${command.name} `,
-        runs: command.needsArguments ? undefined : `/${command.name}`,
       }));
     }
     const command = slashCommands().find((known) => known.name === asked.name);
@@ -168,7 +166,7 @@ function useSlashMenu() {
         "tab",
         () => {
           const row = current();
-          if (row) setDraft(row.completion);
+          if (row) onComplete(row);
         },
         { when: "always" },
       ),
@@ -698,7 +696,20 @@ export function Composer() {
   const caretPos = signal(0);
   let trackedDraft = untracked(composerDraft);
   const height = signal(MIN_HEIGHT);
-  const slash = useSlashMenu();
+  /** An input method's marked text shows in the field while `composerDraft` is still empty; the hint stays away for it. */
+  const composing = signal(false);
+  /** Confirming a menu row fills it into the draft with the caret at the end so arguments or a second Enter can follow. */
+  const completeSlash = (row: SlashRow) => {
+    const next = row.completion;
+    composing.set(false);
+    trackedDraft = next;
+    selection = { start: next.length, end: next.length };
+    caretPos.set(next.length);
+    setDraft(next);
+    input?.setSelection(next.length, next.length);
+    focusComposer();
+  };
+  const slash = useSlashMenu(completeSlash);
   const applyDocMention = (row: DocMentionRow, mention: DocMentionInput) => {
     const next = removeDocMention(composerDraft(), mention);
     trackedDraft = next.text;
@@ -721,8 +732,6 @@ export function Composer() {
   const canSend = () => ready() || isDraftAhead();
   const working = () => isRunning() || isBashRunning() || waitingCount() > 0;
   const hasText = () => composerDraft().trim().length > 0 || composerAttachments().length > 0 || composerDocs().length > 0;
-  /** An input method's marked text shows in the field while `composerDraft` is still empty; the hint stays away for it. */
-  const composing = signal(false);
   const showPlaceholder = computed(() => composerDraft().length === 0 && !composing());
   const statusLine = () => Object.values(extensionStatuses()).join("  ·  ");
   const shownStatus = keepLast(() => statusLine() || undefined, "");
@@ -778,20 +787,15 @@ export function Composer() {
   const wireMode = () => (sendMode() === "queue" ? ("followUp" as const) : ("steer" as const));
   /** A send press: an explicit mode wins; otherwise the menu's choice decides. */
   const fireSend = (mode?: "steer" | "followUp") => void send(mode ?? wireMode());
-  /** Choosing a menu row runs it; one that needs more first is filled in for it, as Tab does. */
-  const choose = (row: SlashRow, mode?: "steer" | "followUp") => {
-    if (row.runs === undefined) return setDraft(row.completion);
-    setDraft(row.runs);
-    fireSend(mode);
-  };
   const chooseDocMention = (row: DocMentionRow) => {
     const mention = docMention.input();
     if (mention) applyDocMention(row, mention);
     else void attachDocToCurrentComposer(row.path);
   };
   const submit = (mode?: "steer" | "followUp") => {
+    if (untracked(composing)) return;
     const row = slash.current();
-    if (row) return choose(row, mode);
+    if (row) return completeSlash(row);
     const mentioned = docMention.current();
     if (mentioned) return chooseDocMention(mentioned);
     fireSend(mode);
@@ -929,7 +933,7 @@ export function Composer() {
         class="pointer-events-auto relative w-full max-w-190 self-center"
       >
         <ExtensionPrompt />
-        <SlashMenu menu={slash} onChoose={choose} anchor={column()} width={columnWidth()} />
+        <SlashMenu menu={slash} onChoose={completeSlash} anchor={column()} width={columnWidth()} />
         <DocMentionMenu menu={docMention} onChoose={chooseDocMention} anchor={column()} width={columnWidth()} />
         <AttachmentTray />
         <View class={`relative rounded-[22px] corner-squircle ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
@@ -956,6 +960,7 @@ export function Composer() {
               caretPos.set(end);
             }}
             onSubmit={() => submit()}
+            onBlur={() => composing.set(false)}
             onCompositionChange={({ composing: now }) => composing.set(now)}
             onPaste={paste}
             pasteBehavior="report"

@@ -1675,30 +1675,36 @@ let acpLastEventAt = 0;
 //
 // An Antigravity `session/prompt` returns `end_turn` as soon as it pauses to
 // wait on a background command (`run_command` past `WaitMsBeforeAsync`), a
-// scheduled wake (`schedule`), or a detached subagent (`invoke_subagent`).
+// scheduled wake (`schedule`), a detached subagent (`invoke_subagent`), or a
+// swarm board wait (`swarm_wait`).
 // Settling the turn right then makes the UI look stopped/idle and drops or
 // fragments the wake reply when Gemini thinks or runs tools longer than a
 // short quiet timeout. Instead — following T3 Code's Antigravity ACP adapter —
 // the bridge holds the turn open while background work is still running:
 //   - Non-daemon `execute` commands, `schedule` calls, pending permission /
-//     question requests, active detached subagents, and unread high-priority
-//     inbox wakes (`hasPendingReply`) all defer finalization.
+//     question requests, active detached subagents, `swarm_wait` parks, and
+//     unread high-priority inbox wakes (`hasPendingReply`) all defer
+//     finalization.
 //   - Pre-wake replies are checkpointed as completed visible messages before
 //     waiting so they stay visible and distinct when wakes follow in the run.
 //   - Every Antigravity reply ends with `usage_update`: while a wake reply is
 //     open (`replyOpen`), the quiet limit is 2 minutes (never 6s); once
 //     `usage_update` arrives and no background work remains, a 3s debounce
 //     re-checks `hasPendingReply` before settling.
-//   - Daemons (`IsDaemon: true`) settle immediately and still wake via
-//     `ensureAcpWakeTurn` (using the same `usage_update` + 2-minute machinery)
-//     if they ever exit later.
+//   - Daemons (`IsDaemon: true`) and reply-and-park swarm turns settle
+//     immediately and still wake via `ensureAcpWakeTurn` (using the same
+//     `usage_update` + 2-minute machinery) when they report later; while a
+//     swarm has active working members, `pipi_background_watch` stays on so
+//     the daemon does not evict the idle process mid-swarm.
 //   - Steering on agy >= 1.5.0 sends `session/prompt` without `session/cancel`
-//     so running background commands and subagents are never killed; only Stop
-//     (`abort`) sends `session/cancel`.
+//     so running background commands, subagents and swarms are never killed;
+//     only Stop (`abort`) sends `session/cancel`.
 let acpWakeTurn = undefined; // {epoch, stream} while a post-settle wake turn is open
 let acpDeferred = undefined; // active deferred-finalization / wake state for the live turn
 let acpWakeSleepWake = undefined; // resolves an active sleep immediately on abort
 let acpAttaching = false; // session/load|resume replay in flight: not live traffic
+let acpSwarmActive = false; // Antigravity session has spawned/waited on a swarm that may wake it
+let acpSwarmWatchTimer = undefined; // slow idle poll to release daemon backgroundWatch once swarm workers stop
 // Calls a turn left running (daemons, or tools surviving a steer), by id → {name, startedAt, ...}:
 // a later turn or wake says when they end — wherever in the conversation.
 const acpBackgroundTools = new Map();
@@ -1708,12 +1714,17 @@ const ACP_DEFERRED_FINALIZE_DEBOUNCE_MS = Number(process.env.PIPI_ACP_DEFERRED_F
 const ACP_OPEN_REPLY_QUIET_LIMIT_MS = Number(process.env.PIPI_ACP_OPEN_REPLY_QUIET_MS) || 2 * 60_000;
 // Poll cadence while waiting exclusively on detached subagents (which report via parent inbox).
 const ACP_SUBAGENT_POLL_MS = Number(process.env.PIPI_ACP_SUBAGENT_POLL_MS) || 1_000;
+// Slow idle poll cadence to release daemon backgroundWatch once swarm workers finish or stop.
+const ACP_SWARM_WATCH_POLL_MS = Number(process.env.PIPI_ACP_SWARM_WATCH_POLL_MS) || 30_000;
 // Quiet fallback for non-Antigravity post-settle wake turns.
 const ACP_WAKE_QUIET_MS = Number(process.env.PIPI_ACP_WAKE_QUIET_MS) || 6_000;
 const ACP_CONTENT_UPDATES = new Set(["user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"]);
 const isFinalToolStatus = (status) => status === "completed" || status === "failed";
 
 const ANTIGRAVITY_SCHEDULE_TITLES = new Set(["Run schedule", "Running schedule"]);
+const ANTIGRAVITY_SWARM_WAIT_TITLES = new Set(["Run swarm_wait", "Running swarm_wait", "Run swarm_wait?"]);
+const ANTIGRAVITY_SWARM_TITLES = new Set(["Run swarm", "Running swarm", "Run swarm?"]);
+const AGY_SWARM_PASSIVE_ROLE = /^Swarm Worker \((?:monitor|narrator)(?:-\d+)?\)$/i;
 const ANTIGRAVITY_SUBAGENT_TITLES = new Set([
   "Running start_subagent",
   "Run start_subagent?",
@@ -1774,6 +1785,20 @@ function antigravityToolOutlivesPrompt(info) {
 function isAntigravitySubagentLaunch(u) {
   const title = typeof u?.title === "string" ? u.title : "";
   if (!ANTIGRAVITY_SUBAGENT_TITLES.has(title)) return false;
+  if (u.kind !== undefined && u.kind !== "other") return false;
+  return u._meta?.is_mcp_tool_call !== true;
+}
+
+function isAntigravitySwarmWait(u) {
+  const title = typeof u?.title === "string" ? u.title : "";
+  if (!ANTIGRAVITY_SWARM_WAIT_TITLES.has(title)) return false;
+  if (u.kind !== undefined && u.kind !== "other") return false;
+  return u._meta?.is_mcp_tool_call !== true;
+}
+
+function isAntigravitySwarmTool(u) {
+  const title = typeof u?.title === "string" ? u.title : "";
+  if (!ANTIGRAVITY_SWARM_TITLES.has(title)) return false;
   if (u.kind !== undefined && u.kind !== "other") return false;
   return u._meta?.is_mcp_tool_call !== true;
 }
@@ -1964,6 +1989,96 @@ function agyChildrenAtWork(acpId, toolCallIds) {
 }
 
 /**
+ * True while a swarm worker's inbox or transcript shows it is actively
+ * mid-turn rather than parked in `swarm_wait`, finished, or errored.
+ */
+function agySwarmChildWorking(root, childId) {
+  if (agyHasUnreadHighPriorityInbox(root, childId)) return true;
+  const lastStep = agyLastTranscriptStep(root, childId);
+  if (!lastStep) return false;
+  if (lastStep.status !== "DONE" && lastStep.status !== "ERROR" && lastStep.status !== "CANCELLED") return true;
+  if (lastStep.status === "ERROR" || lastStep.status === "CANCELLED") return false;
+  if (lastStep.type === "SYSTEM_MESSAGE") return true;
+  if (lastStep.type === "PLANNER_RESPONSE") {
+    return Array.isArray(lastStep.tool_calls) && lastStep.tool_calls.length > 0;
+  }
+  if (lastStep.type === "GENERIC") {
+    const content = typeof lastStep.content === "string" ? lastStep.content : "";
+    return !content.includes("Waiting for a message");
+  }
+  return false;
+}
+
+/**
+ * Inspects Antigravity's `subagents/*.json` records for swarm workers under
+ * `acpId`. Returns `undefined` when no swarm records are readable (so
+ * `swarm_wait` stays open when disk records are absent, while passive daemon
+ * watch fails closed), otherwise reports alive swarm workers (`alive`),
+ * non-monitor/narrator alive workers (`activeWorkers`), and those actively
+ * mid-turn (`working`).
+ */
+function agySwarmWorkerStatus(acpId) {
+  if (!acpId || !AGY_NATIVE_ID.test(acpId)) return undefined;
+  const root = agyHomeRoot();
+  if (!root) return undefined;
+  const subDir = agyManagedPathSync(root, ["brain", acpId, ".system_generated", "subagents"], "directory");
+  if (!subDir) return undefined;
+  let entries;
+  try {
+    entries = fs.readdirSync(subDir.path).filter((n) => n.endsWith(".json") && AGY_NATIVE_ID.test(n.slice(0, -5)));
+  } catch {
+    return undefined;
+  }
+  if (!entries.length || entries.length > AGY_MAX_DETACHED_CHILDREN) return undefined;
+  let total = 0;
+  let alive = 0;
+  let activeWorkers = 0;
+  let working = 0;
+  for (const name of entries) {
+    const childId = name.slice(0, -5);
+    const subFile = agyManagedPathSync(root, ["brain", acpId, ".system_generated", "subagents", name], "file");
+    if (!subFile || subFile.info.size > AGY_MAX_STEP_BYTES) continue;
+    let rec;
+    try {
+      rec = JSON.parse(fs.readFileSync(subFile.path, "utf8"));
+    } catch {
+      continue;
+    }
+    const role = typeof rec?.subagentDescriptor?.role === "string" ? rec.subagentDescriptor.role : "";
+    if (!role.startsWith("Swarm Worker")) continue;
+    total++;
+    if (rec?.state === "SUBAGENT_STATE_KILLED") continue;
+    alive++;
+    if (!AGY_SWARM_PASSIVE_ROLE.test(role)) {
+      activeWorkers++;
+      if (agySwarmChildWorking(root, childId)) working++;
+    }
+  }
+  return total > 0 ? { total, alive, activeWorkers, working } : undefined;
+}
+
+function hasAcpSwarmWait(state) {
+  if (!isAntigravityAcp() || !state.swarmWaiting) return false;
+  const swarm = agySwarmWorkerStatus(state.acpId);
+  if (swarm !== undefined && swarm.alive === 0) {
+    state.swarmWaiting = false;
+    return false;
+  }
+  return true;
+}
+
+function hasActiveAgySwarm() {
+  if (!acpSwarmActive || !isAntigravityAcp() || !acpSessionId) return false;
+  const swarm = agySwarmWorkerStatus(acpSessionId);
+  if (!swarm) return false;
+  if (swarm.activeWorkers === 0) {
+    acpSwarmActive = false;
+    return false;
+  }
+  return swarm.working > 0;
+}
+
+/**
  * Reads Antigravity's local per-conversation `transcript.jsonl` tail when present
  * (`~/.gemini/antigravity-cli/brain/<acpId>/.system_generated/logs/transcript.jsonl`),
  * giving sub-second ground truth on whether a reactive wake turn is still mid-step
@@ -2069,6 +2184,7 @@ function hasAcpOutlivingTools(state) {
 function hasAcpDeferredWork(state) {
   if (pendingUiRequests.size > 0) return true;
   if (hasAcpOutlivingTools(state)) return true;
+  if (hasAcpSwarmWait(state)) return true;
   if (isAntigravityAcp() && state.subagentIds.size > 0 && agyChildrenAtWork(state.acpId, [...state.subagentIds]).length > 0) {
     return true;
   }
@@ -2077,9 +2193,10 @@ function hasAcpDeferredWork(state) {
 
 /**
  * Holds a settled-prompt (or post-settle wake) turn open while background
- * commands, scheduled wakes, detached subagents, pending permission dialogs,
- * or in-flight wake replies (`replyOpen`, awaiting `usage_update`) are still
- * active. Mirrors T3 Code's `scheduleDeferredFinalize` + `hasPendingReply`.
+ * commands, scheduled wakes, detached subagents, swarm board waits, pending
+ * permission dialogs, or in-flight wake replies (`replyOpen`, awaiting
+ * `usage_update`) are still active. Mirrors T3 Code's `scheduleDeferredFinalize`
+ * + `hasPendingReply`.
  */
 async function waitAcpDeferred(state) {
   for (;;) {
@@ -2089,6 +2206,11 @@ async function waitAcpDeferred(state) {
     }
     if (pendingUiRequests.size > 0 || hasAcpOutlivingTools(state)) {
       await acpDeferredSleep(0, state);
+      continue;
+    }
+    if (hasAcpSwarmWait(state)) {
+      const swarm = agySwarmWorkerStatus(state.acpId);
+      await acpDeferredSleep(swarm !== undefined ? ACP_SUBAGENT_POLL_MS : 0, state);
       continue;
     }
     if (isAntigravityAcp() && state.subagentIds.size > 0 && agyChildrenAtWork(state.acpId, [...state.subagentIds]).length > 0) {
@@ -2139,9 +2261,24 @@ function clearStaleBackgroundTools(list = messages, onlyId = undefined) {
 }
 
 let reportedBackgroundWatch = false;
+function clearSwarmWatchTimer() {
+  if (acpSwarmWatchTimer) {
+    clearTimeout(acpSwarmWatchTimer);
+    acpSwarmWatchTimer = undefined;
+  }
+}
 function syncBackgroundWatch() {
+  clearSwarmWatchTimer();
+  const swarmIdleActive = !acpWakeTurn && !acpDeferred && acpBackgroundTools.size === 0 && hasActiveAgySwarm();
+  if (swarmIdleActive) {
+    acpSwarmWatchTimer = setTimeout(() => {
+      acpSwarmWatchTimer = undefined;
+      syncBackgroundWatch();
+    }, ACP_SWARM_WATCH_POLL_MS);
+    acpSwarmWatchTimer.unref?.();
+  }
   if (!process.env.PIPI_SESSION_ID) return;
-  const active = Boolean(acpWakeTurn || acpDeferred?.promptSettled || acpBackgroundTools.size > 0);
+  const active = Boolean(acpWakeTurn || acpDeferred?.promptSettled || acpBackgroundTools.size > 0 || swarmIdleActive);
   if (active === reportedBackgroundWatch) return;
   reportedBackgroundWatch = active;
   emit({ type: "pipi_background_watch", active });
@@ -2149,6 +2286,8 @@ function syncBackgroundWatch() {
 
 function clearAcpBackground() {
   acpBackgroundTools.clear();
+  acpSwarmActive = false;
+  clearSwarmWatchTimer();
   clearStaleBackgroundTools();
   syncBackgroundWatch();
 }
@@ -2192,6 +2331,9 @@ async function runAcpWakeTurn(epoch) {
     stream,
     promptSettled: true,
     replyOpen: true,
+    swarmWaiting: false,
+    swarmWaitToolId: undefined,
+    swarmWaitDone: false,
     generation: 0,
     promptSeq: 0,
     subagentIds: new Set(),
@@ -2641,6 +2783,7 @@ function handleAcpUpdate(u, params = undefined) {
     if (!replaying) {
       acpStream?.thinkDelta(textOf(u.content));
       if (acpDeferred) {
+        acpDeferred.swarmWaiting = false;
         acpDeferred.replyOpen = true;
         bumpAcpDeferred();
       }
@@ -2652,6 +2795,7 @@ function handleAcpUpdate(u, params = undefined) {
       if (retry) acpStream?.retry(retry.attempt, retry.maxAttempts, retry.errorMessage);
       else acpStream?.textDelta(text);
       if (acpDeferred) {
+        if (!retry && text.trim().length > 0) acpDeferred.swarmWaiting = false;
         acpDeferred.replyOpen = true;
         bumpAcpDeferred();
       }
@@ -2666,8 +2810,20 @@ function handleAcpUpdate(u, params = undefined) {
         rawInput: u.rawInput,
         startedAfterPromptSettled: Boolean(acpDeferred?.promptSettled),
       });
-      if (acpDeferred && isAntigravityAcp() && isAntigravitySubagentLaunch(u)) {
-        acpDeferred.subagentIds.add(id);
+      if (isAntigravityAcp() && (isAntigravitySwarmWait(u) || isAntigravitySwarmTool(u))) {
+        acpSwarmActive = true;
+      }
+      if (acpDeferred && isAntigravityAcp()) {
+        if (isAntigravitySubagentLaunch(u)) {
+          acpDeferred.subagentIds.add(id);
+        }
+        if (isAntigravitySwarmWait(u)) {
+          acpDeferred.swarmWaitToolId = id;
+          acpDeferred.swarmWaitDone = isFinalToolStatus(u.status);
+          acpDeferred.swarmWaiting = u.status !== "failed";
+        } else if (acpDeferred.swarmWaiting && (acpDeferred.promptSettled || acpDeferred.swarmWaitDone)) {
+          acpDeferred.swarmWaiting = false;
+        }
       }
       if (isFinalToolStatus(u.status)) {
         acpStream?.toolEnd(id, formatAcpToolContent(u.content, u.rawOutput), u.status === "failed", acpBackgroundTools.get(id));
@@ -2694,8 +2850,28 @@ function handleAcpUpdate(u, params = undefined) {
         ...(u.title !== undefined ? { title: u.title } : {}),
         ...(u.rawInput !== undefined ? { rawInput: u.rawInput } : {}),
       });
-      if (acpDeferred && isAntigravityAcp() && isAntigravitySubagentLaunch({ ...known, ...u })) {
-        acpDeferred.subagentIds.add(id);
+      const mergedTool = { ...known, ...u };
+      if (isAntigravityAcp() && (isAntigravitySwarmWait(mergedTool) || isAntigravitySwarmTool(mergedTool))) {
+        acpSwarmActive = true;
+      }
+      if (acpDeferred && isAntigravityAcp()) {
+        if (isAntigravitySubagentLaunch(mergedTool)) {
+          acpDeferred.subagentIds.add(id);
+        }
+        if (isAntigravitySwarmWait(mergedTool)) {
+          const fresh = id !== acpDeferred.swarmWaitToolId;
+          acpDeferred.swarmWaitToolId = id;
+          if (fresh) {
+            acpDeferred.swarmWaiting = u.status !== "failed";
+            acpDeferred.swarmWaitDone = isFinalToolStatus(u.status);
+          } else {
+            if (isFinalToolStatus(u.status)) acpDeferred.swarmWaitDone = true;
+            if (u.status === "failed") acpDeferred.swarmWaiting = false;
+          }
+        } else if (id === acpDeferred.swarmWaitToolId && isFinalToolStatus(u.status)) {
+          acpDeferred.swarmWaitDone = true;
+          if (u.status === "failed") acpDeferred.swarmWaiting = false;
+        }
       }
       if (isFinalToolStatus(u.status)) {
         acpStream?.toolEnd(u.toolCallId, formatAcpToolContent(u.content, u.rawOutput), u.status === "failed", acpBackgroundTools.get(id));
@@ -3135,6 +3311,9 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
     stream,
     promptSettled: false,
     replyOpen: false,
+    swarmWaiting: false,
+    swarmWaitToolId: undefined,
+    swarmWaitDone: false,
     generation: 0,
     promptSeq: 0,
     subagentIds: new Set(),
@@ -3204,6 +3383,9 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
         emitTurn({ type: "message_start", message: steerUserMsg });
         emitTurn({ type: "message_end", message: steerUserMsg });
         activeSeq = ++deferred.promptSeq;
+        deferred.swarmWaiting = false;
+        deferred.swarmWaitToolId = undefined;
+        deferred.swarmWaitDone = false;
         deferred.replyOpen = true;
         currentPrompt = acpPromptWatched(
           acpId,
@@ -3625,6 +3807,7 @@ process.stdin.on("data", (chunk) => {
 if (driver === "claude") void ensureClaudeCatalog();
 
 function shutdownBridge() {
+  clearSwarmWatchTimer();
   try {
     acpChild?.kill();
   } catch {}

@@ -156,8 +156,9 @@ multi-agent orchestration, and settings.
   switches, on a manual clock with slow agent starts (`harness.startDelay`);
   `open` and `press` run the clock ~400ms themselves, so delays must exceed that
 - `nsh test Slash.test.tsx` — the composer's slash menu: what `/` lists on
-  each agent, Enter runs, Tab fills in, Escape closes; `nsh test
-  store/slash.test.ts` — what a command puts on the wire across engines
+  each agent, Enter and Tab confirm into the draft (a second Enter sends),
+  Escape closes; `nsh test store/slash.test.ts` — what a command puts on
+  the wire across engines
 - `nsh test Recover.test.tsx` — an agent process lost at rest, under a run,
   or again and again (`harness.dies`, or a prompt containing "crash"): what
   stays on screen, what is said, and when the app stops starting it again

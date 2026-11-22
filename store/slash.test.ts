@@ -47,6 +47,12 @@ test("an engine's command reaches it as written, a shell-owned name never does, 
   expect(prompts().at(-1)).toBe("/security-review src");
   await until(() => !store.isRunning(), "the command's run");
 
+  // A confirmed command carries a trailing space from menu completion: it trims cleanly on the wire and keeps the handoff waiting.
+  store.setDraft("/security-review ");
+  await store.send();
+  expect(prompts().at(-1)).toBe("/security-review");
+  await until(() => !store.isRunning(), "the trimmed command's run");
+
   // The handoff was kept for the next message, and goes with it.
   store.setDraft("and now explain it");
   await store.send();
@@ -60,7 +66,7 @@ test("an engine's command reaches it as written, a shell-owned name never does, 
   await store.send();
   await until(() => store.sessionState()?.sessionName === "Audit", "the rename");
   const auditDaemonId = store.currentDaemonId();
-  store.setDraft("/clear");
+  store.setDraft("/clear ");
   await store.send();
   await until(() => store.transcriptRows().length === 0 && store.currentDaemonId() !== auditDaemonId, "the new session");
   expect(store.sessionState()?.sessionName).toBeUndefined();
@@ -69,4 +75,16 @@ test("an engine's command reaches it as written, a shell-owned name never does, 
   expect(auditSession?.title).not.toBe("New session");
   expect(store.daemonSessionTitle(auditSession!)).toBe("Audit");
   expect(prompts().length).toBe(sent);
+
+  // Confirming `/new ` also trims cleanly and starts a fresh session once the current one has history.
+  store.setDraft("follow up");
+  await store.send();
+  await until(() => !store.isRunning() && store.transcriptRows().length > 0, "the follow-up run");
+  const afterFollowUp = prompts().length;
+  const followUpDaemonId = store.currentDaemonId();
+  store.setDraft("/new ");
+  await store.send();
+  await until(() => store.transcriptRows().length === 0 && store.currentDaemonId() !== followUpDaemonId, "the second new session");
+  expect(store.composerDraft()).toBe("");
+  expect(prompts().length).toBe(afterFollowUp);
 });

@@ -893,6 +893,45 @@ test("a message shows what the person wrote, not what Pi told the model about it
   expect(withoutImageNotes("Plain\n\n[Image: a cat]")).toBe("Plain\n\n[Image: a cat]");
 });
 
+test("user messages carry real image blocks across staging, live echo, history reload and adopt", () => {
+  const pic = { type: "image" as const, data: "iVBORw0KGgo=", mimeType: "image/png" };
+  const resized = { type: "image" as const, data: "iVBORw0KGgoAAA==", mimeType: "image/png" };
+
+  const live = new Transcript();
+  const stagedId = live.stageUser("Check this screenshot", [pic]);
+  expect(live.rows()[0]).toEqual({
+    kind: "user",
+    id: stagedId,
+    text: "Check this screenshot",
+    images: 1,
+    imageBlocks: [pic],
+  });
+  const stagedRow = live.rows()[0];
+
+  // Echoing the message with resized bytes keeps the exact staged row reference (no flicker).
+  live.apply({
+    type: "message_start",
+    message: { role: "user", content: [{ type: "text", text: "Check this screenshot" }, resized], timestamp: 1 },
+  });
+  expect(live.rows()[0]).toBe(stagedRow);
+
+  // Loading history from disk preserves imageBlocks on user rows (including image-only messages).
+  const loaded = new Transcript();
+  loaded.load([
+    { role: "user", content: [{ type: "text", text: "Check this screenshot" }, resized], timestamp: 1 },
+    { role: "user", content: [pic], timestamp: 2 },
+  ]);
+  expect(loaded.rows()).toMatchObject([
+    { kind: "user", text: "Check this screenshot", images: 1, imageBlocks: [resized] },
+    { kind: "user", text: "", images: 1, imageBlocks: [pic] },
+  ]);
+  expect(sameVisualRows(live.rows(), [loaded.rows()[0]])).toBe(true);
+
+  // Adopting keeps the existing row object when counts match.
+  loaded.adopt(live.rows());
+  expect(loaded.rows()[0]).toBe(stagedRow);
+});
+
 test("titles a tool call from partial argument JSON", () => {
   const t = new Transcript();
   t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });

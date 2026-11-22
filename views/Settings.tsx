@@ -1948,7 +1948,15 @@ function ShortcutsPage() {
           caps={<Kbd text="/" />}
         />
         <Rule />
-        <ShortcutRow title={tr("Complete the highlighted command", "补全高亮命令")} caps={<Kbd keys="tab" />} />
+        <ShortcutRow
+          title={tr("Complete the highlighted command", "补全高亮命令")}
+          caps={
+            <>
+              <Kbd keys="enter" />
+              <Kbd keys="tab" />
+            </>
+          }
+        />
         <Rule />
         <ShortcutRow
           title={tr("Move through the menu", "在菜单中移动")}

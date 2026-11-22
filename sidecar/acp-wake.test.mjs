@@ -27,6 +27,7 @@ const FAST_TIMINGS = {
   PIPI_ACP_DEFERRED_FINALIZE_MS: "150",
   PIPI_ACP_OPEN_REPLY_QUIET_MS: "4000",
   PIPI_ACP_SUBAGENT_POLL_MS: "100",
+  PIPI_ACP_SWARM_WATCH_POLL_MS: "120",
   PIPI_ACP_WAKE_QUIET_MS: "500",
 };
 
@@ -410,5 +411,94 @@ test("new_session mid-turn settles the interrupted turn as aborted and saves the
   assert.ok(
     savedMsgs.some((m) => m.role === "assistant" && m.stopReason === "aborted"),
     "outgoing session file must persist the aborted assistant record",
+  );
+});
+
+test("Run swarm_wait holds the run open across end_turn with no reply text until the swarm wakes", async (t) => {
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "450", PIPI_SESSION_ID: "s_swarm_wait" });
+  assert.equal((await bridge.prompt("start a background swarm-wait")).success, true);
+
+  await bridge.waitFor(
+    () => bridge.records.some((r) => r.type === "pipi_background_watch" && r.active === true),
+    5000,
+    "pipi_background_watch active while parked in swarm_wait",
+  );
+  assert.equal(bridge.records.filter((r) => r.type === "agent_settled").length, 0, "swarm_wait must hold the run open");
+  const { data: midState } = await bridge.send({ type: "get_state" });
+  assert.equal(midState.isStreaming, true, "isStreaming stays true while waiting on swarm_wait");
+
+  await bridge.settles(1, 8000);
+  const allRuns = runs(bridge.records);
+  assert.equal(allRuns.length, 1, "swarm_wait and its wake reply belong to one continuous run");
+  assert.deepEqual(assistantTexts(allRuns[0]), ["Swarm finished: all tests green."]);
+  const lastWatch = bridge.records.filter((r) => r.type === "pipi_background_watch").at(-1);
+  assert.equal(lastWatch?.active, false, "background watch clears once the swarm run settles");
+});
+
+test("chained swarm_wait wakes keep one continuous run open until a non-wait reply finishes", async (t) => {
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "350" });
+  await bridge.prompt("start a background swarm-wait chain");
+
+  await bridge.waitFor(() => bridge.records.some((r) => r.type === "tool_execution_end" && r.toolName === "Run read_board"));
+  assert.equal(bridge.records.filter((r) => r.type === "agent_settled").length, 0, "second swarm_wait must keep the run open");
+
+  await bridge.settles(1, 8000);
+  const allRuns = runs(bridge.records);
+  assert.equal(allRuns.length, 1);
+  assert.deepEqual(assistantTexts(allRuns[0]), ["Swarm chain finished: verified."]);
+});
+
+test("swarm_wait followed immediately by a reply in the same turn settles without hanging", async (t) => {
+  const bridge = startBridge(t, {});
+  await bridge.prompt("start a background swarm-immediate");
+  await bridge.settles(1, 5000);
+  const allRuns = runs(bridge.records);
+  assert.equal(allRuns.length, 1);
+  assert.deepEqual(assistantTexts(allRuns[0]), ["Board already updated."]);
+});
+
+test("swarm_wait settles once every swarm worker on disk is killed", async (t) => {
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "350" });
+  await bridge.prompt("start a background swarm-killed");
+  await bridge.waitFor(() => bridge.records.some((r) => r.type === "tool_execution_end" && r.toolName === "Run swarm_wait"));
+  assert.equal(bridge.records.filter((r) => r.type === "agent_settled").length, 0, "run stays open while worker is alive");
+  await bridge.settles(1, 8000);
+  assert.equal(runs(bridge.records).length, 1);
+});
+
+test("steering during swarm_wait preserves the swarm without session/cancel, while Stop cancels it", async (t) => {
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "60000" });
+  await bridge.prompt("start a background swarm-wait never");
+  await bridge.waitFor(() => bridge.records.some((r) => r.type === "tool_execution_end" && r.toolName === "Run swarm_wait"));
+  assert.equal(bridge.records.filter((r) => r.type === "agent_settled").length, 0);
+
+  const steered = await bridge.prompt("hello");
+  assert.equal(steered.data?.disposition, "queued");
+  await bridge.settles(1, 8000);
+  assert.equal(bridge.methods().includes("session/cancel"), false, "steering during swarm_wait must not send session/cancel");
+  assert.ok(runs(bridge.records).map(textOf).join("\n").includes("I ran the tool — bash finished."));
+
+  const stopBridge = startBridge(t, { FAKE_ACP_WAKE_MS: "60000" });
+  await stopBridge.prompt("start a background swarm-wait never");
+  await stopBridge.waitFor(() => stopBridge.records.some((r) => r.type === "tool_execution_end" && r.toolName === "Run swarm_wait"));
+  await stopBridge.send({ type: "abort" });
+  await stopBridge.settles(1, 8000);
+  assert.equal(stopBridge.methods().includes("session/cancel"), true, "Stop during swarm_wait must send session/cancel");
+  assert.equal(stopBridge.records.filter((r) => r.type === "agent_settled").at(-1)?.aborted, true);
+});
+
+test("reply-and-park swarm turn settles cleanly while keeping daemon backgroundWatch alive until workers park", async (t) => {
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "450", PIPI_SESSION_ID: "s_swarm_async" });
+  await bridge.prompt("start a background swarm-async");
+  await bridge.settles(1, 5000);
+  assert.deepEqual(assistantTexts(runs(bridge.records)[0]), ["Swarm started."]);
+
+  const watchesAfterSettle = bridge.records.filter((r) => r.type === "pipi_background_watch");
+  assert.equal(watchesAfterSettle.at(-1)?.active, true, "daemon backgroundWatch stays active while swarm worker is working");
+
+  await bridge.waitFor(
+    () => bridge.records.filter((r) => r.type === "pipi_background_watch").at(-1)?.active === false,
+    5000,
+    "backgroundWatch releases once active swarm worker parks (ignoring passive monitor)",
   );
 });
