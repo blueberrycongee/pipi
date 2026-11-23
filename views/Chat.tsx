@@ -672,7 +672,7 @@ function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: 
   return (
     <If when={mounted()}>
       <View
-        class="pointer-events-none absolute inset-x-0 z-10 items-end pr-4"
+        class="pointer-events-none absolute inset-x-0 z-10 items-center"
         style={{ bottom: props.bottom, opacity, transform: [{ translateY }, { scale }] }}
       >
         <BaseButton

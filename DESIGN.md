@@ -443,7 +443,7 @@ composer's glass, not underlined words: words do not stand on a picture.
 | Wallpaper veil: composer in the middle ↔ docked ↔ conversation | 200ms | opacity only, under the pane |
 | Composer: the middle of the pane ↔ its dock | ~480ms | a spring with no bounce (`DOCK_SPRING`), played as keyframes; the stage it leaves fades where it stood in 140ms |
 | Waiting on a session change | after 600ms, 480ms in | `PATIENCE_MS`; a change that lands sooner never shows it |
-| "Working", "Thinking" and activity labels | one shared breath (`BREATH_MS`, 1600ms) + 160ms vertical morph | `useBreathingOpacity` + `RollingText` (`StatusMorph`, honors reduced motion) |
+| "Working", "Thinking" and activity labels | one shared breath (`BREATH_MS`, 1600ms) + 200ms vertical cross-glide, paced at 380ms dwell | `useBreathingOpacity` + `RollingText` (honors reduced motion) |
 | Update card, size unknown | the drift's two breaths (3200ms) | `BREATH_MS × 2` ping-pong, Pip riding |
 | Streamed text pacer & veil | 16ms cadence, cut at word edges + 100–240ms fade, travelling word by word within 36ms | opacity only, zero offset (`StreamPacer` + `RowVeil`) |
 

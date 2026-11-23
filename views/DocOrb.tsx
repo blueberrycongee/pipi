@@ -771,7 +771,7 @@ function ReplySkeleton(props: { label: () => string }) {
       <View class="flex-row items-center gap-2" style={{ opacity: breath }}>
         <Icon name="sparkle" size={13} tone="brand-text" class="shrink-0" />
         <View class="min-w-0 flex-1">
-          <RollingText text={props.label} class={`${uiType("xs")} font-medium text-muted-foreground`} />
+          <RollingText text={props.label} pace class={`${uiType("xs")} font-medium text-muted-foreground`} />
         </View>
       </View>
       <View class="gap-2 pl-5">

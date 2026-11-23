@@ -22,9 +22,12 @@ test("titled calls sit on one line", async () => {
   await app.wait(1000);
   await app.screenshot("/tmp/pipi-tool-titles-running.png");
   await app.waitFor("label:复制回复", { timeout: 60000 });
-  await app.press("text:秒");
+  await app.waitUntil(() => app.texts().some((t) => t.startsWith("用时 ")), { timeout: 10000 });
+  const header = app.texts().find((t) => t.startsWith("用时 "))!;
+  await app.press(`text:${header}`);
   await app.wait(600);
-  await app.press("text:具");
+  const summary = app.texts().find((t) => t.includes("工具"))!;
+  await app.press(`text:${summary}`);
   await app.wait(600);
   await app.screenshot("/tmp/pipi-tool-titles.png");
   const texts = app.texts();

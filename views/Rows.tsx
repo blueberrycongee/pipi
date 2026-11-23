@@ -1194,7 +1194,15 @@ function ActivityView(props: { row: ActivityRow }) {
     >
       <View class="flex-row items-center gap-1">
         <ProcessLine open={open() && hasBody()} onPress={hasBody() ? () => toggle(props.row.id, false) : undefined}>
-          <RollingText id={() => props.row.id} text={title} class={`min-w-0 shrink truncate ${uiType("md")} text-subtle`} style={{ opacity: breathOpacity }} />
+          <RollingText
+            id={() => props.row.id}
+            text={title}
+            pace
+            settled={() => !props.row.running}
+            holdSettle={() => props.row.mayGrow === true}
+            class={`min-w-0 shrink truncate ${uiType("md")} text-subtle`}
+            style={{ opacity: breathOpacity }}
+          />
         </ProcessLine>
         <If when={onlySession()}>
           {(sid) => (
@@ -1273,7 +1281,13 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
           <If when={!props.row.running}>
             <Text class={`shrink-0 ${uiType("md")} text-subtle`}>·</Text>
           </If>
-          <RollingText id={() => `${props.row.id}:preview`} text={() => shownPreview() ?? ""} class={`min-w-0 shrink truncate ${uiType("md")} text-subtle`} />
+          <RollingText
+            id={() => `${props.row.id}:preview`}
+            text={() => shownPreview() ?? ""}
+            pace
+            settled={() => !props.row.running}
+            class={`min-w-0 shrink truncate ${uiType("md")} text-subtle`}
+          />
         </Presence>
       </ProcessLine>
     </View>

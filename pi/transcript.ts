@@ -231,6 +231,8 @@ export interface ToolRow extends TurnStamp {
   details?: unknown;
   durationMs?: number;
   background?: boolean;
+  /** While `status === "call"`, the argument key whose string value has not seen its closing quote yet. */
+  incompleteArg?: string;
 }
 
 const textOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
@@ -319,21 +321,22 @@ export function withoutHandoff(text: string): string {
 const QUEUE_ECHO_GRACE_MS = 3000;
 
 /** The arguments a partial JSON object has so far: enough to title a tool call while it streams. */
-function partialArgs(json: string): Record<string, unknown> {
+function partialArgs(json: string): { args: Record<string, unknown>; incompleteKey?: string } {
   const args: Record<string, unknown> = {};
+  let incompleteKey: string | undefined;
   let i = json.indexOf("{") + 1;
-  if (!i) return args;
+  if (!i) return { args };
   const n = json.length;
   const skip = () => {
     while (i < n && (json.charCodeAt(i) <= 32 || json[i] === ",")) i++;
   };
-  /** String contents from the `"` at i; stops at its close or at end of input. */
-  const scanString = (): string => {
+  /** String contents from the `"` at i; reports whether the closing quote was reached. */
+  const scanString = (): { value: string; closed: boolean } => {
     let out = "";
     i++;
     while (i < n) {
       const c = json[i++];
-      if (c === '"') break;
+      if (c === '"') return { value: out, closed: true };
       if (c === "\\" && i < n) {
         const e = json[i++];
         if (e === "u" && i + 4 <= n) {
@@ -346,13 +349,15 @@ function partialArgs(json: string): Record<string, unknown> {
         out += e === "n" ? "\n" : e === "t" ? "\t" : e === "r" ? "\r" : e === "b" ? "\b" : e === "f" ? "\f" : e;
       } else out += c;
     }
-    return out;
+    return { value: out, closed: false };
   };
   while (i < n) {
     skip();
     if (i >= n || json[i] === "}") break;
     if (json[i] !== '"') break;
-    const key = scanString();
+    const keyScan = scanString();
+    if (!keyScan.closed) break;
+    const key = keyScan.value;
     skip();
     if (json[i] !== ":") break;
     i++;
@@ -361,7 +366,9 @@ function partialArgs(json: string): Record<string, unknown> {
     const c = json[i];
     if (c === '"') {
       // An unfinished string still titles the call: `{"path":"src/ap` reads as { path: "src/ap" }.
-      args[key] = scanString();
+      const valScan = scanString();
+      args[key] = valScan.value;
+      if (!valScan.closed) incompleteKey = key;
       continue;
     }
     if (c === "{" || c === "[") {
@@ -390,7 +397,7 @@ function partialArgs(json: string): Record<string, unknown> {
       args[key] = JSON.parse(json.slice(start, i));
     } catch {}
   }
-  return args;
+  return { args, incompleteKey };
 }
 
 /**
@@ -787,7 +794,10 @@ export class Transcript {
         if (!this.#toolSince.has(rowId)) this.#toolSince.set(rowId, Date.now());
         this.#tool(
           rowId,
-          (row) => ({ ...row, callId: row.callId ?? event.toolCallId, name: event.toolName, args: event.args ?? row.args, status: "running" }),
+          (row) => {
+            const { incompleteArg: _inc, ...rest } = row;
+            return { ...rest, callId: rest.callId ?? event.toolCallId, name: event.toolName, args: event.args ?? rest.args, status: "running" };
+          },
           event.toolName,
           event.toolCallId,
         );
@@ -798,7 +808,10 @@ export class Transcript {
         if (!this.#toolSince.has(rowId)) this.#toolSince.set(rowId, Date.now());
         this.#tool(
           rowId,
-          (row) => ({ ...row, callId: row.callId ?? event.toolCallId, ...this.#result(event.partialResult, row), status: "running" }),
+          (row) => {
+            const { incompleteArg: _inc, ...rest } = row;
+            return { ...rest, callId: rest.callId ?? event.toolCallId, ...this.#result(event.partialResult, row), status: "running" };
+          },
           event.toolName,
           event.toolCallId,
         );
@@ -812,7 +825,7 @@ export class Transcript {
         this.#tool(
           rowId,
           (row) => {
-            const { background: _bg, ...rest } = row;
+            const { background: _bg, incompleteArg: _inc, ...rest } = row;
             return {
               ...rest,
               callId: rest.callId ?? event.toolCallId,
@@ -1370,7 +1383,9 @@ export class Transcript {
         const now = Date.now();
         if (now - (live.argsAt.get(event.contentIndex) ?? 0) > 90) {
           live.argsAt.set(event.contentIndex, now);
-          this.#set({ ...row, args: partialArgs(json) });
+          const { args, incompleteKey } = partialArgs(json);
+          const { incompleteArg: _inc, ...rest } = row;
+          this.#set({ ...rest, args, ...(incompleteKey ? { incompleteArg: incompleteKey } : {}) });
         }
         break;
       }
@@ -1381,12 +1396,13 @@ export class Transcript {
           row?.kind === "tool"
             ? row
             : { kind: "tool", id: rowId, callId: event.toolCall.id, name: event.toolCall.name, args: {}, status: "queued", output: "", images: 0 };
+        const { incompleteArg: _inc, ...rest } = base;
         this.#set({
-          ...base,
-          callId: base.callId ?? event.toolCall.id,
+          ...rest,
+          callId: rest.callId ?? event.toolCall.id,
           name: event.toolCall.name,
           args: event.toolCall.arguments ?? {},
-          status: base.status === "call" ? "queued" : base.status,
+          status: rest.status === "call" ? "queued" : rest.status,
         });
         break;
       }
@@ -1441,7 +1457,7 @@ export class Transcript {
         const bg = !!block.background && !failed && message.stopReason !== "aborted";
         // A call the failed message never got to run will not run: it does not go on spinning through the retries.
         if (failed && (base.status === "call" || base.status === "queued")) {
-          const { background: _bg, ...rest } = base;
+          const { background: _bg, incompleteArg: _inc, ...rest } = base;
           this.#set({
             ...rest,
             callId: rest.callId ?? block.id,
@@ -1453,9 +1469,10 @@ export class Transcript {
         } else {
           const settled = base.status === "done" || base.status === "error";
           if (bg && !settled) {
-            this.#set({ ...base, callId: base.callId ?? block.id, name: block.name, args: block.arguments ?? {}, status: "running", background: true });
+            const { incompleteArg: _inc, ...rest } = base;
+            this.#set({ ...rest, callId: rest.callId ?? block.id, name: block.name, args: block.arguments ?? {}, status: "running", background: true });
           } else {
-            const { background: _bg, ...rest } = base;
+            const { background: _bg, incompleteArg: _inc, ...rest } = base;
             this.#set({
               ...rest,
               callId: rest.callId ?? block.id,

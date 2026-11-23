@@ -485,6 +485,54 @@ test("a call is not said until it can be said whole: no placeholder line that th
   expect(folded.activeStep).toMatchObject({ kind: "tool", name: "read" });
 });
 
+test("mid-token tool arguments wait until whole, parallel bursts advance monotonically, and mayGrow tracks trailing groups", () => {
+  const t = new Transcript();
+  const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
+  const acts = (running = true) => buildDisplayRows(t.rows(), running).filter((row) => row.kind === "activity") as ActivityRow[];
+  t.apply({ type: "message_start", message: asked("go") });
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+
+  // Unclosed target string (`"views/Ro`) is still mid-token: never rendered as "Reading Ro".
+  update({ type: "toolcall_start", contentIndex: 0, id: "c1", toolName: "edit" });
+  update({ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"views/Ro' });
+  expect(acts()).toHaveLength(0);
+
+  // Once `path` closes, streaming a long `newText` body shows "Updating Rows.tsx" immediately.
+  const origNow = Date.now;
+  let clock = origNow();
+  Date.now = () => (clock += 120);
+  try {
+    update({ type: "toolcall_delta", contentIndex: 0, delta: 'ws.tsx","newText":"const a = 1' });
+    expect(acts().map((row) => describeActivity(row, "en"))).toEqual(["Updating Rows.tsx"]);
+    expect(acts()[0].mayGrow).toBe(true);
+  } finally {
+    Date.now = origNow;
+  }
+
+  // Parallel batch: c1, c2, c3 all running simultaneously stay on c1 even as c3 and c2 finish out of order.
+  update({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "c1", name: "edit", arguments: { path: "views/Rows.tsx", newText: "const a = 1" } } });
+  t.apply({ type: "tool_execution_start", toolCallId: "c1", toolName: "edit", args: { path: "views/Rows.tsx" } });
+  t.apply({ type: "tool_execution_start", toolCallId: "c2", toolName: "read", args: { path: "pi/turns.ts" } });
+  t.apply({ type: "tool_execution_start", toolCallId: "c3", toolName: "read", args: { path: "ui/RollingText.tsx" } });
+  expect(describeActivity(acts()[0], "en")).toBe("Updating Rows.tsx");
+
+  // c3 finishes first — line does NOT jump backwards to c2.
+  t.apply({ type: "tool_execution_end", toolCallId: "c3", toolName: "read", result: { content: [] }, isError: false });
+  expect(describeActivity(acts()[0], "en")).toBe("Updating Rows.tsx");
+
+  // c1 finishes — advances monotonically forward to c2.
+  t.apply({ type: "tool_execution_end", toolCallId: "c1", toolName: "edit", result: { content: [] }, isError: false });
+  expect(describeActivity(acts()[0], "en")).toBe("Reading turns.ts");
+
+  // c2 finishes — still the trailing activity of a running turn, so `mayGrow` stays true until prose or turn end seals it.
+  t.apply({ type: "tool_execution_end", toolCallId: "c2", toolName: "read", result: { content: [] }, isError: false });
+  expect(acts()[0].mayGrow).toBe(true);
+
+  // Commentary prose seals the preceding activity group (`mayGrow` becomes falsy).
+  update({ type: "text_delta", contentIndex: 1, delta: "Done inspecting." });
+  expect(acts()[0].mayGrow).toBeUndefined();
+});
+
 test("a turn's length is said in the whole seconds its timer counted", () => {
   expect(elapsedSeconds(13_900)).toBe(13);
   expect(spokenDuration(13_900, false)).toBe("13 seconds");

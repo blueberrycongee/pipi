@@ -433,6 +433,81 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     }
 
     /**
+     * A high-frequency burst of tool calls (token-by-token partial JSON args,
+     * parallel launches finishing out of order, and sub-100ms inter-step gaps)
+     * that stresses aggregated toolcall choreography against flickering.
+     */
+    async function runBurst(user: AgentMessage, step: (record: object, pauseMs?: number) => Promise<void>, update: (event: object, pauseMs?: number) => Promise<void>) {
+      isStreaming = true;
+      const base = { role: "assistant", provider: "anthropic", model: "claude-sonnet-4-5", usage, timestamp: Date.now() };
+      await step({ type: "agent_start" }, 0);
+      await step({ type: "turn_start" }, 0);
+      await step({ type: "message_start", message: user }, 0);
+      await step({ type: "message_end", message: user }, 0);
+      // Let the composer dock animation settle (`app.submit` runs the manual clock ~1s) before filming the burst.
+      await later(1600);
+
+      // Wave 1: partial-arg streaming into 4 parallel fast reads finishing out of order.
+      const wave1 = [
+        { id: `call_${++calls}`, name: "read", args: { path: "views/Rows.tsx" }, out: "rows" },
+        { id: `call_${++calls}`, name: "read", args: { path: "pi/turns.ts" }, out: "turns" },
+        { id: `call_${++calls}`, name: "read", args: { path: "ui/RollingText.tsx" }, out: "rolling" },
+        { id: `call_${++calls}`, name: "read", args: { path: "views/Chat.tsx" }, out: "chat" },
+      ];
+      await step({ type: "message_start", message: { ...base, content: [], stopReason: "pending" } }, 0);
+      await update({ type: "toolcall_start", contentIndex: 0, id: wave1[0].id, toolName: "read" }, 0);
+      await update({ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"views/Ro' }, 100);
+      await update({ type: "toolcall_delta", contentIndex: 0, delta: 'ws.ts' }, 100);
+      await update({ type: "toolcall_delta", contentIndex: 0, delta: 'x"}' }, 100);
+      await update({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: wave1[0].id, name: "read", arguments: wave1[0].args } }, 16);
+      for (let i = 1; i < wave1.length; i++) {
+        const t = wave1[i];
+        await update({ type: "toolcall_start", contentIndex: i, id: t.id, toolName: t.name }, 16);
+        await update({ type: "toolcall_delta", contentIndex: i, delta: JSON.stringify(t.args) }, 16);
+        await update({ type: "toolcall_end", contentIndex: i, toolCall: { type: "toolCall", id: t.id, name: t.name, arguments: t.args } }, 16);
+      }
+      await step({ type: "message_end", message: { ...base, content: wave1.map((t) => ({ type: "toolCall", id: t.id, name: t.name, arguments: t.args })), stopReason: "toolUse" } }, 16);
+      for (const t of wave1) await step({ type: "tool_execution_start", toolCallId: t.id, toolName: t.name, args: t.args }, 16);
+      // Finish in reverse order (3 -> 2 -> 1 -> 0) within 80ms.
+      for (let i = wave1.length - 1; i >= 0; i--) {
+        const t = wave1[i];
+        await step({ type: "tool_execution_end", toolCallId: t.id, toolName: t.name, result: { content: [{ type: "text", text: t.out }] }, isError: false, durationMs: 30 }, 20);
+      }
+
+      // Brief 90ms inter-turn gap (must NOT ping-pong to "Read 4 files" before Wave 2 arrives).
+      await later(90);
+
+      // Wave 2: grep + bash, streaming partial command before closing.
+      const grepCall = { id: `call_${++calls}`, name: "grep", args: { pattern: "RollingText", path: "views" }, out: "Rows.tsx:32" };
+      const bashCall = { id: `call_${++calls}`, name: "bash", args: { command: "git status --short" }, out: "M ui/RollingText.tsx" };
+      await step({ type: "message_start", message: { ...base, content: [], stopReason: "pending" } }, 0);
+      await update({ type: "toolcall_start", contentIndex: 0, id: grepCall.id, toolName: "grep" }, 0);
+      await update({ type: "toolcall_delta", contentIndex: 0, delta: '{"pattern":"Roll' }, 100);
+      await update({ type: "toolcall_delta", contentIndex: 0, delta: 'ingText","path":"views"}' }, 100);
+      await update({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: grepCall.id, name: "grep", arguments: grepCall.args } }, 16);
+      await update({ type: "toolcall_start", contentIndex: 1, id: bashCall.id, toolName: "bash" }, 16);
+      await update({ type: "toolcall_delta", contentIndex: 1, delta: '{"command":"git ' }, 100);
+      await update({ type: "toolcall_delta", contentIndex: 1, delta: 'status --short"}' }, 100);
+      await update({ type: "toolcall_end", contentIndex: 1, toolCall: { type: "toolCall", id: bashCall.id, name: "bash", arguments: bashCall.args } }, 16);
+      await step({ type: "message_end", message: { ...base, content: [{ type: "toolCall", id: grepCall.id, name: "grep", arguments: grepCall.args }, { type: "toolCall", id: bashCall.id, name: "bash", arguments: bashCall.args }], stopReason: "toolUse" } }, 16);
+      await step({ type: "tool_execution_start", toolCallId: grepCall.id, toolName: grepCall.name, args: grepCall.args }, 16);
+      await step({ type: "tool_execution_end", toolCallId: grepCall.id, toolName: grepCall.name, result: { content: [{ type: "text", text: grepCall.out }] }, isError: false, durationMs: 25 }, 420);
+      await step({ type: "tool_execution_start", toolCallId: bashCall.id, toolName: bashCall.name, args: bashCall.args }, 16);
+      await step({ type: "tool_execution_end", toolCallId: bashCall.id, toolName: bashCall.name, result: { content: [{ type: "text", text: bashCall.out }] }, isError: false, durationMs: 35 }, 420);
+
+      // Commentary seals the activity group so the final settled summary appears before the final answer.
+      const commentary = "All checks are green.";
+      await step({ type: "message_start", message: { ...base, content: [], stopReason: "pending" } }, 0);
+      await update({ type: "text_start", contentIndex: 0 }, 16);
+      await update({ type: "text_delta", contentIndex: 0, delta: commentary }, 16);
+      await update({ type: "text_end", contentIndex: 0, content: commentary }, 400);
+      await step({ type: "message_end", message: { ...base, content: [{ type: "text", text: commentary }], stopReason: "stop" } }, 16);
+      emit({ type: "agent_end", willRetry: false });
+      isStreaming = false;
+      emit({ type: "agent_settled", aborted: false });
+    }
+
+    /**
      * A run as the external-agent bridge plays an ACP harness's (Devin's): the
      * whole turn is one assistant message — reasoning, calls that run inside
      * it, then the answer — so its prose is final only when the run settles.
@@ -638,6 +713,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       // "recite <path>": the reply is what that file holds now — how a test reads the disk.
       const recited = /^recite (\S+)/.exec(prompt)?.[1];
       if (recited) reply = `\`\`\`\n${await fs.readFile(recited, "utf8").catch(() => "(no file)")}\n\`\`\``;
+      if (prompt.includes("burst")) return runBurst(user, step, update);
       if (prompt.includes("steps")) return runSteps(user, prompt, step, update);
       if (prompt.includes("acp")) return runAcp(user, prompt, step, update);
       isStreaming = true;

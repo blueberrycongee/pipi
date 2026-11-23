@@ -56,6 +56,8 @@ export interface ActivityRow {
   running: boolean;
   /** The newest row still working: it alone loops its breathing cue, the rest stand still. */
   live?: boolean;
+  /** Trailing activity group of a running turn: more steps may still join it before prose or turn end seals it. */
+  mayGrow?: boolean;
   hasError: boolean;
   /** Sum of the steps' recorded durations when any has one. */
   durationMs?: number;
@@ -92,14 +94,38 @@ export type DisplayRow = Exclude<Row, ToolRow> | ActivityRow | TurnHeaderRow;
 
 const isToolActive = (status: ToolRow["status"]) => status === "call" || status === "queued" || status === "running";
 
+const TITLE_KEYS: Partial<Record<ToolCategory, readonly string[]>> = {
+  read: ["path", "Path", "file_path", "filePath", "file", "target_file", "notebook_path"],
+  edit: ["path", "Path", "file_path", "filePath", "file", "target_file", "notebook_path"],
+  create: ["path", "Path", "file_path", "filePath", "file", "target_file", "notebook_path"],
+  list: ["path", "Path", "DirectoryPath", "dir", "directory"],
+  search: ["pattern", "Pattern", "query", "Query", "search", "regex", "glob", "q", "url", "Url"],
+  web: ["query", "Query", "url", "Url", "q", "prompt"],
+  command: ["command", "cmd", "CommandLine", "script"],
+  agent: ["title", "description", "Role", "name", "task", "message", "agent", "agentId", "subagent_type", "session", "sessionId", "id"],
+};
+
 /**
  * A call the model has only begun to write: its name is known, nothing of what
- * it is for. Said now, its line would be a placeholder ("Reading file") that
- * the next delta rewrites ("Reading package.json") — a line that changes its
- * mind a frame after it appears. It is not said until it can be said whole:
- * the row before it stands meanwhile.
+ * it is for (or its primary target string is still mid-token without a closing
+ * quote). Said now, its line would be a placeholder ("Reading file") or a
+ * half-typed fragment ("Reading Ro") that the next delta rewrites — a line
+ * that changes its mind a frame after it appears. It is not said until it can
+ * be said whole: the row before it stands meanwhile.
  */
-const isUnnamedCall = (step: ProcessStep) => step.kind === "tool" && step.status === "call" && Object.keys(step.args ?? {}).length === 0;
+const isUnnamedCall = (step: ProcessStep) => {
+  if (step.kind !== "tool" || step.status !== "call") return false;
+  const args = step.args ?? {};
+  if (Object.keys(args).length === 0) return true;
+  const pending = step.incompleteArg;
+  if (!pending) return false;
+  const keys = TITLE_KEYS[classifyTool(step.name).category];
+  if (!keys?.includes(pending)) return false;
+  if (keys.some((k) => k !== pending && typeof args[k] === "string" && (args[k] as string).trim().length > 0)) return false;
+  const raw = typeof args[pending] === "string" ? (args[pending] as string) : "";
+  if (raw.includes("\n") || raw.length >= 90) return false;
+  return true;
+};
 
 /** Normalizes tool names across Pi, Claude Code, Codex, Devin, OpenCode, Cursor, Gemini & ACP servers. */
 export function classifyTool(rawName: string): { category: ToolCategory; subkind?: "find" | "fetch"; icon: IconName } {
@@ -626,17 +652,30 @@ function segmentLine(key: SegmentKey, tools: ToolRow[], zh: boolean): string {
   }
 }
 
-/** The step a running group is on: the newest call still running, reasoning under way, or the last call. */
-function currentLine(all: readonly ProcessStep[], zh: boolean): string {
+/** Picks the steady step representing a running group: oldest active foreground tool
+ * (so parallel bursts stay monotonic forward instead of reversing as calls finish),
+ * else active reasoning, else a background tool, else the last step. */
+function selectActiveStep(all: readonly ProcessStep[]): ProcessStep | undefined {
   // A call not named yet says nothing: the line stays on the step before it.
   const steps = all.filter((step) => !isUnnamedCall(step));
+  for (const step of steps) {
+    if (step.kind === "tool" && !step.background && isToolActive(step.status)) return step;
+  }
   for (let i = steps.length - 1; i >= 0; i--) {
     const step = steps[i];
-    if (step.kind === "tool" && isToolActive(step.status)) return toolLine(step, true, zh);
+    if (step.kind === "thinking" && step.streaming) return step;
   }
-  const last = steps[steps.length - 1];
-  if (!last || last.kind === "thinking") return zh ? "正在思考" : "Thinking";
-  return toolLine(last, false, zh);
+  for (const step of steps) {
+    if (step.kind === "tool" && step.background && isToolActive(step.status)) return step;
+  }
+  return steps[steps.length - 1];
+}
+
+/** The step a running group is on: the active foreground call, reasoning under way, or the last call. */
+function currentLine(all: readonly ProcessStep[], zh: boolean): string {
+  const step = selectActiveStep(all);
+  if (!step || step.kind === "thinking") return zh ? "正在思考" : "Thinking";
+  return toolLine(step, isToolActive(step.status), zh);
 }
 
 /** Compact summary of settled tool calls by kind, in first-seen order ("Ran git, Read 3 files"). */
@@ -776,8 +815,8 @@ export function buildDisplayRows(
     const process: DisplayRow[] = [];
     const answer: DisplayRow[] = [];
     const turnTools: ToolRow[] = [];
+    const turnSteps: ProcessStep[] = [];
     let steps: ProcessStep[] = [];
-    let activeStep: TurnHeaderRow["activeStep"];
     let backgroundStep: ToolRow | undefined;
     let totalTurnMs = first.turnMs;
     let tailClosed = first.turnMs !== undefined;
@@ -802,7 +841,7 @@ export function buildDisplayRows(
       }
       if (cur.kind === "tool" || cur.kind === "thinking") {
         steps.push(cur);
-        if (!isUnnamedCall(cur)) activeStep = cur;
+        turnSteps.push(cur);
         if (cur.kind === "tool") {
           turnTools.push(cur);
           if (cur.background && isToolActive(cur.status)) backgroundStep = cur;
@@ -825,6 +864,9 @@ export function buildDisplayRows(
     // Bubbles the queue still holds trail the end but were not sent into the run: they
     // cut nothing short — the turn goes on until their echo lands them among the rows.
     const running = sessionRunning && rows.slice(i).every((rest) => rest.kind === "user" && rest.queued) && !answered && !tailClosed;
+    const tail = process[process.length - 1];
+    if (running && tail?.kind === "activity") tail.mayGrow = true;
+    const activeStep = selectActiveStep(turnSteps);
     const hasDetails = process.length > 0;
     const id = `turn:${first.id}`;
     const chosen = folds.chosen?.(id);
@@ -872,7 +914,7 @@ const sameList = (a: readonly unknown[], b: readonly unknown[]) => a.length === 
 
 function sameRow(a: DisplayRow, b: DisplayRow): boolean {
   if (a === b) return true;
-  if (a.kind === "activity" && b.kind === "activity") return a.live === b.live && sameList(a.steps, b.steps);
+  if (a.kind === "activity" && b.kind === "activity") return a.live === b.live && a.mayGrow === b.mayGrow && sameList(a.steps, b.steps);
   if (a.kind === "turn" && b.kind === "turn") {
     return (
       a.running === b.running &&

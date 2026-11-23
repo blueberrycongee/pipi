@@ -119,3 +119,42 @@ test("the turn ends on the seconds its timer counted", async () => {
   for (let i = 1; i < counted.length; i++) expect(counted[i]).toBeGreaterThanOrEqual(counted[i - 1]);
   expect(Number(header!.match(/\d+/)![0])).toBe(counted[counted.length - 1]);
 });
+
+test("aggregated toolcall bursts stay calm: no partial-arg stutters, no running/settled ping-pong, paced cadence", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  await app.type("label:Message", "run a burst of tool calls");
+  await app.submit("label:Message");
+
+  const frames: { at: number; texts: string[] }[] = [];
+  for (let elapsed = 0; elapsed < 20_000; elapsed += 16) {
+    const all = app.texts();
+    const to = all.indexOf("Claude Sonnet 4.5");
+    const chat = to < 0 ? all : all.slice(0, to);
+    const from = chat.lastIndexOf("run a burst of tool calls");
+    frames.push({ at: elapsed, texts: from < 0 ? [] : chat.slice(from + 1) });
+    if (elapsed > 1000 && app.shows("label:Send")) break;
+    await app.wait(16);
+  }
+
+  const everSaid = new Set(frames.flatMap((f) => f.texts));
+  // 1. Mid-token partial arguments never stutter onto screen.
+  for (const fragment of ["Reading Ro", "Reading Rows.ts", "Searching Roll", "Running git", "Reading file"]) {
+    expect(everSaid.has(fragment)).toBe(false);
+  }
+  // 2. Parallel reads finishing out of order never bounce through every file or flash an intermediate settled summary across the 90ms gap.
+  expect([...everSaid]).toContain("Reading Rows.tsx");
+  expect(everSaid.has("Read 4 files")).toBe(false);
+  expect(everSaid.has("Reading turns.ts")).toBe(false);
+  expect(everSaid.has("Reading RollingText.tsx")).toBe(false);
+  expect(everSaid.has("Reading Chat.tsx")).toBe(false);
+  // 3. Later sustained steps (grep + bash) appear cleanly once whole, and the final settled summary lands once prose seals the group.
+  expect(everSaid.has("Searching RollingText")).toBe(true);
+  expect(everSaid.has("Running git status --short")).toBe(true);
+  expect(everSaid.has("Read 4 files, Searched RollingText, Ran git")).toBe(true);
+  // 4. Consecutive active label introductions stay paced (>= 350ms apart — never high-frequency strobing).
+  const activeLabels = ["Reading Rows.tsx", "Searching RollingText", "Running git status --short"];
+  const firstSeen = activeLabels.map((label) => frames.find((f) => f.texts.includes(label))!.at);
+  expect(firstSeen[1] - firstSeen[0]).toBeGreaterThanOrEqual(350);
+  expect(firstSeen[2] - firstSeen[1]).toBeGreaterThanOrEqual(350);
+});
