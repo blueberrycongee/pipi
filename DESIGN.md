@@ -339,8 +339,10 @@ Three shadows exist: `shadow-composer` (the composer; `COMPOSER_SURFACE` in
 `ui/styles.ts`), `shadow-popover` (every anchored surface, always with
 `border` and `bg-popover`; the recipe is `POPUP`), and `shadow-toast`
 (toasts; `POPUP_TOAST`). The composer's is a tight contact shadow under a
-wide, soft ambient one, with a half-point top highlight; focus deepens
-both, never adds color. The toast's is the same family drawn tight — toasts
+wide, soft ambient one — drawn dark enough to touch the pane, heaviest in
+dark — with a half-point top highlight over a half-point darker lower
+edge: the glass edge in profile, bright where the light catches and
+shaded where it turns under. Focus deepens both, never adds color. The toast's is the same family drawn tight — toasts
 stack, and a wide shadow would fall on the card below. Toasts alone drop
 the translucent glass fill for an opaque `bg-popover`: they float over the
 scrolling transcript, and translucency lets the rows behind ghost through.

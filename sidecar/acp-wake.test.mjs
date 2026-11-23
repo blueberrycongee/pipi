@@ -502,3 +502,48 @@ test("reply-and-park swarm turn settles cleanly while keeping daemon backgroundW
     "backgroundWatch releases once active swarm worker parks (ignoring passive monitor)",
   );
 });
+
+test("reloading an Antigravity session backfills replies finished while disconnected without duplicating", async (t) => {
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "60000" });
+  await bridge.prompt("start a background swarm-async");
+  await bridge.settles(1, 5000);
+  const { data: state } = await bridge.send({ type: "get_state" });
+  assert.ok(state.sessionFile);
+
+  const header = JSON.parse(fs.readFileSync(state.sessionFile, "utf8").split("\n")[0]);
+  const nativeId = header.nativeThreadId;
+  assert.ok(nativeId);
+
+  // Simulate Antigravity finishing a final swarm summary in transcript_full.jsonl
+  // while pipi's bridge was detached/restarted.
+  const logsDir = path.join(bridge.agyHome, "brain", nativeId, ".system_generated", "logs");
+  fs.mkdirSync(logsDir, { recursive: true });
+  const t0 = new Date(Date.now() - 5000).toISOString();
+  const t1 = new Date(Date.now() + 5000).toISOString();
+  fs.writeFileSync(
+    path.join(logsDir, "transcript_full.jsonl"),
+    [
+      JSON.stringify({ step_index: 0, type: "USER_INPUT", status: "DONE", created_at: t0, content: "<USER_REQUEST>\nstart a background swarm-async\n</USER_REQUEST>" }),
+      JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", status: "DONE", created_at: t0, content: "Swarm started." }),
+      JSON.stringify({ step_index: 2, type: "PLANNER_RESPONSE", status: "DONE", created_at: t1, tool_calls: [{ name: "read_board" }] }),
+      JSON.stringify({ step_index: 3, type: "PLANNER_RESPONSE", status: "DONE", created_at: t1, thinking: "Wrapping up.", content: "Swarm completed while disconnected: all 53 tests pass." }),
+    ].join("\n") + "\n",
+  );
+
+  await bridge.send({ type: "new_session" });
+  await bridge.send({ type: "switch_session", sessionPath: state.sessionFile });
+  const { data: firstLoad } = await bridge.send({ type: "get_messages" });
+  const firstTexts = firstLoad.messages
+    .filter((m) => m.role === "assistant")
+    .map((m) => m.content.filter((b) => b.type === "text").map((b) => b.text).join(""));
+  assert.deepEqual(firstTexts, ["Swarm started.", "Swarm completed while disconnected: all 53 tests pass."]);
+
+  // Reloading a second time must be idempotent (no duplicated backfill).
+  await bridge.send({ type: "new_session" });
+  await bridge.send({ type: "switch_session", sessionPath: state.sessionFile });
+  const { data: secondLoad } = await bridge.send({ type: "get_messages" });
+  const secondTexts = secondLoad.messages
+    .filter((m) => m.role === "assistant")
+    .map((m) => m.content.filter((b) => b.type === "text").map((b) => b.text).join(""));
+  assert.deepEqual(secondTexts, ["Swarm started.", "Swarm completed while disconnected: all 53 tests pass."]);
+});

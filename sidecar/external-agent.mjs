@@ -466,11 +466,17 @@ async function loadExternalSession(targetPath) {
   }
   messagesDirty = false;
   if (clearStaleBackgroundTools(loadedMessages)) messagesDirty = true;
+  if (isAntigravityAcp() && nativeThreadId) {
+    if (reconcileAgyTranscript(loadedMessages, nativeThreadId)) messagesDirty = true;
+  }
   messages = loadedMessages;
   // The file already holds what was loaded: appends continue from there, and
   // the next structural header difference (a Pi header, a driver switch) falls
   // back to a rewrite.
   flushed = { key: stableHeaderKey(header || {}), messages: loadedMessages.length, usage: loadedUsage.length, bytes: Buffer.byteLength(raw) };
+  if (messagesDirty && sessionFile) {
+    await saveExternalSession().catch(() => undefined);
+  }
 }
 
 // ── Orchestration Guidance for External Coordinator Agents ──────────────────
@@ -2075,7 +2081,128 @@ function hasActiveAgySwarm() {
     acpSwarmActive = false;
     return false;
   }
-  return swarm.working > 0;
+  return swarm.working > 0 || agyHasPendingReply(acpSessionId);
+}
+
+const AGY_MAX_RECONCILE_BYTES = 32 * 1024 * 1024;
+
+function extractAgyUserRequest(raw) {
+  if (typeof raw !== "string") return "";
+  const m = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/.exec(raw);
+  return (m ? m[1] : raw).trim();
+}
+
+function messagePlainText(msg) {
+  if (!msg || !Array.isArray(msg.content)) return "";
+  return msg.content
+    .filter((b) => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
+/**
+ * Backfills completed Antigravity replies written to `transcript_full.jsonl`
+ * (or `transcript.jsonl`) while this bridge was disconnected/unloaded (e.g. a
+ * `/swarm` that finished in the background after an app restart or daemon
+ * eviction). Anchors on the last saved assistant reply (or user prompt) so
+ * existing messages are never duplicated.
+ */
+function reconcileAgyTranscript(loadedMessages, acpId) {
+  if (!Array.isArray(loadedMessages) || loadedMessages.length === 0) return false;
+  if (!acpId || !AGY_NATIVE_ID.test(acpId)) return false;
+  const root = agyHomeRoot();
+  if (!root) return false;
+  const full = agyManagedPathSync(root, ["brain", acpId, ".system_generated", "logs", "transcript_full.jsonl"], "file");
+  const compact = full ? undefined : agyManagedPathSync(root, ["brain", acpId, ".system_generated", "logs", "transcript.jsonl"], "file");
+  const file = full || compact;
+  if (!file || file.info.size <= 0 || file.info.size > AGY_MAX_RECONCILE_BYTES) return false;
+
+  let raw;
+  try {
+    raw = fs.readFileSync(file.path, "utf8");
+  } catch {
+    return false;
+  }
+  const steps = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object") steps.push(parsed);
+    } catch {}
+  }
+  if (!steps.length) return false;
+
+  const existingAssistantTexts = new Set();
+  let lastAssistantText = "";
+  let lastUserText = "";
+  let lastSavedAt = 0;
+  for (const m of loadedMessages) {
+    if (typeof m?.timestamp === "number" && m.timestamp > lastSavedAt) lastSavedAt = m.timestamp;
+    const text = messagePlainText(m);
+    if (!text) continue;
+    if (m.role === "assistant") {
+      existingAssistantTexts.add(text);
+      lastAssistantText = text;
+    } else if (m.role === "user") {
+      lastUserText = text;
+    }
+  }
+
+  let anchorIdx = -1;
+  if (lastAssistantText) {
+    for (let i = steps.length - 1; i >= 0; i--) {
+      const s = steps[i];
+      if (s.type === "PLANNER_RESPONSE" && typeof s.content === "string" && s.content.trim() === lastAssistantText) {
+        anchorIdx = i;
+        break;
+      }
+    }
+  }
+  if (anchorIdx === -1 && lastUserText) {
+    for (let i = steps.length - 1; i >= 0; i--) {
+      const s = steps[i];
+      if (s.type === "USER_INPUT" && extractAgyUserRequest(s.content) === lastUserText) {
+        anchorIdx = i;
+        break;
+      }
+    }
+  }
+
+  const lastMsg = loadedMessages[loadedMessages.length - 1];
+  const minAfterAbort = lastMsg?.role === "assistant" && lastMsg.stopReason === "aborted" ? Number(lastMsg.timestamp || 0) : 0;
+  const requireTimestampAfter = anchorIdx === -1 ? lastSavedAt : minAfterAbort;
+
+  let added = false;
+  for (let i = anchorIdx + 1; i < steps.length; i++) {
+    const s = steps[i];
+    if (s.type !== "PLANNER_RESPONSE" || s.status !== "DONE") continue;
+    if (typeof s.content !== "string") continue;
+    const text = s.content.trim();
+    if (!text || existingAssistantTexts.has(text)) continue;
+    const stepMs = typeof s.created_at === "string" ? Date.parse(s.created_at) : NaN;
+    if (requireTimestampAfter > 0 && (!Number.isFinite(stepMs) || stepMs <= requireTimestampAfter)) continue;
+    const content = [];
+    if (typeof s.thinking === "string" && s.thinking.trim()) {
+      content.push({ type: "thinking", thinking: s.thinking });
+    }
+    content.push({ type: "text", text: s.content });
+    loadedMessages.push({
+      role: "assistant",
+      content,
+      provider: currentModel.provider,
+      model: currentModel.id,
+      usage: zeroUsage,
+      stopReason: "stop",
+      turnStart: true,
+      timestamp: Number.isFinite(stepMs) ? stepMs : Date.now(),
+    });
+    existingAssistantTexts.add(text);
+    added = true;
+  }
+  return added;
 }
 
 /**
@@ -3192,6 +3319,22 @@ async function negotiateAcpRound(bin, epoch) {
       nativeThreadId = acpSessionId;
       acpReset = false;
       adoptSessionInfo(sess);
+      if (!begun && isAntigravityAcp()) {
+        const beforeCount = messages.length;
+        if (reconcileAgyTranscript(messages, acpSessionId)) {
+          messagesDirty = true;
+          for (const addedMsg of messages.slice(beforeCount)) {
+            emit({ type: "message_start", message: { ...addedMsg, stopReason: "pending" } });
+            emit({ type: "message_end", message: addedMsg });
+          }
+          if (sessionFile) await saveExternalSession().catch(() => undefined);
+        }
+        const swarm = agySwarmWorkerStatus(acpSessionId);
+        if (swarm && swarm.activeWorkers > 0) {
+          acpSwarmActive = true;
+          syncBackgroundWatch();
+        }
+      }
       if (learnedNativeId && sessionFile) {
         await saveExternalSession().catch(() => undefined);
       }

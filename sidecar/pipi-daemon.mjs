@@ -31,9 +31,11 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { childEnv } from "./env-paths.mjs";
+import { sidecarFingerprint } from "./daemon-client.mjs";
 import { titleWords } from "./session-index.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DAEMON_FINGERPRINT = sidecarFingerprint(__dirname);
 const LAUNCH_PI = path.join(__dirname, "launch-pi.mjs");
 const EXTERNAL_AGENT = path.join(__dirname, "external-agent.mjs");
 const PIPI_CLI = path.join(__dirname, "pipi-cli.mjs");
@@ -2074,12 +2076,27 @@ async function controlOp(conn, msg) {
       respond(conn, id, "pong", {});
       return;
     }
+    case "shutdown_if_idle": {
+      if (conn.kind !== "ui") {
+        respondError(conn, id, "ui client required");
+        return;
+      }
+      if (!hasActiveRuns()) {
+        respond(conn, id, "ok", { shuttingDown: true });
+        setTimeout(() => shutdownDaemon(), 25).unref?.();
+      } else {
+        pendingUpgrade = true;
+        respond(conn, id, "ok", { shuttingDown: false, deferred: true });
+      }
+      return;
+    }
     default:
       if (id) respondError(conn, id, `unknown op "${msg.type}"`);
   }
 }
 
 let sawUiClient = false;
+let pendingUpgrade = false;
 let windowlessTimer;
 let shutdownDaemon = () => process.exit(0);
 
@@ -2092,6 +2109,14 @@ function hasActiveRuns() {
 
 function checkWindowlessExit() {
   const hasUi = [...controlClients].some((c) => c.kind === "ui");
+  if (pendingUpgrade && !hasUi && !hasActiveRuns()) {
+    if (windowlessTimer) {
+      clearTimeout(windowlessTimer);
+      windowlessTimer = undefined;
+    }
+    shutdownDaemon();
+    return;
+  }
   if (!sawUiClient || hasUi || config.linger) {
     if (windowlessTimer) {
       clearTimeout(windowlessTimer);
@@ -2507,7 +2532,15 @@ async function main() {
   });
   mcpPort = mcp.address().port;
 
-  const instance = { pid: process.pid, controlPort, mcpPort, token: CONTROL_TOKEN, started: now() };
+  const instance = {
+    pid: process.pid,
+    controlPort,
+    mcpPort,
+    token: CONTROL_TOKEN,
+    started: now(),
+    fingerprint: DAEMON_FINGERPRINT,
+    sidecarDir: __dirname,
+  };
   // daemon.json carries the control token — full session authority; owner-read only.
   await fsp.writeFile(INSTANCE_FILE, JSON.stringify(instance, null, 2), { mode: 0o600 });
   await fsp.chmod(INSTANCE_FILE, 0o600).catch(() => {});

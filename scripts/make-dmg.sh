@@ -78,7 +78,15 @@ fi
 chflags hidden "$MOUNT_DIR/.background" 2>/dev/null || true
 rm -rf "$MOUNT_DIR/.fseventsd" 2>/dev/null || true
 sync
-hdiutil detach "$MOUNT_DIR" -force
+detached=""
+for _ in 1 2 3 4 5; do
+  if hdiutil detach "$MOUNT_DIR" -force; then
+    detached=1
+    break
+  fi
+  sleep 2
+done
+[ -n "$detached" ]
 MOUNT_DIR=""
 hdiutil convert "$RW_DMG" -format UDZO -imagekey zlib-level=9 -ov -o "$DMG"
 rm -f "$RW_DMG"

@@ -10,6 +10,7 @@ import { connectDaemon } from "./daemon-client.mjs";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DAEMON_SCRIPT = path.join(__dirname, "pipi-daemon.mjs");
 const CLI_SCRIPT = path.join(__dirname, "pipi-cli.mjs");
 const MCP_STDIO_SCRIPT = path.join(__dirname, "pipi-mcp-stdio.mjs");
 const PI_EXT_SCRIPT = path.join(__dirname, "pipi-orchestrator-extension.mjs");
@@ -1576,4 +1577,96 @@ test("pipi_background_watch stays hidden from UI clients and keeps daemon alive 
     }
   }
   assert.equal(alive, false, "daemon exits once backgroundWatch clears");
+});
+
+test("connectDaemon upgrades a stale idle daemon on UI connect, preserves running ones, and ignores CLI connects", async (t) => {
+  const { connectDaemon, sidecarFingerprint } = await import("./daemon-client.mjs");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-upgrade-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+
+  // 1. Start a daemon with a stale fingerprint (simulating an older app install).
+  const staleEnv = { ...process.env, HOME: tmp, PIPI_DAEMON_POOL: "0", PIPI_DAEMON_FINGERPRINT: "stale-v0-2-21" };
+  const staleChild = spawn(process.execPath, [DAEMON_SCRIPT, "--home", homeDir], { env: staleEnv, stdio: "ignore" });
+  t.after(() => {
+    try {
+      staleChild.kill("SIGTERM");
+    } catch {}
+    try {
+      const info = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+      if (info?.pid) process.kill(info.pid, "SIGTERM");
+    } catch {}
+  });
+  const instPath = path.join(homeDir, "daemon.json");
+  for (let i = 0; i < 100 && !fs.existsSync(instPath); i++) await new Promise((r) => setTimeout(r, 40));
+  const staleInfo = JSON.parse(fs.readFileSync(instPath, "utf8"));
+  assert.equal(staleInfo.fingerprint, "stale-v0-2-21");
+
+  // 2. A CLI connection must NOT recycle the stale daemon.
+  const cli = await connectDaemon({ home: homeDir, kind: "cli", timeoutMs: 8000 });
+  const cliHello = await new Promise((resolve) => cli.onLine((m) => m.type === "hello" && resolve(m)));
+  assert.equal(cliHello.type, "hello");
+  cli.close();
+  assert.equal(JSON.parse(fs.readFileSync(instPath, "utf8")).pid, staleInfo.pid, "CLI connect keeps existing daemon");
+
+  // 3. A UI connection to an idle stale daemon cleanly replaces it with the current fingerprint.
+  const ui = await connectDaemon({ home: homeDir, kind: "ui", timeoutMs: 8000 });
+  const uiHello = await new Promise((resolve) => ui.onLine((m) => m.type === "hello" && resolve(m)));
+  assert.equal(uiHello.type, "hello");
+  const freshInfo = JSON.parse(fs.readFileSync(instPath, "utf8"));
+  assert.notEqual(freshInfo.pid, staleInfo.pid, "stale idle daemon was replaced");
+  assert.equal(freshInfo.fingerprint, sidecarFingerprint(), "replacement daemon reports current fingerprint");
+
+  // 4. Start an actively working session, then spoof daemon.json with a stale fingerprint:
+  // a new UI connection must NOT kill the running session.
+  const req = (channel, msg) =>
+    new Promise((resolve) => {
+      const id = `r_${Math.random().toString(36).slice(2)}`;
+      const fn = (m) => {
+        if (m.id === id) {
+          channel._handlers.splice(channel._handlers.indexOf(fn), 1);
+          resolve(m);
+        }
+      };
+      channel._handlers.push(fn);
+      channel.send({ ...msg, id });
+    });
+  await req(ui, {
+    type: "config",
+    agents: [{ id: "pi", name: "Pi", driver: "pi", binaryPath: mockBin }],
+    allowAgentTools: true,
+    linger: false,
+  });
+  const attached = await req(ui, {
+    type: "attach",
+    session: { cwd: workDir, agentId: "pi", agentName: "Pi", driver: "pi", runtimeMode: "full-access" },
+  });
+  const sid = attached.session.id;
+  const workingReady = new Promise((resolve) => {
+    const fn = (m) => {
+      if (m.type === "session" && m.session?.id === sid && m.session.status === "working") {
+        ui._handlers.splice(ui._handlers.indexOf(fn), 1);
+        resolve();
+      }
+    };
+    ui._handlers.push(fn);
+  });
+  ui.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "slow1", type: "prompt", message: "slow:1500" }) });
+  await workingReady;
+
+  fs.writeFileSync(instPath, JSON.stringify({ ...freshInfo, fingerprint: "older-build" }, null, 2));
+  const ui2 = await connectDaemon({ home: homeDir, kind: "ui", timeoutMs: 8000 });
+  const ui2Hello = await new Promise((resolve) => ui2.onLine((m) => m.type === "hello" && resolve(m)));
+  assert.equal(ui2Hello.type, "hello");
+  assert.equal(
+    ui2Hello.sessions.find((s) => s.id === sid)?.status,
+    "working",
+    "running session was preserved without killing the daemon",
+  );
+  assert.doesNotThrow(() => process.kill(freshInfo.pid, 0), "daemon stayed alive while session was working");
+
+  ui2.close();
+  ui.close();
 });
