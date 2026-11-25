@@ -270,6 +270,46 @@ function adoptCommands(reported) {
   emit({ type: "commands_changed" });
 }
 
+const PIPI_MCP_TOOLS = new Set([
+  "agents_list",
+  "workspaces_list",
+  "sessions_list",
+  "session_read",
+  "session_send",
+  "session_start",
+  "session_stop",
+  "present_files",
+]);
+
+const ACP_TOOL_VERB_RE = /^(?:running|run|calling|call|using|use|invoking|invoke|executing|execute|tool)\s*:?\s+/i;
+
+/**
+ * Recognizes pipi's own MCP tools regardless of how each harness namespaces or
+ * formats them (`present_files`, `mcp__pipi__present_files`, Antigravity's
+ * `Run mcp_pipi_present_files`, `pipi:present_files`, etc.).
+ */
+function canonicalPipiToolName(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return undefined;
+  const withoutVerb = s.replace(ACP_TOOL_VERB_RE, "").trim().replace(/\?+$/, "").trim();
+  const extract = (value) => {
+    const lower = value.toLowerCase();
+    let m = /^mcp__[^_]+__(.+)$/.exec(lower);
+    if (m) return m[1];
+    m = /^mcp[:/.][^:/.]+[:/.](.+)$/.exec(lower);
+    if (m) return m[1];
+    m = /^mcp_(?:pipi|t3[-_]code)_(.+)$/.exec(lower);
+    if (m) return m[1];
+    m = /^(?:pipi|t3[-_]code)(?:__|[:/.]|_)(.+)$/.exec(lower);
+    if (m) return m[1];
+    return undefined;
+  };
+  const candidate = (extract(s) ?? extract(withoutVerb) ?? withoutVerb.toLowerCase()).replace(/[\s-]+/g, "_");
+  if (PIPI_MCP_TOOLS.has(candidate)) return candidate;
+  if (/^(?:mcp_[a-z0-9-]+_|[a-z0-9._-]+(?:__|:))present[-_\s]files$/.test(withoutVerb.toLowerCase())) return "present_files";
+  return undefined;
+}
+
 function normalizeToolName(raw) {
   const s = String(raw || "tool").trim();
   switch (s) {
@@ -294,8 +334,13 @@ function normalizeToolName(raw) {
       return "find";
     case "LS":
       return "ls";
-    default:
-      return s.replace(/^mcp__(?:pipi|t3[-_]code)__/, "");
+    default: {
+      const pipiTool = canonicalPipiToolName(s);
+      if (pipiTool) return pipiTool;
+      return s
+        .replace(/^(?:(?:running|run|calling|call|using|use)\s+)?mcp__(?:pipi|t3[-_]code)__/i, "")
+        .replace(/^(?:(?:running|run|calling|call|using|use)\s+)?mcp_(?:pipi|t3[-_]code)_/i, "");
+    }
   }
 }
 
@@ -952,6 +997,7 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       calledTools.add(id);
       openTools.set(id, {
         name,
+        block: tc,
         startedAt: Date.now(),
         ...(meta
           ? {
@@ -976,6 +1022,24 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       if (patch.rawName !== undefined) info.rawName = patch.rawName;
       if (patch.isMcp !== undefined) info.isMcp = !!patch.isMcp;
       if (patch.rawInput !== undefined) info.rawInput = patch.rawInput;
+      let changed = false;
+      const upgradedName = canonicalPipiToolName(patch.rawName) || canonicalPipiToolName(patch.title);
+      if (upgradedName && upgradedName !== info.name) {
+        info.name = upgradedName;
+        if (info.block) info.block.name = upgradedName;
+        changed = true;
+      }
+      if (patch.args && typeof patch.args === "object" && Object.keys(patch.args).length > 0 && info.block) {
+        const nextArgs = { ...(info.block.arguments || {}), ...patch.args };
+        if (patch.rawInput && typeof patch.rawInput === "object" && "description" in nextArgs && !("description" in patch.rawInput)) {
+          delete nextArgs.description;
+        }
+        info.block.arguments = nextArgs;
+        changed = true;
+      }
+      if (changed) {
+        emitTurn({ type: "tool_execution_start", toolCallId: id, toolName: info.name, args: info.block?.arguments || {} });
+      }
     },
     /** True when the open assistant message ends on non-empty prose (a completed reply before a wake). */
     hasTrailingText() {
@@ -1729,7 +1793,18 @@ function normalizeMcpResultPayload(result) {
 }
 
 function extractAcpToolResult(content, rawOutput) {
-  const details = rawOutput && typeof rawOutput === "object" && rawOutput.structuredContent !== undefined ? rawOutput.structuredContent : undefined;
+  const details =
+    rawOutput && typeof rawOutput === "object"
+      ? rawOutput.structuredContent !== undefined
+        ? rawOutput.structuredContent
+        : rawOutput.result && typeof rawOutput.result === "object" && rawOutput.result.structuredContent !== undefined
+          ? rawOutput.result.structuredContent
+          : rawOutput.pipiMedia === true
+            ? rawOutput
+            : rawOutput.result && typeof rawOutput.result === "object" && rawOutput.result.pipiMedia === true
+              ? rawOutput.result
+              : undefined
+      : undefined;
   const blocks = [];
   const parts = [];
   const pushItem = (item) => {
@@ -3177,8 +3252,9 @@ function handleAcpPermission(msg) {
   const opts = Array.isArray(msg.params?.options) ? msg.params.options : [];
   const pick = (prefix) => opts.find((o) => o.kind === prefix) || opts.find((o) => o.kind?.startsWith(prefix));
   // Legacy agy sends answers as permission options, even in full-access mode.
+  // Normalize into the same single-question `form` path so it shares the
+  // stepped UI, one-tap selection, and persisted answer record.
   if (String(tc.toolCallId || "").startsWith("interaction_")) {
-    const options = opts.map((o) => String(o.name || o.optionId));
     // The question the agent is really asking rides in the tool call's input —
     // a bare "Run ask_question" title is a tool name, not something to read.
     const asked =
@@ -3186,9 +3262,31 @@ function handleAcpPermission(msg) {
         .find((v) => typeof v === "string" && v.trim())?.trim() ||
       (title && !/^(run |use |call )?(ask[_-]?(user|question)|question)/i.test(title.trim()) ? title : undefined) ||
       "Choose an option";
-    showAcpDialog(msg.id, { method: "select", title: asked, options }, ({ value, cancelled }) => {
-      if (cancelled || typeof value !== "string") return acpPermissionResult();
-      return acpPermissionResult(opts.find((o) => o.optionId === value) || opts[options.indexOf(value)]);
+    const options = opts.map((o) => ({
+      value: String(o.optionId),
+      label: String(o.name || o.optionId),
+      ...(typeof o.description === "string" && o.description.trim() ? { description: o.description.trim() } : {}),
+    }));
+    const field = { id: "answer", label: asked, required: true, kind: "choice", options };
+    showAcpDialog(msg.id, {
+      method: "form",
+      agent: config.customAgent?.name || AGENT_NAMES[agentId] || acpAgentInfo?.title || agentId,
+      title: "",
+      message: "",
+      fields: [field],
+    }, (answer) => {
+      if (answer?.cancelled === true || answer?.declined === true) return acpPermissionResult();
+      const picked = typeof answer?.answers?.answer === "string" ? answer.answers.answer : typeof answer?.value === "string" ? answer.value : undefined;
+      if (typeof picked !== "string") return acpPermissionResult();
+      const chosen = opts.find((o) => String(o.optionId) === picked) || opts.find((o) => String(o.name || o.optionId) === picked);
+      if (chosen) {
+        const said = formAnswerText([field], { answer: String(chosen.optionId) });
+        if (said) {
+          messages.push({ role: "user", content: [{ type: "text", text: said }], timestamp: Date.now() });
+          void saveExternalSession().catch(() => undefined);
+        }
+      }
+      return acpPermissionResult(chosen);
     });
     return;
   }
@@ -3300,7 +3398,8 @@ function handleAcpUpdate(u, params = undefined) {
       rawInput: u.rawInput,
     });
     if (!replaying) {
-      acpStream?.toolStart(id, u.title || u.kind || "tool", acpToolArgs(u), {
+      const toolLabel = canonicalPipiToolName(u.name) || canonicalPipiToolName(u.title) || u.title || u.kind || "tool";
+      acpStream?.toolStart(id, toolLabel, acpToolArgs(u), {
         kind: u.kind,
         title: u.title,
         rawName: u.name,
@@ -3350,7 +3449,7 @@ function handleAcpUpdate(u, params = undefined) {
         ...(u.title !== undefined ? { title: u.title } : {}),
         ...(u.name !== undefined ? { rawName: u.name } : {}),
         ...(u._meta?.is_mcp_tool_call !== undefined ? { isMcp: u._meta.is_mcp_tool_call === true } : {}),
-        ...(u.rawInput !== undefined ? { rawInput: u.rawInput } : {}),
+        ...(u.rawInput !== undefined ? { rawInput: u.rawInput, args: acpToolArgs(u) } : {}),
       });
       const mergedTool = { ...known, ...u };
       if (isAntigravityAcp() && (isAntigravitySwarmWait(mergedTool) || isAntigravitySwarmTool(mergedTool))) {
@@ -4332,6 +4431,49 @@ async function handleCommand(cmd) {
   }
 }
 
+/**
+ * Direct daemon side-channel for pipi's own `present_files` MCP tool: appends
+ * a first-class `presented_media` block directly into the active turn (and
+ * session persistence) with full daemon-resolved metadata, completely decoupled
+ * from how any external engine formats or drops MCP tool calls.
+ */
+function handlePresentedMedia(payload) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.items) || payload.items.length === 0) return;
+  const title = typeof payload.title === "string" && payload.title.trim() ? payload.title.trim() : undefined;
+  const block = {
+    type: "presented_media",
+    ...(title ? { title } : {}),
+    items: payload.items,
+  };
+  if (!liveTurnStream && driver === "acp" && acpSessionId) {
+    ensureAcpWakeTurn();
+  }
+  if (liveTurnStream) {
+    liveTurnStream.mediaBlock(block);
+    if (acpDeferred) {
+      acpDeferred.swarmWaiting = false;
+      acpDeferred.replyOpen = true;
+      bumpAcpDeferred();
+    }
+    return;
+  }
+  const assistantMsg = {
+    role: "assistant",
+    content: [block],
+    provider: currentModel.provider,
+    model: currentModel.id,
+    usage: zeroUsage,
+    stopReason: "stop",
+    turnStart: true,
+    timestamp: Date.now(),
+  };
+  messages.push(assistantMsg);
+  void saveExternalSession().catch(() => undefined);
+  emit({ type: "message_start", message: { ...assistantMsg, content: [], stopReason: "pending" } });
+  emit({ type: "message_update", usage: zeroUsage, assistantMessageEvent: { type: "media_block", contentIndex: 0, block } });
+  emit({ type: "message_end", message: assistantMsg });
+}
+
 let stdinBuf = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -4345,6 +4487,8 @@ process.stdin.on("data", (chunk) => {
         const parsed = JSON.parse(line);
         if (parsed.type === "extension_ui_response" && parsed.id) {
           finishAcpDialog(parsed.id, parsed);
+        } else if (parsed.type === "present_media" && parsed.payload) {
+          handlePresentedMedia(parsed.payload);
         } else {
           Promise.resolve(handleCommand(parsed))
             .then((data) => emit({ id: parsed.id, type: "response", command: parsed.type, success: true, data }))

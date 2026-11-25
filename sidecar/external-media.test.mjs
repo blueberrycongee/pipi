@@ -71,7 +71,7 @@ function startBridge(t, driver, agentId, binaryPath) {
       watchers.push(check);
       check();
     });
-  return { home, records, request, waitUntil };
+  return { home, records, request, waitUntil, sendRaw: (obj) => child.stdin.write(`${JSON.stringify(obj)}\n`) };
 }
 
 test("Claude tool_result preserves image blocks alongside text", async (t) => {
@@ -189,4 +189,163 @@ rl.on("line", (line) => {
   assert.equal(toolEnd.result.content.some((b) => b.type === "resource" && b.uri === "file:///tmp/clip.mp4"), true);
   const assistantEnd = bridge.records.find((r) => r.type === "message_end" && r.message?.role === "assistant");
   assert.ok(assistantEnd.message.content.some((b) => b.type === "audio" && b.mimeType === "audio/mpeg"));
+});
+
+test("ACP normalizes Antigravity Run mcp_pipi_present_files and preserves args/rawOutput across updates", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-mock-acp-agy-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, "mock-acp-agy.mjs");
+  fs.writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    console.log(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } }));
+  } else if (msg.method === "session/new") {
+    console.log(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "acp-agy" } }));
+  } else if (msg.method === "session/prompt") {
+    // 1. Exact Antigravity shape: "Run mcp_pipi_present_files" with rawInput on tool_call and empty completed update.
+    console.log(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "acp-agy",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tc_agy_1",
+          title: "Run mcp_pipi_present_files",
+          status: "in_progress",
+          rawInput: {
+            title: "Previews",
+            files: [{ path: "/tmp/before.png", title: "Before" }, { path: "/tmp/after.png", title: "After" }]
+          }
+        }
+      }
+    }));
+    console.log(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "acp-agy",
+        update: { sessionUpdate: "tool_call_update", toolCallId: "tc_agy_1", status: "completed" }
+      }
+    }));
+    // 2. Generic title on tool_call, late name + rawInput + direct pipiMedia rawOutput on tool_call_update.
+    console.log(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "acp-agy",
+        update: { sessionUpdate: "tool_call", toolCallId: "tc_agy_2", title: "Show artifacts", status: "pending" }
+      }
+    }));
+    console.log(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "acp-agy",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tc_agy_2",
+          name: "mcp_pipi_present_files",
+          status: "completed",
+          rawInput: { files: [{ path: "/tmp/late.png" }] },
+          rawOutput: { pipiMedia: true, items: [{ path: "/tmp/late.png", kind: "image", exists: true }] }
+        }
+      }
+    }));
+    console.log(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: "acp-agy", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Shown above." } } }
+    }));
+    console.log(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } }));
+  }
+});
+`,
+    { mode: 0o755 },
+  );
+  const bridge = startBridge(t, "acp", "antigravity", bin);
+  await bridge.request("prompt", { message: "show previews" });
+  await bridge.waitUntil(() => bridge.records.some((r) => r.type === "agent_settled"));
+
+  const ends = bridge.records.filter((r) => r.type === "tool_execution_end");
+  assert.equal(ends.length, 2);
+  assert.equal(ends[0].toolName, "present_files");
+  assert.equal(ends[1].toolName, "present_files");
+  assert.equal(ends[1].result.details?.pipiMedia, true);
+
+  const assistantEnd = bridge.records.find((r) => r.type === "message_end" && r.message?.role === "assistant");
+  const calls = assistantEnd.message.content.filter((b) => b.type === "toolCall");
+  assert.equal(calls[0].name, "present_files");
+  assert.equal(calls[0].arguments.files.length, 2);
+  assert.equal(calls[1].name, "present_files");
+  assert.deepEqual(calls[1].arguments.files, [{ path: "/tmp/late.png" }]);
+});
+
+test("external-agent accepts daemon present_media side-channel mid-turn, exposes it in pending(), and persists it", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-mock-acp-sc-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, "mock-acp-hold.mjs");
+  fs.writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    console.log(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } }));
+  } else if (msg.method === "session/new") {
+    console.log(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "acp-hold" } }));
+  } else if (msg.method === "session/prompt") {
+    console.log(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: "acp-hold", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Working..." } } }
+    }));
+    setTimeout(() => {
+      console.log(JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId: "acp-hold", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " All done." } } }
+      }));
+      console.log(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } }));
+    }, 250);
+  }
+});
+`,
+    { mode: 0o755 },
+  );
+  const bridge = startBridge(t, "acp", "antigravity", bin);
+  await bridge.request("prompt", { message: "show gallery" });
+  await bridge.waitUntil(() =>
+    bridge.records.some((r) => r.type === "message_update" && r.assistantMessageEvent?.type === "text_delta"),
+  );
+
+  // Daemon pushes side-channel `present_media` while the turn is still streaming.
+  bridge.sendRaw({
+    type: "present_media",
+    payload: {
+      pipiMedia: true,
+      title: "Direct Gallery",
+      items: [{ path: "/tmp/direct.png", kind: "image", width: 320, height: 240, size: 1024, exists: true }],
+    },
+  });
+  await bridge.waitUntil(() =>
+    bridge.records.some((r) => r.type === "message_update" && r.assistantMessageEvent?.type === "media_block"),
+  );
+
+  // Mid-turn `get_messages` carries the pending `presented_media` block for reattaching clients.
+  const mid = await bridge.request("get_messages");
+  const pendingMsg = mid.data.messages.find((m) => m.role === "assistant" && m.stopReason === "pending");
+  assert.ok(pendingMsg?.content?.some((b) => b.type === "presented_media" && b.title === "Direct Gallery"));
+
+  await bridge.waitUntil(() => bridge.records.some((r) => r.type === "agent_settled"));
+  const finalMsgs = await bridge.request("get_messages");
+  const doneAssistant = finalMsgs.data.messages.find((m) => m.role === "assistant");
+  assert.ok(doneAssistant?.content?.some((b) => b.type === "presented_media" && b.items[0]?.width === 320));
 });

@@ -912,11 +912,22 @@ function SessionsPage() {
 
       <SettingGroup title={tr("Background", "后台")}>
         <SettingRow
-          title={tr("Keep running after the window closes", "关闭窗口后继续运行")}
-          description={tr(
-            "Sessions stay alive under the pipi daemon; reopen the window to find them where they were.",
-            "会话由 pipi 守护进程保持运行；重新打开窗口即可回到原处。",
-          )}
+          title={
+            platform.os === "macos"
+              ? tr("Keep running after quitting", "退出应用后继续运行")
+              : tr("Keep running after the window closes", "关闭窗口后继续运行")
+          }
+          description={
+            platform.os === "macos"
+              ? tr(
+                  "Sessions stay alive under the pipi daemon even after you quit; reopen pipi to find them where they were.",
+                  "退出后会话仍由 pipi 守护进程保持运行；重新打开 pipi 即可回到原处。",
+                )
+              : tr(
+                  "Sessions stay alive under the pipi daemon; reopen pipi to find them where they were.",
+                  "会话由 pipi 守护进程保持运行；重新打开 pipi 即可回到原处。",
+                )
+          }
         >
           <Switch label={tr("Keep running in the background", "后台继续运行")} checked={runInBackground()} onChange={setRunInBackground} />
         </SettingRow>

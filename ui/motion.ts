@@ -236,6 +236,11 @@ export function markRowsSeen(ids: Iterable<string>) {
   liveEntranceEnabled = true;
 }
 
+/** Whether a row id (or its parent transcript row id) was already seen on screen. */
+export function isRowSeen(id: string): boolean {
+  return seenRowIds.has(id);
+}
+
 /** Enables live entrance animations (e.g. right before sending a prompt in an
  * empty session). */
 export function enableLiveRowEntrance() {

@@ -13,6 +13,7 @@ const ICONS = {
   x: { stroke: "M4.25 4.25l7.5 7.5M11.75 4.25l-7.5 7.5" },
   check: { stroke: "M3.5 8.5l3 3 6-7" },
   chevronDown: { stroke: "M4.25 6.25L8 10l3.75-3.75" },
+  chevronLeft: { stroke: "M9.75 4.25L6 8l3.75 3.75" },
   chevronRight: { stroke: "M6.25 4.25L10 8l-3.75 3.75" },
   chevronsUpDown: { stroke: "M5 6.25L8 3.5l3 2.75M5 9.75L8 12.5l3-2.75" },
   arrowUp: { stroke: "M8 12.75V3.5M4 7.25L8 3.25l4 4" },

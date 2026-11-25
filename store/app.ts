@@ -255,8 +255,9 @@ export const workspacePath = () => workspace();
 
 /**
  * Where a chat with no project runs: an empty folder of the app's own, under no
- * repository, so no project's `AGENTS.md` or `CLAUDE.md` rides along. It is
- * never a workspace — its sessions are listed in 最近 only.
+ * repository, so no project's `AGENTS.md` or `CLAUDE.md` rides along. Shown as
+ * a special built-in workspace (闲聊) under 工作区 and in 最近, never persisted
+ * into the user's project workspace list.
  */
 export const chatFolder = () => `${backend().dataDir().replace(/\/$/, "")}/chat`;
 export const isChatFolder = (cwd: string | undefined) => Boolean(cwd) && cwd === chatFolder();
@@ -746,6 +747,33 @@ export const headingDaemonSession = computed(() => {
   const target = heading();
   if (!target) return undefined;
   return target.daemonId ? daemonSessionOfId(target.daemonId) : daemonSessionByFile(target.file);
+});
+
+/** Whether the conversation currently shown (or immediately landing) is Pip, the personal agent. */
+export const isPersonaSession = computed(() => {
+  const target = !leaving() ? heading() : undefined;
+  if (target) {
+    const ds = target.daemonId ? daemonSessionOfId(target.daemonId) : daemonSessionByFile(target.file);
+    return Boolean(ds?.persona);
+  }
+  return Boolean(currentDaemonSession()?.persona);
+});
+
+/** Display name of the active persona (from `PERSONA.md`, defaulting to `"Pip"`). */
+export const personaDisplayName = computed(() => {
+  const target = !leaving() ? heading() : undefined;
+  const ds = target
+    ? (target.daemonId ? daemonSessionOfId(target.daemonId) : daemonSessionByFile(target.file))
+    : currentDaemonSession();
+  const pip = ds?.persona ? ds : personalAgent();
+  return pip ? daemonSessionTitle(pip) : "Pip";
+});
+
+/** Descendant sessions under the currently open (or landing) session, in tree order. */
+export const currentChildSessions = computed<DaemonSession[]>(() => {
+  const target = !leaving() ? heading() : undefined;
+  const id = target ? (target.daemonId ?? daemonSessionByFile(target.file)?.id) : openDaemonId();
+  return descendantSessionsOf(id, true);
 });
 
 /** The active project folder in the sidebar (maps open child worktree sessions back to their parent project). */

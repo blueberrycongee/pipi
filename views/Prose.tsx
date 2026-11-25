@@ -30,15 +30,16 @@ import {
   chunkAlpha,
   clearVeils,
   finishVeilPass,
+  pruneSettledChunks,
   rowVeil,
   settleVeil,
   sliceChunks,
   veilEnd,
-  waveDelay,
   type RowVeil,
   type VeilChunk,
 } from "../lib/veil";
 import { openLocalFile, workspacePath } from "../store/app";
+import type { PipRowSlot } from "../pi/turns";
 import { backend } from "../store/backend";
 import { Icon } from "../ui/Icon";
 import { EASING } from "../ui/motion";
@@ -57,8 +58,8 @@ export const proseClasses = computed(() => ({
   heading2: `mt-2 ${readingType("lg")}`,
   heading3: `mt-1.5 ${readingType()}`,
   heading4: `mt-1 ${readingType()}`,
-  code: `rounded-sm corner-squircle bg-muted px-1 ${readingType("sm")} text-foreground`,
-  codeBlock: "rounded-xl corner-squircle border border-border bg-sunken",
+  code: `rounded-[4px] bg-muted/85 px-1 ${readingType("sm")} text-foreground`,
+  codeBlock: "rounded-xl corner-squircle border-[0.5px] border-border bg-sunken",
   codeBlockCode: `p-3.5 ${codeType()} leading-relaxed`,
   link: "text-brand-text",
   blockquote: "border-l-2 border-border pl-3.5 text-muted-foreground",
@@ -66,7 +67,7 @@ export const proseClasses = computed(() => ({
   tableHead: "bg-muted",
   tableCell: `px-3 py-1.5 ${readingType("sm")}`,
   tableHeaderCell: `${readingType("xs")} font-semibold text-muted-foreground`,
-  rule: "border-border",
+  rule: "border-hairline",
   listMarker: "text-subtle",
 }));
 
@@ -329,11 +330,9 @@ export function proseVeilUntil(): number {
 /** Current opacity (0..1) of `chunk` inside `chunks` at `offset` characters past the chunk's start,
  * subscribing to `veilClock` only while active. */
 function activeChunkAlpha(chunks: VeilChunk[], chunk: VeilChunk, offset?: number): number {
-  const now = Date.now();
-  const delay = offset === undefined ? 0 : waveDelay(chunk, offset);
-  if (now - chunk.startedAt - delay >= chunk.durationMs) return 1;
-  veilClock();
-  return chunkAlpha(chunks, chunk, Date.now(), offset);
+  const alpha = chunkAlpha(chunks, chunk, Date.now(), offset);
+  if (alpha < 1) veilClock();
+  return alpha;
 }
 
 function decorationLine(run: InlineRun): TextStyle["textDecorationLine"] {
@@ -345,7 +344,7 @@ function decorationLine(run: InlineRun): TextStyle["textDecorationLine"] {
 
 /** Builds a paint-only `TextStyle` for `run` with foreground, inline background wash, and
  * underline/strikethrough colors all multiplied by the chunk's veil `alpha` (matching `apply_veil`). */
-function runVeiledStyle(run: InlineRun, chunks: VeilChunk[] | undefined, hit: VeilChunk | undefined, offset?: number): TextStyle {
+function runVeiledStyle(run: InlineRun, chunks: VeilChunk[] | undefined, hit: VeilChunk | undefined, offset?: number, paintBackground = true): TextStyle {
   const fgHex = resolvedToneHex(run.tone);
   const bgHex = run.bg ? resolvedBgHex(run.bg) : undefined;
   const decLine = decorationLine(run);
@@ -354,7 +353,7 @@ function runVeiledStyle(run: InlineRun, chunks: VeilChunk[] | undefined, hit: Ve
   if (alpha >= 1) {
     return {
       color: fgHex,
-      backgroundColor: bgHex,
+      backgroundColor: paintBackground ? bgHex : undefined,
       textDecorationLine: decLine,
       textDecorationColor: decLine ? fgHex : undefined,
     };
@@ -362,7 +361,7 @@ function runVeiledStyle(run: InlineRun, chunks: VeilChunk[] | undefined, hit: Ve
   const veiledFg = withAlpha(fgHex, alpha);
   return {
     color: veiledFg,
-    backgroundColor: bgHex ? withAlpha(bgHex, alpha) : undefined,
+    backgroundColor: paintBackground && bgHex ? withAlpha(bgHex, alpha) : undefined,
     textDecorationLine: decLine,
     textDecorationColor: decLine ? veiledFg : undefined,
   };
@@ -389,7 +388,8 @@ function veilCuts(local: readonly { start: number; end: number; chunk: VeilChunk
 }
 
 /** Renders an array of `TextViewInline` nodes with per-chunk opacity veil spans (zero width shift). */
-function renderVeiledInlines(content: readonly TextViewInline[], chunks: VeilChunk[], baseTone: ToneRole): JSX.Element[] {
+export function renderVeiledInlines(content: readonly TextViewInline[], chunks: VeilChunk[], baseTone: ToneRole): JSX.Element[] {
+  pruneSettledChunks(chunks, Date.now());
   const runs: InlineRun[] = [];
   collectRuns(content, { cls: "", tone: baseTone }, runs);
   const out: JSX.Element[] = [];
@@ -418,22 +418,29 @@ function renderVeiledInlines(content: readonly TextViewInline[], chunks: VeilChu
     }
 
     const cuts = veilCuts(local, start, run.text.length);
-
+    const pieces: { a: number; b: number; hit: (typeof local)[number] | undefined }[] = [];
     for (let i = 0; i + 1 < cuts.length; i++) {
       const a = cuts[i];
       const b = cuts[i + 1];
       if (a >= b) continue;
-      const hit = local.find((c) => a >= c.start && a < c.end);
-      out.push(
-        <Text
-          class={cls}
-          style={[runVeiledStyle(run, chunks, hit?.chunk, hit ? start + a - hit.chunk.start : undefined), size]}
-          onPress={clickableUrl ? () => openProseLink(clickableUrl) : undefined}
-        >
-          {run.text.slice(a, b)}
-        </Text>,
-      );
+      pieces.push({ a, b, hit: local.find((c) => a >= c.start && a < c.end) });
     }
+
+    const shell = pieces[0];
+    const shellHit = shell?.hit;
+    out.push(
+      <Text
+        class={cls}
+        style={[runVeiledStyle(run, chunks, shellHit?.chunk, shell && shellHit ? start + shell.a - shellHit.chunk.start : undefined), size]}
+        onPress={clickableUrl ? () => openProseLink(clickableUrl) : undefined}
+      >
+        {pieces.map(({ a, b, hit }) => (
+          <Text style={runVeiledStyle(run, chunks, hit?.chunk, hit ? start + a - hit.chunk.start : undefined, false)}>
+            {run.text.slice(a, b)}
+          </Text>
+        ))}
+      </Text>,
+    );
   }
 
   return out;
@@ -740,12 +747,15 @@ export interface ProseRow {
   tail: boolean;
   /** What is fading in this reply, by element key, as of when this block last changed. */
   chunks: ReadonlyMap<string, VeilChunk[]>;
+  /** Present in Pip persona IM mode: carries the lead avatar slot and turn metadata. */
+  pip?: PipRowSlot;
 }
 
 interface ProseEntry {
   text: string;
   streaming: boolean;
   reduced: boolean;
+  pipKey: string;
   rows: ProseRow[];
   /** Each block as JSON: what tells a block that changed from one that did not. */
   shapes: string[];
@@ -912,11 +922,17 @@ function advanceDocVeil(
  * parse only the trailing window (`O(tail)`). A block that did not change keeps
  * its exact `ProseRow` object so the virtualized list leaves it untouched.
  */
-export function proseRows(row: { id: string; text: string; streaming: boolean }): ProseRow[] {
+function pipSlotKey(pip?: PipRowSlot): string {
+  if (!pip) return "";
+  return `${pip.lead ? 1 : 0}:${pip.indent ? 1 : 0}:${pip.meta?.turnId ?? ""}:${pip.meta?.durationMs ?? ""}:${pip.meta?.stepCount ?? ""}:${pip.meta?.summary ?? ""}`;
+}
+
+export function proseRows(row: { id: string; text: string; streaming: boolean; pip?: PipRowSlot }): ProseRow[] {
   const reduced = reduceMotion();
   const text = pacedStreamText(row.id, row.text, row.streaming, reduced);
+  const pipKey = pipSlotKey(row.pip);
   const before = proseEntries.get(row.id);
-  if (before && before.text === text && before.streaming === row.streaming && before.reduced === reduced) {
+  if (before && before.text === text && before.streaming === row.streaming && before.reduced === reduced && before.pipKey === pipKey) {
     return before.rows;
   }
 
@@ -990,7 +1006,12 @@ export function proseRows(row: { id: string; text: string; streaming: boolean })
     const shape = JSON.stringify(block);
     shapes[index] = shape;
     const old = before?.rows[index];
-    if (old?.block && before?.shapes[index] === shape && old.tail === tail) {
+    const pip: PipRowSlot | undefined = row.pip
+      ? index === 0
+        ? row.pip
+        : { lead: false, indent: true, meta: row.pip.meta }
+      : undefined;
+    if (old?.block && before?.shapes[index] === shape && old.tail === tail && before?.pipKey === pipKey) {
       rows[index] = old;
       continue;
     }
@@ -1007,17 +1028,19 @@ export function proseRows(row: { id: string; text: string; streaming: boolean })
       block,
       tail,
       chunks,
+      ...(pip ? { pip } : {}),
     };
   }
 
   if (footnotes?.length) {
     const shape = JSON.stringify(footnotes);
     const old = before?.rows[rows.length];
+    const footPip: PipRowSlot | undefined = row.pip ? { lead: false, indent: true, meta: row.pip.meta } : undefined;
     shapes.push(shape);
     rows.push(
-      old?.footnotes && before?.shapes[rows.length] === shape
+      old?.footnotes && before?.shapes[rows.length] === shape && before?.pipKey === pipKey
         ? old
-        : { kind: "prose", id: `${row.id}#notes`, rowId: row.id, index: rows.length, footnotes, tail: false, chunks },
+        : { kind: "prose", id: `${row.id}#notes`, rowId: row.id, index: rows.length, footnotes, tail: false, chunks, ...(footPip ? { pip: footPip } : {}) },
     );
   }
 
@@ -1025,6 +1048,7 @@ export function proseRows(row: { id: string; text: string; streaming: boolean })
     text,
     streaming: row.streaming,
     reduced,
+    pipKey,
     rows,
     shapes,
     blocks,

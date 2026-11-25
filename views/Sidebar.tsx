@@ -18,7 +18,8 @@ import {
 import type { AnimatedValue, ContextMenuEvent, GestureResponderEvent, JSX, MouseEvent, PressEvent, ScrollRef, ViewRef } from "nsh";
 import { AlertDialog, Button as BaseButton, Collapsible } from "nsh/base";
 import { Haptics, isAvailable as hapticsAvailable } from "nsh/mobile";
-import { Menu, type MenuItem, titleBar } from "nsh/desktop";
+import { Menu, type MenuItem } from "nsh/desktop";
+import { titleBarArea } from "../lib/layout";
 import { basename, tildePath } from "../lib/format";
 import { tr } from "../lib/i18n";
 import { Pip } from "../mascot/Pip";
@@ -105,6 +106,7 @@ import {
   setRecentRankOverrides,
   setSessionRankOverrides,
   setSidebarOpen,
+  setWorkspaceCollapsed,
   toggleGroupCollapsed,
   toggleWorkspaceCollapsed,
 } from "../store/prefs";
@@ -139,7 +141,7 @@ const groupActionTop = () => Math.round((uiRowHeight(24) - 24) / 2);
  * lights; a Linux layout can place them there too — `titleBar().left`).
  * `platform.os` covers them headless, where `titleBar()` reports zeros.
  */
-const leftControls = () => platform.os === "macos" || titleBar().left > 0;
+const leftControls = () => platform.os === "macos" || titleBarArea().left > 0;
 /** True when the platform's primary modifier (⌘ on macOS, Ctrl elsewhere) was held on a press. */
 const isModPress = (e?: { modifiers?: { platform?: boolean; control?: boolean } }) =>
   Boolean(platform.os === "macos" ? e?.modifiers?.platform : e?.modifiers?.control);
@@ -175,6 +177,19 @@ const projects = computed(() => {
   const list = recentWorkspaces();
   if (!active || isChatFolder(active)) return list;
   return list.includes(active) ? list : [active, ...list];
+});
+
+const WORKSPACE_LIMIT = 6;
+const workspacesExpanded = signal(false);
+const shownProjects = computed(() => {
+  const all = projects();
+  if (workspacesExpanded() || all.length <= WORKSPACE_LIMIT) return all;
+  const head = all.slice(0, WORKSPACE_LIMIT);
+  const active = activeProjectPath();
+  if (active && !isChatFolder(active) && all.includes(active) && !head.includes(active)) {
+    return [active, ...head.slice(0, WORKSPACE_LIMIT - 1)];
+  }
+  return head;
 });
 
 /** The folders 最近 gathers sessions from: every open project, and the chat folder. */
@@ -223,6 +238,7 @@ const singleEmpty = computed(
     projects().length === 1 &&
     !isChatFolder(activeProjectPath()) &&
     savedSessions().length === 0 &&
+    (workspaceSessions()[chatFolder()]?.length ?? 0) === 0 &&
     notes().length === 0 &&
     archivedSessionItems().length === 0 &&
     !daemonSessions().some(
@@ -1169,7 +1185,7 @@ const daemonShownInRecents = (ds: DaemonSession) => !isGroupCollapsed("recents")
  */
 function ownsActiveSession(group: GroupId, sessionPath: string, cwd: string): boolean {
   if (isSessionArchived(sessionPath)) return group === "archived";
-  const inWorkspaces = !isGroupCollapsed("workspaces") && !isWorkspaceCollapsed(cwd) && !isChatFolder(cwd);
+  const inWorkspaces = !isGroupCollapsed("workspaces") && !isWorkspaceCollapsed(cwd);
   const inRecents = !isGroupCollapsed("recents") && recentSessionPaths().has(sessionPath);
   const owner: GroupId =
     chosenGroups()[sessionPath] === "recents" && inRecents ? "recents" : inWorkspaces ? "workspaces" : inRecents ? "recents" : "workspaces";
@@ -1179,8 +1195,9 @@ function ownsActiveSession(group: GroupId, sessionPath: string, cwd: string): bo
 /** Whether a daemon session's row is nested somewhere under 工作区 right now. */
 function daemonRowInWorkspaces(ds: DaemonSession): boolean {
   if (isGroupCollapsed("workspaces")) return false;
+  const folders = recentFolders();
   const files = new Set<string>();
-  for (const cwd of projects()) {
+  for (const cwd of folders) {
     if (isWorkspaceCollapsed(cwd)) continue;
     for (const s of sessionsOf(cwd)) files.add(s.path);
   }
@@ -1191,7 +1208,7 @@ function daemonRowInWorkspaces(ds: DaemonSession): boolean {
     daemonRootEarnsRow(top) &&
     (!top.file || !files.has(top.file)) &&
     !isSessionArchived(top.file) &&
-    projects().some((cwd) => !isWorkspaceCollapsed(cwd) && projectCwdOf(top.cwd, top) === cwd)
+    folders.some((cwd) => !isWorkspaceCollapsed(cwd) && projectCwdOf(top.cwd, top) === cwd)
   );
 }
 
@@ -1206,7 +1223,7 @@ function ownsDaemonRow(group: GroupId, ds: DaemonSession): boolean {
 
 /** Which group highlights the open draft session when both 工作区 and 最近 list it (the mark follows `active`, not the owner). */
 function ownsDraftSession(group: GroupId, cwd: string): boolean {
-  const inWorkspaces = !isGroupCollapsed("workspaces") && !isWorkspaceCollapsed(cwd) && !isChatFolder(cwd);
+  const inWorkspaces = !isGroupCollapsed("workspaces") && !isWorkspaceCollapsed(cwd);
   const inRecents = !isGroupCollapsed("recents") && hasRecentDraft();
   const owner: GroupId =
     draftGroup() === "recents" && inRecents ? "recents" : inWorkspaces ? "workspaces" : inRecents ? "recents" : "workspaces";
@@ -1319,9 +1336,16 @@ function startNewSessionFromRecents(newTab = false) {
 }
 
 function startNewChat(newTab = false) {
-  setGroupCollapsed("recents", false);
-  explicitDraftGroup = "recents";
-  draftGroup.set("recents");
+  const cwd = chatFolder();
+  if (isWorkspaceCollapsed(cwd)) {
+    setGroupCollapsed("recents", false);
+    explicitDraftGroup = "recents";
+    draftGroup.set("recents");
+  } else {
+    setGroupCollapsed("workspaces", false);
+    explicitDraftGroup = "workspaces";
+    draftGroup.set("workspaces");
+  }
   void openNewChatTab({ newTab });
 }
 
@@ -1533,7 +1557,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
             accessibilityLabel={tr("Running in the background", "后台运行中")}
             class="absolute inset-0 items-center justify-center"
           >
-            <Pip size={16} mood="work" />
+            <View class="size-[5.5px] rounded-full bg-brand" />
           </Presence>
           <Presence
             show={!startingHere() && collapsedUnread()}
@@ -1543,11 +1567,6 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
           >
             <View class="size-1.5 rounded-full bg-brand" />
           </Presence>
-          <If when={!startingHere() && !collapsedRunning() && !collapsedUnread() && collapsed() && sessions().length > 0}>
-            <View class="absolute inset-0 items-center justify-center">
-              <Text class={`${uiType("xs")} tabular-nums text-subtle`}>{String(sessions().length)}</Text>
-            </View>
-          </If>
         </View>
         <IconButton
           icon="plus"
@@ -1564,6 +1583,157 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
   );
 }
 
+/**
+ * The special workspace for repo-free chats (`<dataDir>/chat`): sits inside
+ * 工作区 alongside project folders, with its own message mark, hover `+` to
+ * start a chat, and expand/collapse once it holds sessions (a click when empty
+ * opens a chat straight away). Never persisted into the user's project list.
+ */
+function ChatWorkspaceRow(props: { first: boolean }) {
+  const cwd = () => chatFolder();
+  const active = () => cwd() === activeProjectPath();
+  const collapsed = () => isWorkspaceCollapsed(cwd());
+  const sessions = () => sessionsOf(cwd());
+  const hasDaemonInside = () =>
+    daemonSessions().some(
+      (ds) =>
+        projectCwdOf(ds.cwd, ds) === cwd() &&
+        !isSessionArchived(ds.file) &&
+        !(ds.id === openDaemonId() && isDraftSession()) &&
+        daemonRootEarnsRow(ds),
+    );
+  const hasChildren = () => sessions().length > 0 || (active() && isDraftSession()) || hasDaemonInside();
+  const shownInRecents = (path: string | undefined) => !isGroupCollapsed("recents") && Boolean(path && recentSessionPaths().has(path));
+  const activeShownInRecents = () =>
+    !isGroupCollapsed("recents") && (isDraftSession() ? hasRecentDraft() : shownInRecents(openFile()));
+  const hiddenRunningInside = () =>
+    sessions().some((s) => isSessionRunning(s.path) && !shownInRecents(s.path)) ||
+    daemonSessions().some(
+      (ds) =>
+        projectCwdOf(ds.cwd, ds) === cwd() &&
+        (ds.status === "working" || ds.status === "blocked") &&
+        !daemonShownInRecents(ds),
+    );
+  const collapsedRunning = () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents()));
+  const collapsedUnread = () =>
+    collapsed() &&
+    !collapsedRunning() &&
+    (sessions().some((s) => isSessionUnread(s.path) && !shownInRecents(s.path)) ||
+      daemonSessions().some((ds) => projectCwdOf(ds.cwd, ds) === cwd() && ds.unread && !daemonShownInRecents(ds)));
+  const startingHere = () => active() && sidecarPhase().name === "starting" && !isDraftAhead();
+
+  const openChat = (newTab = false) => {
+    if (collapsed()) setWorkspaceCollapsed(cwd(), false);
+    startNewChat(newTab);
+  };
+
+  return (
+    <View
+      class={props.first ? "" : "pt-1"}
+      onContextMenu={(e) =>
+        Menu.popup(
+          [
+            { label: tr("New Session Here", "在此新建会话"), onSelect: () => startNewChat() },
+            ...(hasChildren()
+              ? [
+                  {
+                    label: collapsed() ? tr("Expand Sessions", "展开会话") : tr("Collapse Sessions", "收起会话"),
+                    onSelect: () => toggleProject(cwd()),
+                  },
+                ]
+              : []),
+          ],
+          e.pagePosition,
+        )
+      }
+    >
+      <View class={hoverGroup()}>
+        <View
+          role="button"
+          testID="sidebar-chat-workspace"
+          onPress={(e: PressEvent) => {
+            if (isModPress(e)) {
+              openChat(true);
+              return;
+            }
+            if (hasChildren()) toggleProject(cwd());
+            else openChat(false);
+          }}
+          onMouseUp={(e: MouseEvent) => {
+            if (e.button === "middle") openChat(true);
+          }}
+          accessibilityLabel={
+            hasChildren()
+              ? collapsed()
+                ? tr("Expand Chat", "展开闲聊")
+                : tr("Collapse Chat", "收起闲聊")
+              : tr("New chat", "新建闲聊")
+          }
+          hitSlop={props.first ? undefined : { top: 4 }}
+          tooltip={tip(tr("Chat · No project folder", "闲聊 · 不在任何项目里"), undefined, "right")}
+          class={`${uiHeight(28)} w-full min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle pl-2.5 pr-8 ${calm(ROW_PRESS)}`}
+        >
+          <View class={ICON_SLOT}>
+            <Icon name="message" size={uiIconSize(14)} tone={active() ? "foreground" : "muted-foreground"} />
+          </View>
+          <Text
+            class={`shrink truncate ${uiType("base")} ${
+              active() ? "font-semibold text-sidebar-foreground" : "font-medium text-muted-foreground group-hover:text-sidebar-foreground"
+            }`}
+          >
+            {tr("Chat", "闲聊")}
+          </Text>
+          <If when={hasChildren()}>
+            <View
+              class={`shrink-0 transition-all duration-200 ease-out-quint motion-reduce:transition-none ${
+                collapsed() ? "" : "rotate-90"
+              } opacity-0 group-hover:opacity-100`}
+            >
+              <Icon name="chevronRight" size={12} tone="subtle" />
+            </View>
+          </If>
+        </View>
+        <View class={`${TRAILING_SLOT} transition-opacity group-hover:opacity-0`} style={{ top: rowTrailingTop() }}>
+          <If when={startingHere()}>
+            <View class="absolute inset-0 items-center justify-center">
+              <FadeIn>
+                <View class="size-2.5 rounded-full border-[1.5px] border-input border-t-brand animate-spin" />
+              </FadeIn>
+            </View>
+          </If>
+          <Presence
+            show={!startingHere() && collapsedRunning()}
+            testID="sidebar-project-running"
+            accessibilityLabel={tr("Running in the background", "后台运行中")}
+            class="absolute inset-0 items-center justify-center"
+          >
+            <View class="size-[5.5px] rounded-full bg-brand" />
+          </Presence>
+          <Presence
+            show={!startingHere() && collapsedUnread()}
+            testID="sidebar-project-unread"
+            accessibilityLabel={tr("Finished in the background", "后台已完成")}
+            class="absolute inset-0 items-center justify-center"
+          >
+            <View class="size-1.5 rounded-full bg-brand" />
+          </Presence>
+        </View>
+        <IconButton
+          testID="sidebar-chat-new"
+          icon="plus"
+          size="sm"
+          label={tr("New session in Chat", "在闲聊中新建会话")}
+          tipPlacement="right"
+          hitSlop={{ top: 2, bottom: 2 }}
+          onPress={() => startNewChat()}
+          class={`absolute right-1 transition-opacity ${inert(HOVER_REVEAL)}`}
+          style={{ top: rowTrailingTop() }}
+        />
+      </View>
+    </View>
+  );
+}
+
 /** A session row anywhere in the sidebar: the engine's mark, the title, and the running cue or archive action. */
 const sessionRowClass = (
   indent: boolean,
@@ -1572,7 +1742,7 @@ const sessionRowClass = (
   depth = 0,
   keepTrailingOnHover = false,
 ) =>
-  `${uiHeight(28)} w-full min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle ${
+  `${uiHeight(28)} w-full min-w-0 flex-row items-center gap-1.5 rounded-lg corner-squircle border-[0.5px] border-transparent ${
     depth >= 3 ? "pl-16" : depth === 2 ? "pl-14" : depth === 1 ? "pl-12" : indent ? "pl-8" : "pl-2.5"
   } ${
     reserveTrailing && reserveHoverAction && keepTrailingOnHover
@@ -1582,7 +1752,7 @@ const sessionRowClass = (
         : reserveHoverAction
           ? "pr-2.5 group-hover:pr-8"
           : "pr-2.5"
-  } ${PRESS} active:scale-[0.99] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-sidebar-accent group-hover:bg-sidebar-accent active:bg-sidebar-accent selected:bg-sidebar-accent`;
+  } ${PRESS} active:scale-[0.99] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-sidebar-accent group-hover:bg-sidebar-accent active:bg-sidebar-accent selected:border-hairline selected:bg-card selected:shadow-sidebar-row dark:selected:shadow-sidebar-row-dark`;
 
 const sessionTitleClass = (selected: boolean) =>
   // `transition-colors` only: font-weight is a discrete/variable-font property that cannot
@@ -1597,7 +1767,7 @@ function FadeIn(props: { children: JSX.Element }) {
 }
 
 /** A row's engine mark; switching the engine settles the new mark in rather than swapping it in one frame. */
-function EngineMark(props: { id: string; available: boolean }) {
+function EngineMark(props: { id: string; available: boolean; selected?: boolean }) {
   const opacity = createAnimatedValue(1);
   const scale = createAnimatedValue(1);
   let shown = untracked(() => props.id);
@@ -1610,8 +1780,10 @@ function EngineMark(props: { id: string; available: boolean }) {
     scale.keyframes([0.6, 1], { duration: 260, easing: EASING.signature });
   });
   return (
-    <View class={ICON_SLOT} style={{ opacity, transform: [{ scale }] }}>
-      <AgentLogo id={props.id} size={uiIconSize(14)} tone="muted-foreground" status={props.available ? "ready" : "off"} />
+    <View class={`${ICON_SLOT} transition-opacity duration-150 ${props.selected ? "opacity-100" : "opacity-65 group-hover:opacity-100"}`}>
+      <View style={{ opacity, transform: [{ scale }] }}>
+        <AgentLogo id={props.id} size={uiIconSize(13)} tone={props.selected ? "foreground" : "muted-foreground"} status={props.available ? "ready" : "off"} />
+      </View>
     </View>
   );
 }
@@ -1661,12 +1833,12 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
         )}
         class={calm(sessionRowClass(Boolean(props.indent), running(), false))}
       >
-        <EngineMark id={engine().id} available={engine().available} />
+        <EngineMark id={engine().id} available={engine().available} selected={selected()} />
         <Text class={sessionTitleClass(selected())}>{shownTitle()}</Text>
       </View>
       <View class={TRAILING_SLOT} style={{ top: rowTrailingTop() }}>
-        <Presence show={running()} testID="sidebar-draft-running">
-          <Pip size={16} mood="work" />
+        <Presence show={running()} testID="sidebar-draft-running" class="items-center justify-center">
+          <View class="size-[5.5px] rounded-full bg-brand" />
         </Presence>
       </View>
     </View>
@@ -1723,7 +1895,7 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
         tooltip={tip(`${engine().name} · ${placeLabel(props.cwd)}`, undefined, "right")}
         class={calm(sessionRowClass(Boolean(props.indent), running() || unread() || blocked() || failed(), true, 0, keepCue()))}
       >
-        <EngineMark id={engine().id} available={engine().available} />
+        <EngineMark id={engine().id} available={engine().available} selected={selected()} />
         <Text class={sessionTitleClass(selected())}>{titleOf(props.session)}</Text>
       </View>
       <View class={keepCue() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`} style={{ top: rowTrailingTop() }}>
@@ -1731,8 +1903,9 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           show={running() && !blocked()}
           testID="sidebar-session-running"
           accessibilityLabel={backgroundRunning() ? tr("Running in the background", "后台运行中") : undefined}
+          class="items-center justify-center"
         >
-          <Pip size={16} mood="work" />
+          <View class="size-[5.5px] rounded-full bg-brand" />
         </Presence>
         <Presence
           show={blocked()}
@@ -1862,7 +2035,7 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
           ),
         )}
       >
-        <EngineMark id={engine().id} available={engine().available} />
+        <EngineMark id={engine().id} available={engine().available} selected={selected()} />
         <Text class={sessionTitleClass(selected())}>{daemonSessionTitle(session())}</Text>
       </View>
       <View class={working() || !archivable() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`} style={{ top: rowTrailingTop() }}>
@@ -1870,8 +2043,9 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
           show={working() && !blocked()}
           testID="sidebar-child-running"
           accessibilityLabel={tr("Running in the background", "后台运行中")}
+          class="items-center justify-center"
         >
-          <Pip size={16} mood="work" />
+          <View class="size-[5.5px] rounded-full bg-brand" />
         </Presence>
         <Presence
           show={blocked()}
@@ -1985,7 +2159,7 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; c
     isCurrent() &&
     listSteady() &&
     isDraftSession() &&
-    (folderSessions().length > 0 || props.allProjects.length > 1 || childSessionsOfOpen().length > 0);
+    (isChatFolder(props.cwd) || folderSessions().length > 0 || props.allProjects.length > 1 || childSessionsOfOpen().length > 0);
 
   let lastItems: FolderItem[] = [];
   const items = computed<FolderItem[]>(() => {
@@ -2033,7 +2207,7 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; c
   );
 }
 
-function ProjectSection(props: { cwd: string; first: boolean; allProjects: readonly string[] }) {
+function ProjectSection(props: { cwd: string; first: boolean; allProjects: readonly string[]; chat?: boolean }) {
   const collapsed = () => isWorkspaceCollapsed(props.cwd);
   const mounted = signal(!untracked(collapsed));
   let unmountTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2066,7 +2240,7 @@ function ProjectSection(props: { cwd: string; first: boolean; allProjects: reado
         </If>
       }
     >
-      <ProjectRow cwd={props.cwd} first={props.first} allProjects={props.allProjects} />
+      {props.chat ? <ChatWorkspaceRow first={props.first} /> : <ProjectRow cwd={props.cwd} first={props.first} allProjects={props.allProjects} />}
     </Collapsible>
   );
 }
@@ -2252,7 +2426,7 @@ function SidebarTree() {
         <FunctionalGroup
           id="workspaces"
           label={tr("Workspaces", "工作区")}
-          count={projects().length}
+          count={projects().length + 1}
           first
           action={{
             icon: "plus",
@@ -2265,9 +2439,25 @@ function SidebarTree() {
           }}
         >
           <View testID="sidebar-workspaces" ref={(ref) => registerDropList("workspaces", ref)}>
-            <Each of={projects()} key={(cwd) => cwd}>
+            <Each of={shownProjects()} key={(cwd) => cwd}>
               {(cwd, index) => <ProjectSection cwd={cwd()} first={index() === 0} allProjects={projects()} />}
             </Each>
+            <ProjectSection cwd={chatFolder()} first={shownProjects().length === 0} allProjects={projects()} chat />
+            <If when={projects().length > WORKSPACE_LIMIT}>
+              <BaseButton
+                testID="sidebar-workspaces-more"
+                onPress={() => {
+                  animateSidebarList();
+                  workspacesExpanded.update((on) => !on);
+                }}
+                accessibilityLabel={workspacesExpanded() ? tr("Show less", "收起") : tr("Show more", "展开更多…")}
+                class={`${uiHeight(26)} w-full min-w-0 flex-row items-center rounded-md corner-squircle pl-8 pr-2.5 ${ROW_PRESS}`}
+              >
+                <Text class={`truncate ${uiType("xs")} text-subtle/80`}>
+                  {workspacesExpanded() ? tr("Show less", "收起") : tr("Show more…", "展开更多…")}
+                </Text>
+              </BaseButton>
+            </If>
           </View>
         </FunctionalGroup>
         <Reveal open={showRecents()}>
@@ -2420,13 +2610,13 @@ export function Sidebar() {
       <View
         desktop={{ windowDrag: true }}
         class="shrink-0 flex-row items-center justify-end pr-2.5"
-        style={{ height: leftControls() ? titleBar().height || 44 : 12, paddingLeft: (titleBar().left || 0) + 14 }}
+        style={{ height: leftControls() ? titleBarArea().height || 44 : 12, paddingLeft: (titleBarArea().left || 0) + 14 }}
       >
         <If when={leftControls()}>
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
         </If>
       </View>
-      <View class={`shrink-0 flex-row items-center gap-1 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
+      <View class={`shrink-0 flex-row items-center gap-1 pb-2 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
         <View
           role="button"
           testID="sidebar-new-session"
@@ -2447,26 +2637,8 @@ export function Sidebar() {
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
         </If>
       </View>
-      <View class="shrink-0 px-2 pb-2">
-        <View
-          role="button"
-          testID="sidebar-new-chat"
-          onPress={(e: PressEvent) => startNewChat(isModPress(e))}
-          onMouseUp={(e: MouseEvent) => {
-            if (e.button === "middle") startNewChat(true);
-          }}
-          accessibilityLabel={tr("New chat", "新闲聊")}
-          tooltip={tip(tr("New chat — no project folder", "新闲聊 · 不在任何项目里"), undefined, "right")}
-          class={`${uiHeight(32)} flex-row items-center gap-1.5 rounded-md corner-squircle px-2.5 ${ROW_PRESS}`}
-        >
-          <View class={ICON_SLOT}>
-            <Icon name="message" size={uiIconSize(14)} tone="muted-foreground" />
-          </View>
-          <Text class={`${uiType("base")} text-sidebar-foreground`}>{tr("New chat", "新闲聊")}</Text>
-        </View>
-      </View>
       <SidebarTree />
-      <View class="border-t border-sidebar-border px-2 py-1">
+      <View class="px-2 py-1.5">
         <View class="flex-row items-center justify-between pl-1.5 pr-0.5">
           <IconButton
             icon="gear"

@@ -356,14 +356,21 @@ test("switching back to a saved session strips stale background flags", async (t
   assert.equal(call?.background, undefined);
 });
 
-test("an interaction_ question reaches the user as a select, and the picked answer goes back", async (t) => {
+test("an interaction_ question reaches the user as a single-question form, and the picked answer goes back", async (t) => {
   const bridge = startBridge(t, {});
   await bridge.prompt("ask me something");
   await bridge.waitFor(() => bridge.records.some((r) => r.type === "extension_ui_request"));
   const req = bridge.records.find((r) => r.type === "extension_ui_request");
-  assert.equal(req.method, "select", "an interaction_ id is a question, never an auto-approval");
-  assert.deepEqual(req.options, ["Option A", "Option B"]);
-  bridge.write({ type: "extension_ui_response", id: req.id, value: "Option B" });
+  assert.equal(req.method, "form", "an interaction_ id is normalized to a question form, never an auto-approval");
+  assert.equal(req.fields.length, 1);
+  assert.deepEqual(
+    req.fields[0].options.map((o) => [o.value, o.label]),
+    [
+      ["opt_a", "Option A"],
+      ["opt_b", "Option B"],
+    ],
+  );
+  bridge.write({ type: "extension_ui_response", id: req.id, answers: { answer: "opt_b" } });
   await bridge.settles(1);
   const [run] = runs(bridge.records);
   assert.equal(textOf(run), "You picked opt_b.", "the picked option's own id is what the agent gets");

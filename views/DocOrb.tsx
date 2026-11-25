@@ -1371,8 +1371,8 @@ function DocReplyCard(props: {
                 else={<InlineApproval dialog={dialog()} onAnswer={props.assistant.answerDialog} />}
               >
                 {(request) => (
-                  <View class="rounded-xl corner-squircle border border-border bg-muted/60 p-2.5">
-                    <QuestionForm request={request()} onAnswer={props.assistant.answerDialog} />
+                  <View class="rounded-xl corner-squircle border border-border bg-muted/60 p-3">
+                    <QuestionForm request={request()} onAnswer={props.assistant.answerDialog} compact />
                   </View>
                 )}
               </If>

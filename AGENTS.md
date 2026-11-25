@@ -64,12 +64,14 @@ multi-agent orchestration, and settings.
   evenly down to a floor, past which it scrolls, and a close with the
   pointer in the strip holds their width until the pointer leaves, so a run
   of closes keeps its close button under it.
-- A chat needs no project. 新闲聊 (under 新会话, and 闲聊 in the welcome
-  folder picker) starts a session in `<dataDir>/chat/` (`chatFolder` in
+- A chat needs no project. 闲聊 lives as a special built-in workspace inside
+  工作区 (and in the welcome folder picker) — never crowding 新会话 at the
+  sidebar's top — starting a session in `<dataDir>/chat/` (`chatFolder` in
   `store/app.ts`): an empty folder of the app's own, under no repository,
   so no project's `AGENTS.md`/`CLAUDE.md` rides along. It is never
-  remembered as a workspace; its sessions are listed in 最近 only, and a
-  新会话 from a chat goes back to the last project.
+  remembered in the user's persisted project list; its sessions appear under
+  工作区 → 闲聊 and in 最近, and a 新会话 from a chat goes back to the last
+  project.
 - Documents are the strip's other surface (`store/docs.ts`,
   `views/DocEditor.tsx`): a page of the person's own words — an article or
   note the agents help polish, a long brief the composer is too small and too

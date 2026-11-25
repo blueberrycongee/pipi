@@ -185,10 +185,16 @@ function ConfirmBody(props: { detail?: ConfirmDetail }) {
   );
 }
 
-/** Whether the active extension prompt is shown inline above the composer rather than as a modal. */
+/** Whether an active question form is rendered directly inside the Composer surface. */
+export function hasFormTakeover() {
+  const dialog = pendingDialog();
+  return dialog?.method === "form" && currentView().name === "chat";
+}
+
+/** Whether the active extension prompt is shown as a compact tray above the composer rather than a modal or full takeover. */
 export function hasInlinePrompt() {
   const dialog = pendingDialog();
-  return !!dialog && currentView().name === "chat" && dialog.method !== "editor";
+  return !!dialog && currentView().name === "chat" && dialog.method !== "editor" && dialog.method !== "form";
 }
 
 /**
@@ -214,7 +220,7 @@ export function ExtensionPrompt() {
     if (dialog) answerDialog(dialog.id, { value: text() });
   };
 
-  const of = <M extends "select" | "confirm" | "input" | "form">(method: M) => {
+  const of = <M extends "select" | "confirm" | "input">(method: M) => {
     const dialog = shownDialog();
     return dialog?.method === method ? (dialog as Extract<NonNullable<typeof dialog>, { method: M }>) : undefined;
   };
@@ -224,12 +230,9 @@ export function ExtensionPrompt() {
       <If when={shownDialog()}>
         <View
           role="region"
-          accessibilityLabel={shownDialog()?.method === "form" ? tr("Agent questions", "智能体提问") : tr("Confirmation prompt", "确认提示")}
+          accessibilityLabel={tr("Confirmation prompt", "确认提示")}
           class={`mx-4 -mb-2 gap-2.5 overflow-hidden rounded-t-2xl corner-squircle border-[0.5px] border-b-0 border-hairline bg-card/85 p-3.5 dark:bg-card/75`}
         >
-        <If when={of("form")}>
-          {(dialog) => <QuestionForm request={dialog()} onAnswer={answerDialog} />}
-        </If>
         <If when={of("confirm")}>
           {(dialog) => {
             const info = () => describeConfirm(dialog().title, dialog().message);
@@ -286,7 +289,7 @@ export function ExtensionPrompt() {
                     {(option) => (
                       <BaseButton
                         onPress={() => answerDialog(dialog().id, { value: option() })}
-                        class={`${uiMinHeight(32)} flex-row items-center rounded-md corner-squircle px-2.5 py-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent focus:bg-accent active:bg-accent`}
+                        class={`${uiMinHeight(32)} flex-row items-center rounded-md corner-squircle px-2.5 py-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent focus-visible:bg-accent active:bg-accent`}
                       >
                         <Text class={`${uiType("base")} text-foreground`}>{option()}</Text>
                       </BaseButton>
@@ -351,7 +354,7 @@ export function ExtensionDialog() {
     const dialog = pendingDialog();
     if (dialog) answerDialog(dialog.id, { value: text() });
   };
-  const modalOpen = () => !!pendingDialog() && !hasInlinePrompt();
+  const modalOpen = () => !!pendingDialog() && !hasInlinePrompt() && !hasFormTakeover();
   const of = <M extends "select" | "confirm" | "input" | "editor" | "form">(method: M) => {
     if (!modalOpen()) return undefined;
     const dialog = pendingDialog();

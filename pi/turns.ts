@@ -5,6 +5,7 @@ import {
   extractPresentedMedia,
   extractToolResultMedia,
   isPresentFilesTool,
+  normalizeMcpToolName,
   type MediaItem,
 } from "../lib/media";
 import type { IconName } from "../ui/Icon";
@@ -29,7 +30,7 @@ import type { Row, ToolRow } from "./transcript";
  * else folds or unfolds on its own, and a reader's own toggle holds from then on.
  */
 
-export type ToolCategory = "read" | "edit" | "create" | "search" | "list" | "command" | "agent" | "web" | "todo" | "present" | "other";
+export type ToolCategory = "read" | "edit" | "create" | "search" | "list" | "command" | "agent" | "web" | "todo" | "present" | "ask" | "other";
 
 export interface DiffStats {
   added: number;
@@ -95,14 +96,68 @@ export interface TurnHeaderRow {
   summaryTools?: readonly ToolRow[];
 }
 
+export interface PipTurnMeta {
+  turnId: string;
+  durationMs?: number;
+  stepCount: number;
+  summary?: string;
+}
+
+export interface PipRowSlot {
+  /** First visible row of a settled Pip IM turn: carries Pip's avatar on the left. */
+  lead?: boolean;
+  /** Aligned to Pip's IM content column (past the avatar gutter). */
+  indent?: boolean;
+  /** Concise metadata for this turn, shown when hovering the message's Pip avatar at rest. */
+  meta?: PipTurnMeta;
+}
+
+export interface PipDelegatedSession {
+  toolId: string;
+  sessionId?: string;
+  title: string;
+  agent?: string;
+  failed?: boolean;
+}
+
+export interface PipSessionsRow {
+  kind: "pip-sessions";
+  id: string;
+  sessions: PipDelegatedSession[];
+  pip?: PipRowSlot;
+}
+
+export interface PipFooterRow {
+  kind: "pip-footer";
+  id: string;
+  turnId: string;
+  text: string;
+  open: boolean;
+  hasDetails: boolean;
+  stepCount: number;
+  durationMs?: number;
+  summary?: string;
+  pip?: PipRowSlot;
+}
+
 export interface MediaDisplayRow {
   kind: "media";
   id: string;
   title?: string;
   items: MediaItem[];
+  pip?: PipRowSlot;
 }
 
-export type DisplayRow = Exclude<Row, ToolRow | { kind: "media" }> | ActivityRow | TurnHeaderRow | MediaDisplayRow;
+export type DisplayTextRow = Extract<Row, { kind: "text" }> & { pip?: PipRowSlot };
+
+export type DisplayRow =
+  | Exclude<Row, ToolRow | { kind: "media" | "text" }>
+  | DisplayTextRow
+  | ActivityRow
+  | TurnHeaderRow
+  | MediaDisplayRow
+  | PipSessionsRow
+  | PipFooterRow;
 
 // ── Tool Classification & Copywriting ────────────────────────────────────────
 
@@ -143,11 +198,10 @@ const isUnnamedCall = (step: ProcessStep) => {
 
 /** Normalizes tool names across Pi, Claude Code, Codex, Devin, OpenCode, Cursor, Gemini & ACP servers. */
 export function classifyTool(rawName: string): { category: ToolCategory; subkind?: "find" | "fetch"; icon: IconName } {
-  const lower = rawName
-    .trim()
-    .toLowerCase()
-    .replace(/^mcp__[^_]+__/, "")
-    .replace(/[\s-]+/g, "_");
+  const lower = normalizeMcpToolName(rawName);
+  if (isPresentFilesTool(rawName)) {
+    return { category: "present", icon: "image" };
+  }
   if (lower === "read" || lower === "read_file" || lower === "read_files" || lower === "view_file" || lower === "cat" || lower === "open_file") {
     return { category: "read", icon: "file" };
   }
@@ -202,11 +256,19 @@ export function classifyTool(rawName: string): { category: ToolCategory; subkind
     lower === "session_send" ||
     lower === "session_read" ||
     lower === "sessions_list" ||
+    lower === "workspaces_list" ||
     lower === "agents_list"
   ) {
     return {
       category: "agent",
-      icon: lower === "session_stop" ? "stop" : lower === "session_read" || lower === "sessions_list" || lower === "agents_list" ? "clock" : "agents",
+      icon:
+        lower === "session_stop"
+          ? "stop"
+          : lower === "workspaces_list"
+            ? "folder"
+            : lower === "session_read" || lower === "sessions_list" || lower === "agents_list"
+              ? "clock"
+              : "agents",
     };
   }
   if (lower === "web_search" || lower === "websearch" || lower === "search_web" || lower === "google_search") {
@@ -220,6 +282,10 @@ export function classifyTool(rawName: string): { category: ToolCategory; subkind
   }
   if (lower === "present_files") {
     return { category: "present", icon: "image" };
+  }
+  const bareAsk = lower.replace(/^(?:running|run|use|call)_/, "").replace(/\?+$/, "");
+  if (bareAsk === "ask_question" || bareAsk === "ask_user" || bareAsk === "ask_user_question" || bareAsk === "askuserquestion") {
+    return { category: "ask", icon: "message" };
   }
   return { category: "other", icon: "wrench" };
 }
@@ -289,7 +355,11 @@ function sumDiffStats(tools: readonly ToolRow[]): DiffStats | undefined {
 }
 
 function humanizeToolName(name: string): string {
-  const trimmed = name.replace(/^mcp__[^_]+__/, "").trim();
+  const trimmed = name
+    .trim()
+    .replace(/^(?:(?:running|run|calling|call|using|use)\s+)?mcp__[^_]+__/i, "")
+    .replace(/^(?:(?:running|run|calling|call|using|use)\s+)?mcp_(?:pipi|t3[-_]code)_/i, "")
+    .trim();
   if (/\s/.test(trimmed)) return trimmed.replace(/\s*\n\s*/g, " ; ").replace(/\s+/g, " ");
   return trimmed
     .replace(/[_-]+/g, " ")
@@ -524,6 +594,21 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
       };
     }
 
+    case "ask": {
+      const questions = Array.isArray(args.questions) ? args.questions : [];
+      const firstQ = questions[0] && typeof questions[0] === "object" ? pickStr(questions[0] as Record<string, unknown>, "question", "title", "prompt") : "";
+      const target = firstQ || pickStr(args, "question", "prompt", "message", "title");
+      const verb = active ? (zh ? "正在提问" : "Asking") : failed ? (zh ? "提问已跳过" : "Skipped question") : zh ? "已提问" : "Asked";
+      return {
+        category,
+        icon,
+        verb,
+        target: target ? compactCommand(target) : "",
+        meta: questions.length > 1 ? (zh ? `${questions.length} 个问题` : `${questions.length} questions`) : "",
+        monoTarget: false,
+      };
+    }
+
     default: {
       const label = humanizeToolName(row.name) || (zh ? "工具" : "tool");
       const target = pickStr(args, "path", "file_path", "command", "query", "pattern", "url", "title", "name", "description");
@@ -561,7 +646,7 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
 // by kind in the order it first happened ("Ran git, Read 3 files"). No icons,
 // target lists, timings or counters that tick along with every call.
 
-type SegmentKey = "read" | "list" | "search" | "edit" | "command" | "agent" | "todo" | "present" | "other";
+type SegmentKey = "read" | "list" | "search" | "edit" | "command" | "agent" | "todo" | "present" | "ask" | "other";
 
 const segmentKey = (category: ToolCategory): SegmentKey => (category === "create" ? "edit" : category === "web" ? "search" : category);
 
@@ -665,6 +750,9 @@ function toolLine(tool: ToolRow, running: boolean, zh: boolean): string {
       if (files.length > 1) return zh ? `${verb} ${files.length} 个文件` : `${verb} ${files.length} files`;
       return firstPath ? `${verb} ${basename(firstPath)}` : zh ? `${verb}文件` : `${verb} files`;
     }
+    case "ask":
+      return zh ? (running ? "正在提问" : "已提问") : running ? "Asking a question" : "Asked a question";
+
     default: {
       const name = humanizeToolName(tool.name) || (zh ? "工具" : "tool");
       const label = /\s/.test(tool.name.trim()) ? name : name[0].toUpperCase() + name.slice(1);
@@ -705,6 +793,9 @@ function segmentLine(key: SegmentKey, tools: ToolRow[], zh: boolean): string {
       if (tools.length === 1) return toolLine(tools[0], false, zh);
       return zh ? `已展示 ${tools.length} 组文件` : `Presented ${tools.length} sets`;
     }
+    case "ask":
+      return toolLine(tools[0], false, zh);
+
     default: {
       const names = unique(tools.map((tool) => humanizeToolName(tool.name)));
       if (names.length <= 1) return toolLine(tools[0], false, zh);
@@ -716,7 +807,7 @@ function segmentLine(key: SegmentKey, tools: ToolRow[], zh: boolean): string {
 /** Picks the steady step representing a running group: oldest active foreground tool
  * (so parallel bursts stay monotonic forward instead of reversing as calls finish),
  * else active reasoning, else a background tool, else the last step. */
-function selectActiveStep(all: readonly ProcessStep[]): ProcessStep | undefined {
+export function selectActiveStep(all: readonly ProcessStep[]): ProcessStep | undefined {
   // A call not named yet says nothing: the line stays on the step before it.
   const steps = all.filter((step) => !isUnnamedCall(step));
   for (const step of steps) {
@@ -860,14 +951,54 @@ function mediaItemKey(item: MediaItem): string | undefined {
   return undefined;
 }
 
+/** Extracts delegated child sessions started via `session_start` tool calls in a turn. */
+export function extractDelegatedSessions(tools: readonly ToolRow[]): PipDelegatedSession[] {
+  const out: PipDelegatedSession[] = [];
+  const seenSessions = new Set<string>();
+  for (const tool of tools) {
+    if (normalizeMcpToolName(tool.name) !== "session_start") continue;
+    if (tool.status !== "done" && tool.status !== "error") continue;
+    const args = tool.args ?? {};
+    const agent = pickStr(args, "agent", "agentId");
+    const rawTitle = pickStr(args, "title", "description", "task", "message");
+    let sessionId: string | undefined;
+    let outputTitle = "";
+    if (tool.output) {
+      try {
+        const parsed = JSON.parse(tool.output) as { id?: unknown; title?: unknown };
+        if (typeof parsed?.id === "string" && parsed.id) sessionId = parsed.id;
+        if (typeof parsed?.title === "string" && parsed.title.trim()) outputTitle = parsed.title.trim();
+      } catch {
+        const match = /"id"\s*:\s*"([^"]+)"/.exec(tool.output);
+        if (match?.[1]) sessionId = match[1];
+      }
+    }
+    if (sessionId) {
+      if (seenSessions.has(sessionId)) continue;
+      seenSessions.add(sessionId);
+    }
+    const title = outputTitle || rawTitle || agent || "Subtask";
+    out.push({
+      toolId: tool.id,
+      ...(sessionId ? { sessionId } : {}),
+      title: truncate(title, 64),
+      ...(agent ? { agent } : {}),
+      ...(tool.status === "error" ? { failed: true } : {}),
+    });
+  }
+  return out;
+}
+
 export function buildDisplayRows(
   rows: readonly Row[],
   sessionRunning = false,
   folds: TurnFolds = {},
   /** Filled with the turn each shown process row belongs to, by row id, when given. */
   processOf?: Map<string, string>,
-  context?: { cwd?: string; home?: string },
+  context?: { cwd?: string; home?: string; persona?: boolean; lang?: Lang },
 ): DisplayRow[] {
+  const persona = context?.persona === true;
+  const lang: Lang = context?.lang ?? "en";
   const out: DisplayRow[] = [];
   /** The reader folded the work the next turn carries on. */
   let hushed = false;
@@ -882,8 +1013,9 @@ export function buildDisplayRows(
 
     const first = row;
     const process: DisplayRow[] = [];
-    const answer: DisplayRow[] = [];
-    const presentedMedia: MediaDisplayRow[] = [];
+    const answer: DisplayTextRow[] = [];
+    const directMedia: MediaDisplayRow[] = [];
+    const toolPresentedMedia: MediaDisplayRow[] = [];
     const autoMedia: MediaDisplayRow[] = [];
     const turnTools: ToolRow[] = [];
     const turnSteps: ProcessStep[] = [];
@@ -912,7 +1044,7 @@ export function buildDisplayRows(
       }
       if (cur.kind === "media") {
         if (cur.items.length > 0) {
-          presentedMedia.push({ kind: "media", id: cur.id, ...(cur.title ? { title: cur.title } : {}), items: cur.items });
+          directMedia.push({ kind: "media", id: cur.id, ...(cur.title ? { title: cur.title } : {}), items: cur.items });
         }
         continue;
       }
@@ -923,16 +1055,14 @@ export function buildDisplayRows(
           turnTools.push(cur);
           if (cur.background && isToolActive(cur.status)) backgroundStep = cur;
           if (cur.status === "done") {
-            if (isPresentFilesTool(cur.name)) {
-              const presented = extractPresentedMedia(cur, context?.cwd, context?.home);
-              if (presented && presented.items.length > 0) {
-                presentedMedia.push({
-                  kind: "media",
-                  id: `media:${cur.id}`,
-                  ...(presented.title ? { title: presented.title } : {}),
-                  items: presented.items,
-                });
-              }
+            const presented = extractPresentedMedia(cur, context?.cwd, context?.home);
+            if (presented && presented.items.length > 0) {
+              toolPresentedMedia.push({
+                kind: "media",
+                id: `media:${cur.id}`,
+                ...(presented.title ? { title: presented.title } : {}),
+                items: presented.items,
+              });
             } else if (classifyTool(cur.name).category !== "read" && (cur.imageBlocks?.length || cur.resources?.length)) {
               const items = extractToolResultMedia(cur, context?.cwd, context?.home);
               if (items.length > 0) {
@@ -958,7 +1088,9 @@ export function buildDisplayRows(
     }
     const seenKeys = new Set<string>();
     const surfacedMedia: MediaDisplayRow[] = [];
-    for (const group of presentedMedia) {
+    // First-class daemon side-channel `media` rows take priority over tool-echo fallbacks so rich
+    // metadata (dimensions/size/exists) wins and duplicate engine echoes are cleanly deduplicated.
+    for (const group of [...directMedia, ...toolPresentedMedia]) {
       const items = group.items.filter((item) => {
         const key = mediaItemKey(item);
         if (!key) return true;
@@ -988,6 +1120,88 @@ export function buildDisplayRows(
     // Bubbles the queue still holds trail the end but were not sent into the run: they
     // cut nothing short — the turn goes on until their echo lands them among the rows.
     const running = sessionRunning && rows.slice(i).every((rest) => rest.kind === "user" && rest.queued) && !answered && !tailClosed;
+
+    if (persona) {
+      // Pip (personal agent) uses non-streaming IM delivery: while a turn is still
+      // running, its thinking/tool calls/streaming tokens stay off the main stream
+      // and surface exclusively through the bottom active Pip avatar + hover status card.
+      if (running) continue;
+
+      const id = `turn:${first.id}`;
+      let messages: DisplayTextRow[] = answer.filter((m) => !m.streaming && m.text.trim().length > 0);
+      let remainingProcess = process;
+      // Fallback for settled/interrupted turns that only wrote completed prose before tool calls
+      // and ended without a separate final message: surface the prose so nothing is ever lost.
+      if (messages.length === 0) {
+        const fallbackTexts = process.filter(
+          (item): item is DisplayTextRow => item.kind === "text" && !item.streaming && item.text.trim().length > 0,
+        );
+        if (fallbackTexts.length > 0) {
+          const fallbackIds = new Set(fallbackTexts.map((t) => t.id));
+          messages = fallbackTexts.map((t) => ({ ...t, streaming: false, final: true }));
+          remainingProcess = process.filter((item) => !fallbackIds.has(item.id));
+        }
+      }
+
+      const delegated = extractDelegatedSessions(turnTools);
+      const hasDetails = remainingProcess.length > 0;
+      if (messages.length === 0 && surfacedMedia.length === 0 && delegated.length === 0 && !hasDetails) continue;
+
+      const summary = turnTools.length > 0 ? describeToolsSummary(turnTools, lang) : undefined;
+      const stepCount = turnTools.length || remainingProcess.length;
+      const turnMeta: PipTurnMeta = {
+        turnId: id,
+        ...(durationMs !== undefined ? { durationMs } : {}),
+        stepCount,
+        ...(summary ? { summary } : {}),
+      };
+      // Process details stay quietly collapsed by default; only an explicit user click opens them.
+      const open = folds.chosen?.(id) ?? false;
+      let leadPlaced = false;
+      const claimSlot = (): PipRowSlot => {
+        const lead = !leadPlaced;
+        leadPlaced = true;
+        return { lead, indent: true, meta: turnMeta };
+      };
+
+      for (const msg of messages) {
+        out.push({ ...msg, streaming: false, final: true, pip: claimSlot() });
+      }
+      for (const media of surfacedMedia) {
+        out.push({ ...media, pip: claimSlot() });
+      }
+      if (delegated.length > 0) {
+        out.push({
+          kind: "pip-sessions",
+          id: `pipsess:${first.id}`,
+          sessions: delegated,
+          pip: claimSlot(),
+        });
+      }
+
+      const copyText = messages.map((m) => m.text).join("\n\n");
+      if (copyText || hasDetails) {
+        out.push({
+          kind: "pip-footer",
+          id: `pipfoot:${first.id}`,
+          turnId: id,
+          text: copyText,
+          open,
+          hasDetails,
+          stepCount,
+          ...(durationMs !== undefined ? { durationMs } : {}),
+          ...(summary ? { summary } : {}),
+          pip: leadPlaced ? { lead: false, indent: true, meta: turnMeta } : claimSlot(),
+        });
+      }
+
+      if (hasDetails && (open || folds.keepMounted?.(id))) {
+        out.push(...remainingProcess);
+        if (processOf) for (const proc of remainingProcess) processOf.set(proc.id, id);
+      }
+      continue;
+    }
+
     const tail = process[process.length - 1];
     if (running && tail?.kind === "activity") tail.mayGrow = true;
     const activeStep = selectActiveStep(turnSteps);
@@ -1055,10 +1269,54 @@ function sameMediaItem(a: MediaItem, b: MediaItem): boolean {
   );
 }
 
+function samePipSlot(a?: PipRowSlot, b?: PipRowSlot): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.lead === b.lead &&
+    a.indent === b.indent &&
+    a.meta?.turnId === b.meta?.turnId &&
+    a.meta?.durationMs === b.meta?.durationMs &&
+    a.meta?.stepCount === b.meta?.stepCount &&
+    a.meta?.summary === b.meta?.summary
+  );
+}
+
+function sameDelegatedSession(a: PipDelegatedSession, b: PipDelegatedSession): boolean {
+  return a === b || (a.toolId === b.toolId && a.sessionId === b.sessionId && a.title === b.title && a.agent === b.agent && a.failed === b.failed);
+}
+
 function sameRow(a: DisplayRow, b: DisplayRow): boolean {
   if (a === b) return true;
+  if (a.kind === "text" && b.kind === "text") {
+    return a.text === b.text && a.streaming === b.streaming && a.final === b.final && samePipSlot(a.pip, b.pip);
+  }
   if (a.kind === "media" && b.kind === "media") {
-    return a.title === b.title && a.items.length === b.items.length && a.items.every((item, at) => sameMediaItem(item, b.items[at]));
+    return (
+      a.title === b.title &&
+      samePipSlot(a.pip, b.pip) &&
+      a.items.length === b.items.length &&
+      a.items.every((item, at) => sameMediaItem(item, b.items[at]))
+    );
+  }
+  if (a.kind === "pip-sessions" && b.kind === "pip-sessions") {
+    return (
+      samePipSlot(a.pip, b.pip) &&
+      a.sessions.length === b.sessions.length &&
+      a.sessions.every((s, at) => sameDelegatedSession(s, b.sessions[at]))
+    );
+  }
+  if (a.kind === "pip-footer" && b.kind === "pip-footer") {
+    return (
+      a.turnId === b.turnId &&
+      a.text === b.text &&
+      a.open === b.open &&
+      a.hasDetails === b.hasDetails &&
+      a.stepCount === b.stepCount &&
+      a.durationMs === b.durationMs &&
+      a.summary === b.summary &&
+      samePipSlot(a.pip, b.pip)
+    );
   }
   if (a.kind === "activity" && b.kind === "activity") return a.live === b.live && a.mayGrow === b.mayGrow && sameList(a.steps, b.steps);
   if (a.kind === "turn" && b.kind === "turn") {
@@ -1090,6 +1348,8 @@ export function displayRowIds(rows: readonly Row[]): string[] {
     ids.push(row.id);
     if (!isTurnRow(row)) continue;
     ids.push(`turn:${row.id}`);
+    ids.push(`pipsess:${row.id}`);
+    ids.push(`pipfoot:${row.id}`);
     if (row.kind === "text") ids.push(`${row.id}#actions`);
     else if (row.kind === "tool") {
       ids.push(`act:${row.id}`);

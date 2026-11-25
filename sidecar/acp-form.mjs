@@ -155,3 +155,15 @@ export function formAnswerText(fields, answers, labels) {
   }
   return lines.join("\n");
 }
+
+const GENERIC_FORM_MESSAGE = /^(?:the agent has \d+ questions?\.?|please answer (?:the )?(?:following )?questions?\.?|answer (?:the )?(?:following )?questions?\.?)$/i;
+
+/** Drops boilerplate count-only ACP messages ("The agent has 2 questions.") and duplicates of the first question. */
+export function meaningfulFormMessage(message, title, fields) {
+  const clean = typeof message === "string" ? message.trim() : "";
+  if (!clean) return "";
+  if (GENERIC_FORM_MESSAGE.test(clean)) return "";
+  if (typeof title === "string" && clean === title.trim()) return "";
+  if (Array.isArray(fields) && fields.length === 1 && clean === String(fields[0]?.label ?? "").trim()) return "";
+  return clean;
+}

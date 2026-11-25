@@ -63,7 +63,7 @@ export function AgentPicker(props: { onOpen?: () => void }) {
       popupStyle={popupStyle("top", "start")}
       popupStartingStyle={popupHiddenStyle("top", "start")}
       popupEndingStyle={popupLeavingStyle("top", "start")}
-      trigger={<Chip testID="agent-chip" leading={<AgentLogo id={current().id} size={14} />} label={current().name} />}
+      trigger={<Chip testID="agent-chip" leading={<AgentLogo id={current().id} size={14} />} label={current().name} class="font-medium text-foreground" />}
     >
       <Scroll class="max-h-80" testID="agent-picker">
         <Each of={pickerAgents()} key={(a) => a.id}>

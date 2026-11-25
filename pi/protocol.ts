@@ -44,6 +44,28 @@ export interface MediaResourceContent {
   text?: string;
 }
 
+export interface PresentedMediaEntry {
+  path?: string;
+  remoteUrl?: string;
+  title?: string;
+  caption?: string;
+  kind?: string;
+  mimeType?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  exists?: boolean;
+}
+
+/** First-class curated media gallery pushed directly by pipi's daemon side-channel for `present_files`. */
+export interface PresentedMediaContent {
+  type: "presented_media";
+  title?: string;
+  items: PresentedMediaEntry[];
+}
+
+export type ProtocolMediaBlock = ImageContent | AudioContent | MediaResourceContent | PresentedMediaContent;
+
 export type ToolResultBlock = TextContent | ImageContent | AudioContent | MediaResourceContent;
 
 export interface ThinkingContent {
@@ -86,7 +108,7 @@ export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "
 
 export interface AssistantMessage {
   role: "assistant";
-  content: (TextContent | ThinkingContent | ToolCall | ImageContent | AudioContent | MediaResourceContent)[];
+  content: (TextContent | ThinkingContent | ToolCall | ProtocolMediaBlock)[];
   provider: string;
   model: string;
   usage: Usage;
@@ -315,7 +337,7 @@ export type AssistantMessageEvent =
   | { type: "toolcall_start"; contentIndex: number; id: string; toolName: string }
   | { type: "toolcall_delta"; contentIndex: number; delta: string }
   | { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall }
-  | { type: "media_block"; contentIndex: number; block: ImageContent | AudioContent | MediaResourceContent }
+  | { type: "media_block"; contentIndex: number; block: ProtocolMediaBlock }
   | { type: "start" }
   | { type: "done" }
   | { type: "error" };

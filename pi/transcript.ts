@@ -1,5 +1,5 @@
 import type { Lang } from "../lib/i18n";
-import { mediaItemFromProtocolBlock, type MediaItem } from "../lib/media";
+import { mediaRowFromProtocolBlock, type MediaItem } from "../lib/media";
 import type {
   AgentMessage,
   AssistantMessage,
@@ -229,13 +229,17 @@ const signature = (row: Row): string => {
   }
 };
 
+const isProcessBlock = (block: AssistantMessage["content"][number]): boolean =>
+  block.type === "toolCall" || block.type === "thinking";
+
 /** Whether the message answered its turn: called no tools without failing, or —
  * a turn held in one message, as the bridge plays ACP harnesses — ended on
- * prose after its steps. One still calling tools or that failed answers nothing. */
+ * prose/media after its steps. One still calling tools or that failed answers nothing. */
 const answeredTurn = (message: AssistantMessage): boolean => {
   if (message.stopReason === "error") return false;
   if (!message.content.some((block) => block.type === "toolCall")) return true;
-  return message.stopReason !== "toolUse" && message.content.at(-1)?.type === "text";
+  const last = message.content.at(-1);
+  return message.stopReason !== "toolUse" && Boolean(last && !isProcessBlock(last));
 };
 
 export interface ToolRow extends TurnStamp {
@@ -1479,10 +1483,10 @@ export class Transcript {
         break;
       }
       case "media_block": {
-        const item = mediaItemFromProtocolBlock(event.block, id);
-        if (item) {
+        const media = mediaRowFromProtocolBlock(event.block, id);
+        if (media) {
           live.rowIds.set(event.contentIndex, id);
-          this.#set({ kind: "media", id, items: [item] });
+          this.#set({ kind: "media", id, ...(media.title ? { title: media.title } : {}), items: media.items });
         }
         break;
       }
@@ -1509,7 +1513,7 @@ export class Transcript {
     // `#settle` marks when the live run ends. Not one that failed: what it left
     // becomes the answer only if the failure stands (`#reportFailure`).
     const hasTools = message.content.some((block) => block.type === "toolCall");
-    const lastStep = message.content.reduce((at, block, index) => (block.type === "text" ? at : index), -1);
+    const lastStep = message.content.reduce((at, block, index) => (isProcessBlock(block) ? index : at), -1);
     const final = (index: number) => !failed && (hasTools ? message.stopReason !== "toolUse" && index > lastStep : true);
     message.content.forEach((block, index) => {
       const id = rowIds?.get(index) ?? `${key}.${index}`;
@@ -1523,9 +1527,9 @@ export class Transcript {
         } else {
           this.#removeRow(id);
         }
-      } else if (block.type === "image" || block.type === "audio" || block.type === "resource") {
-        const item = mediaItemFromProtocolBlock(block, id);
-        if (item) this.#set({ kind: "media", id, items: [item] });
+      } else if (block.type === "image" || block.type === "audio" || block.type === "resource" || block.type === "presented_media") {
+        const media = mediaRowFromProtocolBlock(block, id);
+        if (media) this.#set({ kind: "media", id, ...(media.title ? { title: media.title } : {}), items: media.items });
       } else if (block.type === "toolCall") {
         // The block's own call is the one streamed at its content index, if
         // there was one; anything else — history, a call never streamed — is
@@ -1645,11 +1649,11 @@ export class Transcript {
           if (block.streaming === true) live.thinkingSince.set(index, Date.now());
           this.#set({ kind: "thinking", id, text: block.thinking, streaming: block.streaming === true, redacted: !!block.redacted });
         }
-      } else if (block.type === "image" || block.type === "audio" || block.type === "resource") {
-        const item = mediaItemFromProtocolBlock(block, id);
-        if (item) {
+      } else if (block.type === "image" || block.type === "audio" || block.type === "resource" || block.type === "presented_media") {
+        const media = mediaRowFromProtocolBlock(block, id);
+        if (media) {
           live.rowIds.set(index, id);
-          this.#set({ kind: "media", id, items: [item] });
+          this.#set({ kind: "media", id, ...(media.title ? { title: media.title } : {}), items: media.items });
         }
       } else if (block.type === "toolCall") {
         const rowId = this.#mintToolId(block.id);
@@ -1791,7 +1795,7 @@ export class Transcript {
     // Prose a stopped run left at the end is as much of an answer as there will
     // be — prose a message already classified keeps the place it was given.
     let tail = this.#rows.length;
-    while (tail > 0 && this.#rows[tail - 1].kind === "text") tail--;
+    while (tail > 0 && (this.#rows[tail - 1].kind === "text" || this.#rows[tail - 1].kind === "media")) tail--;
     this.#rows = this.#rows.map((row, at) => {
       if (row.kind === "text" && at >= tail && row.final === undefined) return { ...row, streaming: false, final: true };
       if ((row.kind === "text" || row.kind === "thinking") && row.streaming) return { ...row, streaming: false };

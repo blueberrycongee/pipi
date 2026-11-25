@@ -42,8 +42,8 @@ export function PipRow() {
           if (e.button === "middle") void openPersonalAgent(true);
         }}
         tooltip={tip(tr("Pip, your personal agent", "Pip，你的私人助理"), undefined, "right")}
-        class={`${uiHeight(32)} flex-row items-center gap-1.5 rounded-md corner-squircle px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-sidebar-accent active:bg-sidebar-accent ${
-          selected() ? "bg-sidebar-accent" : ""
+        class={`${uiHeight(32)} flex-row items-center gap-1.5 rounded-lg corner-squircle border-[0.5px] px-2.5 ${PRESS} ${FOCUS_RING} hover:bg-sidebar-accent active:bg-sidebar-accent ${
+          selected() ? "border-hairline bg-card shadow-sidebar-row dark:shadow-sidebar-row-dark" : "border-transparent"
         }`}
       >
         <View class="size-5 shrink-0 items-center justify-center">

@@ -12,7 +12,9 @@ import {
   extractToolResultMedia,
   formatBytes,
   formatMediaDuration,
+  isPresentFilesTool,
   isRichPasteFile,
+  normalizeMcpToolName,
   resolveMediaTarget,
   splitFileMessage,
 } from "./media";
@@ -144,4 +146,110 @@ test("extracts presented files and tool-returned images/resources", () => {
   );
   expect(toolItems.map((i) => i.kind)).toEqual(["image", "video"]);
   expect(toolItems[1].path).toBe("/tmp/trace.mp4");
+});
+
+test("recognizes present_files and pipi MCP tool names across all harness formats without false positives", () => {
+  expect(normalizeMcpToolName("Run mcp_pipi_present_files")).toBe("present_files");
+  expect(normalizeMcpToolName("Running mcp_pipi_present_files")).toBe("present_files");
+  expect(normalizeMcpToolName("mcp_pipi_sessions_list")).toBe("sessions_list");
+  expect(normalizeMcpToolName("Run mcp_pipi_workspaces_list")).toBe("workspaces_list");
+  expect(normalizeMcpToolName("pipi:present_files")).toBe("present_files");
+  expect(normalizeMcpToolName("mcp/pipi/session_start")).toBe("session_start");
+  expect(normalizeMcpToolName("Run git status")).toBe("run_git_status");
+
+  for (const name of [
+    "present_files",
+    "Present files",
+    "Run present_files",
+    "Running present_files",
+    "mcp__pipi__present_files",
+    "Run mcp__pipi__present_files",
+    "mcp_pipi_present_files",
+    "Run mcp_pipi_present_files",
+    "Running mcp_pipi_present_files",
+    "pipi:present_files",
+    "pipi/present_files",
+    "pipi.present_files",
+    "pipi__present_files",
+    "pipi_present_files",
+    "mcp:pipi:present_files",
+    "mcp/pipi/present_files",
+    "mcp_custom_present_files",
+    "custom-server:present_files",
+  ]) {
+    expect(isPresentFilesTool(name)).toBe(true);
+  }
+
+  for (const name of [
+    "read_file",
+    "present_files_helper",
+    "represent_files",
+    "rg -n present_files lib/",
+    "File lib/present_files.ts",
+    "Run ./present_files",
+    "Run scripts/present_files",
+  ]) {
+    expect(isPresentFilesTool(name)).toBe(false);
+  }
+});
+
+test("extractPresentedMedia handles Antigravity ACP args fallback and renamed pipiMedia payloads", () => {
+  // Antigravity ACP: empty toolResult content/details, full file list in args, title prefixed with "Run mcp_pipi_".
+  const agy = extractPresentedMedia(
+    {
+      id: "call_agy",
+      name: "Run mcp_pipi_present_files",
+      args: {
+        title: "Before & After",
+        files: [
+          { path: "/repo/.nsh/shots/before.png", title: "Before", caption: "Old layout" },
+          { path: ".nsh/shots/after.png", title: "After" },
+        ],
+      },
+      output: "",
+    },
+    "/repo",
+  );
+  expect(agy?.title).toBe("Before & After");
+  expect(agy?.items).toHaveLength(2);
+  expect(agy?.items[0]).toMatchObject({ kind: "image", path: "/repo/.nsh/shots/before.png", title: "Before", caption: "Old layout" });
+  expect(agy?.items[1]).toMatchObject({ kind: "image", path: "/repo/.nsh/shots/after.png", title: "After" });
+
+  // Arbitrary ACP display title (e.g. toolSummary) still surfaces when pipiMedia sentinel is present in details or output.
+  const byDetails = extractPresentedMedia(
+    {
+      id: "call_custom_details",
+      name: "Present before and after previews",
+      args: {},
+      output: "",
+      details: { pipiMedia: true, title: "Previews", items: [{ path: "/repo/a.png", kind: "image" }] },
+    },
+    "/repo",
+  );
+  expect(byDetails?.title).toBe("Previews");
+  expect(byDetails?.items[0]?.path).toBe("/repo/a.png");
+
+  const byOutput = extractPresentedMedia(
+    {
+      id: "call_custom_output",
+      name: "Show screenshots",
+      args: {},
+      output: JSON.stringify({ pipiMedia: true, items: [{ path: "/repo/b.png", kind: "image" }] }),
+    },
+    "/repo",
+  );
+  expect(byOutput?.items[0]?.path).toBe("/repo/b.png");
+
+  // Unrelated tool with a `files` argument and no pipiMedia sentinel is never misclassified as presented media.
+  expect(
+    extractPresentedMedia(
+      {
+        id: "call_other",
+        name: "lint_files",
+        args: { files: [{ path: "/repo/a.png" }] },
+        output: "",
+      },
+      "/repo",
+    ),
+  ).toBeUndefined();
 });

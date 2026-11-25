@@ -8,8 +8,8 @@ import { type DocPart, splitDocMessage } from "../lib/doc-wire";
 import { fitImageBox, imageSizeFromBase64 } from "../lib/image-size";
 import {
   extractMarkdownMediaPaths,
+  extractPresentedMedia,
   extractToolResultMedia,
-  isPresentFilesTool,
   resolveMediaTarget,
   splitFileMessage,
   type FileAttachment,
@@ -29,18 +29,22 @@ import {
   classifyTool,
   type DiffStats,
   type DisplayRow,
+  type PipRowSlot,
   thinkingLabel,
   type TurnHeaderRow,
 } from "../pi/turns";
+import { Pip } from "../mascot/Pip";
 import {
   conversationKey,
   copyMessage,
   copyText,
   daemonSessionOfId,
   forkFrom,
+  isPersonaSession,
   messageQueue,
   openDaemonSession,
   openLocalFile,
+  pipMood,
   takeQueued,
   transcriptRows,
   workspacePath,
@@ -50,7 +54,7 @@ import { docTabTitle, titleLine } from "../store/docs";
 import { openDocIfThere } from "../store/tabs";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
-import { EASING, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
+import { EASING, isRowSeen, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
@@ -58,6 +62,7 @@ import { openZoom } from "../ui/Zoom";
 import { readingType, codeType, uiHeight, uiType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
 import { MediaGallery, openMediaZoom } from "./Media";
+import { PipAvatarBadge, PipFooterView, PipSessionsView } from "./PipPresence";
 import { clearProseState, proseClasses, ProseBlock, proseVeilUntil, type ProseRow } from "./Prose";
 
 /**
@@ -698,7 +703,7 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
         <If when={hasBubble()}>
           <View
             testID="message-bubble"
-            class="max-w-full gap-1.5 rounded-2xl rounded-br-md corner-squircle bg-secondary px-3.5 py-2.5"
+            class="max-w-full gap-1.5 rounded-2xl rounded-br-md corner-squircle border-[0.5px] border-hairline bg-secondary px-4 py-2.5"
             selectable
             onContextMenu={contextMenu}
           >
@@ -892,7 +897,7 @@ function Disclosure(props: {
       role="button"
       onPress={props.onPress}
       accessibilityState={{ expanded: props.open }}
-      class={`group -mx-2 ${props.compact ? uiHeight(26) : uiHeight(28)} select-none flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} active:scale-[0.995] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-accent active:bg-accent`}
+      class={`group ${props.compact ? `${uiHeight(26)} px-2` : `-mx-2 ${uiHeight(28)} px-2`} select-none flex-row items-center gap-2 rounded-md corner-squircle ${PRESS} active:scale-[0.995] motion-reduce:active:scale-100 ${FOCUS_RING} hover:bg-accent active:bg-accent`}
     >
       {props.children}
       <View
@@ -1025,7 +1030,7 @@ function ThinkingRow(props: { row: Extract<Row, { kind: "thinking" }>; defaultOp
   const open = () => isOpen(props.row.id, fallback());
   const label = () => thinkingLabel(props.row, activeLanguage());
   const hasBody = () => Boolean(props.row.text.trim());
-  const text = () => `min-w-0 shrink truncate ${props.compact ? uiType("sm") : uiType("md")} text-subtle`;
+  const text = () => `min-w-0 shrink truncate ${uiType("sm")} text-muted-foreground`;
 
   // Among a run's steps it reads as the tool calls beside it do: a glyph, then the words.
   if (props.compact) {
@@ -1090,8 +1095,9 @@ const diffOf = (row: ToolRow) => {
 /** What a call did, unfolded: the diff an edit made, media results returned/presented, else its output (a command's under its command line). */
 function ToolDetail(props: { row: ToolRow; insetClass?: string }) {
   const command = () => (classifyTool(props.row.name).category === "command" ? String(props.row.args?.command ?? props.row.args?.cmd ?? "").trim() : "");
-  const media = () => extractToolResultMedia(props.row, workspacePath(), backend().home());
-  const suppressPresentDump = () => isPresentFilesTool(props.row.name) && props.row.status !== "error" && media().length > 0;
+  const presented = () => extractPresentedMedia(props.row, workspacePath(), backend().home());
+  const media = () => presented()?.items ?? extractToolResultMedia(props.row, workspacePath(), backend().home());
+  const suppressPresentDump = () => Boolean(presented()) && props.row.status !== "error";
   const detail = () => {
     if (suppressPresentDump()) return "";
     if (props.row.output) return props.row.output;
@@ -1220,6 +1226,19 @@ function ActivityView(props: { row: ActivityRow }) {
     return !step || step.kind === "tool" || Boolean(step.text.trim());
   };
 
+  const aggregateDiff = (): DiffStats | undefined => {
+    let added = 0;
+    let removed = 0;
+    for (const tool of props.row.tools) {
+      const stats = describeToolCall(tool, activeLanguage()).diffStats;
+      if (stats) {
+        added += stats.added;
+        removed += stats.removed;
+      }
+    }
+    return added > 0 || removed > 0 ? { added, removed } : undefined;
+  };
+
   return (
     <Collapsible
       open={open() && hasBody()}
@@ -1228,7 +1247,7 @@ function ActivityView(props: { row: ActivityRow }) {
         <If
           when={only()}
           else={
-            <View class="mb-1 gap-0.5 border-l border-hairline py-0.5 pl-3.5">
+            <View class="mb-1 gap-0.5 py-0.5">
               <Each of={props.row.steps} key={(step) => step.id}>
                 {(step) => (
                   <If
@@ -1250,7 +1269,7 @@ function ActivityView(props: { row: ActivityRow }) {
         </If>
       }
     >
-      <View class="flex-row items-center gap-1">
+      <View class="flex-row items-center gap-1.5">
         <ProcessLine open={open() && hasBody()} onPress={hasBody() ? () => toggle(props.row.id, false) : undefined}>
           <RollingText
             id={() => props.row.id}
@@ -1258,9 +1277,12 @@ function ActivityView(props: { row: ActivityRow }) {
             pace
             settled={() => !props.row.running}
             holdSettle={() => props.row.mayGrow === true}
-            class={`min-w-0 shrink truncate ${uiType("md")} text-subtle`}
+            class={`min-w-0 shrink truncate ${uiType("sm")} text-muted-foreground`}
             style={{ opacity: breathOpacity }}
           />
+          <If when={!open()}>
+            <DiffBadge stats={aggregateDiff()} />
+          </If>
         </ProcessLine>
         <If when={onlySession()}>
           {(sid) => (
@@ -1320,31 +1342,35 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
   };
   const shownPreview = keepLast(() => preview() || undefined, "");
   return (
-    // The hairline under the header stays in both live and settled states, so the handoff cannot jump.
-    <View class="border-b border-hairline pb-1.5">
+    <View class="pb-0.5">
       <ProcessLine
         open={props.row.open}
         onPress={props.row.hasDetails ? () => toggleTurn(props.row.id, props.row.open, props.row.running) : undefined}
       >
+        <If when={props.row.running}>
+          <View class="mr-0.5 size-5 shrink-0 items-center justify-center">
+            <Pip size={19} mood={pipMood()} />
+          </View>
+        </If>
         <RollingText
           id={() => props.row.id}
           text={() => describeTurn(props.row, activeLanguage())}
-          class={`shrink-0 ${uiType("md")} text-subtle`}
+          class={`shrink-0 ${uiType("base")} ${props.row.running ? "font-medium text-foreground/85" : "text-subtle"}`}
           style={{ opacity: breathOpacity }}
         />
         <If when={elapsed() !== undefined && (elapsed() ?? 0) >= 1000}>
-          <Text class={`shrink-0 ${uiType("md")} tabular-nums text-subtle`}>{runningFor(elapsed() ?? 0)}</Text>
+          <Text class={`shrink-0 font-mono ${uiType("xs")} tabular-nums text-subtle`}>{runningFor(elapsed() ?? 0)}</Text>
         </If>
         <Presence show={Boolean(preview())} scaleFrom={0.97} class="min-w-0 shrink flex-row items-center gap-1.5">
           <If when={!props.row.running}>
-            <Text class={`shrink-0 ${uiType("md")} text-subtle`}>·</Text>
+            <Text class={`shrink-0 ${uiType("sm")} text-subtle`}>·</Text>
           </If>
           <RollingText
             id={() => `${props.row.id}:preview`}
             text={() => shownPreview() ?? ""}
             pace
             settled={() => !props.row.running}
-            class={`min-w-0 shrink truncate ${uiType("md")} text-subtle`}
+            class={`min-w-0 shrink truncate ${uiType("sm")} text-subtle`}
           />
         </Presence>
       </ProcessLine>
@@ -1524,15 +1550,17 @@ export type ChatRow = Exclude<DisplayRow, { kind: "text" }> | ProseRow | ReplyAc
 /** The room around a row: turns are set apart, a turn's steps sit close, a reply's blocks a line apart. */
 const SPACING: Record<ChatRow["kind"], string> = {
   user: "pt-7",
-  turn: "pt-1.5 pb-2",
+  turn: "pt-2 pb-1",
   // Selection drops target line boxes only, so room between a reply's blocks is
   // where a drag dead-ends back to the block before; keep it thin.
   prose: "py-0.5",
   actions: "pb-1",
   media: "py-2",
-  thinking: "py-1",
-  activity: "py-1",
-  bash: "py-1",
+  "pip-sessions": "py-1.5",
+  "pip-footer": "pb-1",
+  thinking: "py-0.5",
+  activity: "py-0.5",
+  bash: "py-0.5",
   notice: "py-2",
   summary: "py-3",
   delivery: "py-3",
@@ -1540,36 +1568,88 @@ const SPACING: Record<ChatRow["kind"], string> = {
 
 /** One row of the transcript. */
 export function TranscriptRow(props: { row: ChatRow }) {
+  const pipSlot = (): PipRowSlot | undefined => ("pip" in props.row ? props.row.pip : undefined);
+  const isPipProcess = () => isPersonaSession() && processTurns.has(props.row.id);
   const isStreamingRow = () =>
     (props.row.kind === "turn" && props.row.running) ||
     (props.row.kind === "thinking" && props.row.streaming) ||
     (props.row.kind === "activity" && props.row.running);
   const fold = useProcessFold(() => props.row.id);
+  const inProcessRail = () =>
+    (props.row.kind === "activity" || props.row.kind === "thinking" || props.row.kind === "bash") && processTurns.has(props.row.id);
   const entrance = useRowEntrance(
     () => props.row.id,
     isStreamingRow,
-    () => props.row.kind === "prose" || fold.isFolding(), // streamed text settles through its veil; folding rows animate via fold
-    () => props.row.kind === "user",
+    () => {
+      if (fold.isFolding()) return true;
+      if (props.row.kind === "prose") {
+        // Normal coding mode settles prose through its streaming veil; Pip IM mode delivers
+        // complete messages that glide in once (skipping seeded historical rows on session switch).
+        return !props.row.pip || isRowSeen(props.row.rowId);
+      }
+      return false;
+    },
+    () => props.row.kind === "user" || Boolean(pipSlot()),
   );
   const of = <K extends ChatRow["kind"]>(kind: K) => (props.row.kind === kind ? (props.row as Extract<ChatRow, { kind: K }>) : undefined);
+  const spacing = () => (pipSlot()?.lead ? "pt-4 pb-0.5" : SPACING[props.row.kind]);
+  const renderBody = () => (
+    <>
+      <If when={of("user")}>{(row) => <UserRow row={row()} />}</If>
+      <If when={of("turn")}>{(row) => <TurnHeaderView row={row()} />}</If>
+      <If when={of("activity")}>{(row) => <ActivityView row={row()} />}</If>
+      <If when={of("prose")}>{(row) => <ProseBlock row={row()} />}</If>
+      <If when={of("media")}>{(row) => <MediaGallery title={row().title} items={row().items} />}</If>
+      <If when={of("pip-sessions")}>{(row) => <PipSessionsView row={row()} />}</If>
+      <If when={of("pip-footer")}>
+        {(row) => (
+          <PipFooterView
+            row={row()}
+            renderCopy={(id, text) => <CopyButton id={id} text={text} label={tr("Copy reply", "复制回复")} />}
+            onToggleProcess={(turnId, open) => toggleTurn(turnId, open, false)}
+          />
+        )}
+      </If>
+      <If when={of("actions")}>{(row) => <ReplyActionsView row={row()} />}</If>
+      <If when={of("thinking")}>{(row) => <ThinkingRow row={row()} />}</If>
+      <If when={of("bash")}>{(row) => <BashRow row={row()} />}</If>
+      <If when={of("notice")}>{(row) => <NoticeRow row={row()} />}</If>
+      <If when={of("summary")}>{(row) => <SummaryRow row={row()} />}</If>
+      <If when={of("delivery")}>{(row) => <DeliveryRow row={row()} />}</If>
+    </>
+  );
+
   return (
     <Collapsible
       open={fold.open()}
       reveal={fold.reveal()}
       content={
-        <View class={`w-full max-w-190 self-center ${SPACING[props.row.kind]}${fold.open() ? "" : " pointer-events-none"}`} style={entrance}>
-          <View style={fold.style}>
-            <If when={of("user")}>{(row) => <UserRow row={row()} />}</If>
-            <If when={of("turn")}>{(row) => <TurnHeaderView row={row()} />}</If>
-            <If when={of("activity")}>{(row) => <ActivityView row={row()} />}</If>
-            <If when={of("prose")}>{(row) => <ProseBlock row={row()} />}</If>
-            <If when={of("media")}>{(row) => <MediaGallery title={row().title} items={row().items} />}</If>
-            <If when={of("actions")}>{(row) => <ReplyActionsView row={row()} />}</If>
-            <If when={of("thinking")}>{(row) => <ThinkingRow row={row()} />}</If>
-            <If when={of("bash")}>{(row) => <BashRow row={row()} />}</If>
-            <If when={of("notice")}>{(row) => <NoticeRow row={row()} />}</If>
-            <If when={of("summary")}>{(row) => <SummaryRow row={row()} />}</If>
-            <If when={of("delivery")}>{(row) => <DeliveryRow row={row()} />}</If>
+        <View class={`w-full max-w-180 self-center ${spacing()}${fold.open() ? "" : " pointer-events-none"}`} style={entrance}>
+          <View style={fold.style} class={!isPipProcess() && inProcessRail() ? "ml-[9px] border-l border-hairline pl-4" : undefined}>
+            <If
+              when={pipSlot()?.lead}
+              else={
+                <If
+                  when={pipSlot()?.indent}
+                  else={
+                    <If when={isPipProcess()} else={renderBody()}>
+                      <View class="pl-10">
+                        <View class="border-l border-hairline pl-3">{renderBody()}</View>
+                      </View>
+                    </If>
+                  }
+                >
+                  <View class="pl-10">{renderBody()}</View>
+                </If>
+              }
+            >
+              <View class="flex-row items-start gap-3">
+                <View class="w-7 shrink-0 pt-0.5">
+                  <PipAvatarBadge rowId={() => props.row.id} turnMeta={() => pipSlot()?.meta} />
+                </View>
+                <View class="min-w-0 flex-1">{renderBody()}</View>
+              </View>
+            </If>
           </View>
         </View>
       }

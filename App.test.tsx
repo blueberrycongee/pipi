@@ -89,35 +89,39 @@ test("switches sessions and starts a new one", async () => {
   await app.waitFor("text:What are we building?");
 });
 
-test("a chat runs in the app's own folder: listed in Recent, never a workspace", async () => {
+test("a chat runs in the app's own special workspace under Workspaces, never persisted as a project", async () => {
   const dir = `/tmp/pipi-chat-${Date.now()}`;
   const app = await launch("welcome", { storage: { "harness.scenario": "welcome", "harness.dataDir": dir } });
   await app.waitFor("text:What are we building?");
-  await app.press("id:sidebar-new-chat");
+  // Sidebar top keeps only New session; Chat lives as a special workspace inside Workspaces.
+  expect(app.count("id:sidebar-new-chat")).toBe(0);
+  await app.press("id:sidebar-workspaces >> id:sidebar-chat-workspace");
   await app.waitFor("text:What's on your mind?");
   expect(app.texts()).toContain("Pi · Chat");
   await app.type("label:Message", "make a plan");
   await app.submit("label:Message");
   await app.waitFor("text:Here is the plan.");
   await app.waitFor("id:sidebar-recents >> text:make a plan");
-  expect(app.count("id:sidebar-workspaces >> text:make a plan")).toBe(0);
+  expect(app.count("id:sidebar-workspaces >> text:make a plan")).toBe(1);
   const prefs = JSON.parse(app.storage()["pipi.prefs.v1"]);
   expect(prefs.workspaces ?? []).not.toContain(`${dir}/chat`);
   expect(prefs.activeWorkspace).not.toBe(`${dir}/chat`);
 
-  // Another chat from a chat is a chat; a new session from a chat, even an empty one, is back in the project.
-  await app.press("id:sidebar-new-chat");
+  // Another chat from the special workspace's `+` stays a chat; New session goes back to the project.
+  await app.hover("id:sidebar-workspaces >> id:sidebar-chat-workspace");
+  await app.press("id:sidebar-workspaces >> id:sidebar-chat-new");
   await app.waitFor("text:What's on your mind?");
   await app.press("id:sidebar-new-session");
   await app.waitFor("text:What are we building?");
   expect(app.texts()).toContain("Pi · ~");
   expect(app.count("id:sidebar-recents >> text:make a plan")).toBe(1);
+  expect(app.count("id:sidebar-workspaces >> text:make a plan")).toBe(1);
 });
 
 test("a blank tab comes back in the folder it was left in", async () => {
   const app = await launch("welcome", { storage: { "harness.scenario": "welcome", "harness.dataDir": `/tmp/pipi-chat-tab-${Date.now()}` } });
   await app.waitFor("text:What are we building?");
-  await app.press("id:sidebar-new-chat");
+  await app.press("id:sidebar-workspaces >> id:sidebar-chat-workspace");
   await app.waitFor("text:What's on your mind?");
   await app.press("id:tab-new");
   await app.waitFor("text:What are we building?");
@@ -141,7 +145,7 @@ test("a blank tab comes back in the folder it was left in", async () => {
 test("the blank tab a closed chat leaves stays a chat", async () => {
   const app = await launch("welcome", { storage: { "harness.scenario": "welcome", "harness.dataDir": `/tmp/pipi-chat-close-${Date.now()}` } });
   await app.waitFor("text:What are we building?");
-  await app.press("id:sidebar-new-chat");
+  await app.press("id:sidebar-workspaces >> id:sidebar-chat-workspace");
   await app.type("label:Message", "make a plan");
   await app.submit("label:Message");
   await app.waitFor("text:Here is the plan.");
@@ -317,16 +321,16 @@ test("organizes multiple projects in the sidebar and opens sessions across works
   expect(app.texts()).toContain("Fix QuickJS GC mark phase");
 
   // Collapsing a project hides its sessions in the workspace group (最近 keeps its own
-  // copy of recent sessions) and shows its count badge while keeping siblings intact
+  // copy of recent sessions) while keeping siblings intact and the row quiet
   await app.press("label:Collapse pipi");
   await app.waitUntil(() => app.count("id:sidebar-workspaces >> text:Refactor the transcript reducer") === 0);
-  expect(app.texts()).toContain("4");
+  expect(app.shows("label:Expand pipi")).toBe(true);
   expect(app.texts()).toContain("Benchmark native list recycling");
 
   // Collapsing and re-expanding a subsequent project folder also updates cleanly
   await app.press("label:Collapse nsh");
   await app.waitUntil(() => app.count("id:sidebar-workspaces >> text:Benchmark native list recycling") === 0);
-  expect(app.texts()).toContain("2");
+  expect(app.shows("label:Expand nsh")).toBe(true);
   await app.press("label:Expand nsh");
   await app.waitFor("text:Benchmark native list recycling");
 
@@ -497,28 +501,40 @@ test("shows tool permission confirmation inline above the composer while keeping
   expect(app.texts()).toContain("Here is the plan.");
 });
 
-test("answers an Antigravity form in place, leaving the chat draft untouched", async () => {
+test("answers an Antigravity form in place, stepping cleanly while preserving the chat draft", async () => {
   const app = await launch("history");
   await app.waitFor("text:Here is the plan.");
   await app.type("label:Message", "ask a question");
   await app.submit("label:Message");
-  await app.waitFor("text:Antigravity asks");
+  await app.waitFor("id:question-form");
   await app.waitFor("text:Which fruit should we use for the recipe?");
+  // Boilerplate count-only message is suppressed and step 2 stays hidden until step 1 advances.
+  expect(app.texts()).not.toContain("The agent has 2 questions.");
+  expect(app.texts()).not.toContain("Which toppings do you want?");
+
+  // Stepping out to queue a separate draft preserves it intact when returning to answer.
+  await app.press("id:question-to-draft");
+  await app.waitFor("label:Message");
   await app.type("label:Message", "a separate chat draft");
   await app.waitFor("label:Queue");
+  await app.press("id:question-resume");
+  await app.waitFor("id:question-form");
+
+  // "Other…" stays folded until chosen, then expands inline and submits into step 2.
+  await app.press("text:Other…");
   await app.type("label:Custom answer for Which fruit should we use for the recipe?", "Mango");
-  await app.scroll("id:question-fields", 220);
+  await app.press("id:question-next");
+  await app.waitFor("text:Which toppings do you want?");
   await app.press("text:Honey");
   await app.press("text:Yogurt");
-  // The draft is never the answer's vehicle: it stays exactly as typed.
-  expect(app.value("label:Message")).toBe("a separate chat draft");
-  // The card's own reply sends the picks and records them as the user's bubble.
-  await app.press("text:Reply");
+
+  // Submitting records the answers as a user bubble and restores the untouched draft.
+  await app.press("id:question-submit");
   await app.waitFor('text:Answers received: {"q1_other":"Mango","q2":["1","2"]}');
   const texts = app.texts();
   expect(texts).toContain("Which fruit should we use for the recipe?: Mango\nWhich toppings do you want?: Honey, Yogurt");
-  expect(app.value("label:Message")).toBe("a separate chat draft");
   await app.waitUntil(() => !app.shows("id:question-form"));
+  expect(app.value("label:Message")).toBe("a separate chat draft");
 });
 
 test("a blocked question reappears on its own session and can be skipped there", async () => {
@@ -526,13 +542,13 @@ test("a blocked question reappears on its own session and can be skipped there",
   await app.waitFor("text:What are we building?");
   await app.type("label:Message", "ask a question");
   await app.submit("label:Message");
-  await app.waitFor("text:Antigravity asks");
+  await app.waitFor("id:question-form");
   await app.press("id:sidebar-workspaces >> text:Refactor the transcript reducer");
   await app.waitFor("text:Here is the plan.");
   expect(app.shows("id:question-form")).toBe(false);
   await app.press("id:sidebar-workspaces >> text:ask a question");
-  await app.waitFor("text:Antigravity asks");
-  await app.press("label:Skip questions");
+  await app.waitFor("id:question-form");
+  await app.press("id:question-skip");
   await app.waitFor("text:Question declined.");
 });
 

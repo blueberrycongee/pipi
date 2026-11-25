@@ -1,5 +1,33 @@
-import { keyboardFrame, platform, safeArea, windowSize } from "nsh";
-import { titleBar } from "nsh/desktop";
+import { keyboardFrame, platform, safeArea, signal, windowSize } from "nsh";
+import { focusedWindow, isAvailable, Window, windows, type TitleBarArea, type WindowRef } from "nsh/desktop";
+
+const ZERO_TITLE_BAR: TitleBarArea = { height: 0, left: 0, right: 0 };
+const boundWindow = signal<WindowRef | null>(null);
+
+/**
+ * Registers the `WindowRef` captured while rendering the window root (`Shell`).
+ * All layout helpers read `win.titleBar()` through this ref rather than calling
+ * the render-scoped global `titleBar()`, which throws outside a `<Window>`
+ * render frame (event handlers, rAF, Promise callbacks, timers).
+ */
+export function bindWindow(win: WindowRef | null): () => void {
+  boundWindow.set(win);
+  return () => {
+    if (boundWindow() === win) boundWindow.set(null);
+  };
+}
+
+/**
+ * Reactive title bar insets for the active window, safe to read from any
+ * context (render, reactive props/effects, event handlers, async callbacks).
+ */
+export function titleBarArea(win?: WindowRef | null): TitleBarArea {
+  const target =
+    win ??
+    boundWindow() ??
+    (isAvailable ? (Window.get("main") ?? focusedWindow() ?? windows()[0] ?? null) : null);
+  return target ? target.titleBar() : ZERO_TITLE_BAR;
+}
 
 /**
  * Under this width the sidebar stops taking a slice of the window and floats
@@ -14,7 +42,7 @@ export const compactLayout = () => windowSize().width < SIDEBAR_DRAWER_BELOW;
  * over the surface (a phone's notch and status bar) its inset — on a desktop
  * the title bar's own.
  */
-export const topBarHeight = () => (titleBar().height || 44) + (platform.desktop ? 0 : safeArea().top);
+export const topBarHeight = () => (titleBarArea().height || 44) + (platform.desktop ? 0 : safeArea().top);
 
 /**
  * What a bottom-docked element rises by: the home indicator's inset, and the

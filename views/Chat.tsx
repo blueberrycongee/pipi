@@ -4,7 +4,7 @@ import { Button as BaseButton, Popover } from "nsh/base";
 import { edgeStep, edgeTarget } from "../lib/edge-scroll";
 import { topBarHeight } from "../lib/layout";
 import { basename, tildePath } from "../lib/format";
-import { tr } from "../lib/i18n";
+import { activeLanguage, tr } from "../lib/i18n";
 import { markPacersSeeded } from "../lib/stream-pacer";
 import { markVeilsSeeded } from "../lib/veil";
 import type { Mood } from "../mascot/geometry";
@@ -25,6 +25,7 @@ import {
   isChatFolder,
   isDraftAhead,
   isLeavingSession,
+  isPersonaSession,
   isRunning,
   isSwitching,
   newSession,
@@ -57,7 +58,8 @@ import { tip } from "../ui/Tip";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { uiHeight, uiMinHeight, uiType } from "../ui/typography";
 import { Composer } from "./Composer";
-import { hasInlinePrompt } from "./ExtensionDialog";
+import { hasFormTakeover, hasInlinePrompt } from "./ExtensionDialog";
+import { PipWorkingFooter } from "./PipPresence";
 import { proseRows } from "./Prose";
 import {
   type ChatRow,
@@ -99,7 +101,7 @@ function isChatActive() {
  */
 function activityLabel(said: boolean) {
   const dialog = pendingDialog();
-  if (dialog?.method === "form") return tr("Waiting for your answer", "等待你的回答");
+  if (dialog?.method === "form") return hasFormTakeover() ? "" : tr("Waiting for your answer", "等待你的回答");
   if (dialog) return tr("Waiting for confirmation", "等待确认");
   // A blocked session is waiting before its dialog replay lands: the daemon's
   // word is earlier than the attach's, and "thinking" would be a lie it tells.
@@ -132,16 +134,26 @@ function activityLabel(said: boolean) {
  * Reserves a constant 36pt (`h-9`) slot so starting, finishing or celebrating a run never
  * shifts the scroll content height or causes a layout jump at the end of a stream.
  * It is the last thing in the list, so where it stands is where the conversation ends (`anchor`). */
-function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void; said: () => boolean }) {
+function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void; said: () => boolean; hostedByTurn: () => boolean }) {
   const alreadyWorking = untracked(() => (isChatActive() || pipMood() === "happy") && transcriptRows().some((row) => row.kind !== "user"));
   const shown = signal(alreadyWorking);
   const opacity = createAnimatedValue(alreadyWorking ? 1 : 0);
   const translateY = createAnimatedValue(alreadyWorking ? 0 : 4);
   let exitTimer: ReturnType<typeof setTimeout> | undefined;
 
+  const reason = () => {
+    const activity = currentActivity();
+    return activity.kind === "retrying" ? activity.reason : "";
+  };
+  const label = () => (isChatActive() ? activityLabel(props.said()) : "");
+  // When a live TurnHeaderView already anchors Pip on screen and there is no
+  // extra status label to announce, keep this foot slot quietly empty so Pip
+  // is never duplicated underneath the running turn.
+  const activeHere = () => (isChatActive() && (!props.hostedByTurn() || label() !== "")) || pipMood() === "happy";
+
   effect(() => {
     if (isLeavingSession()) return;
-    const active = isChatActive() || pipMood() === "happy";
+    const active = activeHere();
     const reduced = reduceMotion();
     untracked(() => {
       clearTimeout(exitTimer);
@@ -178,16 +190,11 @@ function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void; sai
     void translateY.stop();
   });
 
-  const reason = () => {
-    const activity = currentActivity();
-    return activity.kind === "retrying" ? activity.reason : "";
-  };
-  const label = () => (isChatActive() ? activityLabel(props.said()) : "");
   // The words leave as they came, whole: they keep what they said to the last frame of the fade.
   const shownLabel = keepLast(() => label() || undefined, "");
 
   return (
-    <View ref={(node: ViewRef) => props.anchor?.(node)} class="h-9 w-full max-w-190 select-none justify-center overflow-hidden self-center">
+    <View ref={(node: ViewRef) => props.anchor?.(node)} class="h-9 w-full max-w-180 select-none justify-center overflow-hidden self-center">
       <If when={shown()}>
         <View
           class="min-w-0 flex-row items-center gap-2.5 pt-1"
@@ -326,12 +333,13 @@ function WelcomeProject(props: { onActiveChange?: (active: boolean) => void }) {
           tooltip={open() || closing() ? undefined : tip(placeLabel(current()))}
           class={`${uiHeight(28)} flex-row items-center gap-1.5 ${PRESS} ${FOCUS_RING} ${
             // Over a wallpaper the words cannot stand on the picture: they get the composer's glass, as a capsule.
-            wallpaper() ? "rounded-full border-[0.5px] border-hairline bg-card/65 pl-3 pr-2.5 hover:bg-card/85 dark:bg-card/58 dark:hover:bg-card/75" : "rounded-md corner-squircle px-1.5 hover:bg-accent"
+            wallpaper() ? "rounded-full border-[0.5px] border-hairline bg-card/65 pl-3 pr-2.5 hover:bg-card/85 dark:bg-card/58 dark:hover:bg-card/75" : "rounded-md corner-squircle px-2 hover:bg-accent"
           }`}
           style={wallpaper() ? GLASS_REGULAR : undefined}
         >
-          <Text class={`max-w-80 truncate ${uiType("sm")} text-muted-foreground ${wallpaper() ? "" : "underline"}`}>{`${activeAgent().name} · ${placeLabel(current())}`}</Text>
-          <Icon name="chevronDown" size={12} tone="subtle" />
+          <Icon name={isChatFolder(current()) ? "message" : "folder"} size={12.5} tone="subtle" />
+          <Text class={`max-w-80 truncate ${uiType("sm")} text-muted-foreground`}>{`${activeAgent().name} · ${placeLabel(current())}`}</Text>
+          <Icon name="chevronDown" size={11.5} tone="subtle" />
         </BaseButton>
       }
     >
@@ -406,12 +414,14 @@ function HeroStage(props: { mode: () => "welcome" | "starting"; fading?: () => b
   const title = () =>
     props.mode() === "starting"
       ? tr(`Waking ${agentName()}…`, `正在唤醒 ${agentName()}…`)
-      : isChatFolder(workspacePath())
-        ? tr("What's on your mind?", "想聊点什么？")
-        : tr("What are we building?", "今天要构建什么？");
+      : isPersonaSession()
+        ? tr("Hey, what's up?", "嗨，有什么想聊的？")
+        : isChatFolder(workspacePath())
+          ? tr("What's on your mind?", "想聊点什么？")
+          : tr("What are we building?", "今天要构建什么？");
   return (
     <Stage around title={title} mood={stageMood}>
-      <If when={Boolean(workspacePath()) && (props.mode() === "welcome" || pickerActive())}>
+      <If when={Boolean(workspacePath()) && !isPersonaSession() && (props.mode() === "welcome" || pickerActive())}>
         <View class={props.mode() === "welcome" ? "items-center" : "pointer-events-none h-0 overflow-hidden opacity-0"}>
           <WelcomeProject onActiveChange={(on) => pickerActive.set(on)} />
         </View>
@@ -841,7 +851,7 @@ export function Chat() {
         keepMounted: isTurnClosing,
       },
       processOf,
-      { cwd: workspacePath(), home: backend().home() },
+      { cwd: workspacePath(), home: backend().home(), persona: isPersonaSession(), lang: activeLanguage() },
     );
     let merged = projected;
     const snapEntries = Object.entries(recallingUserSnapshots());
@@ -872,6 +882,10 @@ export function Chat() {
       const row = stabilized[idx];
       if (row.kind !== "text") {
         rows.push(row);
+        continue;
+      }
+      if (row.pip || isPersonaSession()) {
+        rows.push(...proseRows(row));
         continue;
       }
       if (row.final) {
@@ -909,6 +923,8 @@ export function Chat() {
    * the run is not settled, and words would pop in under a finished reply for the frames in between.
    * Before the run's first row the last thing said is still the reader's own message.
    */
+  const hasRunningTurn = computed(() => displayRows().some((row) => row.kind === "turn" && row.running));
+
   const liveRowShown = computed(() => {
     const rows = displayRows();
     for (let i = rows.length - 1; i >= 0; i--) {
@@ -1453,7 +1469,7 @@ export function Chat() {
     const rose = end > footEnd;
     footEnd = end;
     if (!rose || !untracked(bottomFollowing) || isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
-    if (untracked(hasInlinePrompt) && !untracked(reduceMotion)) list?.scrollToEnd({ animated: true });
+    if ((untracked(hasInlinePrompt) || untracked(hasFormTakeover)) && !untracked(reduceMotion)) list?.scrollToEnd({ animated: true });
     else scheduleEndSettle(2);
   });
   /**
@@ -1662,13 +1678,26 @@ export function Chat() {
                     }}
                     accessibilityLabel={tr("Conversation", "对话")}
                     footer={
-                      <ActivityLine
-                        said={liveRowShown}
-                        anchor={(node) => {
-                          if (node) ending = mountedEnding = node;
-                          else if (ending === mountedEnding) ending = undefined;
-                        }}
-                      />
+                      <If
+                        when={isPersonaSession()}
+                        else={
+                          <ActivityLine
+                            said={liveRowShown}
+                            hostedByTurn={hasRunningTurn}
+                            anchor={(node) => {
+                              if (node) ending = mountedEnding = node;
+                              else if (ending === mountedEnding) ending = undefined;
+                            }}
+                          />
+                        }
+                      >
+                        <PipWorkingFooter
+                          anchor={(node) => {
+                            if (node) ending = mountedEnding = node;
+                            else if (ending === mountedEnding) ending = undefined;
+                          }}
+                        />
+                      </If>
                     }
                   >
                     {(row) => <TranscriptRow row={row()} />}

@@ -11,6 +11,7 @@ import { compactNumber } from "../pi/transcript";
 import {
   activeAgent,
   addAttachment,
+  answerDialog,
   attachLocalPath,
   composerAttachments,
   composerDocs,
@@ -57,6 +58,7 @@ import { AgentPicker, PermissionPicker } from "./AgentPicker";
 import { openMediaZoom } from "./Media";
 import { ExtensionPrompt } from "./ExtensionDialog";
 import { ModelConfigPickers, ModelPicker, ThinkingPicker } from "./ModelPicker";
+import { QuestionForm } from "./QuestionForm";
 
 const MIN_HEIGHT = 32;
 const MAX_HEIGHT = 220;
@@ -838,12 +840,32 @@ export function Composer() {
     }
   });
 
+  /** When the user temporarily steps out of a question card to queue a chat message. */
+  const composeDuringForm = signal<string | undefined>(undefined);
+  const formDialog = () => {
+    const dialog = pendingDialog();
+    return dialog?.method === "form" && currentView().name === "chat" ? dialog : undefined;
+  };
+  const showFormTakeover = () => Boolean(formDialog()) && composeDuringForm() !== formDialog()?.id;
+  const showFormResume = () => Boolean(formDialog()) && composeDuringForm() === formDialog()?.id;
+
+  effect(() => {
+    const id = formDialog()?.id;
+    if (!id && untracked(composeDuringForm)) composeDuringForm.set(undefined);
+  });
+
   effect(() => {
     composerFocusTick();
-    // The keyboard is the composer's only while the chat is in front: under a
-    // document it would take the document's typing, and open its menus over it.
-    if (currentView().name === "chat") input?.focus();
+    // The keyboard is the composer's only while the chat is in front and no
+    // question card currently owns the surface.
+    if (currentView().name === "chat" && !showFormTakeover()) input?.focus();
     else input?.blur();
+  });
+
+  // Escape while temporarily drafting a queued message returns to the waiting question card.
+  effect(() => {
+    if (!showFormResume()) return;
+    cleanup(keymap.bind("escape", () => composeDuringForm.set(undefined), { when: "always" }));
   });
 
   const sendMenuOpen = signal(false);
@@ -1020,142 +1042,203 @@ export function Composer() {
           if (node) column.set(node);
         }}
         onLayout={(e) => columnWidth.set(e.bounds.size.width)}
-        class="pointer-events-auto relative w-full max-w-190 self-center"
+        class="pointer-events-auto relative w-full max-w-180 self-center"
       >
         <ExtensionPrompt />
+        <Reveal open={showFormResume()} offset={6}>
+          <If when={formDialog()}>
+            {(dialog) => (
+              <View class="mx-4 -mb-2 flex-row items-center justify-between gap-2 overflow-hidden rounded-t-2xl corner-squircle border-[0.5px] border-b-0 border-hairline bg-card/85 px-3.5 py-2 dark:bg-card/75">
+                <View class="min-w-0 flex-1 flex-row items-center gap-2">
+                  <Icon name="message" size={14} tone="brand-text" />
+                  <Text class={`truncate ${uiType("sm")} text-muted-foreground`}>
+                    {dialog().fields.length > 1
+                      ? tr(`${dialog().agent} is waiting on ${dialog().fields.length} questions`, `${dialog().agent} 正在等待回答 ${dialog().fields.length} 个问题`)
+                      : tr(`${dialog().agent} is waiting for your answer`, `${dialog().agent} 正在等待你的回答`)}
+                  </Text>
+                </View>
+                <BaseButton
+                  testID="question-resume"
+                  onPress={() => composeDuringForm.set(undefined)}
+                  class={`${uiHeight(24)} shrink-0 flex-row items-center gap-1 rounded-md corner-squircle bg-brand-soft px-2 ${uiType("xs")} font-medium text-brand-text ${PRESS} ${FOCUS_RING} hover:bg-brand/15`}
+                >
+                  <Text>{tr("Answer", "返回回答")}</Text>
+                </BaseButton>
+              </View>
+            )}
+          </If>
+        </Reveal>
         <SlashMenu menu={slash} onChoose={completeSlash} anchor={column()} width={columnWidth()} />
         <DocMentionMenu menu={docMention} onChoose={chooseDocMention} anchor={column()} width={columnWidth()} />
-        <AttachmentTray />
+        <If when={!showFormTakeover()}>
+          <AttachmentTray />
+        </If>
         <View class={`relative rounded-[22px] corner-squircle ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
-          <ExtensionLines below={false} />
-          <Input
-            ref={input}
-            multiline
-            autoFocus
-            scrollbar={false}
-            value={composerDraft()}
-            onChange={({ value }) => {
-              const before = trackedDraft.length;
-              const start = Math.max(0, Math.min(selection.start, before));
-              const end = Math.max(start, Math.min(selection.end, before));
-              const inserted = value.length - before + (end - start);
-              const caret = Math.max(0, Math.min(value.length, start + inserted));
-              trackedDraft = value;
-              selection = { start: caret, end: caret };
-              caretPos.set(caret);
-              setDraft(value);
-            }}
-            onSelectionChange={({ start, end }) => {
-              selection = { start, end };
-              caretPos.set(end);
-            }}
-            onSubmit={() => submit()}
-            onBlur={() => composing.set(false)}
-            onCompositionChange={({ composing: now }) => composing.set(now)}
-            onPaste={paste}
-            pasteBehavior="report"
-            onContentSizeChange={({ size }) => height.set(Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, Math.ceil(size.height))))}
-            submitBehavior="submit"
-            autoCapitalize="none"
-            autoCorrect={false}
-            disabled={sidecarPhase().name === "failed"}
-            accessibilityLabel={tr("Message", "消息")}
-            class={`ml-4 mr-9 mt-4 ${readingType()} text-foreground caret-brand`}
-            style={{ height: Math.max(height(), Math.ceil(MIN_HEIGHT * readingSize() / FONT_SIZES.reading.default)) }}
-          />
-          {/* A draft past its second line is offered room: it goes on as a document, where Return is
-              a new line and every word is kept. The field's right margin is the button's seat always,
-              so its arrival never re-wraps what is written. */}
-          <Presence show={height() >= Math.round(LONG_DRAFT_HEIGHT * readingSize() / FONT_SIZES.reading.default)} scaleFrom={0.85} class="absolute right-2 top-2.5">
-            <IconButton
-              testID="composer-to-doc"
-              icon="expand"
-              size="sm"
-              tone="subtle"
-              label={tr("Continue in a document", "在文档中继续写")}
-              shortcut="mod+e"
-              tipPlacement="top"
-              onPress={() => void draftToDoc()}
-            />
-          </Presence>
-          {/* The hint is app-drawn, not the host's placeholder: host text re-rasterizes at
-              integer offsets under the dock's transform and visibly steps a frame late. */}
-          <If when={showPlaceholder()}>
-            <View class="pointer-events-none absolute left-4 right-9 top-4">
-              <Text class={`truncate ${readingType()} text-subtle`}>{placeholder()}</Text>
-            </View>
-          </If>
-          <ExtensionLines below />
-          <View class="flex-row items-end justify-between gap-2 pb-2 pl-2.5 pr-2 pt-2">
-            <View class="min-w-0 flex-1 flex-row flex-wrap items-center gap-0.5">
-              <AgentPicker onOpen={dismissMenus} />
-              <ModelPicker onOpen={dismissMenus} />
-              <ModelConfigPickers onOpen={dismissMenus} />
-              <ThinkingPicker onOpen={dismissMenus} />
-            </View>
-            <View class="shrink-0 flex-row items-center gap-1.5">
-              <If when={ready()}>
-                <ContextMeter />
-              </If>
-              <IconButton
-                icon="paperclip"
-                size="sm"
-                tone="subtle"
-                label={tr("Attach file", "添加文件")}
-                tipPlacement="top"
-                onPress={() => void pickComposerFile()}
-              />
-              <PermissionPicker onOpen={dismissMenus} />
-              <View style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
-                <If
-                  when={showStop()}
-                  else={
-                    <View class={`h-7 shrink-0 flex-row items-stretch rounded-full shadow-sm ${canSend() && hasText() ? "bg-primary" : "bg-muted shadow-none"}`}>
-                      <BaseButton
-                        onPress={() => {
-                          sendMenuOpen.set(false);
-                          submit();
-                        }}
-                        disabled={!canSend() || !hasText()}
-                        accessibilityLabel={sendLabel()}
-                        tooltip={tip(sendTipText(), "enter", "top")}
-                        class={`w-8 items-center justify-center rounded-l-full ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:hover:bg-transparent`}
-                      >
-                        <Icon name="arrowUp" tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
-                      </BaseButton>
-                      <View class={`my-1.5 w-px ${canSend() && hasText() ? "bg-brand-foreground/25" : "bg-foreground/10"}`} />
-                      <BaseButton
-                        onPress={() => {
-                          if (Date.now() - sendMenuClosedAt < 400) {
-                            sendMenuClosedAt = 0;
-                            return;
-                          }
-                          // The menu is the send's: the slash or mention menu behind it would take the press's send.
-                          dismissMenus();
-                          sendMenuOpen.update((v) => !v);
-                        }}
-                        disabled={!canSend()}
-                        accessibilityLabel={tr("Send options", "发送选项")}
-                        tooltip={sendMenuOpen() ? undefined : tip(tr("Send options", "发送选项"), undefined, "top")}
-                        class={`w-6 items-center justify-center rounded-r-full ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:hover:bg-transparent`}
-                      >
-                        <Icon name="chevronDown" size={12} tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
-                      </BaseButton>
-                    </View>
-                  }
-                >
-                  <BaseButton
-                    onPress={() => void stop()}
-                    accessibilityLabel={tr("Stop", "停止")}
-                    tooltip={tip(tr("Stop", "停止"), "escape", "top")}
-                    class={`size-7 shrink-0 items-center justify-center rounded-full bg-secondary shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-secondary/80 active:scale-92 motion-reduce:active:scale-100`}
-                  >
-                    <Icon name="stop" tone="foreground" />
-                  </BaseButton>
+          <If
+            when={showFormTakeover() ? formDialog() : undefined}
+            else={
+              <View>
+                <ExtensionLines below={false} />
+                <Input
+                  ref={input}
+                  multiline
+                  autoFocus
+                  scrollbar={false}
+                  value={composerDraft()}
+                  onChange={({ value }) => {
+                    const before = trackedDraft.length;
+                    const start = Math.max(0, Math.min(selection.start, before));
+                    const end = Math.max(start, Math.min(selection.end, before));
+                    const inserted = value.length - before + (end - start);
+                    const caret = Math.max(0, Math.min(value.length, start + inserted));
+                    trackedDraft = value;
+                    selection = { start: caret, end: caret };
+                    caretPos.set(caret);
+                    setDraft(value);
+                  }}
+                  onSelectionChange={({ start, end }) => {
+                    selection = { start, end };
+                    caretPos.set(end);
+                  }}
+                  onSubmit={() => submit()}
+                  onBlur={() => composing.set(false)}
+                  onCompositionChange={({ composing: now }) => composing.set(now)}
+                  onPaste={paste}
+                  pasteBehavior="report"
+                  onContentSizeChange={({ size }) => height.set(Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, Math.ceil(size.height))))}
+                  submitBehavior="submit"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  disabled={sidecarPhase().name === "failed"}
+                  accessibilityLabel={tr("Message", "消息")}
+                  class={`ml-4 mr-9 mt-4 ${readingType()} text-foreground caret-brand`}
+                  style={{ height: Math.max(height(), Math.ceil(MIN_HEIGHT * readingSize() / FONT_SIZES.reading.default)) }}
+                />
+                {/* A draft past its second line is offered room: it goes on as a document, where Return is
+                    a new line and every word is kept. The field's right margin is the button's seat always,
+                    so its arrival never re-wraps what is written. */}
+                <Presence show={height() >= Math.round(LONG_DRAFT_HEIGHT * readingSize() / FONT_SIZES.reading.default)} scaleFrom={0.85} class="absolute right-2 top-2.5">
+                  <IconButton
+                    testID="composer-to-doc"
+                    icon="expand"
+                    size="sm"
+                    tone="subtle"
+                    label={tr("Continue in a document", "在文档中继续写")}
+                    shortcut="mod+e"
+                    tipPlacement="top"
+                    onPress={() => void draftToDoc()}
+                  />
+                </Presence>
+                {/* The hint is app-drawn, not the host's placeholder: host text re-rasterizes at
+                    integer offsets under the dock's transform and visibly steps a frame late. */}
+                <If when={showPlaceholder()}>
+                  <View class="pointer-events-none absolute left-4 right-9 top-4">
+                    <Text class={`truncate ${readingType()} text-subtle`}>{placeholder()}</Text>
+                  </View>
                 </If>
+                <ExtensionLines below />
+                <View class="flex-row items-end justify-between gap-2 pb-2 pl-2.5 pr-2 pt-2">
+                  <View class="min-w-0 flex-1 flex-row flex-wrap items-center gap-1">
+                    <AgentPicker onOpen={dismissMenus} />
+                    <View class="mx-0.5 h-3 w-[0.5px] bg-hairline-hover" />
+                    <ModelPicker onOpen={dismissMenus} />
+                    <ModelConfigPickers onOpen={dismissMenus} />
+                    <ThinkingPicker onOpen={dismissMenus} />
+                  </View>
+                  <View class="shrink-0 flex-row items-center gap-1.5">
+                    <If when={ready()}>
+                      <ContextMeter />
+                    </If>
+                    <IconButton
+                      icon="paperclip"
+                      size="sm"
+                      tone="subtle"
+                      label={tr("Attach file", "添加文件")}
+                      tipPlacement="top"
+                      onPress={() => void pickComposerFile()}
+                    />
+                    <PermissionPicker onOpen={dismissMenus} />
+                    <View style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
+                      <If
+                        when={showStop()}
+                        else={
+                          <View class={`h-7 shrink-0 flex-row items-stretch rounded-full shadow-sm ${canSend() && hasText() ? "bg-primary" : "bg-muted shadow-none"}`}>
+                            <BaseButton
+                              onPress={() => {
+                                sendMenuOpen.set(false);
+                                submit();
+                              }}
+                              disabled={!canSend() || !hasText()}
+                              accessibilityLabel={sendLabel()}
+                              tooltip={tip(sendTipText(), "enter", "top")}
+                              class={`w-8 items-center justify-center rounded-l-full ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:hover:bg-transparent`}
+                            >
+                              <Icon name="arrowUp" tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
+                            </BaseButton>
+                            <View class={`my-1.5 w-px ${canSend() && hasText() ? "bg-brand-foreground/25" : "bg-foreground/10"}`} />
+                            <BaseButton
+                              onPress={() => {
+                                if (Date.now() - sendMenuClosedAt < 400) {
+                                  sendMenuClosedAt = 0;
+                                  return;
+                                }
+                                // The menu is the send's: the slash or mention menu behind it would take the press's send.
+                                dismissMenus();
+                                sendMenuOpen.update((v) => !v);
+                              }}
+                              disabled={!canSend()}
+                              accessibilityLabel={tr("Send options", "发送选项")}
+                              tooltip={sendMenuOpen() ? undefined : tip(tr("Send options", "发送选项"), undefined, "top")}
+                              class={`w-6 items-center justify-center rounded-r-full ${PRESS} ${FOCUS_RING} hover:bg-primary/90 active:scale-92 motion-reduce:active:scale-100 disabled:hover:bg-transparent`}
+                            >
+                              <Icon name="chevronDown" size={12} tone={canSend() && hasText() ? "brand-foreground" : "subtle"} />
+                            </BaseButton>
+                          </View>
+                        }
+                      >
+                        <BaseButton
+                          onPress={() => void stop()}
+                          accessibilityLabel={tr("Stop", "停止")}
+                          tooltip={tip(tr("Stop", "停止"), "escape", "top")}
+                          class={`size-7 shrink-0 items-center justify-center rounded-full bg-foreground ${PRESS} ${FOCUS_RING} hover:bg-foreground/85 active:scale-92 motion-reduce:active:scale-100`}
+                        >
+                          <View class="size-[8.5px] rounded-[2px] bg-background" />
+                        </BaseButton>
+                      </If>
+                    </View>
+                  </View>
+                </View>
               </View>
-            </View>
-          </View>
+            }
+          >
+            {(dialog) => (
+              <View class="px-4 pb-3 pt-3.5">
+                <QuestionForm
+                  request={dialog()}
+                  onAnswer={answerDialog}
+                  shortcuts
+                  footerLeft={
+                    <BaseButton
+                      testID="question-to-draft"
+                      onPress={() => {
+                        composeDuringForm.set(dialog().id);
+                        queueMicrotask(() => input?.focus());
+                      }}
+                      class={`-ml-2 ${uiHeight(24)} flex-row items-center gap-1.5 rounded-md corner-squircle px-2 text-subtle ${PRESS} ${FOCUS_RING} hover:bg-accent hover:text-foreground`}
+                    >
+                      <Icon name="queue" size={12} tone="subtle" />
+                      <Text class={`${uiType("xs")}`}>
+                        {composerDraft().trim() ? tr("Draft", "草稿") : tr("Queue message", "排队消息")}
+                      </Text>
+                      <If when={composerDraft().trim()}>
+                        <View class="size-1.5 rounded-full bg-brand" />
+                      </If>
+                    </BaseButton>
+                  }
+                />
+              </View>
+            )}
+          </If>
         </View>
         {/* The send menu's anchor: an invisible column at the composer's right edge,
             so the menu stands on the box's top-right corner like the surfaces that
@@ -1205,7 +1288,7 @@ export function Composer() {
         </Popover>
       </View>
       <Reveal open={Boolean(statusLine())}>
-        <Text class={`w-full max-w-190 self-center truncate px-3 pt-2 text-center ${uiType("xs")} text-subtle`}>{shownStatus()}</Text>
+        <Text class={`w-full max-w-180 self-center truncate px-3 pt-2 text-center ${uiType("xs")} text-subtle`}>{shownStatus()}</Text>
       </Reveal>
     </View>
   );

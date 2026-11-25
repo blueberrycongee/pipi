@@ -1,8 +1,8 @@
 {
   "name": "pipi",
   "id": "dev.pipi.app",
-  "version": "0.2.28",
-  "build": 13,
+  "version": "0.2.29",
+  "build": 14,
   "icon": "icon.png",
   "theme": "theme.json",
   "updater": {
@@ -31,6 +31,10 @@
       "popover": "0 0 0 0.5px rgb(0 0 0 / 0.12), 0 12px 36px -8px rgb(0 0 0 / 0.22), 0 3px 10px -2px rgb(0 0 0 / 0.1)",
       "toast": "0 0 0 0.5px rgb(0 0 0 / 0.12)",
       "raised": "0 8px 24px rgb(0 0 0 / 0.12)",
+      "sheet": "0 1px 2px rgb(15 23 42 / 0.025), 0 10px 28px -12px rgb(15 23 42 / 0.055)",
+      "sheet-dark": "0 10px 32px -10px rgb(0 0 0 / 0.55), inset 0 0.5px 0 rgb(255 255 255 / 0.055)",
+      "sidebar-row": "0 1px 2px rgb(15 23 42 / 0.045)",
+      "sidebar-row-dark": "0 1px 2px rgb(0 0 0 / 0.3), inset 0 0.5px 0 rgb(255 255 255 / 0.06)",
       "composer": "0 0.5px 1px rgb(0 0 0 / 0.05), 0 3px 10px -2px rgb(0 0 0 / 0.06), 0 14px 36px -12px rgb(0 0 0 / 0.1), 0 32px 64px -28px rgb(0 0 0 / 0.07), inset 0 0.5px 0 rgb(255 255 255 / 0.65), inset 0 -0.5px 0 rgb(0 0 0 / 0.05)",
       "composer-focus": "0 0.5px 1px rgb(0 0 0 / 0.06), 0 4px 12px -2px rgb(0 0 0 / 0.07), 0 18px 44px -12px rgb(0 0 0 / 0.13), 0 36px 76px -28px rgb(0 0 0 / 0.09), inset 0 0.5px 0 rgb(255 255 255 / 0.8), inset 0 -0.5px 0 rgb(0 0 0 / 0.06)",
       "composer-dark": "0 0.5px 1px rgb(0 0 0 / 0.45), 0 3px 10px -1px rgb(0 0 0 / 0.4), 0 16px 40px -10px rgb(0 0 0 / 0.5), 0 32px 72px -24px rgb(0 0 0 / 0.42), inset 0 0.5px 0 rgb(255 255 255 / 0.11), inset 0 -0.5px 0 rgb(0 0 0 / 0.35)",

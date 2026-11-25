@@ -14,8 +14,9 @@ import {
   View,
 } from "nsh";
 import { AlertDialog } from "nsh/base";
-import { Application, currentWindow, isAvailable, Menu, titleBar, Window } from "nsh/desktop";
+import { Application, currentWindow, isAvailable, Menu, Window, type WindowRef } from "nsh/desktop";
 import { tr } from "../lib/i18n";
+import { bindWindow, titleBarArea } from "../lib/layout";
 import { DYNAMIC_WALLPAPER_ENABLED } from "../lib/wallpaper";
 import {
   activeDaemonSessionCount,
@@ -103,10 +104,10 @@ const SASH_HOVER_DELAY_MS = 140;
  * picture (a bright one in dark, a dark one in light). Linux draws no backdrop
  * filter: there the sidebar keeps its solid fill.
  */
-const sidebarSurface = () => (!WALLPAPER_FROST ? "bg-sidebar" : wallpaper() ? "bg-sidebar/50" : "bg-sidebar/30");
+const sidebarSurface = () => (!WALLPAPER_FROST ? "bg-sidebar" : wallpaper() ? "bg-sidebar/50" : "bg-sidebar");
 
 const effectiveSidebarMinWidth = () =>
-  Math.max(SIDEBAR_MIN_WIDTH, Math.ceil((titleBar().left || 0) + SIDEBAR_HEADER_RIGHT_CLEARANCE));
+  Math.max(SIDEBAR_MIN_WIDTH, Math.ceil((titleBarArea().left || 0) + SIDEBAR_HEADER_RIGHT_CLEARANCE));
 
 const toggleSidebar = () => setSidebarOpen(!sidebarOpen());
 const toggleSettings = () => (currentView().name === "settings" ? leaveSettings() : showSettings());
@@ -123,20 +124,65 @@ function escape() {
   if (currentView().name === "chat" && (isRunning() || isBashRunning() || waitingCount() > 0)) void stop();
 }
 
-const needsCloseConfirm = () => !runInBackground() && activeDaemonSessionCount() > 0;
+let mainWindow: WindowRef | null = null;
 let exitPrompting = false;
 
+const activeMainWindow = () => mainWindow ?? (isAvailable ? Window.get("main") : null);
+
+function showMainWindow() {
+  const win = activeMainWindow();
+  if (!win) return;
+  win.show();
+  win.focus();
+}
+
+function ensureMainWindowVisible() {
+  const win = activeMainWindow();
+  if (win && win.state()?.visible === false) {
+    win.show();
+    win.focus();
+  }
+}
+
+async function flushDocsSafely() {
+  await flushDocs().catch(() => undefined);
+}
+
+/**
+ * Closing the main window:
+ * - On macOS, a single-window app hides its window instead of tearing down its
+ *   content tree, so Dock/Finder `reopen` restores the live UI state instantly
+ *   while active sessions continue uninterrupted.
+ * - On Windows and Linux, closing the last window exits the app, so we run the
+ *   same running-session confirmation as Quit before closing.
+ */
+async function handleWindowClose() {
+  if (platform.os === "macos") {
+    await flushDocsSafely();
+    activeMainWindow()?.hide();
+    return;
+  }
+  await confirmExit("close");
+}
+
 async function confirmExit(how: "quit" | "close") {
-  if (exitPrompting) return;
+  if (exitPrompting) {
+    showMainWindow();
+    return;
+  }
   const count = activeDaemonSessionCount();
   if (runInBackground() || count === 0) {
-    await flushDocs();
+    await flushDocsSafely();
     if (how === "quit") Application.quit();
-    else Window.get("main")?.close();
+    else activeMainWindow()?.close();
     return;
   }
   exitPrompting = true;
+  let approved = false;
   try {
+    // Ensure the confirmation dialog is visible if Quit was triggered from the
+    // Dock or menu bar while the main window was hidden or minimized.
+    ensureMainWindowVisible();
     const { action } = await AlertDialog.show({
       title:
         count === 1
@@ -159,24 +205,27 @@ async function confirmExit(how: "quit" | "close") {
     } else {
       return;
     }
-    await flushDocs();
+    approved = true;
+    await flushDocsSafely();
     if (how === "quit") Application.quit();
-    else Window.get("main")?.close();
+    else activeMainWindow()?.close();
   } finally {
     exitPrompting = false;
+    if (how === "quit" && !approved) Application.cancelQuitRequest();
   }
 }
 
 /** ⌘W's target: the front tab while there are several, the window when the strip holds only one. */
 function closeTabOrWindow() {
+  const win = activeMainWindow();
+  if (win && win.state()?.visible === false) return;
   const id = activeTabId();
   if (id && openTabs().length > 1) void closeTab(id);
-  else void confirmExit("close");
+  else void handleWindowClose();
 }
 
 /** The application menu: every command has a place in it, and its shortcut lives here. */
 function applicationMenu() {
-  const interceptExit = needsCloseConfirm();
   const severalTabs = openTabs().length > 1 && activeTabId() !== undefined;
   Menu.setApplicationMenu([
     {
@@ -184,30 +233,65 @@ function applicationMenu() {
       submenu: [
         { role: "about" },
         { type: "separator" },
-        { label: tr("Settings…", "设置…"), shortcut: "mod+,", onSelect: toggleSettings },
+        {
+          label: tr("Settings…", "设置…"),
+          shortcut: "mod+,",
+          onSelect: () => {
+            ensureMainWindowVisible();
+            toggleSettings();
+          },
+        },
         { type: "separator" },
         { role: "hide" },
         { role: "hideOthers" },
         { role: "showAll" },
         { type: "separator" },
-        interceptExit
-          ? { label: tr("Quit pipi", "退出 pipi"), shortcut: "mod+q", onSelect: () => void confirmExit("quit") }
-          : { role: "quit" },
+        { role: "quit" },
       ],
     },
     {
       label: tr("File", "文件"),
       submenu: [
-        { label: tr("New Tab", "新建标签页"), shortcut: "mod+t", onSelect: () => void openNewSessionTab({ newTab: true }) },
-        { label: tr("New Session", "新建会话"), shortcut: "mod+n", onSelect: () => void openNewSessionTab({ newTab: false }) },
-        { label: tr("New Document", "新建文档"), shortcut: "mod+shift+n", onSelect: () => void newDocTab() },
+        {
+          label: tr("New Tab", "新建标签页"),
+          shortcut: "mod+t",
+          onSelect: () => {
+            ensureMainWindowVisible();
+            void openNewSessionTab({ newTab: true });
+          },
+        },
+        {
+          label: tr("New Session", "新建会话"),
+          shortcut: "mod+n",
+          onSelect: () => {
+            ensureMainWindowVisible();
+            void openNewSessionTab({ newTab: false });
+          },
+        },
+        {
+          label: tr("New Document", "新建文档"),
+          shortcut: "mod+shift+n",
+          onSelect: () => {
+            ensureMainWindowVisible();
+            void newDocTab();
+          },
+        },
         {
           label: tr("Continue Draft in a Document", "在文档中继续写"),
           shortcut: "mod+e",
           disabled: currentView().name !== "chat",
-          onSelect: () => void draftToDoc(),
+          onSelect: () => {
+            ensureMainWindowVisible();
+            void draftToDoc();
+          },
         },
-        { label: tr("Open Markdown File…", "打开 Markdown 文件…"), onSelect: () => void pickDocTab() },
+        {
+          label: tr("Open Markdown File…", "打开 Markdown 文件…"),
+          onSelect: () => {
+            ensureMainWindowVisible();
+            void pickDocTab();
+          },
+        },
         {
           label: tr("Save Document As…", "文档另存为…"),
           disabled: currentView().name !== "doc",
@@ -224,15 +308,20 @@ function applicationMenu() {
             if (v.name === "doc") void revealDoc(v.docId);
           },
         },
-        { label: tr("Add Project Folder…", "添加项目文件夹…"), shortcut: "mod+o", onSelect: () => void chooseWorkspace() },
+        {
+          label: tr("Add Project Folder…", "添加项目文件夹…"),
+          shortcut: "mod+o",
+          onSelect: () => {
+            ensureMainWindowVisible();
+            void chooseWorkspace();
+          },
+        },
         { type: "separator" },
         { label: tr("Export as HTML", "导出为 HTML"), onSelect: () => void exportHtml() },
         { type: "separator" },
         severalTabs
           ? { label: tr("Close Tab", "关闭标签页"), shortcut: "mod+w", onSelect: () => void closeTabOrWindow() }
-          : interceptExit
-            ? { label: tr("Close Window", "关闭窗口"), shortcut: "mod+w", onSelect: () => void confirmExit("close") }
-            : { role: "close" },
+          : { role: "close" },
       ],
     },
     {
@@ -242,7 +331,14 @@ function applicationMenu() {
     {
       label: tr("View", "视图"),
       submenu: [
-        { label: tr("Command Palette…", "命令面板…"), shortcut: "mod+k", onSelect: () => setPaletteOpen(!isPaletteOpen()) },
+        {
+          label: tr("Command Palette…", "命令面板…"),
+          shortcut: "mod+k",
+          onSelect: () => {
+            ensureMainWindowVisible();
+            setPaletteOpen(!isPaletteOpen());
+          },
+        },
         { label: sidebarOpen() ? tr("Hide Sidebar", "隐藏侧边栏") : tr("Show Sidebar", "显示侧边栏"), shortcut: "mod+b", onSelect: toggleSidebar },
         { label: tr("Random Wallpaper", "随机壁纸"), shortcut: "mod+u", onSelect: () => void randomWallpaper() },
         { type: "separator" },
@@ -255,8 +351,23 @@ function applicationMenu() {
     {
       label: tr("Session", "会话"),
       submenu: [
-        { label: tr("Focus Message", "聚焦输入框"), shortcut: "mod+l", onSelect: () => (showChat(), focusComposer()) },
-        { label: tr("Compare Agents…", "智能体并行对比…"), shortcut: "mod+shift+o", onSelect: () => setCompareOpen(!isCompareOpen()) },
+        {
+          label: tr("Focus Message", "聚焦输入框"),
+          shortcut: "mod+l",
+          onSelect: () => {
+            ensureMainWindowVisible();
+            showChat();
+            focusComposer();
+          },
+        },
+        {
+          label: tr("Compare Agents…", "智能体并行对比…"),
+          shortcut: "mod+shift+o",
+          onSelect: () => {
+            ensureMainWindowVisible();
+            setCompareOpen(!isCompareOpen());
+          },
+        },
         { label: tr("Stop", "停止"), shortcut: "mod+.", disabled: !isRunning() && !isBashRunning() && waitingCount() === 0, onSelect: () => void stop() },
         { type: "separator" },
         {
@@ -268,7 +379,16 @@ function applicationMenu() {
         { label: tr("Restart Agent", "重启智能体"), onSelect: () => void restartPi() },
       ],
     },
-    { label: tr("Window", "窗口"), submenu: [{ role: "minimize" }, { role: "zoom" }] },
+    {
+      label: tr("Window", "窗口"),
+      submenu: [
+        { role: "minimize" },
+        { role: "zoom" },
+        ...(platform.os === "macos"
+          ? [{ type: "separator" as const }, { label: "pipi", onSelect: showMainWindow }]
+          : []),
+      ],
+    },
   ]);
 }
 
@@ -463,19 +583,19 @@ function SidebarSplit(props: { children: JSX.Element }) {
   };
 
   return (
-    <View class="relative flex-1 flex-row bg-background">
+    <View class={`relative flex-1 flex-row ${wallpaper() ? "bg-background" : "bg-sidebar"}`}>
       <WallpaperUnderlay />
       <View
         class="shrink-0 overflow-hidden"
         style={{ width: sidebarOpen() ? currentWidth() : 0 }}
       >
         <View
-          class={`h-full border-r border-sidebar-border ${sidebarSurface()}`}
+          class={`h-full ${wallpaper() ? "border-r border-sidebar-border" : ""} ${sidebarSurface()}`}
           style={{
             width: currentWidth(),
             opacity: drawerOpacity,
             transform: [{ translateX: drawerSlideX }],
-            ...(WALLPAPER_FROST ? SIDEBAR_GLASS : undefined),
+            ...(WALLPAPER_FROST && wallpaper() ? SIDEBAR_GLASS : undefined),
           }}
         >
           <If when={sidebarMounted()}>
@@ -484,9 +604,18 @@ function SidebarSplit(props: { children: JSX.Element }) {
         </View>
       </View>
 
-      {/* Over a wallpaper the pane has no fill of its own: the chat's veil is its page. */}
-      <View class={`relative min-w-0 flex-1 ${wallpaper() ? "" : "bg-background"}`}>
-        {props.children}
+      {/* Without a wallpaper the main pane sits as a floating paper sheet inside the
+          sidebar tray; over a wallpaper the surface runs continuously edge-to-edge. */}
+      <View class={`relative min-w-0 flex-1 ${wallpaper() ? "" : sidebarOpen() ? "py-[7px] pr-[7px]" : "p-[7px]"}`}>
+        <View
+          class={`relative min-w-0 flex-1 ${
+            wallpaper()
+              ? ""
+              : "overflow-hidden rounded-[14px] corner-squircle border-[0.5px] border-hairline bg-background shadow-sheet dark:shadow-sheet-dark"
+          }`}
+        >
+          {props.children}
+        </View>
       </View>
 
       <If when={(sidebarOpen() && !transitioning()) || dragging()}>
@@ -589,18 +718,31 @@ function SidebarSplit(props: { children: JSX.Element }) {
 /** The window: sidebar, title bar, and the pane the view names; overlays above them all. */
 export function Shell() {
   if (isAvailable) {
+    const win = currentWindow();
+    mainWindow = win;
+    const unbindWindow = bindWindow(win);
     // In an effect, the menu follows what it reads: the sidebar's label, whether Stop applies.
     effect(applicationMenu);
-    const win = currentWindow();
-    // The close button always routes through `confirmExit` — it fast-paths
-    // when nothing runs, and it is the last chance to land document saves.
+    // The close button always routes through `handleWindowClose` — on macOS it
+    // flushes documents and hides the window so Dock reopen brings the same
+    // session state straight back; elsewhere it confirms active runs before closing.
     win.set({ closeOnPress: false });
-    win.on("closePress", () => void confirmExit("close"));
+    win.on("closePress", () => void handleWindowClose());
     // Back from another app: a document open here may have been written there, and the notes folder too.
     win.on("focusChange", ({ focused }) => {
       if (!focused) return;
       void syncDocs();
       void refreshNotes();
+    });
+    const offReopen = Application.on("reopen", showMainWindow);
+    const offQuitRequest = Application.on("quitRequest", () => void confirmExit("quit"));
+    const offQuit = Application.on("quit", () => flushDocsSafely());
+    cleanup(() => {
+      offReopen();
+      offQuitRequest();
+      offQuit();
+      unbindWindow();
+      if (mainWindow === win) mainWindow = null;
     });
   } else {
     keymap.bind({

@@ -1872,7 +1872,14 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
       if (!items.length) throw new Error("no valid files provided");
       const missingCount = items.filter((item) => item.exists === false).length;
       const title = typeof args.title === "string" && args.title.trim() ? args.title.trim() : undefined;
-      return { pipiMedia: true, ...(title ? { title } : {}), items, missingCount };
+      const payload = { pipiMedia: true, ...(title ? { title } : {}), items, missingCount };
+      // First-party side-channel: push the resolved media straight into external-agent sessions
+      // before returning the MCP response so presentation never depends on how an engine renames
+      // or strips tool calls/outputs. (Pi's extension receives `structuredContent` directly.)
+      if (caller && caller.driver !== "pi") {
+        writeLine(caller, JSON.stringify({ type: "present_media", payload }));
+      }
+      return payload;
     }
     default:
       throw new Error(`unknown tool "${name}"`);

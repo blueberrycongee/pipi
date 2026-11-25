@@ -4,7 +4,7 @@ import { PiClient, type Transport } from "./client";
 import { DaemonClient } from "./daemon";
 import { createLineSplitter } from "./jsonl";
 import { firstVisualRowDiff, type Row, sameVisualRows, Transcript, toolSummary, withoutPreamble, withoutImageNotes } from "./transcript";
-import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, describeToolsSummary, displayRowIds, elapsedSeconds, spokenDuration, stableDisplayRows, type TurnHeaderRow } from "./turns";
+import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, describeToolCall, describeToolsSummary, displayRowIds, elapsedSeconds, spokenDuration, stableDisplayRows, type TurnHeaderRow } from "./turns";
 
 test("splits records on LF only, across chunks, keeping U+2028", () => {
   const lines: string[] = [];
@@ -1799,4 +1799,168 @@ test("the personal agent's persona block never shows in the person's bubble, liv
   const reloaded = new Transcript();
   reloaded.load([{ role: "user", content: wire, timestamp: 1 }] as never);
   expect(reloaded.rows().map((r) => ("text" in r ? r.text : r.kind))).toEqual(["<pipi-persona> is what I typed"]);
+});
+
+test("Antigravity ACP Run mcp_pipi_present_files and renamed pipiMedia results surface outside folded turns", () => {
+  expect(classifyTool("Run mcp_pipi_present_files")).toEqual({ category: "present", icon: "image" });
+  expect(classifyTool("Run mcp_pipi_workspaces_list")).toEqual({ category: "agent", icon: "folder" });
+  expect(classifyTool("Run mcp_pipi_sessions_list")).toEqual({ category: "agent", icon: "clock" });
+
+  // Historical Antigravity ACP session shape: toolResult precedes the merged assistant message,
+  // toolName is "Run mcp_pipi_present_files", and toolResult has empty text + no details.
+  const t = new Transcript();
+  t.load(
+    [
+      { role: "user", content: [{ type: "text", text: "Show the previews again" }], timestamp: 1000 } as never,
+      {
+        role: "toolResult",
+        toolCallId: "call_agy_present",
+        toolName: "Run mcp_pipi_present_files",
+        content: [{ type: "text", text: "" }],
+        isError: false,
+        timestamp: 2000,
+      } as never,
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_agy_present",
+            name: "Run mcp_pipi_present_files",
+            arguments: {
+              title: "Before & After",
+              files: [
+                { path: "/repo/.nsh/shots/before.png", title: "Before", caption: "Old" },
+                { path: "/repo/.nsh/shots/after.png", title: "After", caption: "New" },
+              ],
+            },
+          },
+          {
+            type: "text",
+            text: "Displayed above:\n\n* [before.png](file:///repo/.nsh/shots/before.png)\n* [after.png](file:///repo/.nsh/shots/after.png)",
+          },
+        ],
+        stopReason: "stop",
+        timestamp: 3000,
+      } as never,
+    ],
+    false,
+  );
+
+  const display = buildDisplayRows(t.rows(), false, {}, undefined, { cwd: "/repo" });
+  const mediaRows = display.filter((r) => r.kind === "media");
+  expect(mediaRows).toHaveLength(1);
+  expect(mediaRows[0]).toMatchObject({
+    kind: "media",
+    title: "Before & After",
+    items: [
+      { kind: "image", path: "/repo/.nsh/shots/before.png", title: "Before", caption: "Old" },
+      { kind: "image", path: "/repo/.nsh/shots/after.png", title: "After", caption: "New" },
+    ],
+  });
+
+  const toolRow = t.rows().find((r) => r.kind === "tool");
+  expect(toolRow && toolRow.kind === "tool" ? describeToolCall(toolRow, "zh") : undefined).toMatchObject({
+    category: "present",
+    verb: "已展示",
+    target: "2 个文件",
+  });
+
+  // Renamed ACP tool carrying `pipiMedia: true` in details also surfaces outside collapsed folds.
+  const t2 = new Transcript();
+  t2.load(
+    [
+      { role: "user", content: "show", timestamp: 1000 } as never,
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_renamed", name: "Present screenshots", arguments: {} },
+          { type: "text", text: "Done." },
+        ],
+        stopReason: "stop",
+        timestamp: 2000,
+      } as never,
+      {
+        role: "toolResult",
+        toolCallId: "call_renamed",
+        toolName: "Present screenshots",
+        content: [{ type: "text", text: "" }],
+        details: { pipiMedia: true, title: "Shots", items: [{ path: "/repo/shot.png", kind: "image" }] },
+        isError: false,
+        timestamp: 2100,
+      } as never,
+    ],
+    false,
+  );
+  const display2 = buildDisplayRows(t2.rows(), false, {}, undefined, { cwd: "/repo" });
+  const media2 = display2.filter((r) => r.kind === "media");
+  expect(media2).toHaveLength(1);
+  expect(media2[0]).toMatchObject({ title: "Shots", items: [{ kind: "image", path: "/repo/shot.png" }] });
+});
+
+test("first-class presented_media blocks stream live, survive pending/reload, keep prose final, and beat duplicate tool echoes", () => {
+  // 1. Live `media_block` -> `message_end` with `[toolCall, text, presented_media]`.
+  const live = new Transcript();
+  live.apply({ type: "message_start", message: { role: "user", content: "show me", timestamp: 1 } });
+  live.apply({ type: "message_start", message: { role: "assistant", content: [], provider: "antigravity", model: "m", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "pending", timestamp: 2 } });
+  live.apply({
+    type: "message_update",
+    assistantMessageEvent: {
+      type: "media_block",
+      contentIndex: 0,
+      block: {
+        type: "presented_media",
+        title: "Side-channel",
+        items: [{ path: "/repo/a.png", kind: "image", title: "A", width: 640, height: 480, size: 2048, exists: true }],
+      },
+    },
+  });
+  expect(live.rows().find((r) => r.kind === "media")).toMatchObject({
+    kind: "media",
+    title: "Side-channel",
+    items: [{ kind: "image", path: "/repo/a.png", title: "A", width: 640, height: 480, size: 2048 }],
+  });
+
+  // 2. Reloaded turn with BOTH a degraded tool echo (`args.files`, no width/height) AND a first-class
+  // `presented_media` block (with full daemon metadata) + trailing prose: prose stays `final`, and
+  // deduplication keeps the richer `presented_media` metadata with zero duplicates.
+  const reloaded = new Transcript();
+  reloaded.load(
+    [
+      { role: "user", content: "show me", timestamp: 1 } as never,
+      {
+        role: "toolResult",
+        toolCallId: "tc1",
+        toolName: "present_files",
+        content: [{ type: "text", text: "" }],
+        isError: false,
+        timestamp: 2,
+      } as never,
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "tc1", name: "present_files", arguments: { title: "Echo", files: [{ path: "/repo/a.png", title: "A" }] } },
+          { type: "text", text: "Here is the preview." },
+          {
+            type: "presented_media",
+            title: "Side-channel",
+            items: [{ path: "/repo/a.png", kind: "image", title: "A", width: 640, height: 480, size: 2048, exists: true }],
+          },
+        ],
+        stopReason: "stop",
+        timestamp: 3,
+      } as never,
+    ],
+    false,
+  );
+  const textRow = reloaded.rows().find((r) => r.kind === "text");
+  expect(textRow && textRow.kind === "text" ? textRow.final : false).toBe(true);
+
+  const display = buildDisplayRows(reloaded.rows(), false, {}, undefined, { cwd: "/repo" });
+  const mediaRows = display.filter((r) => r.kind === "media");
+  expect(mediaRows).toHaveLength(1);
+  expect(mediaRows[0]).toMatchObject({
+    title: "Side-channel",
+    items: [{ path: "/repo/a.png", width: 640, height: 480, size: 2048 }],
+  });
 });

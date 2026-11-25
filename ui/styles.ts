@@ -36,18 +36,18 @@ export const POPUP = `rounded-xl corner-squircle border-[0.5px] border-hairline 
 export const POPUP_TOAST = "rounded-xl corner-squircle border-[0.5px] border-hairline bg-popover shadow-toast dark:bg-popover";
 
 /** Floating header bar recipe over scrolling pages. */
-export const HEADER_GLASS = "border-b-[0.5px] border-border bg-background/62 dark:bg-background/58";
+export const HEADER_GLASS = "border-b-[0.5px] border-hairline bg-background/72 dark:bg-background/68";
 
 /** How a popup arrives and leaves: a short fade and settle toward its trigger. */
 export const POPUP_MOTION = "transition-all duration-200 ease-out-quint motion-reduce:transition-none";
 export const POPUP_HIDDEN = "opacity-0 scale-[0.96] translate-y-1";
 
 /** Keyboard focus, the same ring everywhere. */
-export const FOCUS_RING = "focus:ring-2 focus:ring-ring";
+export const FOCUS_RING = "focus-visible:ring-2 focus-visible:ring-ring";
 
 /** A control that only shows under the group's pointer — or its own keyboard focus, so a
  * control Tab reaches never stays invisible while it holds the ring. */
-export const HOVER_REVEAL = "opacity-0 group-hover:opacity-100 focus:opacity-100";
+export const HOVER_REVEAL = "opacity-0 group-hover:opacity-100 focus-visible:opacity-100";
 
 /** The feedback of anything pressable: smooth color & micro-scale press. */
 export const PRESS = "transition duration-150 ease-out-quint motion-reduce:transition-none";
@@ -59,7 +59,7 @@ export const FIELD_SURFACE =
 
 /** Modern hairline + Liquid Glass + multi-layer photographic ambient shadow for the floating composer. */
 export const COMPOSER_SURFACE =
-  "border-[0.5px] border-hairline bg-card/65 shadow-composer transition-all duration-220 ease-out-quint hover:border-hairline-hover focus-within:border-hairline-focus focus-within:bg-card/78 focus-within:shadow-composer-focus dark:bg-card/58 dark:shadow-composer-dark dark:hover:border-hairline-hover dark:focus-within:border-hairline-focus dark:focus-within:bg-card/72 dark:focus-within:shadow-composer-dark-focus motion-reduce:transition-none";
+  "border-[0.5px] border-hairline bg-card/88 shadow-composer transition-all duration-220 ease-out-quint hover:border-hairline-hover focus-within:border-hairline-focus focus-within:bg-card/95 focus-within:shadow-composer-focus dark:bg-card/82 dark:shadow-composer-dark dark:hover:border-hairline-hover dark:focus-within:border-hairline-focus dark:focus-within:bg-card/90 dark:focus-within:shadow-composer-dark-focus motion-reduce:transition-none";
 
 /** Where the wallpaper laid under the whole window can be frosted — everywhere
  * but Linux, which draws no backdrop filter: there the sidebar keeps its solid

@@ -1848,3 +1848,141 @@ test("workspaces_list names the app's open projects and the folders sessions ran
   assert.ok(workspaces[0].lastActive >= worker.createdAt);
   assert.ok(!workspaces.some((w) => w.path === pip.cwd), "the personal agent's folder is not a project");
 });
+
+test("present_files pushes a direct side-channel presented_media block into external sessions regardless of engine tool echoing", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-sidechannel-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+
+  const pngPath = path.join(workDir, "shot.png");
+  const pngBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mP8z8BQz0AEwDiqAAAWBAQCAQIDAgAAAABJRU5ErkJggg==", "base64");
+  fs.writeFileSync(pngPath, pngBytes);
+
+  // Mock ACP engine that calls pipi's real stdio MCP proxy for `present_files`
+  // and emits ZERO tool_call / tool_call_update frames — proving presentation
+  // rides pipi's own daemon side-channel, completely decoupled from engine echoing.
+  const acpBin = path.join(tmp, "mock-acp-silent-mcp.mjs");
+  fs.writeFileSync(
+    acpBin,
+    `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import readline from "node:readline";
+
+let mcpSpec = undefined;
+const rl = readline.createInterface({ input: process.stdin });
+
+function callPipiMcp(name, args) {
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env };
+    for (const pair of mcpSpec?.env || []) env[pair.name] = pair.value;
+    const child = spawn(mcpSpec.command, mcpSpec.args || [], { env, stdio: ["pipe", "pipe", "pipe"] });
+    let buf = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buf += chunk;
+      const nl = buf.indexOf("\\n");
+      if (nl !== -1) {
+        const line = buf.slice(0, nl);
+        child.kill();
+        resolve(JSON.parse(line));
+      }
+    });
+    child.on("error", reject);
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) + "\\n");
+  });
+}
+
+rl.on("line", async (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    console.log(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } }));
+  } else if (msg.method === "session/new") {
+    mcpSpec = (msg.params?.mcpServers || []).find((s) => s.name === "pipi");
+    console.log(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "acp-sc-1" } }));
+  } else if (msg.method === "session/prompt") {
+    await callPipiMcp("present_files", {
+      title: "Side-channel gallery",
+      files: [
+        { path: "shot.png", title: "Captured", caption: "2x2 PNG" },
+        { path: "gone.mp4" }
+      ]
+    });
+    console.log(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId: "acp-sc-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Previews ready." } } }
+    }));
+    console.log(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } }));
+  }
+});
+`,
+    { mode: 0o755 },
+  );
+
+  const ctrl = await openControl(homeDir, { HOME: tmp, PI_CODING_AGENT_DIR: path.join(tmp, "agent") });
+  t.after(() => {
+    ctrl.client.close();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid, "SIGTERM");
+    } catch {}
+  });
+  await ctrl.call("config", {
+    allowAgentTools: true,
+    agents: [
+      {
+        id: "silent-acp",
+        name: "SilentACP",
+        driver: "acp",
+        binaryPath: acpBin,
+        available: true,
+        enabled: true,
+        supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
+      },
+    ],
+  });
+
+  const attached = await ctrl.call("attach", {
+    session: { cwd: workDir, agentId: "silent-acp", agentName: "SilentACP", driver: "acp", runtimeMode: "full-access", binaryPath: acpBin },
+  });
+  const sid = attached.session.id;
+  ctrl.events.length = 0;
+  ctrl.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "p1", type: "prompt", message: "show me" }) });
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.status === "idle" && ctrl.events.some((e) => e.type === "out" && e.line?.includes("agent_settled")));
+
+  const records = ctrl.events
+    .filter((e) => e.type === "out" && e.sessionId === sid && typeof e.line === "string")
+    .map((e) => {
+      try {
+        return JSON.parse(e.line);
+      } catch {
+        return undefined;
+      }
+    })
+    .filter(Boolean);
+
+  // 1. Live stream received the first-class `presented_media` block directly from the daemon.
+  const mediaUpdate = records.find(
+    (r) => r.type === "message_update" && r.assistantMessageEvent?.type === "media_block" && r.assistantMessageEvent.block?.type === "presented_media",
+  );
+  assert.ok(mediaUpdate, "live stream must receive presented_media directly from daemon side-channel");
+  const liveBlock = mediaUpdate.assistantMessageEvent.block;
+  assert.equal(liveBlock.title, "Side-channel gallery");
+  assert.equal(liveBlock.items.length, 2);
+  assert.equal(liveBlock.items[0].path, pngPath);
+  assert.equal(liveBlock.items[0].width, 2);
+  assert.equal(liveBlock.items[0].height, 2);
+  assert.equal(liveBlock.items[0].size, pngBytes.length);
+  assert.equal(liveBlock.items[0].exists, true);
+  assert.equal(liveBlock.items[0].caption, "2x2 PNG");
+  assert.equal(liveBlock.items[1].exists, false);
+
+  // 2. Final assistant message and persisted session JSONL both keep the exact `presented_media` block.
+  const assistantEnd = records.find((r) => r.type === "message_end" && r.message?.role === "assistant");
+  assert.ok(assistantEnd?.message?.content?.some((b) => b.type === "presented_media" && b.title === "Side-channel gallery"));
+  const sessionFile = ctrl.sessions.get(sid)?.file;
+  assert.ok(sessionFile && fs.existsSync(sessionFile), "external session file should be written");
+  const persisted = fs.readFileSync(sessionFile, "utf8");
+  assert.ok(persisted.includes('"type":"presented_media"'), "persisted JSONL must retain presented_media across reloads");
+  assert.ok(persisted.includes('"title":"Side-channel gallery"'));
+});

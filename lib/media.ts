@@ -1,5 +1,5 @@
 import type { TextViewBlock, TextViewInline } from "nsh/base";
-import type { AudioContent, ImageContent, MediaResourceContent } from "../pi/protocol";
+import type { AudioContent, ImageContent, MediaResourceContent, ProtocolMediaBlock } from "../pi/protocol";
 import type { ToolRow } from "../pi/transcript";
 import { basename } from "./format";
 import { PENDING_LINK_URL } from "./mend";
@@ -612,13 +612,53 @@ export function extractMarkdownMediaPaths(markdown: string, cwd?: string, home?:
 
 // ── Protocol & tool-result media extraction ───────────────────────────────────
 
+const ACP_TOOL_VERB_PREFIX = /^(?:running|run|calling|call|using|use|invoking|invoke|executing|execute|tool)\s*:?\s+/i;
+
+/**
+ * Strips MCP server namespaces (`mcp__server__tool`, `mcp:server:tool`,
+ * `mcp/server/tool`, `mcp.server.tool`, Antigravity's `mcp_pipi_tool`, and
+ * direct `pipi:tool` / `pipi__tool` forms), including ACP display prefixes
+ * such as `"Run mcp_pipi_present_files"`.
+ */
+export function normalizeMcpToolName(rawName: string): string {
+  const trimmed = rawName.trim();
+  if (!trimmed) return "";
+  const withoutVerb = trimmed.replace(ACP_TOOL_VERB_PREFIX, "").trim();
+  const stripNamespace = (value: string): string | undefined => {
+    const lower = value.toLowerCase();
+    let match = /^mcp__[^_]+__(.+)$/.exec(lower);
+    if (match) return match[1];
+    match = /^mcp[:/.][^:/.]+[:/.](.+)$/.exec(lower);
+    if (match) return match[1];
+    match = /^mcp_(?:pipi|t3[-_]code)_(.+)$/.exec(lower);
+    if (match) return match[1];
+    match = /^(?:pipi|t3[-_]code)(?:__|[:/.]|_)(.+)$/.exec(lower);
+    if (match) return match[1];
+    return undefined;
+  };
+  const stripped = stripNamespace(trimmed) ?? stripNamespace(withoutVerb);
+  if (stripped) return stripped.replace(/[\s-]+/g, "_");
+  return trimmed.toLowerCase().replace(/[\s-]+/g, "_");
+}
+
 export function isPresentFilesTool(rawName: string): boolean {
-  const lower = rawName.trim().toLowerCase().replace(/^mcp__[^_]+__/, "").replace(/[\s-]+/g, "_");
-  return lower === "present_files";
+  if (normalizeMcpToolName(rawName) === "present_files") return true;
+  const bare = rawName
+    .trim()
+    .replace(ACP_TOOL_VERB_PREFIX, "")
+    .trim()
+    .replace(/\?+$/, "")
+    .trim()
+    .toLowerCase();
+  if (!bare) return false;
+  if (bare.replace(/[\s-]+/g, "_") === "present_files") return true;
+  return /^(?:mcp_[a-z0-9-]+_|[a-z0-9._-]+(?:__|:))present[-_\s]files$/.test(bare);
 }
 
 interface RawPresentedEntry {
   path?: unknown;
+  url?: unknown;
+  uri?: unknown;
   title?: unknown;
   caption?: unknown;
   kind?: unknown;
@@ -642,7 +682,11 @@ function presentedItem(raw: unknown, id: string, cwd?: string, home?: string): M
       ? rec.remoteUrl
       : typeof rec.path === "string" && rec.path
         ? rec.path
-        : "";
+        : typeof rec.url === "string" && rec.url
+          ? rec.url
+          : typeof rec.uri === "string" && rec.uri
+            ? rec.uri
+            : "";
   if (!targetStr) return undefined;
   const resolved = resolveMediaTarget(targetStr, cwd, home);
   if (!resolved) return undefined;
@@ -671,11 +715,12 @@ export function extractPresentedMedia(
   cwd?: string,
   home?: string,
 ): { title?: string; items: MediaItem[] } | undefined {
-  if (!isPresentFilesTool(row.name)) return undefined;
+  const byName = isPresentFilesTool(row.name);
 
-  const fromStructured = (obj: unknown): { title?: string; items: MediaItem[] } | undefined => {
+  const fromStructured = (obj: unknown, requireMarker: boolean): { title?: string; items: MediaItem[] } | undefined => {
     if (!obj || typeof obj !== "object") return undefined;
     const rec = obj as { pipiMedia?: unknown; title?: unknown; items?: unknown; files?: unknown };
+    if (requireMarker && rec.pipiMedia !== true) return undefined;
     const list = Array.isArray(rec.items) ? rec.items : Array.isArray(rec.files) ? rec.files : undefined;
     if (!list) return undefined;
     const items = list
@@ -686,15 +731,19 @@ export function extractPresentedMedia(
     return { ...(title ? { title } : {}), items };
   };
 
-  const fromDetails = fromStructured(row.details);
+  // Recognize pipi's own `{ pipiMedia: true }` payload even if an ACP harness replaced the tool title.
+  const fromDetails = fromStructured(row.details, !byName);
   if (fromDetails) return fromDetails;
 
-  if (row.output?.trim()) {
+  const trimmedOutput = row.output?.trim();
+  if (trimmedOutput && (byName || trimmedOutput.includes('"pipiMedia"'))) {
     try {
-      const parsed = fromStructured(JSON.parse(row.output));
+      const parsed = fromStructured(JSON.parse(trimmedOutput), !byName);
       if (parsed) return parsed;
     } catch {}
   }
+
+  if (!byName) return undefined;
 
   const args = row.args ?? {};
   const argFiles = Array.isArray(args.files) ? args.files : typeof args.path === "string" ? [args.path] : undefined;
@@ -772,6 +821,25 @@ export function mediaItemFromProtocolBlock(
     }
   }
   return undefined;
+}
+
+export function mediaRowFromProtocolBlock(
+  block: ProtocolMediaBlock,
+  id: string,
+  cwd?: string,
+  home?: string,
+): { title?: string; items: MediaItem[] } | undefined {
+  if (block.type === "presented_media") {
+    if (!Array.isArray(block.items) || !block.items.length) return undefined;
+    const items = block.items
+      .map((entry, idx) => presentedItem(entry, `${id}:pm:${idx}`, cwd, home))
+      .filter((item): item is MediaItem => Boolean(item));
+    if (!items.length) return undefined;
+    const title = typeof block.title === "string" && block.title.trim() ? block.title.trim() : undefined;
+    return { ...(title ? { title } : {}), items };
+  }
+  const item = mediaItemFromProtocolBlock(block, id, cwd, home);
+  return item ? { items: [item] } : undefined;
 }
 
 export function extractToolResultMedia(

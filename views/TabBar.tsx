@@ -1,9 +1,10 @@
 import { batch, Clipboard, cleanup, createAnimatedValue, effect, keymap, Overlay, platform, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
 import type { AnimatedValue, ContextMenuEvent, GestureResponderEvent, InputRef, MouseEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input } from "nsh/base";
-import { Menu, type MenuItem, titleBar } from "nsh/desktop";
+import { Menu, type MenuItem } from "nsh/desktop";
+import { basename } from "../lib/format";
+import { titleBarArea } from "../lib/layout";
 import { tr } from "../lib/i18n";
-import { Pip } from "../mascot/Pip";
 import type { DaemonSession } from "../pi/daemon";
 import {
   cancelRenaming,
@@ -11,6 +12,8 @@ import {
   currentParentSession,
   currentTitle,
   currentView,
+  gitWorkspaceInfo,
+  isChatFolder,
   isSwitching,
   isCurrentSessionArchived,
   isRenaming,
@@ -22,6 +25,7 @@ import {
   startRenaming,
   unarchiveCurrentSession,
   wallpaper,
+  workspacePath,
 } from "../store/app";
 import { docTabTitle, revealDoc } from "../store/docs";
 import { stripTabWidth, TAB_GAP, tabWidthBounds } from "../lib/strip-width";
@@ -107,40 +111,43 @@ interface PillAnim {
   liftRun: Promise<{ finished: boolean }>;
 }
 
-/** The chat status mark of a tab's trailing slot, in the sidebar's own language. */
+/** The chat status mark of a tab, in its own non-overlapping slot before the close control. */
 function StatusMark(props: { session: () => DaemonSession | undefined }) {
   const status = () => props.session()?.status;
   const unread = () => props.session()?.unread === true;
   const working = () => status() === "working" || status() === "blocked";
   const blocked = () => status() === "blocked";
   const failed = () => status() === "failed" || status() === "interrupted";
+  const hasAny = () => working() || failed() || unread();
   return (
-    <>
-      <Presence show={working() && !blocked()} accessibilityLabel={tr("Running in the background", "后台运行中")}>
-        <Pip size={14} mood="work" />
-      </Presence>
-      <Presence
-        show={blocked()}
-        accessibilityLabel={tr("Waiting for confirmation", "等待确认")}
-        class="absolute inset-0 items-center justify-center"
-      >
-        <Icon name="clock" size={12} tone="warning" />
-      </Presence>
-      <Presence
-        show={failed()}
-        accessibilityLabel={status() === "interrupted" ? tr("Interrupted", "已中断") : tr("Failed", "已失败")}
-        class="absolute inset-0 items-center justify-center"
-      >
-        <Icon name="alert" size={12} tone="destructive" />
-      </Presence>
-      <Presence
-        show={!working() && !failed() && unread()}
-        accessibilityLabel={tr("Finished in the background", "后台已完成")}
-        class="absolute inset-0 items-center justify-center"
-      >
-        <View class="size-1.5 rounded-full bg-brand" />
-      </Presence>
-    </>
+    <If when={hasAny()}>
+      <View class="relative mr-0.5 size-3.5 shrink-0 items-center justify-center">
+        <Presence show={working() && !blocked()} accessibilityLabel={tr("Running in the background", "后台运行中")}>
+          <View class="size-[5px] rounded-full bg-brand" />
+        </Presence>
+        <Presence
+          show={blocked()}
+          accessibilityLabel={tr("Waiting for confirmation", "等待确认")}
+          class="absolute inset-0 items-center justify-center"
+        >
+          <Icon name="clock" size={12} tone="warning" />
+        </Presence>
+        <Presence
+          show={failed()}
+          accessibilityLabel={status() === "interrupted" ? tr("Interrupted", "已中断") : tr("Failed", "已失败")}
+          class="absolute inset-0 items-center justify-center"
+        >
+          <Icon name="alert" size={12} tone="destructive" />
+        </Presence>
+        <Presence
+          show={!working() && !failed() && unread()}
+          accessibilityLabel={tr("Finished in the background", "后台已完成")}
+          class="absolute inset-0 items-center justify-center"
+        >
+          <View class="size-[5px] rounded-full bg-brand" />
+        </Presence>
+      </View>
+    </If>
   );
 }
 
@@ -934,15 +941,17 @@ export function TabBar() {
             style={{ opacity: lift }}
           />
         </If>
-        {/* Fill: the active tab's card on its hairline edge, hover on the rest — under everything in the pill. */}
+        {/* Fill: the active tab's quiet sculpted surface on its hairline edge, hover on the rest — under everything in the pill. */}
         <View
-          class={`pointer-events-none absolute inset-0 rounded-md corner-squircle border-[0.5px] transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
-            active() ? "border-hairline bg-card" : "border-transparent group-hover:bg-accent"
+          class={`pointer-events-none absolute inset-0 rounded-lg corner-squircle border-[0.5px] transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
+            active() ? "border-hairline bg-muted/85 dark:bg-card" : "border-transparent group-hover:bg-accent"
           }`}
         />
         {props.tab().kind === "chat" ? (
           session()?.agentId ? (
-            <AgentLogo id={session()!.agentId} size={uiIconSize(14)} tone={active() ? "foreground" : "muted-foreground"} class="shrink-0" />
+            <View class={`shrink-0 transition-opacity duration-150 ${active() ? "opacity-100" : "opacity-65 group-hover:opacity-100"}`}>
+              <AgentLogo id={session()!.agentId} size={uiIconSize(13)} tone={active() ? "foreground" : "muted-foreground"} />
+            </View>
           ) : (
             <Icon name={isDraftRef(props.tab().ref) ? "pencil" : "terminal"} size={uiIconSize(13)} tone={active() ? "foreground" : "subtle"} class="shrink-0" />
           )
@@ -953,8 +962,8 @@ export function TabBar() {
           when={renaming()}
           else={
             <Text
-              class={`mx-1.5 min-w-0 flex-1 truncate ${uiType("sm")} font-medium transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
-                active() ? "text-foreground" : "text-muted-foreground group-hover:text-foreground"
+              class={`mx-1.5 min-w-0 flex-1 truncate ${uiType("sm")} transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
+                active() ? "font-medium text-foreground" : "text-muted-foreground group-hover:text-foreground"
               }`}
             >
               {tabTitle(props.tab())}
@@ -963,16 +972,15 @@ export function TabBar() {
         >
           <RenameField />
         </If>
-        {/* Trailing slot: status mark at rest, the close control over it on hover (or always on the active tab). */}
+        {/* Dedicated non-overlapping status dot, followed by the close control. */}
+        {props.tab().kind === "chat" ? <StatusMark session={session} /> : null}
         <View class={`relative ${uiSize() >= 15 ? "size-5" : "size-4"} shrink-0 items-center justify-center`}>
-          {/* A document carries no mark: it is saved as it is written, and a dot that came and went with every pause would say otherwise. */}
-          {props.tab().kind === "chat" ? <StatusMark session={session} /> : null}
           <BaseButton
             onPress={() => closeTab(id())}
             tooltip={tip(tr("Close tab", "关闭标签页"))}
             accessibilityLabel={tr("Close tab", "关闭标签页")}
             class={`absolute inset-0 items-center justify-center rounded transition-opacity ${PRESS} ${
-              active() ? "opacity-60 hover:opacity-100" : "opacity-0 group-hover:opacity-100"
+              active() ? "opacity-55 hover:opacity-100" : "opacity-0 group-hover:opacity-100"
             }`}
           >
             <Icon name="x" size={11} tone="muted-foreground" />
@@ -995,6 +1003,14 @@ export function TabBar() {
   const parent = () => currentParentSession();
   const worktree = () => currentDaemonSession()?.worktree;
   const chatActive = () => currentView().name === "chat";
+  const cwdName = () => {
+    const cwd = workspacePath();
+    return cwd && !isChatFolder(cwd) ? basename(cwd) : "";
+  };
+  const gitBranch = () => {
+    const info = gitWorkspaceInfo();
+    return info.isGitRepo && info.branch ? info.branch : "";
+  };
 
   return (
     <View
@@ -1002,8 +1018,8 @@ export function TabBar() {
       class={`absolute inset-x-0 top-0 z-20 flex-row items-center gap-1 pr-3 ${wallpaper() ? "" : HEADER_GLASS}`}
       style={{
         ...(wallpaper() ? undefined : GLASS_REGULAR),
-        height: titleBar().height || 44,
-        paddingLeft: sidebarOpen() ? 12 : (titleBar().left ? titleBar().left + 12 : 12),
+        height: titleBarArea().height || 44,
+        paddingLeft: sidebarOpen() ? 12 : (titleBarArea().left ? titleBarArea().left + 12 : 12),
       }}
       onMouseMove={(e: MouseEvent) => {
         lastPageX = e.pagePosition.x;
@@ -1125,6 +1141,15 @@ export function TabBar() {
               )}
             </If>
           </Presence>
+          <If when={!worktree() && !parent() && !isCurrentSessionArchived() && Boolean(cwdName())}>
+            <View class="shrink-0 flex-row items-center gap-1.5 pr-1">
+              <Text class={`max-w-36 truncate ${uiType("xs")} text-subtle`}>{cwdName()}</Text>
+              <If when={Boolean(gitBranch())}>
+                <Text class={`${uiType("2xs")} text-subtle/60`}>/</Text>
+                <Text class={`max-w-28 truncate font-mono ${uiType("2xs")} text-subtle/75`}>{gitBranch()}</Text>
+              </If>
+            </View>
+          </If>
         </View>
       </If>
     </View>
