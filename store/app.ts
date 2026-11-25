@@ -11,8 +11,11 @@ import type {
   WorkspaceIsolation,
   WorktreeInfo,
 } from "../agents/types";
+import { basename, tildePath } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
 import { composeDocMessage } from "../lib/doc-wire";
+import { classifyMediaKind, composeFileMessage, isMarkdownPath, mimeTypeForPath, type FileAttachment } from "../lib/media";
+import { formAnswerText } from "../lib/form-answers";
 import { answersTo, type ComposerCommand, parseSlashLine } from "../lib/slash";
 import { markPacersSeeded } from "../lib/stream-pacer";
 import { markVeilsSeeded } from "../lib/veil";
@@ -58,7 +61,7 @@ import { piHistoryMessages } from "../pi/session-file";
 import { type SessionSnapshot, type SessionSummary, sessionTitle } from "../pi/sessions";
 import { EMPTY_USAGE, type UsageStats } from "../pi/usage";
 import { killAllSidecars, SidecarError } from "../pi/sidecar";
-import { type Row, sameVisualRows, Transcript, withoutHandoff, withoutImageNotes } from "../pi/transcript";
+import { type Row, sameVisualRows, Transcript, withoutPreamble, withoutImageNotes } from "../pi/transcript";
 import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
@@ -82,12 +85,13 @@ import {
   lastActiveWorkspace,
   loadPrefs,
   onDaemonPrefsChange,
+  onWorkspacesChange,
   preferredAgentId,
   preferredRuntimeMode,
   recentWorkspaces,
   rememberAutoRetry,
   rememberSessionChoice,
-  rememberWorkspace,
+  rememberWorkspace as listWorkspace,
   removeCustomAgentPref,
   runInBackground,
   setAgentOverride,
@@ -209,6 +213,7 @@ const credentials = signal<Record<string, CredentialKind>>({});
 const view = signal<View>({ name: "chat" });
 const draft = signal("");
 const attachments = signal<Attachment[]>([]);
+const fileAttachments = signal<FileAttachment[]>([]);
 const docRefs = signal<DocRef[]>([]);
 const composerFocus = signal(0, { equals: false });
 /** Ticks when something outside the model chip (`/model`) asks for its list. */
@@ -247,6 +252,34 @@ const openDaemonId = signal<string | undefined>(undefined);
 
 export const sidecarPhase = () => phase();
 export const workspacePath = () => workspace();
+
+/**
+ * Where a chat with no project runs: an empty folder of the app's own, under no
+ * repository, so no project's `AGENTS.md` or `CLAUDE.md` rides along. It is
+ * never a workspace — its sessions are listed in 最近 only.
+ */
+export const chatFolder = () => `${backend().dataDir().replace(/\/$/, "")}/chat`;
+export const isChatFolder = (cwd: string | undefined) => Boolean(cwd) && cwd === chatFolder();
+/** A folder as the reader knows it: `~/code/app`, or 闲聊 for the chat folder. */
+export const placeLabel = (cwd: string) => (isChatFolder(cwd) ? tr("Chat", "闲聊") : tildePath(cwd, backend().home()));
+
+/** The project last worked in, else the first remembered one, else home. */
+export function lastProject() {
+  const list = recentWorkspaces();
+  const last = lastActiveWorkspace();
+  return (last && list.includes(last) ? last : list[0]) ?? backend().home();
+}
+
+function rememberProject(path: string) {
+  if (!isChatFolder(path)) rememberWorkspace(path);
+}
+
+/** Makes sure the chat folder is there for an agent to start in; resolves with its path. */
+export async function ensureChatFolder() {
+  const dir = chatFolder();
+  await fs.mkdir(dir, { recursive: true }).catch(() => undefined);
+  return dir;
+}
 export const sessionState = () => state();
 export const availableModels = () => models();
 export const thinkingLevels = () => levels();
@@ -342,6 +375,7 @@ export const storedProviders = () => credentials();
 export const currentView = () => view();
 export const composerDraft = () => draft();
 export const composerAttachments = () => attachments();
+export const composerFiles = () => fileAttachments();
 export const composerDocs = () => docRefs();
 export const composerFocusTick = () => composerFocus();
 export const modelPickerTick = () => modelPickerAsk();
@@ -575,6 +609,20 @@ const daemonIndex = computed(() => {
   }
   return { byId, byFile, byParent };
 });
+
+/** Pip, the personal agent: the one session the daemon keeps in its own folder of notes. */
+export const personalAgent = computed(() => daemonSessionList().find((s) => s.persona));
+
+/** Whether `cwd` is Pip's folder of notes, which is never a project. */
+export function isPersonaFolder(cwd: string | undefined) {
+  const pip = personalAgent();
+  return pip !== undefined && pip.cwd === cwd;
+}
+
+/** Lists a project folder as the active workspace; Pip's folder of notes is not one. */
+function rememberWorkspace(path: string) {
+  if (!isPersonaFolder(path)) listWorkspace(path);
+}
 
 /** A daemon session by its daemon id. */
 export function daemonSessionOfId(id: string | undefined) {
@@ -882,6 +930,8 @@ export const currentTitle = computed(() => {
     const found = list.find((s) => s.path === target.file) ?? sessions().find((s) => s.path === target.file);
     if (found) return sessionTitle(found, tr("New session", "新会话"));
   }
+  const pip = currentDaemonSession();
+  if (pip?.persona) return daemonSessionTitle(pip);
   const name = state()?.sessionName;
   if (name) return name;
   const first = rows().find((row) => row.kind === "user");
@@ -1448,6 +1498,7 @@ async function ensureDaemon(): Promise<DaemonClient | undefined> {
         });
         daemonClient = started;
         pushDaemonConfig();
+        pushWorkspaces();
         return started;
       } catch (error) {
         toast("warning", `${tr("The session daemon could not start", "会话守护进程启动失败")}: ${message(error)}`);
@@ -1458,6 +1509,27 @@ async function ensureDaemon(): Promise<DaemonClient | undefined> {
     })();
   }
   return daemonStarting;
+}
+
+/** Pip's session id, starting Pip on the preferred agent the first time it is asked for. */
+export async function ensurePersonalAgent(): Promise<string | undefined> {
+  const held = personalAgent();
+  if (held) return held.id;
+  const daemon = await ensureDaemon();
+  if (!daemon) return undefined;
+  try {
+    const session = await daemon.startSession({ persona: true, agentId: preferredAgentId(), runtimeMode: preferredRuntimeMode() });
+    upsertDaemonSession(session);
+    return session.id;
+  } catch (error) {
+    toast("warning", `${tr("Pip could not start", "Pip 启动失败")}: ${message(error)}`);
+    return undefined;
+  }
+}
+
+/** Tells the daemon which project folders are open, for agents asking `workspaces_list`. */
+function pushWorkspaces() {
+  daemonClient?.setWorkspaces(recentWorkspaces());
 }
 
 /** Pushes the agent roster and the session-tree rules the daemon enforces. */
@@ -1499,12 +1571,15 @@ export async function installPipiCli(): Promise<string> {
 }
 
 let unlistenDaemonPrefs: (() => void) | undefined;
+let unlistenWorkspaces: (() => void) | undefined;
 
 /** Lets go of everything this store evaluation holds (invoked before a hot-reload re-boot). The daemon's sessions are not its to stop. */
 function teardownStore() {
   generation++;
   unlistenDaemonPrefs?.();
   unlistenDaemonPrefs = undefined;
+  unlistenWorkspaces?.();
+  unlistenWorkspaces = undefined;
   if (flushFrame !== undefined) cancelAnimationFrame(flushFrame);
   flushFrame = undefined;
   const active = client;
@@ -1541,6 +1616,7 @@ export async function boot() {
   killAllSidecars();
   g[STORE_TEARDOWN_KEY] = teardownStore;
   unlistenDaemonPrefs = onDaemonPrefsChange(() => pushDaemonConfig());
+  unlistenWorkspaces = onWorkspacesChange(pushWorkspaces);
 
   await loadPrefs();
   batch(() => {
@@ -1549,11 +1625,8 @@ export async function boot() {
     agents.set(defaultAgentStatuses(storedCustomAgents(), storedAgentOverrides()));
     usageLoaded.set(false);
   });
-  const list = recentWorkspaces();
-  const last = lastActiveWorkspace();
-  const first = (last && list.includes(last) ? last : list[0]) ?? backend().home();
   void refreshAgents();
-  await start(first, undefined, preferredAgentId());
+  await start(lastProject(), undefined, preferredAgentId());
   if (phase().name !== "failed") {
     void refreshAllWorkspaceSessions();
     void refreshUsageStats();
@@ -1668,7 +1741,7 @@ async function launch(
     if (!started) return;
     const first = await withStartupTimeout(started.request("get_state"), agentLabel);
     if (mine !== generation) return;
-    rememberWorkspace(projectCwdOf(cwd, currentDaemonSession()));
+    rememberProject(projectCwdOf(cwd, currentDaemonSession()));
     const retry = autoRetryChoice();
     if (retry !== undefined) request("set_auto_retry", { enabled: retry }).catch(() => undefined);
     if ((reopen || daemonId) && !preserveRows) {
@@ -2087,7 +2160,7 @@ export async function openWorkspace(path: string, sessionPath?: string, sessionA
   }
   markSessionRead(sessionPath);
   if (path === workspace() && phase().name === "ready" && !isSwitching()) {
-    rememberWorkspace(projectCwd);
+    rememberProject(projectCwd);
     if (sessionPath) {
       await openSession(sessionPath, undefined, sessionAgentId);
     } else {
@@ -2211,6 +2284,8 @@ export async function launchCompareSessions(options: {
   const ceiling = currentRuntimeCeiling();
   const effectiveMode: RuntimeMode =
     runtimeModeRank(currentRuntimeMode()) > runtimeModeRank(ceiling) ? ceiling : currentRuntimeMode();
+  // Pip's notes hold no project: from Pip, the runs go to the latest project, on their own rows.
+  const fromPip = Boolean(currentDaemonSession()?.persona);
 
   await Promise.all(
     options.agentIds.map((agentId) =>
@@ -2219,9 +2294,9 @@ export async function launchCompareSessions(options: {
         await daemon.startSession({
           title: `${spec?.name ?? agentId} · ${promptText.slice(0, 40)}`,
           agentId,
-          cwd: workspace(),
+          cwd: fromPip ? workCwd() : workspace(),
           message: promptText,
-          parentId: openDaemonId(),
+          parentId: fromPip ? undefined : openDaemonId(),
           runtimeMode: effectiveMode,
           worktree: isolation === "worktree" && gitInfo().isGitRepo,
         });
@@ -2419,7 +2494,7 @@ export async function refreshAllWorkspaceSessions() {
   const archivedCwds = Object.values(archivedSessions())
     .map((m) => m.cwd)
     .filter((c): c is string => !!c);
-  const cwds = [...new Set([workspace(), ...recentWorkspaces(), ...archivedCwds].filter(Boolean))];
+  const cwds = [...new Set([workspace(), ...recentWorkspaces(), chatFolder(), ...archivedCwds].filter(Boolean))];
   if (!cwds.length) return;
   try {
     const b = backend();
@@ -2690,7 +2765,11 @@ function onUiRequest(ui: ExtensionUiRequest) {
     case "confirm":
     case "input":
     case "editor":
-      dialogs.update((list) => [...list, ui]);
+    case "form":
+      dialogs.update((list) => list.some((dialog) => dialog.id === ui.id) ? list : [...list, ui]);
+      break;
+    case "dismiss":
+      dialogs.update((list) => list.filter((dialog) => dialog.id !== ui.id));
       break;
     case "notify":
       toast(ui.notifyType ?? "info", ui.message);
@@ -2789,15 +2868,26 @@ function routeExit(source: PiClient | undefined, exit: Exit, stderr: string, age
 
 /** Answers the dialog an extension is waiting on. */
 export function answerDialog(id: string, answer: ExtensionUiAnswer) {
+  const dialog = dialogs().find((entry) => entry.id === id);
+  if (!dialog) return;
+  // A form's picks ride the elicitation response, not the wire — but the
+  // person still answered, so their bubble keeps the record in the chat.
+  if (dialog.method === "form" && "answers" in answer) {
+    transcript.recordAnswer(formAnswerText(dialog.fields, answer.answers));
+    flush();
+  }
   client?.respond(id, answer);
-  dialogs.update((list) => list.filter((dialog) => dialog.id !== id));
+  dialogs.update((list) => list.filter((entry) => entry.id !== id));
 }
 
 /** Dismisses or declines whichever dialog is currently waiting at the head of the queue. */
 export function cancelPendingDialog() {
   const dialog = dialogs()[0];
   if (!dialog) return;
-  answerDialog(dialog.id, dialog.method === "confirm" ? { confirmed: false } : { cancelled: true });
+  answerDialog(
+    dialog.id,
+    dialog.method === "confirm" ? { confirmed: false } : dialog.method === "form" ? { declined: true } : { cancelled: true },
+  );
 }
 
 // ── Toasts ──────────────────────────────────────────────────────────────────
@@ -2916,6 +3006,83 @@ export function removeAttachment(index: number) {
   attachments.update((list) => list.filter((_, i) => i !== index));
 }
 
+export function addFileAttachment(file: FileAttachment) {
+  fileAttachments.update((list) => (list.some((held) => held.path === file.path) ? list.map((held) => (held.path === file.path ? file : held)) : [...list, file]));
+}
+
+export function removeFileAttachment(path: string) {
+  if (fileAttachments().some((held) => held.path === path)) {
+    fileAttachments.update((list) => list.filter((held) => held.path !== path));
+  }
+}
+
+const IMAGE_WIRE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const MAX_WIRE_IMAGE_BYTES = 20 * 1024 * 1024;
+
+/** Hook set by `store/tabs` so opening a `.md` link/card opens it inside pipi's document editor when available. */
+export const docOpener: { open?: (path: string) => Promise<boolean> | boolean } = {};
+
+export async function openLocalFile(filePath: string) {
+  if (!filePath) return;
+  if (isMarkdownPath(filePath) && docOpener.open) {
+    const handled = await Promise.resolve(docOpener.open(filePath)).catch(() => false);
+    if (handled) return;
+  }
+  await attempt(tr("Could not open the file", "无法打开文件"), async () => {
+    await backend().openPath?.(filePath);
+  });
+}
+
+export async function revealLocalFile(filePath: string) {
+  if (!filePath) return;
+  await attempt(tr("Could not show the file in the file manager", "无法在文件管理器中显示文件"), async () => {
+    await backend().revealPath?.(filePath);
+  });
+}
+
+export async function attachLocalPath(filePath: string): Promise<boolean> {
+  if (!filePath) return false;
+  const st = await fs.stat(filePath).catch(() => undefined);
+  if (!st) {
+    toast("warning", tr("That file could not be read.", "无法读取该文件。"));
+    return false;
+  }
+  if (st.isDirectory()) {
+    toast("warning", tr("Folders cannot be attached directly.", "无法直接将文件夹作为附件。"));
+    return false;
+  }
+  const kind = classifyMediaKind(filePath);
+  const name = basename(filePath);
+  const mimeType = mimeTypeForPath(filePath);
+  const vision = Boolean(state()?.model?.input?.includes("image"));
+  if (kind === "image" && mimeType && IMAGE_WIRE_MIMES.has(mimeType) && vision && st.size <= MAX_WIRE_IMAGE_BYTES) {
+    try {
+      const bytes = await fs.readFile(filePath);
+      addAttachment({ type: "image", data: Buffer.from(bytes).toString("base64"), mimeType, name });
+      return true;
+    } catch {
+      // Fall through to attaching by path when raw byte read is unavailable.
+    }
+  }
+  addFileAttachment({ path: filePath, name, kind, ...(mimeType ? { mimeType } : {}), size: st.size });
+  return true;
+}
+
+export async function pickComposerFile() {
+  const pick = backend().pickFile;
+  if (!pick) return;
+  try {
+    const picked = await pick(tr("Attach file", "添加文件"));
+    if (picked) await attachLocalPath(picked);
+  } catch (error) {
+    if (error instanceof NoPickerError) {
+      toast("warning", tr("No file picker found — install zenity or kdialog to choose files.", "找不到文件选择器——请安装 zenity 或 kdialog。"));
+    } else {
+      toast("error", `${tr("Could not attach file", "无法添加文件")}: ${message(error)}`);
+    }
+  }
+}
+
 /**
  * A document riding on the message being written: all of it, or a passage
  * selected in it. It is attached, not pasted — the words stay in the
@@ -2957,19 +3124,30 @@ export function settleDocRef(path: string, text: string) {
  * nothing was typed. A line that is a command of the app's or the shell's is
  * not a message about them: the documents wait for the one after it.
  */
-function takeDocsIntoDraft(): { message: string; said: string; refs: DocRef[] } | undefined {
+function takeDocsIntoDraft(): { message: string; said: string; refs: DocRef[]; files: FileAttachment[] } | undefined {
   const refs = docRefs();
-  if (!refs.length) return undefined;
+  const files = fileAttachments();
+  if (!refs.length && !files.length) return undefined;
   const said = draft().trim();
   const line = said ? parseSlashLine(said) : undefined;
   if (said.startsWith("!") || (line && appCommands().some((own) => answersTo(own, line.name)))) return undefined;
   const parts = refs.map((ref) => ({ path: ref.path, text: ref.excerpt ? ref.text : docRefText.read(ref), ...(ref.excerpt ? { excerpt: true } : {}) }));
-  const message = composeDocMessage(said, parts);
+  let message: string;
+  if (!parts.length) {
+    message = composeFileMessage(said, files);
+  } else if (files.length > 0 && !said && parts.length === 1) {
+    const docTag = parts[0].excerpt ? "selection" : "document";
+    const escapedPath = parts[0].path.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    message = composeFileMessage(`<${docTag} path="${escapedPath}">\n${parts[0].text.trim()}\n</${docTag}>`, files);
+  } else {
+    message = composeFileMessage(composeDocMessage(said, parts), files);
+  }
   batch(() => {
     draft.set(message);
     docRefs.set([]);
+    fileAttachments.set([]);
   });
-  return { message, said, refs };
+  return { message, said, refs, files };
 }
 
 /** A paste's file reads land on promises; `send` waits for them so a fast paste-and-send keeps its attachments. */
@@ -3204,6 +3382,7 @@ export async function send(mode: "steer" | "followUp" = "steer") {
       batch(() => {
         draft.set(withDocs.said);
         docRefs.set(withDocs.refs);
+        fileAttachments.set(withDocs.files);
       });
     }
   } finally {
@@ -3463,7 +3642,7 @@ async function takeQueuedNow(id: string, edit: boolean) {
   const row = held.rows().find((item) => item.kind === "user" && item.id === id);
   if (!activeClient || !row || row.kind !== "user" || !row.queued) return;
   const sent = queuedSends.get(id);
-  const said = (wire: string) => withoutHandoff(withoutImageNotes(wire));
+  const said = (wire: string) => withoutPreamble(withoutImageNotes(wire));
   const mine = (wire: string) => (sent ? wire === sent.wire : said(wire) === row.text);
   queueEditing = true;
   try {
@@ -3696,9 +3875,15 @@ async function requestNewSession() {
   return result;
 }
 
+/** Where work started from the screen runs: its project, or — from Pip's notes — the latest project. */
+function workCwd() {
+  const cwd = activeProjectPath() || workspace();
+  return isPersonaFolder(cwd) ? (recentWorkspaces()[0] ?? cwd) : cwd;
+}
+
 export function newSession() {
   pendingHandoff.set(undefined);
-  const rootCwd = activeProjectPath() || workspace();
+  const rootCwd = workCwd();
   if (isDraftAhead() && heading()?.cwd === rootCwd && (!heading()?.agentId || heading()?.agentId === currentAgentId())) {
     view.set({ name: "chat" });
     return focusComposer();
@@ -3790,7 +3975,7 @@ export async function forkFrom(index: number) {
   const ok = await changeSession(tr("Could not fork", "无法创建分支"), async () => {
     const result = await request("fork", { entryId: target.entryId });
     // Pi hands the message back as the model got it: the draft is what the person wrote.
-    text = withoutHandoff(withoutImageNotes(result.text ?? ""));
+    text = withoutPreamble(withoutImageNotes(result.text ?? ""));
     return result;
   });
   if (ok && text) draft.set(text);
@@ -4084,8 +4269,21 @@ export async function chooseThinkingLevel(level: ThinkingLevel) {
     return true;
   });
   if (!applied) return;
+  // The preference is the user's abstract pick; the session state is the engine's truth
+  // (an ACP model may clamp max to the highest rung it actually offers).
   rememberSessionChoice(currentAgentId(), { thinkingLevel: level });
-  state.update((s) => s && { ...s, thinkingLevel: level });
+  const actual = await refreshState().catch(() => undefined);
+  if (!actual) state.update((s) => s && { ...s, thinkingLevel: level });
+}
+
+/** Changes an engine-reported model-adjacent selector (ACP `model_config`, typically Devin's speed). */
+export async function chooseModelConfig(configId: string, value: string | boolean) {
+  const applied = await attempt(tr("Could not change model setting", "无法更改模型设置"), async () => {
+    await request("set_model_config", { configId, value });
+    return true;
+  });
+  if (!applied) return;
+  await refreshState().catch(() => undefined);
 }
 
 export async function setSteeringMode(mode: QueueMode) {

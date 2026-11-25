@@ -1,4 +1,4 @@
-import { cleanup, createAnimatedValue, effect, Image, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
+import { cleanup, createAnimatedValue, effect, Image, openUrl, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
 import type { JSX, ViewRef } from "nsh";
 import { Collapsible, TextView } from "nsh/base";
 import { Menu } from "nsh/desktop";
@@ -6,9 +6,18 @@ import { clip } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
 import { type DocPart, splitDocMessage } from "../lib/doc-wire";
 import { fitImageBox, imageSizeFromBase64 } from "../lib/image-size";
+import {
+  extractMarkdownMediaPaths,
+  extractToolResultMedia,
+  isPresentFilesTool,
+  resolveMediaTarget,
+  splitFileMessage,
+  type FileAttachment,
+  type MediaItem,
+} from "../lib/media";
 import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
 import type { ImageContent } from "../pi/protocol";
-import { type Row, type ToolRow, withoutHandoff, withoutImageNotes } from "../pi/transcript";
+import { type Row, type ToolRow, withoutPreamble, withoutImageNotes } from "../pi/transcript";
 import {
   type ActivityRow,
   describeActiveStep,
@@ -23,7 +32,20 @@ import {
   thinkingLabel,
   type TurnHeaderRow,
 } from "../pi/turns";
-import { conversationKey, copyMessage, copyText, daemonSessionOfId, forkFrom, messageQueue, openDaemonSession, takeQueued, transcriptRows } from "../store/app";
+import {
+  conversationKey,
+  copyMessage,
+  copyText,
+  daemonSessionOfId,
+  forkFrom,
+  messageQueue,
+  openDaemonSession,
+  openLocalFile,
+  takeQueued,
+  transcriptRows,
+  workspacePath,
+} from "../store/app";
+import { backend } from "../store/backend";
 import { docTabTitle, titleLine } from "../store/docs";
 import { openDocIfThere } from "../store/tabs";
 import { IconButton } from "../ui/Button";
@@ -35,6 +57,7 @@ import { tip } from "../ui/Tip";
 import { openZoom } from "../ui/Zoom";
 import { readingType, codeType, uiHeight, uiType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
+import { MediaGallery, openMediaZoom } from "./Media";
 import { clearProseState, proseClasses, ProseBlock, proseVeilUntil, type ProseRow } from "./Prose";
 
 /**
@@ -553,6 +576,20 @@ function UserImages(props: {
   );
 }
 
+function fileAttachmentToMedia(file: FileAttachment, id: string): MediaItem {
+  const resolved = resolveMediaTarget(file.path, workspacePath(), backend().home());
+  return {
+    id,
+    kind: file.kind,
+    title: file.name,
+    path: resolved?.path ?? file.path,
+    ...(resolved?.src ? { src: resolved.src } : {}),
+    ...(file.mimeType ? { mimeType: file.mimeType } : resolved?.mimeType ? { mimeType: resolved.mimeType } : {}),
+    ...(typeof file.size === "number" ? { size: file.size } : {}),
+    ...(resolved?.isMarkdown ? { isMarkdown: true } : {}),
+  };
+}
+
 function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   // The fork command names a message by its place among the user's messages on screen.
   const ordinal = () =>
@@ -560,18 +597,21 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
       .filter((row) => row.kind === "user")
       .findIndex((row) => row.id === props.row.id);
   const open = () => isOpen(props.row.id, false);
-  /** The message as its words and the documents that rode on them (`lib/doc-wire.ts`); read again only when the text is another. */
+  /** The message as its words, attached documents, and attached files (`lib/doc-wire.ts`, `lib/media.ts`); read again only when the text is another. */
   let readText: string | undefined;
-  let read: { said: string; docs: DocPart[] } = { said: "", docs: [] };
+  let read: { said: string; docs: DocPart[]; files: FileAttachment[] } = { said: "", docs: [], files: [] };
   const parts = () => {
     const text = props.row.text;
     if (text !== readText) {
       readText = text;
-      read = splitDocMessage(text);
+      const fileSplit = splitFileMessage(text);
+      const docSplit = splitDocMessage(fileSplit.said);
+      read = { said: docSplit.said, docs: docSplit.docs, files: fileSplit.files };
     }
     return read;
   };
   const said = () => parts().said;
+  const fileMedia = () => parts().files.map((file, idx) => fileAttachmentToMedia(file, `${props.row.id}:att:${idx}`));
   const measureKey = () => `${props.row.id}:${readingSize()}`;
   const foldable = () => {
     const measured = userLineCounts()[measureKey()];
@@ -584,7 +624,7 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   const queued = () => props.row.queued === true;
   /** How it will go: into the run at its next step, or after the run is done. The queue keeps wire text; the row's is stripped. */
   const followsUp = () => {
-    const said = (wire: string) => withoutHandoff(withoutImageNotes(wire));
+    const said = (wire: string) => withoutPreamble(withoutImageNotes(wire));
     const q = messageQueue();
     return q.followUp.some((wire) => said(wire) === props.row.text) && !q.steering.some((wire) => said(wire) === props.row.text);
   };
@@ -651,6 +691,9 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
       <View class="max-w-[70%] items-end gap-1.5" style={{ opacity: bubbleOpacity }}>
         <If when={hasImages()}>
           <UserImages images={imageBlocks()} missing={missingImages()} onContextMenu={contextMenu} />
+        </If>
+        <If when={fileMedia().length > 0}>
+          <MediaGallery items={fileMedia()} compact align="end" />
         </If>
         <If when={hasBubble()}>
           <View
@@ -1044,31 +1087,46 @@ const diffOf = (row: ToolRow) => {
   return typeof details?.diff === "string" && details.diff ? details.diff : undefined;
 };
 
-/** What a call did, unfolded: the diff an edit made, else its output (a command's under its command line). */
+/** What a call did, unfolded: the diff an edit made, media results returned/presented, else its output (a command's under its command line). */
 function ToolDetail(props: { row: ToolRow; insetClass?: string }) {
   const command = () => (classifyTool(props.row.name).category === "command" ? String(props.row.args?.command ?? props.row.args?.cmd ?? "").trim() : "");
+  const media = () => extractToolResultMedia(props.row, workspacePath(), backend().home());
+  const suppressPresentDump = () => isPresentFilesTool(props.row.name) && props.row.status !== "error" && media().length > 0;
   const detail = () => {
+    if (suppressPresentDump()) return "";
     if (props.row.output) return props.row.output;
     if (props.row.status === "call") return tr("Writing tool arguments…", "正在生成调用参数…");
     if (props.row.status === "queued" || props.row.status === "running") return tr("Running…", "正在运行…");
-    if (props.row.images) return tr(`${props.row.images} image${props.row.images === 1 ? "" : "s"} returned.`, `返回了 ${props.row.images} 张图片。`);
+    if (props.row.images) return media().length > 0 ? "" : tr(`${props.row.images} image${props.row.images === 1 ? "" : "s"} returned.`, `返回了 ${props.row.images} 张图片。`);
     if (command()) return "";
     const rawArgs = JSON.stringify(props.row.args ?? {}, null, 2);
     return rawArgs && rawArgs !== "{}" ? rawArgs : tr("Completed with no output.", "已完成，无额外输出。");
   };
   return (
-    <If when={diffOf(props.row)} else={<Output text={detail()} command={command()} tone={props.row.status === "error" ? "error" : undefined} insetClass={props.insetClass} />}>
-      {(diff) => (
-        <View class={`mb-1 mt-0.5 ${props.insetClass ?? "ml-6"}`}>
-          <TextView
-            markdown={`\`\`\`diff\n${clip(diff(), 400).text}\n\`\`\``}
-            selectable
-            codeBlockScrollbar={false}
-            classes={{ codeBlock: proseClasses().codeBlock, codeBlockCode: `p-3 ${codeType()}` }}
-          />
-        </View>
-      )}
-    </If>
+    <View>
+      <If when={media().length > 0}>
+        <MediaGallery items={media()} compact class={`mb-1 mt-1 ${props.insetClass ?? "ml-6"}`} />
+      </If>
+      <If
+        when={diffOf(props.row)}
+        else={
+          <If when={detail() || command()}>
+            <Output text={detail()} command={command()} tone={props.row.status === "error" ? "error" : undefined} insetClass={props.insetClass} />
+          </If>
+        }
+      >
+        {(diff) => (
+          <View class={`mb-1 mt-0.5 ${props.insetClass ?? "ml-6"}`}>
+            <TextView
+              markdown={`\`\`\`diff\n${clip(diff(), 400).text}\n\`\`\``}
+              selectable
+              codeBlockScrollbar={false}
+              classes={{ codeBlock: proseClasses().codeBlock, codeBlockCode: `p-3 ${codeType()}` }}
+            />
+          </View>
+        )}
+      </If>
+    </View>
   );
 }
 
@@ -1366,6 +1424,27 @@ function SummaryRow(props: { row: Extract<Row, { kind: "summary" }> }) {
   );
 }
 
+function extractDeliveryMedia(markdown: string, cwd?: string, home?: string, rowId = "del"): MediaItem[] {
+  const paths = [...extractMarkdownMediaPaths(markdown, cwd, home)];
+  const out: MediaItem[] = [];
+  paths.forEach((p, idx) => {
+    const resolved = resolveMediaTarget(p, cwd, home);
+    if (!resolved) return;
+    if (resolved.kind === "image" || resolved.kind === "video" || resolved.kind === "audio" || resolved.kind === "document" || resolved.kind === "archive") {
+      out.push({
+        id: `${rowId}:m:${idx}`,
+        kind: resolved.kind,
+        title: resolved.title,
+        ...(resolved.path ? { path: resolved.path } : {}),
+        ...(resolved.src ? { src: resolved.src } : {}),
+        ...(resolved.mimeType ? { mimeType: resolved.mimeType } : {}),
+        ...(resolved.isMarkdown ? { isMarkdown: true } : {}),
+      });
+    }
+  });
+  return out;
+}
+
 /** An answer delivered back from another session (`<pipi-message>`): one labelled divider, its text unfolds. */
 function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
   const open = () => isOpen(props.row.id, false);
@@ -1375,13 +1454,42 @@ function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
       : props.row.status === "failed"
         ? tr(`${props.row.fromTitle} stopped`, `「${props.row.fromTitle}」已停止`)
         : tr(`Answer from ${props.row.fromTitle}`, `「${props.row.fromTitle}」的回答`);
+  const media = () => extractDeliveryMedia(props.row.text, workspacePath(), backend().home(), props.row.id);
   return (
     <Collapsible
       open={open()}
       reveal
       content={
-        <View class="mt-2 rounded-lg corner-squircle border border-border bg-card px-3 py-2.5">
-          <TextView markdown={props.row.text} selectable codeBlockScrollbar={false} tableScrollbar={false} classes={detailProse()} />
+        <View class="mt-2 gap-2 rounded-lg corner-squircle border border-border bg-card px-3 py-2.5">
+          <TextView
+            markdown={props.row.text}
+            selectable
+            links="report"
+            codeBlockScrollbar={false}
+            tableScrollbar={false}
+            classes={detailProse()}
+            onLinkPress={({ url }) => {
+              const resolved = resolveMediaTarget(url, workspacePath(), backend().home());
+              if (resolved?.path) void openLocalFile(resolved.path);
+              else void openUrl(url);
+            }}
+            onImagePress={({ image }) => {
+              const resolved = resolveMediaTarget(image.src, workspacePath(), backend().home());
+              openMediaZoom({
+                id: `del-img:${image.src}`,
+                kind: "image",
+                title: image.title || image.alt || resolved?.title || "image",
+                ...(resolved?.path ? { path: resolved.path } : {}),
+                src: resolved?.src ?? image.src,
+                ...(resolved?.remoteUrl ? { remoteUrl: resolved.remoteUrl } : {}),
+                ...(resolved?.mimeType ? { mimeType: resolved.mimeType } : {}),
+                ...(resolved?.data ? { data: resolved.data } : {}),
+              });
+            }}
+          />
+          <If when={media().length > 0}>
+            <MediaGallery items={media()} compact />
+          </If>
         </View>
       }
     >
@@ -1421,6 +1529,7 @@ const SPACING: Record<ChatRow["kind"], string> = {
   // where a drag dead-ends back to the block before; keep it thin.
   prose: "py-0.5",
   actions: "pb-1",
+  media: "py-2",
   thinking: "py-1",
   activity: "py-1",
   bash: "py-1",
@@ -1454,6 +1563,7 @@ export function TranscriptRow(props: { row: ChatRow }) {
             <If when={of("turn")}>{(row) => <TurnHeaderView row={row()} />}</If>
             <If when={of("activity")}>{(row) => <ActivityView row={row()} />}</If>
             <If when={of("prose")}>{(row) => <ProseBlock row={row()} />}</If>
+            <If when={of("media")}>{(row) => <MediaGallery title={row().title} items={row().items} />}</If>
             <If when={of("actions")}>{(row) => <ReplyActionsView row={row()} />}</If>
             <If when={of("thinking")}>{(row) => <ThinkingRow row={row()} />}</If>
             <If when={of("bash")}>{(row) => <BashRow row={row()} />}</If>

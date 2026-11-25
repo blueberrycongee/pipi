@@ -106,6 +106,7 @@ never does.
 | Welcome / waking / failure stage (`views/Chat.tsx`) | 96 (welcome) / 80 (waking, failure) | from `pipMood` |
 | Activity line under the transcript (`views/Chat.tsx`) | 22 | from `pipMood`; alone once the run has rows of its own, with words only for what no row says |
 | Running session, draft, child session, or collapsed running project in the sidebar (`views/Sidebar.tsx`) | 16 | work |
+| Pip's own row, pinned above the sidebar's lists (`views/PipRow.tsx`) | 16, still | idle; work while it runs |
 | Empty single-folder sidebar (`views/Sidebar.tsx`) | 40, still | sleep |
 | Update card (`views/UpdateCard.tsx`) | 22 | `idle` / `work` / `happy` along the track |
 | Settings → General coat picker (`views/Settings.tsx`) | 40 | `idle` (`still`); chosen coat `happy` |
@@ -247,8 +248,9 @@ A document is a page of the person's own words — a brief the composer is too
 small for, a draft the agents help with — and the page is the writing and
 nothing else: no toolbar, no title field (its first line names it), no status
 bar. Formatting comes to the caret: `/` lists the blocks, a selection raises
-the marks. The column is the conversation's, a step narrower (720): prose
-being written, not replies being read.
+the marks. The column is the conversation's, a step narrower (720), on the
+same 24pt margin when the window is narrow (`DOC_COLUMN`, `lib/layout.ts`):
+prose being written, not replies being read.
 
 The editor lays blocks out as a flow with no gap of its own, so the rhythm is
 each block's margins (`editorClasses`, `views/DocEditor.tsx`): paragraphs

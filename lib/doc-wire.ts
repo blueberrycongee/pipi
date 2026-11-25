@@ -21,6 +21,8 @@
  * (`views/Rows.tsx`) reads the blocks back as cards.
  */
 
+import { stripTrailingAttachments } from "./media";
+
 export interface DocPart {
   /** The document's file. */
   path: string;
@@ -149,10 +151,12 @@ export function splitDocMessage(text: string): { said: string; docs: DocPart[] }
  * `sidecar/session-index.mjs` is the same reading on the Node side).
  */
 export function titleWords(text: string): string {
-  if (!text.includes(' path="')) return text;
-  const said = text.replace(/(?:^|\s)<(?:document|selection) path="[^"]*">[\s\S]*$/, "").trim();
+  const { said: withoutAttach, firstAttachmentName } = stripTrailingAttachments(text);
+  const target = withoutAttach.trim() ? withoutAttach : firstAttachmentName ?? text;
+  if (!target.includes(' path="')) return target;
+  const said = target.replace(/(?:^|\s)<(?:document|selection) path="[^"]*">[\s\S]*$/, "").trim();
   if (said) return said;
-  return text.replace(/^\s*<(?:document|selection) path="[^"]*">\s*/, "").replace(/\s*<\/(?:document|selection)>[\s\S]*$/, "");
+  return target.replace(/^\s*<(?:document|selection) path="[^"]*">\s*/, "").replace(/\s*<\/(?:document|selection)>[\s\S]*$/, "");
 }
 
 /** A line that opens or closes a fenced code block: its marker, or `undefined`. */

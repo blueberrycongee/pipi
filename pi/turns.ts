@@ -1,5 +1,12 @@
 import { basename } from "../lib/format";
 import type { Lang } from "../lib/i18n";
+import {
+  extractMarkdownMediaPaths,
+  extractPresentedMedia,
+  extractToolResultMedia,
+  isPresentFilesTool,
+  type MediaItem,
+} from "../lib/media";
 import type { IconName } from "../ui/Icon";
 import type { Row, ToolRow } from "./transcript";
 
@@ -22,7 +29,7 @@ import type { Row, ToolRow } from "./transcript";
  * else folds or unfolds on its own, and a reader's own toggle holds from then on.
  */
 
-export type ToolCategory = "read" | "edit" | "create" | "search" | "list" | "command" | "agent" | "web" | "todo" | "other";
+export type ToolCategory = "read" | "edit" | "create" | "search" | "list" | "command" | "agent" | "web" | "todo" | "present" | "other";
 
 export interface DiffStats {
   added: number;
@@ -88,7 +95,14 @@ export interface TurnHeaderRow {
   summaryTools?: readonly ToolRow[];
 }
 
-export type DisplayRow = Exclude<Row, ToolRow> | ActivityRow | TurnHeaderRow;
+export interface MediaDisplayRow {
+  kind: "media";
+  id: string;
+  title?: string;
+  items: MediaItem[];
+}
+
+export type DisplayRow = Exclude<Row, ToolRow | { kind: "media" }> | ActivityRow | TurnHeaderRow | MediaDisplayRow;
 
 // ── Tool Classification & Copywriting ────────────────────────────────────────
 
@@ -203,6 +217,9 @@ export function classifyTool(rawName: string): { category: ToolCategory; subkind
   }
   if (lower === "todo_write" || lower === "todowrite" || lower === "update_plan" || lower === "plan" || lower === "todo") {
     return { category: "todo", icon: "check" };
+  }
+  if (lower === "present_files") {
+    return { category: "present", icon: "image" };
   }
   return { category: "other", icon: "wrench" };
 }
@@ -480,6 +497,33 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
       };
     }
 
+    case "present": {
+      const files = Array.isArray(args.files) ? args.files : [];
+      const firstEntry = files[0];
+      const firstPath =
+        typeof firstEntry === "string"
+          ? firstEntry
+          : firstEntry && typeof firstEntry === "object"
+            ? pickStr(firstEntry as Record<string, unknown>, "title", "path")
+            : pickStr(args, "title", "path");
+      const count = files.length;
+      const target =
+        count > 1
+          ? zh ? `${count} 个文件` : `${count} files`
+          : firstPath
+            ? shortFileTarget(firstPath)
+            : zh ? "文件" : "files";
+      const verb = active ? (zh ? "正在展示" : "Presenting") : failed ? (zh ? "展示失败" : "Present failed") : zh ? "已展示" : "Presented";
+      return {
+        category,
+        icon,
+        verb,
+        target,
+        meta: count > 1 && firstPath ? shortFileTarget(firstPath) : "",
+        monoTarget: count <= 1 && Boolean(firstPath) && firstPath.includes("/"),
+      };
+    }
+
     default: {
       const label = humanizeToolName(row.name) || (zh ? "工具" : "tool");
       const target = pickStr(args, "path", "file_path", "command", "query", "pattern", "url", "title", "name", "description");
@@ -517,7 +561,7 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
 // by kind in the order it first happened ("Ran git, Read 3 files"). No icons,
 // target lists, timings or counters that tick along with every call.
 
-type SegmentKey = "read" | "list" | "search" | "edit" | "command" | "agent" | "todo" | "other";
+type SegmentKey = "read" | "list" | "search" | "edit" | "command" | "agent" | "todo" | "present" | "other";
 
 const segmentKey = (category: ToolCategory): SegmentKey => (category === "create" ? "edit" : category === "web" ? "search" : category);
 
@@ -608,6 +652,19 @@ function toolLine(tool: ToolRow, running: boolean, zh: boolean): string {
     }
     case "todo":
       return zh ? (running ? "正在更新计划" : "已更新计划") : running ? "Updating plan" : "Updated plan";
+    case "present": {
+      const files = Array.isArray(args.files) ? args.files : [];
+      const firstEntry = files[0];
+      const firstPath =
+        typeof firstEntry === "string"
+          ? firstEntry
+          : firstEntry && typeof firstEntry === "object"
+            ? pickStr(firstEntry as Record<string, unknown>, "title", "path")
+            : pickStr(args, "title", "path");
+      const verb = running ? (zh ? "正在展示" : "Presenting") : zh ? "已展示" : "Presented";
+      if (files.length > 1) return zh ? `${verb} ${files.length} 个文件` : `${verb} ${files.length} files`;
+      return firstPath ? `${verb} ${basename(firstPath)}` : zh ? `${verb}文件` : `${verb} files`;
+    }
     default: {
       const name = humanizeToolName(tool.name) || (zh ? "工具" : "tool");
       const label = /\s/.test(tool.name.trim()) ? name : name[0].toUpperCase() + name.slice(1);
@@ -644,6 +701,10 @@ function segmentLine(key: SegmentKey, tools: ToolRow[], zh: boolean): string {
       return zh ? `已完成 ${tools.length} 个子任务` : `Ran ${tools.length} subtasks`;
     case "todo":
       return toolLine(tools[0], false, zh);
+    case "present": {
+      if (tools.length === 1) return toolLine(tools[0], false, zh);
+      return zh ? `已展示 ${tools.length} 组文件` : `Presented ${tools.length} sets`;
+    }
     default: {
       const names = unique(tools.map((tool) => humanizeToolName(tool.name)));
       if (names.length <= 1) return toolLine(tools[0], false, zh);
@@ -753,9 +814,9 @@ export function describeActiveStep(step: NonNullable<TurnHeaderRow["activeStep"]
 
 // ── Projection ───────────────────────────────────────────────────────────────
 
-type TurnRow = Extract<Row, { kind: "thinking" | "text" }> | ToolRow;
+type TurnRow = Extract<Row, { kind: "thinking" | "text" | "media" }> | ToolRow;
 
-const isTurnRow = (row: Row): row is TurnRow => row.kind === "thinking" || row.kind === "tool" || row.kind === "text";
+const isTurnRow = (row: Row): row is TurnRow => row.kind === "thinking" || row.kind === "tool" || row.kind === "text" || row.kind === "media";
 
 function activityOf(steps: ProcessStep[]): ActivityRow {
   const tools = steps.filter((step): step is ToolRow => step.kind === "tool");
@@ -792,12 +853,20 @@ export interface TurnFolds {
  * A turn's process shows as the reader left it (`folds.chosen`), else by
  * default: open while the run is on it, folded once it is over.
  */
+function mediaItemKey(item: MediaItem): string | undefined {
+  if (item.path) return `path:${item.path}`;
+  if (item.remoteUrl) return `url:${item.remoteUrl}`;
+  if (item.data) return `data:${item.mimeType ?? ""}:${item.data.slice(0, 64)}:${item.data.length}`;
+  return undefined;
+}
+
 export function buildDisplayRows(
   rows: readonly Row[],
   sessionRunning = false,
   folds: TurnFolds = {},
   /** Filled with the turn each shown process row belongs to, by row id, when given. */
   processOf?: Map<string, string>,
+  context?: { cwd?: string; home?: string },
 ): DisplayRow[] {
   const out: DisplayRow[] = [];
   /** The reader folded the work the next turn carries on. */
@@ -814,6 +883,8 @@ export function buildDisplayRows(
     const first = row;
     const process: DisplayRow[] = [];
     const answer: DisplayRow[] = [];
+    const presentedMedia: MediaDisplayRow[] = [];
+    const autoMedia: MediaDisplayRow[] = [];
     const turnTools: ToolRow[] = [];
     const turnSteps: ProcessStep[] = [];
     let steps: ProcessStep[] = [];
@@ -839,12 +910,36 @@ export function buildDisplayRows(
           tailClosed = false;
         }
       }
+      if (cur.kind === "media") {
+        if (cur.items.length > 0) {
+          presentedMedia.push({ kind: "media", id: cur.id, ...(cur.title ? { title: cur.title } : {}), items: cur.items });
+        }
+        continue;
+      }
       if (cur.kind === "tool" || cur.kind === "thinking") {
         steps.push(cur);
         turnSteps.push(cur);
         if (cur.kind === "tool") {
           turnTools.push(cur);
           if (cur.background && isToolActive(cur.status)) backgroundStep = cur;
+          if (cur.status === "done") {
+            if (isPresentFilesTool(cur.name)) {
+              const presented = extractPresentedMedia(cur, context?.cwd, context?.home);
+              if (presented && presented.items.length > 0) {
+                presentedMedia.push({
+                  kind: "media",
+                  id: `media:${cur.id}`,
+                  ...(presented.title ? { title: presented.title } : {}),
+                  items: presented.items,
+                });
+              }
+            } else if (classifyTool(cur.name).category !== "read" && (cur.imageBlocks?.length || cur.resources?.length)) {
+              const items = extractToolResultMedia(cur, context?.cwd, context?.home);
+              if (items.length > 0) {
+                autoMedia.push({ kind: "media", id: `media:${cur.id}`, items });
+              }
+            }
+          }
         }
         continue;
       }
@@ -855,6 +950,35 @@ export function buildDisplayRows(
       else process.push(cur);
     }
     flushSteps();
+
+    const answerPaths = new Set<string>();
+    for (const ans of answer) {
+      if (ans.kind !== "text") continue;
+      for (const p of extractMarkdownMediaPaths(ans.text, context?.cwd, context?.home)) answerPaths.add(p);
+    }
+    const seenKeys = new Set<string>();
+    const surfacedMedia: MediaDisplayRow[] = [];
+    for (const group of presentedMedia) {
+      const items = group.items.filter((item) => {
+        const key = mediaItemKey(item);
+        if (!key) return true;
+        if (seenKeys.has(key)) return false;
+        seenKeys.add(key);
+        return true;
+      });
+      if (items.length > 0) surfacedMedia.push({ ...group, items });
+    }
+    for (const group of autoMedia) {
+      const items = group.items.filter((item) => {
+        if (item.path && answerPaths.has(item.path)) return false;
+        const key = mediaItemKey(item);
+        if (!key) return true;
+        if (seenKeys.has(key)) return false;
+        seenKeys.add(key);
+        return true;
+      });
+      if (items.length > 0) surfacedMedia.push({ ...group, items });
+    }
 
     const answered = answer.length > 0;
     const durationMs = tailClosed ? totalTurnMs : undefined;
@@ -896,7 +1020,7 @@ export function buildDisplayRows(
       out.push(...process);
       if (processOf) for (const row of process) processOf.set(row.id, id);
     }
-    out.push(...answer);
+    out.push(...answer, ...surfacedMedia);
   }
   // One looping status cue at a time: the newest row still working breathes,
   // every one still working behind it stands still.
@@ -912,8 +1036,30 @@ export function buildDisplayRows(
 
 const sameList = (a: readonly unknown[], b: readonly unknown[]) => a.length === b.length && a.every((item, at) => item === b[at]);
 
+function sameMediaItem(a: MediaItem, b: MediaItem): boolean {
+  return (
+    a === b ||
+    (a.id === b.id &&
+      a.kind === b.kind &&
+      a.title === b.title &&
+      a.caption === b.caption &&
+      a.path === b.path &&
+      a.src === b.src &&
+      a.remoteUrl === b.remoteUrl &&
+      a.mimeType === b.mimeType &&
+      a.data === b.data &&
+      a.size === b.size &&
+      a.width === b.width &&
+      a.height === b.height &&
+      a.missing === b.missing)
+  );
+}
+
 function sameRow(a: DisplayRow, b: DisplayRow): boolean {
   if (a === b) return true;
+  if (a.kind === "media" && b.kind === "media") {
+    return a.title === b.title && a.items.length === b.items.length && a.items.every((item, at) => sameMediaItem(item, b.items[at]));
+  }
   if (a.kind === "activity" && b.kind === "activity") return a.live === b.live && a.mayGrow === b.mayGrow && sameList(a.steps, b.steps);
   if (a.kind === "turn" && b.kind === "turn") {
     return (
@@ -945,7 +1091,10 @@ export function displayRowIds(rows: readonly Row[]): string[] {
     if (!isTurnRow(row)) continue;
     ids.push(`turn:${row.id}`);
     if (row.kind === "text") ids.push(`${row.id}#actions`);
-    else ids.push(`act:${row.id}`);
+    else if (row.kind === "tool") {
+      ids.push(`act:${row.id}`);
+      ids.push(`media:${row.id}`);
+    } else ids.push(`act:${row.id}`);
   }
   return ids;
 }

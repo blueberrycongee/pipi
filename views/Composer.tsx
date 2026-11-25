@@ -5,14 +5,17 @@ import { Button as BaseButton, Input, Popover } from "nsh/base";
 import { money } from "../lib/format";
 import { matchDocMentions, readDocMention, removeDocMention, type DocMentionInput } from "../lib/doc-mention";
 import { commandSourceLabel, tr } from "../lib/i18n";
+import { extensionLabel, formatBytes, isRichPasteFile, type FileAttachment } from "../lib/media";
 import { matchCommands, matchOptions, readSlashInput } from "../lib/slash";
 import { compactNumber } from "../pi/transcript";
 import {
   activeAgent,
   addAttachment,
+  attachLocalPath,
   composerAttachments,
   composerDocs,
   composerDraft,
+  composerFiles,
   composerFocusTick,
   currentView,
   detachDoc,
@@ -24,7 +27,11 @@ import {
   isBashRunning,
   isDraftAhead,
   isRunning,
+  openLocalFile,
+  pendingDialog,
+  pickComposerFile,
   removeAttachment,
+  removeFileAttachment,
   send,
   sessionState,
   sessionStats,
@@ -47,8 +54,9 @@ import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, POPUP, PRESS
 import { tip } from "../ui/Tip";
 import { readingType, uiHeight, uiMinHeight, uiType } from "../ui/typography";
 import { AgentPicker, PermissionPicker } from "./AgentPicker";
+import { openMediaZoom } from "./Media";
 import { ExtensionPrompt } from "./ExtensionDialog";
-import { ModelPicker, ThinkingPicker } from "./ModelPicker";
+import { ModelConfigPickers, ModelPicker, ThinkingPicker } from "./ModelPicker";
 
 const MIN_HEIGHT = 32;
 const MAX_HEIGHT = 220;
@@ -544,17 +552,71 @@ function DocCard(props: { doc: DocRef }) {
   );
 }
 
+function fileCardIcon(kind: FileAttachment["kind"]): IconName {
+  if (kind === "video") return "video";
+  if (kind === "audio") return "audio";
+  if (kind === "image") return "image";
+  if (kind === "archive") return "archive";
+  return "file";
+}
+
+function FileCard(props: { file: FileAttachment }) {
+  const meta = () => [extensionLabel(props.file.path, props.file.mimeType), formatBytes(props.file.size)].filter(Boolean).join(" · ");
+  const preview = () => {
+    if (props.file.kind === "image" || props.file.kind === "video") {
+      openMediaZoom({
+        id: `att:${props.file.path}`,
+        kind: props.file.kind,
+        title: props.file.name,
+        path: props.file.path,
+        src: props.file.path,
+        mimeType: props.file.mimeType,
+        size: props.file.size,
+      });
+    } else {
+      void openLocalFile(props.file.path);
+    }
+  };
+  return (
+    <View testID="composer-file" class={`group relative ${uiHeight(56)} w-52 shrink-0`} style={enter("zoomIn")}>
+      <BaseButton
+        onPress={preview}
+        accessibilityLabel={props.file.name}
+        tooltip={tip(props.file.path)}
+        class={`size-full flex-row items-center gap-2.5 rounded-lg corner-squircle border-[0.5px] border-hairline-hover bg-background/70 pl-2 pr-3 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:border-hairline-focus hover:bg-accent`}
+      >
+        <View class="size-9 shrink-0 items-center justify-center rounded-md corner-squircle bg-muted">
+          <Icon name={fileCardIcon(props.file.kind)} size={16} tone="muted-foreground" />
+        </View>
+        <View class="min-w-0 flex-1">
+          <Text class={`truncate ${uiType("sm")} font-medium text-foreground`}>{props.file.name}</Text>
+          <Text class={`truncate ${uiType("xs")} text-subtle`}>{meta()}</Text>
+        </View>
+      </BaseButton>
+      <BaseButton
+        onPress={() => removeFileAttachment(props.file.path)}
+        accessibilityLabel={tr("Remove file", "移除文件")}
+        tooltip={tip(tr("Remove file", "移除文件"))}
+        class={`absolute right-1 top-1 size-5 items-center justify-center rounded-full border-[0.5px] border-hairline-hover bg-popover shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-secondary ${HOVER_REVEAL}`}
+      >
+        <Icon name="x" size={12} tone="foreground" />
+      </BaseButton>
+    </View>
+  );
+}
+
 /**
  * What rides on the message waits in a tray that rises from behind the
  * composer's top edge: a little narrower than the composer, its lower edge
  * tucked under it, so adding to it never changes the input's own size.
- * Documents come first, then pasted images — a thumbnail is its own card.
- * Each one's remove button shows on hover or focus.
+ * Documents come first, then attached files, then pasted images — each one's
+ * remove button shows on hover or focus.
  */
 function AttachmentTray() {
-  const held = () => composerAttachments().length > 0 || composerDocs().length > 0;
-  const shown = keepLast(() => (held() ? { docs: composerDocs(), images: composerAttachments() } : undefined), {
+  const held = () => composerAttachments().length > 0 || composerDocs().length > 0 || composerFiles().length > 0;
+  const shown = keepLast(() => (held() ? { docs: composerDocs(), files: composerFiles(), images: composerAttachments() } : undefined), {
     docs: composerDocs(),
+    files: composerFiles(),
     images: composerAttachments(),
   });
   return (
@@ -566,6 +628,9 @@ function AttachmentTray() {
         <Scroll horizontal contentClass="flex-row gap-2 p-2">
           <Each of={shown()?.docs ?? []} key={(doc) => doc.path}>
             {(doc) => <DocCard doc={doc()} />}
+          </Each>
+          <Each of={shown()?.files ?? []} key={(file) => file.path}>
+            {(file) => <FileCard file={file()} />}
           </Each>
           <Each of={shown()?.images ?? []} key="index">
             {(image, index) => (
@@ -731,7 +796,7 @@ export function Composer() {
   const ready = () => sidecarPhase().name === "ready";
   const canSend = () => ready() || isDraftAhead();
   const working = () => isRunning() || isBashRunning() || waitingCount() > 0;
-  const hasText = () => composerDraft().trim().length > 0 || composerAttachments().length > 0 || composerDocs().length > 0;
+  const hasText = () => composerDraft().trim().length > 0 || composerAttachments().length > 0 || composerDocs().length > 0 || composerFiles().length > 0;
   const showPlaceholder = computed(() => composerDraft().length === 0 && !composing());
   const statusLine = () => Object.values(extensionStatuses()).join("  ·  ");
   const shownStatus = keepLast(() => statusLine() || undefined, "");
@@ -784,7 +849,8 @@ export function Composer() {
   const sendMenuOpen = signal(false);
   /** When a press closed the menu as an outside press, so the button it landed on doesn't reopen it on release. */
   let sendMenuClosedAt = 0;
-  const wireMode = () => (sendMode() === "queue" ? ("followUp" as const) : ("steer" as const));
+  const questionOpen = () => pendingDialog()?.method === "form";
+  const wireMode = () => (questionOpen() || sendMode() === "queue" ? ("followUp" as const) : ("steer" as const));
   /** A send press: an explicit mode wins; otherwise the menu's choice decides. */
   const fireSend = (mode?: "steer" | "followUp") => void send(mode ?? wireMode());
   const chooseDocMention = (row: DocMentionRow) => {
@@ -817,13 +883,13 @@ export function Composer() {
   };
 
   const sendLabel = () =>
-    sendMode() === "queue"
+    wireMode() === "followUp"
       ? tr("Queue", "排队发送")
       : isRunning()
         ? tr("Interrupt & send", "打断发送")
         : tr("Send", "发送");
   const sendTipText = () =>
-    sendMode() === "queue"
+    wireMode() === "followUp"
       ? tr("Queue — sends after the run finishes", "排队发送 — 本轮结束后发送")
       : isRunning()
         ? tr("Interrupt & send — sent at the run's next step", "打断发送 — 在本轮的下一步发送")
@@ -871,11 +937,34 @@ export function Composer() {
       const paths = uris.map(fileUriPath).filter((path): path is string => !!path);
       for (const path of paths) {
         const name = path.split("/").pop() ?? path;
-        const declared = IMAGE_EXTENSIONS[name.split(".").pop()?.toLowerCase() ?? ""] ?? "";
+        const ext = name.split(".").pop()?.toLowerCase() ?? "";
+        const declared = IMAGE_EXTENSIONS[ext] ?? "";
+        if (!declared && isRichPasteFile(path)) {
+          const ok = await attachLocalPath(path);
+          if (ok) {
+            attached++;
+            continue;
+          }
+        }
         try {
-          attach(name, declared, await readFile(path), path);
+          const bytes = await readFile(path);
+          const mimeType = sniffImageType(bytes) ?? (IMAGE_TYPES.has(declared) ? (declared === "image/jpg" ? "image/jpeg" : declared) : undefined);
+          if (mimeType && (!vision || bytes.length > MAX_IMAGE_BYTES)) {
+            if (await attachLocalPath(path)) {
+              attached++;
+              continue;
+            }
+          }
+          attach(name, declared, bytes, path);
         } catch {
           // A folder, a file gone between copy and paste, or one we may not read.
+          if (isRichPasteFile(path)) {
+            const ok = await attachLocalPath(path);
+            if (ok) {
+              attached++;
+              continue;
+            }
+          }
           (declared ? unreadImages : references).push(path);
         }
       }
@@ -919,6 +1008,7 @@ export function Composer() {
     if (ready() && !hasModel()) return tr("Connect a model provider to start", "连接模型服务商以开始使用");
     // A document rides on the message: words are what to do with it, and none sends it as it is.
     if (composerDocs().length) return tr("Say what to do with it, or just send", "说说要怎么处理，或直接发送");
+    if (questionOpen()) return tr("Queue a follow-up…", "排队发送后续消息…");
     if (isRunning()) return tr(`Steer ${name}…`, `引导 ${name}…`);
     return tr(`Ask ${name}…`, `问问 ${name}…`);
   };
@@ -1000,12 +1090,21 @@ export function Composer() {
             <View class="min-w-0 flex-1 flex-row flex-wrap items-center gap-0.5">
               <AgentPicker onOpen={dismissMenus} />
               <ModelPicker onOpen={dismissMenus} />
+              <ModelConfigPickers onOpen={dismissMenus} />
               <ThinkingPicker onOpen={dismissMenus} />
             </View>
             <View class="shrink-0 flex-row items-center gap-1.5">
               <If when={ready()}>
                 <ContextMeter />
               </If>
+              <IconButton
+                icon="paperclip"
+                size="sm"
+                tone="subtle"
+                label={tr("Attach file", "添加文件")}
+                tipPlacement="top"
+                onPress={() => void pickComposerFile()}
+              />
               <PermissionPicker onOpen={dismissMenus} />
               <View style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
                 <If

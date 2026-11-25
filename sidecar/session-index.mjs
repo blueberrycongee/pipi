@@ -41,20 +41,55 @@ function withoutImageNotes(text) {
 // file (`lib/doc-wire.ts`). A title is the words; a prompt that was only documents is titled by
 // what the first one says. Read loosely, so a text already clipped or run onto one line is too.
 const DOC_BLOCK = /(?:^|\s)<(?:document|selection) path="[^"]*">[\s\S]*$/;
+const ATTACHMENT_LINE = /^<attachment\s+[^>]*\bpath="([^"\n]*)"[^>]*\/>$/;
+
+function stripTrailingAttachments(text) {
+  const trimmed = text.replace(/\s+$/, "");
+  if (!trimmed.includes("<attachment ")) return { said: text };
+  const parseLines = (tail) => {
+    const lines = tail.split("\n");
+    const paths = [];
+    for (const line of lines) {
+      const hit = ATTACHMENT_LINE.exec(line);
+      if (!hit) return undefined;
+      paths.push(hit[1]);
+    }
+    return paths.length ? paths : undefined;
+  };
+  if (trimmed.startsWith("<attachment ")) {
+    const paths = parseLines(trimmed);
+    if (paths) return { said: "", first: path.basename(paths[0]) };
+  }
+  const marker = "\n\n<attachment ";
+  let at = trimmed.lastIndexOf(marker);
+  while (at >= 0) {
+    const paths = parseLines(trimmed.slice(at + 2));
+    if (paths) return { said: trimmed.slice(0, at), first: path.basename(paths[0]) };
+    at = trimmed.lastIndexOf(marker, at - 1);
+  }
+  return { said: text };
+}
 
 export function titleWords(text) {
-  if (typeof text !== "string" || !text.includes(' path="')) return text;
-  const said = text.replace(DOC_BLOCK, "").trim();
+  if (typeof text !== "string") return text;
+  const { said: withoutAttach, first } = stripTrailingAttachments(text);
+  const target = withoutAttach.trim() ? withoutAttach : first ?? text;
+  if (!target.includes(' path="')) return target;
+  const said = target.replace(DOC_BLOCK, "").trim();
   if (said) return said;
-  return text.replace(/^\s*<(?:document|selection) path="[^"]*">\s*/, "").replace(/\s*<\/(?:document|selection)>[\s\S]*$/, "");
+  return target.replace(/^\s*<(?:document|selection) path="[^"]*">\s*/, "").replace(/\s*<\/(?:document|selection)>[\s\S]*$/, "");
 }
+
+// The personal agent's fresh conversations open with its persona (`withPersona` in
+// `sidecar/pipi-daemon.mjs`); the person's words follow it.
+const PERSONA_PREFIX = /^<pipi-persona\b[^>]*>[\s\S]*?<\/pipi-persona>\n\n/;
 
 function messageText(message) {
   const content = message?.content;
-  if (typeof content === "string") return titleWords(content);
+  if (typeof content === "string") return titleWords(content.replace(PERSONA_PREFIX, ""));
   if (Array.isArray(content)) {
     for (const block of content) {
-      if (block?.type === "text" && typeof block.text === "string") return titleWords(withoutImageNotes(block.text));
+      if (block?.type === "text" && typeof block.text === "string") return titleWords(withoutImageNotes(block.text.replace(PERSONA_PREFIX, "")));
     }
   }
   return "";

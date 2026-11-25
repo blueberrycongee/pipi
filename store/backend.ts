@@ -74,6 +74,8 @@ export interface Backend {
   pickSaveFile?(prompt: string, defaultName?: string, defaultDir?: string): Promise<string | undefined>;
   /** Reveals a file or opens a folder in the OS file manager (Finder / Explorer / xdg-open). */
   revealPath?(path: string): Promise<void>;
+  /** Opens a local file with its default OS application. */
+  openPath?(path: string): Promise<void>;
   /** Asks the app's update source (`nsh.json` → `updater`) for a newer version; `null` when up to date or updates don't apply here. */
   checkAppUpdate?(): Promise<AppUpdate | null>;
   /** Downloads the update the last check found; rejects when there is none or it cannot install here. */
@@ -343,6 +345,21 @@ const system: Backend = {
     }
     if (process.platform === "linux") {
       await process.run("sh", ["-c", 'if [ -d "$1" ]; then xdg-open "$1"; else xdg-open "$(dirname "$1")"; fi', "_", path]);
+    }
+  },
+  async openPath(path) {
+    if (!path) return;
+    if (process.platform === "macos") {
+      await process.run("sh", ["-c", 'open "$1"', "_", path]);
+      return;
+    }
+    if (process.platform === "windows") {
+      const script = `Start-Process -FilePath ${JSON.stringify(path)}`;
+      await process.run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script]);
+      return;
+    }
+    if (process.platform === "linux") {
+      await process.run("sh", ["-c", 'xdg-open "$1"', "_", path]);
     }
   },
   checkAppUpdate: () => checkForUpdate(),

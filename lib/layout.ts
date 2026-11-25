@@ -21,3 +21,9 @@ export const topBarHeight = () => (titleBar().height || 44) + (platform.desktop 
  * software keyboard while it is up — both zero on a desktop.
  */
 export const bottomInset = () => Math.max(safeArea().bottom, keyboardFrame().height);
+
+/**
+ * A document's column (`DESIGN.md` → Documents): a 720pt measure, a step
+ * narrower than the conversation's 760, on the conversation's 24pt margin.
+ */
+export const DOC_COLUMN = "mx-auto w-full max-w-192 px-6";

@@ -20,6 +20,8 @@ export interface DaemonSession {
   driver: string;
   parentId?: string;
   initiator?: string;
+  /** The personal agent (Pip): one per home, in its own folder of notes. */
+  persona?: boolean;
   runtimeMode: RuntimeMode;
   worktree?: WorktreeInfo;
   status: "idle" | "working" | "blocked" | "failed" | "interrupted";
@@ -395,9 +397,10 @@ export class DaemonClient {
 
   /** Starts a detached-or-child session (the compare flow): its answer goes to the user. */
   async startSession(input: {
-    title: string;
+    title?: string;
     agentId: string;
-    cwd: string;
+    cwd?: string;
+    persona?: boolean;
     message?: string;
     parentId?: string;
     runtimeMode?: RuntimeMode;
@@ -419,6 +422,11 @@ export class DaemonClient {
     linger?: boolean;
   }) {
     this.notify("config", config as Record<string, unknown>);
+  }
+
+  /** The project folders open in the sidebar, which `workspaces_list` names to agents. */
+  setWorkspaces(paths: string[]) {
+    this.notify("workspaces", { paths });
   }
 
   async externalMcp(): Promise<{ url: string; token: string }> {

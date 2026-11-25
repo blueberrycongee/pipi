@@ -26,9 +26,9 @@ import { runtimeModeRank } from "../agents/catalog";
 import type { RuntimeMode } from "../agents/types";
 import { splitDocMessage } from "../lib/doc-wire";
 import { activeLanguage, formatAgentMeta, runtimeModeIcon, runtimeModeText, thinkingText, tr } from "../lib/i18n";
-import { topBarHeight } from "../lib/layout";
+import { DOC_COLUMN, topBarHeight } from "../lib/layout";
 import { Pip } from "../mascot/Pip";
-import type { ExtensionUiAnswer, ExtensionUiDialog, Model } from "../pi/protocol";
+import type { ExtensionUiAnswer, ExtensionUiDialog, ExtensionUiForm, Model } from "../pi/protocol";
 import { providerName } from "../pi/providers";
 import type { Row, ToolRow } from "../pi/transcript";
 import { describeToolCall, elapsedSeconds, reasoningPreview } from "../pi/turns";
@@ -39,6 +39,7 @@ import { applyDocEdit, undoDoc, type DocUpdateEvent, type MarkdownDoc } from "..
 import { AgentLogo } from "../ui/AgentLogo";
 import { Chip, IconButton } from "../ui/Button";
 import { Icon } from "../ui/Icon";
+import { QuestionForm } from "./QuestionForm";
 import {
   BREATH_MS,
   delayedFade,
@@ -190,7 +191,7 @@ export function DocSkeleton(props: { show: () => boolean }) {
         class="pointer-events-none absolute inset-0"
         style={{ opacity, paddingTop: topBarHeight() + 34 }}
       >
-        <View class="mx-auto w-full max-w-180 gap-4 px-10">
+        <View class={`${DOC_COLUMN} gap-4`}>
           <ShimmerBar width="42%" height={22} delay={0} class="rounded-lg corner-squircle" />
           <View class="mt-2 gap-2.5">
             <ShimmerBar width="94%" height={11} delay={80} />
@@ -328,7 +329,7 @@ export function DocDraftingSkeleton(props: { show: () => boolean; hasContent?: (
         class="pointer-events-none absolute inset-x-0 bottom-0 z-10 bg-background"
         style={{ top: topBarHeight(), opacity: backdropOpacity, paddingTop: 52 }}
       >
-        <View class="mx-auto w-full max-w-180 gap-4 px-10" style={{ opacity: barsOpacity }}>
+        <View class={`${DOC_COLUMN} gap-4`} style={{ opacity: barsOpacity }}>
           <ShimmerBar width="38%" height={24} delay={0} class="rounded-lg corner-squircle bg-brand/[0.11] dark:bg-brand/[0.16]" />
           <View class="mt-2 gap-2.5">
             <ShimmerBar width="92%" height={11} delay={80} />
@@ -429,7 +430,7 @@ export function DocRefreshSweep(props: { doc: MarkdownDoc }) {
               backgroundImage: brandRefreshBeamWash(),
             }}
           >
-            <View class="mx-auto h-full w-full max-w-180 justify-end px-10 pb-8">
+            <View class={`${DOC_COLUMN} h-full justify-end pb-8`}>
               <View
                 class="h-[2px] w-full rounded-full"
                 style={{
@@ -662,7 +663,7 @@ export function DocUpdatePill(props: { doc: MarkdownDoc }) {
         class="absolute inset-x-0 z-20"
         style={{ top: topBarHeight() + 10, pointerEvents: "box-none" }}
       >
-        <View class="mx-auto w-full max-w-180 items-start px-10" style={{ pointerEvents: "box-none" }}>
+        <View class={`${DOC_COLUMN} items-start`} style={{ pointerEvents: "box-none" }}>
           <View
             testID="doc-update-pill"
             onMouseEnter={() => {
@@ -1365,10 +1366,16 @@ function DocReplyCard(props: {
 
           <If when={props.assistant.pendingDialog()}>
             {(dialog) => (
-              <InlineApproval
-                dialog={dialog()}
-                onAnswer={(id, answer) => props.assistant.answerDialog(id, answer as never)}
-              />
+              <If
+                when={dialog().method === "form" ? (dialog() as ExtensionUiForm) : undefined}
+                else={<InlineApproval dialog={dialog()} onAnswer={props.assistant.answerDialog} />}
+              >
+                {(request) => (
+                  <View class="rounded-xl corner-squircle border border-border bg-muted/60 p-2.5">
+                    <QuestionForm request={request()} onAnswer={props.assistant.answerDialog} />
+                  </View>
+                )}
+              </If>
             )}
           </If>
         </Scroll>

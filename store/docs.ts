@@ -584,6 +584,14 @@ function scheduleSave(path: string, state: DocState, session: RichEditorSession)
   if (state.saveTimer !== undefined) clearTimeout(state.saveTimer);
   state.saveTimer = setTimeout(() => {
     state.saveTimer = undefined;
+    // What is typed after `/` is a query, not yet the document's words: the
+    // file is written once the menu closes, so it never holds a half-typed
+    // query — and the title never reads as one. An explicit flush still
+    // writes now: a document on its way to a session is the agent's to read.
+    if (SLASH_KEYS.some((key) => session.suggestion(key)?.active)) {
+      scheduleSave(path, state, session);
+      return;
+    }
     state.saveTail = state.saveTail.then(() => writeDoc(path, state, session));
   }, SAVE_DEBOUNCE_MS);
 }

@@ -4,7 +4,7 @@ import type { AgentHarnessStatus, CustomAgentConfig, RuntimeMode, WorktreeInfo }
 import { splitDocMessage, titleWords } from "../lib/doc-wire";
 import type { Exit, Transport } from "../pi/client";
 import type { DaemonAttachSpec, DaemonCallbacks, DaemonClient, DaemonSession } from "../pi/daemon";
-import type { AgentMessage, ImageContent, Model, SessionState } from "../pi/protocol";
+import type { AgentMessage, ExtensionUiForm, ImageContent, Model, SessionState } from "../pi/protocol";
 import type { SessionSummary } from "../pi/sessions";
 import type { UsageStats } from "../pi/usage";
 import type { Backend } from "../store/backend";
@@ -186,7 +186,9 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   const sessionMessages = new Map<string, AgentMessage[]>();
   /** The id each session file names, as Pi's header does: a session is the same one however often it is opened. */
   const sessionIds = new Map<string, string>();
-  const byWorkspace: Record<string, SessionSummary[]> = { ...(options.workspaceSessions ?? {}) };
+  const dataDir = options.dataDir ?? "/Users/pip/Library/Application Support/dev.pipi.app";
+  // The chat folder is the app's own and starts with nothing in it.
+  const byWorkspace: Record<string, SessionSummary[]> = { [`${dataDir}/chat`]: [], ...(options.workspaceSessions ?? {}) };
   let activeCwd = "/Users/pip";
   // Settings the app changes live; each process reads them, like Pi's shared config.
   let defaultModel: Model = options.noModels ? UNKNOWN : MODELS[0];
@@ -661,6 +663,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     async function run(prompt: string, images?: ImageContent[]) {
       const pace = options.pace ?? 0;
       const needsConfirm = prompt.includes("confirm");
+      const asksQuestion = prompt.includes("ask a question");
       const bashCmd = 'ls -la thirdparty/ 2>/dev/null && echo "---"';
       const step = async (record: object, pauseMs = pace) => {
         if (aborted) return;
@@ -729,6 +732,88 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       const relisted = [entry, ...listed.filter((s) => s.path !== sessionFile)];
       if (byWorkspace[cwd]) byWorkspace[cwd] = relisted;
       else sessions = relisted;
+      if (prompt.includes("show media")) {
+        const presentId = `call_${9 + calls++}`;
+        const shotId = `call_${9 + calls++}`;
+        const custom = /show media:\s*([^\s,]+)\s*,\s*([^\s,]+)/.exec(prompt);
+        const firstPath = custom?.[1] ?? "icon.png";
+        const secondPath = custom?.[2] ?? "assets/brand/dmg-background@2x.png";
+        const presentedDetails = {
+          pipiMedia: true,
+          title: "Generated deliverables",
+          items: [
+            { path: firstPath, kind: "image", title: "App icon", caption: "1024x1024 PNG" },
+            { path: secondPath, kind: "image", title: "Background artwork" },
+          ],
+        };
+        const firstMedia: AgentMessage = {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: presentId, name: "present_files", arguments: { title: "Generated deliverables", files: [{ path: firstPath }, { path: secondPath }] } },
+            { type: "toolCall", id: shotId, name: "screenshot", arguments: { target: "preview" } },
+          ],
+          provider: "anthropic",
+          model: "claude-sonnet-4-5",
+          usage,
+          stopReason: "toolUse",
+          timestamp: Date.now(),
+        };
+        const r1: AgentMessage = {
+          role: "toolResult",
+          toolCallId: presentId,
+          toolName: "present_files",
+          content: [{ type: "text", text: JSON.stringify(presentedDetails) }],
+          details: presentedDetails,
+          isError: false,
+          timestamp: Date.now(),
+        };
+        const tinyPng = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mP8z8BQz0AEwDiqAAAWBAQCAQIDAgAAAABJRU5ErkJggg==";
+        const r2: AgentMessage = {
+          role: "toolResult",
+          toolCallId: shotId,
+          toolName: "screenshot",
+          content: [{ type: "text", text: "Captured preview" }, { type: "image", data: tinyPng, mimeType: "image/png" }],
+          isError: false,
+          timestamp: Date.now(),
+        };
+        const finalMsg: AgentMessage = {
+          role: "assistant",
+          content: [{ type: "text", text: reply }],
+          provider: "anthropic",
+          model: "claude-sonnet-4-5",
+          usage,
+          stopReason: "stop",
+          timestamp: Date.now(),
+        };
+        await step({ type: "agent_start" });
+        await step({ type: "turn_start" });
+        await step({ type: "message_start", message: user });
+        await step({ type: "message_end", message: user });
+        await step({ type: "message_start", message: firstMedia });
+        await step({ type: "message_end", message: firstMedia });
+        await step({ type: "tool_execution_start", toolCallId: presentId, toolName: "present_files", args: { files: [{ path: firstPath }, { path: secondPath }] } });
+        await step({ type: "tool_execution_end", toolCallId: presentId, toolName: "present_files", result: { content: r1.content, details: presentedDetails }, isError: false, durationMs: 5 });
+        await step({ type: "message_start", message: r1 });
+        await step({ type: "message_end", message: r1 });
+        await step({ type: "tool_execution_start", toolCallId: shotId, toolName: "screenshot", args: { target: "preview" } });
+        await step({ type: "tool_execution_end", toolCallId: shotId, toolName: "screenshot", result: { content: r2.content }, isError: false, durationMs: 5 });
+        await step({ type: "message_start", message: r2 });
+        await step({ type: "message_end", message: r2 });
+        await step({ type: "turn_end" });
+        await step({ type: "turn_start" });
+        await step({ type: "message_start", message: { ...finalMsg, content: [], stopReason: "pending" } });
+        await update({ type: "text_start", contentIndex: 0 });
+        for (const piece of reply.match(/[\s\S]{1,24}/g) ?? []) await update({ type: "text_delta", contentIndex: 0, delta: piece });
+        await update({ type: "text_end", contentIndex: 0, content: reply });
+        await step({ type: "message_end", message: finalMsg });
+        await step({ type: "turn_end" });
+        messages = [...messages, user, firstMedia, r1, r2, finalMsg];
+        if (sessionFile) sessionMessages.set(sessionFile, messages);
+        isStreaming = false;
+        emit({ type: "agent_end", willRetry: false });
+        emit({ type: "agent_settled", aborted: false });
+        return;
+      }
       if (prompt.includes("flaky") || prompt.includes("outage")) return runRetries(user, prompt, step, update);
       // "crash": the process dies under the run. Pi has the message on file by then, as it writes one when it is sent.
       if (prompt.includes("crash")) {
@@ -769,9 +854,29 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         });
         approved = response.confirmed === true;
       }
+      let questionReply: string | undefined;
+      if (asksQuestion && !aborted) {
+        const uiId = `form-${callId}`;
+        const response = await new Promise<Record<string, unknown>>((resolve) => {
+          uiWaiters.set(uiId, resolve);
+          emit({
+            type: "extension_ui_request",
+            id: uiId,
+            method: "form",
+            agent: "Antigravity",
+            title: "",
+            message: "The agent has 2 questions.",
+            fields: [
+              { id: "q1", label: "Which fruit should we use for the recipe?", required: true, kind: "choice", options: [{ value: "1", label: "Apple" }, { value: "2", label: "Pear" }], other: { id: "q1_other" } },
+              { id: "q2", label: "Which toppings do you want?", required: true, kind: "multiChoice", options: [{ value: "1", label: "Honey" }, { value: "2", label: "Yogurt" }], other: { id: "q2_other" } },
+            ],
+          } satisfies ExtensionUiForm);
+        });
+        questionReply = response.cancelled ? "Question cancelled." : response.declined ? "Question declined." : `Answers received: ${JSON.stringify(response.answers)}`;
+      }
       const outText = approved ? '{ "name": "pipi" }' : "bash was declined by the user in pipi.";
       const result: AgentMessage = { role: "toolResult", toolCallId: callId, toolName, content: [{ type: "text", text: outText }], isError: !approved, timestamp: Date.now() };
-      const finalReply = approved ? reply : "Understood, skipped the shell command.";
+      const finalReply = questionReply ?? (approved ? reply : "Understood, skipped the shell command.");
       const second: AgentMessage = { role: "assistant", content: [{ type: "text", text: finalReply }], provider: "anthropic", model: "claude-sonnet-4-5", usage, stopReason: "stop", timestamp: Date.now() };
       await step({ type: "tool_execution_end", toolCallId: callId, toolName, result: { content: [{ type: "text", text: outText }] }, isError: !approved, durationMs: 3 });
       await step({ type: "message_start", message: result });
@@ -999,6 +1104,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   let activeAgent = "pi";
   let worktreeSeq = 1;
   let daemonSeq = 0;
+  const FAKE_PERSONA_DIR = "/Users/pip/.pipi/persona";
   let daemonCmdSeq = 0;
   const fakeWorktrees: WorktreeInfo[] = [];
 
@@ -1179,7 +1285,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   const api: Backend & { sent: Record<string, unknown>[] } = {
     sent,
     home: () => "/Users/pip",
-    dataDir: () => options.dataDir ?? "/Users/pip/Library/Application Support/dev.pipi.app",
+    dataDir: () => dataDir,
     async probeAgents(probeOpts) {
       const defaults = defaultAgentStatuses(probeOpts?.customAgents);
       return defaults.map((a): AgentHarnessStatus => {
@@ -1278,7 +1384,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             daemonSessions.set(s.id, s);
             pushDaemon(s);
           }
-          if (spec.title) s.title = spec.title;
+          if (spec.title && !s.persona) s.title = spec.title;
           const file = spec.file ?? s.file;
           if (!s.inner) {
             const inner = await spawnDaemonProcess(s);
@@ -1329,8 +1435,10 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
                   s.pendingQueue = { steering: [], followUp: [] };
                 } else if (record?.type === "new_session") {
                   s.file = undefined;
-                  s.title = "New session";
-                  s.titleLocked = false;
+                  if (!s.persona) {
+                    s.title = "New session";
+                    s.titleLocked = false;
+                  }
                   s.pendingQueue = { steering: [], followUp: [] };
                   s.pendingDialogs?.clear();
                   pushDaemon(s);
@@ -1418,22 +1526,26 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             pushDaemon(s);
           }
         },
-        async startSession(input: { title: string; agentId: string; cwd: string; message?: string; parentId?: string; runtimeMode?: RuntimeMode; worktree?: boolean }) {
+        async startSession(input: { title?: string; agentId: string; cwd?: string; persona?: boolean; message?: string; parentId?: string; runtimeMode?: RuntimeMode; worktree?: boolean }) {
           const parent = input.parentId ? daemonSessions.get(input.parentId) : undefined;
           // As the real daemon does: `worktree` asks for an isolated branch under the given cwd.
-          const wt = input.worktree && api.createWorktree ? await api.createWorktree(input.cwd, input.agentId) : undefined;
+          const held = input.persona ? [...daemonSessions.values()].find((known) => known.persona) : undefined;
+          if (held) throw new Error(`the personal agent already runs as ${held.id}`);
+          const cwd = input.persona ? FAKE_PERSONA_DIR : (input.cwd ?? "");
+          const wt = input.worktree && api.createWorktree ? await api.createWorktree(cwd, input.agentId) : undefined;
           const s: FakeDaemonSession = {
             id: `s_fake_${++daemonSeq}`,
-            title: input.title || "New session",
-            ...(input.title ? { titleLocked: true } : {}),
-            cwd: wt?.path ?? input.cwd,
+            title: input.title || (input.persona ? "Pip" : "New session"),
+            ...(input.title || input.persona ? { titleLocked: true } : {}),
+            ...(input.persona ? { persona: true } : {}),
+            cwd: wt?.path ?? cwd,
             agentId: input.agentId,
             agentName: agentNameOf(input.agentId),
             driver: driverOf(input.agentId),
             parentId: input.parentId,
             initiator: "user",
             runtimeMode: input.runtimeMode ?? "full-access",
-            worktree: wt ?? fakeWorktrees.find((w) => input.cwd === w.path),
+            worktree: wt ?? fakeWorktrees.find((w) => cwd === w.path),
             status: input.message ? "working" : "idle",
             unread: false,
             loaded: false,
@@ -1456,6 +1568,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           return daemonInfo(s);
         },
         configure() {},
+        setWorkspaces() {},
         async externalMcp() {
           return { url: "http://127.0.0.1:49999/mcp", token: "fake" };
         },
@@ -1501,6 +1614,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     pickFile: async () => options.pickedFile,
     pickSaveFile: async () => options.pickedSaveFile,
     revealPath: async () => undefined,
+    openPath: async () => undefined,
     async checkAppUpdate() {
       const u = options.update;
       if (!u) return null;

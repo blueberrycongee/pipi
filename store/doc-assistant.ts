@@ -3,6 +3,7 @@ import { runtimeModeRank } from "../agents/catalog";
 import { buildPortableHandoff } from "../agents/handoff";
 import type { AgentHarnessStatus, RuntimeMode } from "../agents/types";
 import { composeDocMessage } from "../lib/doc-wire";
+import { formAnswerText } from "../lib/form-answers";
 import { activeLanguage, tr } from "../lib/i18n";
 import type { Mood } from "../mascot/geometry";
 import { PiClient } from "../pi/client";
@@ -493,9 +494,11 @@ async function ensureClient(s: AssistantState): Promise<PiClient | undefined> {
       onEvent: (event) => started && handleEvent(s, started, event),
       onUiRequest: (ui) => {
         if (s.disposed || started !== s.client) return;
-        if (ui.method === "confirm" || ui.method === "select" || ui.method === "input") {
-          s.dialogs.update((list) => [...list, ui]);
+        if (ui.method === "confirm" || ui.method === "select" || ui.method === "input" || ui.method === "form") {
+          s.dialogs.update((list) => list.some((dialog) => dialog.id === ui.id) ? list : [...list, ui]);
           s.replyOpen.set(true);
+        } else if (ui.method === "dismiss") {
+          s.dialogs.update((list) => list.filter((dialog) => dialog.id !== ui.id));
         } else if (ui.method === "notify") {
           toast(ui.notifyType ?? "info", ui.message);
         }
@@ -1029,6 +1032,14 @@ export function ensureDocAssistant(path: string): DocAssistant {
     },
 
     answerDialog(id, answer) {
+      const dialog = s.dialogs().find((d) => d.id === id);
+      if (!dialog) return;
+      // A form's picks ride the elicitation response, not the wire — but the
+      // person still answered, so their bubble keeps the record in the reply.
+      if (dialog.method === "form" && "answers" in answer) {
+        s.transcript.recordAnswer(formAnswerText(dialog.fields, answer.answers));
+        flushSoon(s);
+      }
       s.client?.respond(id, answer);
       s.dialogs.update((list) => list.filter((d) => d.id !== id));
     },

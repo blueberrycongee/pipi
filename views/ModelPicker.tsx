@@ -1,9 +1,9 @@
 import { computed, effect, signal, Text, untracked, View } from "nsh";
 import { Button as BaseButton, Command, type CommandItem, Popover } from "nsh/base";
 import { thinkingText, tr } from "../lib/i18n";
-import type { ThinkingLevel } from "../pi/protocol";
+import type { SessionModelConfig, ThinkingLevel } from "../pi/protocol";
 import { providerName } from "../pi/providers";
-import { activeAgent, availableModels, chooseModel, chooseThinkingLevel, draftModel, draftThinkingLevel, focusComposer, modelPickerTick, sessionState, showAgentSettings, sidecarPhase, thinkingLevels } from "../store/app";
+import { activeAgent, availableModels, chooseModel, chooseModelConfig, chooseThinkingLevel, draftModel, draftThinkingLevel, focusComposer, modelPickerTick, sessionState, showAgentSettings, sidecarPhase, thinkingLevels } from "../store/app";
 import { Chip } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import { popupHiddenStyle, popupLeavingStyle, popupStyle, Presence } from "../ui/motion";
@@ -23,7 +23,7 @@ export function ModelList(props: { onChosen: () => void; class?: string }) {
     availableModels().map((model) => ({
       id: modelKey(model),
       label: model.name || model.id,
-      group: providerName(model.provider),
+      group: model.group ?? providerName(model.provider),
       keywords: [model.id, model.provider],
       checked: modelKey(model) === current(),
     })),
@@ -115,6 +115,69 @@ export function ModelPicker(props: { onOpen?: () => void }) {
     >
       <ModelList onChosen={close} />
     </Popover>
+  );
+}
+
+
+/** One engine-reported model-adjacent selector (ACP `model_config` — Devin's speed, for example). */
+function ModelConfigPicker(props: { config: SessionModelConfig; onOpen?: () => void }) {
+  const open = signal(false);
+  const bool = props.config.type === "boolean";
+  const choices: { value: string | boolean; name: string; description?: string }[] = bool
+    ? [
+        { value: true, name: tr("On", "开启") },
+        { value: false, name: tr("Off", "关闭") },
+      ]
+    : (props.config.options ?? []);
+  const current = () => choices.find((choice) => choice.value === props.config.currentValue);
+  if (choices.length < 2) return null;
+  return (
+    <Popover
+      open={open()}
+      onOpenChange={(e) => {
+        if (e.open) props.onOpen?.();
+        open.set(e.open);
+      }}
+      placement="top"
+      align="start"
+      offset={8}
+      margin={12}
+      popupClass={`w-56 p-1 ${POPUP}`}
+      popupStyle={popupStyle("top", "start")}
+      popupStartingStyle={popupHiddenStyle("top", "start")}
+      popupEndingStyle={popupLeavingStyle("top", "start")}
+      trigger={<Chip label={current()?.name ?? String(props.config.currentValue)} class="text-subtle" />}
+    >
+      <Text class={`px-2 pb-1 pt-1.5 ${uiType("xs")} font-medium text-subtle`} role="header">
+        {props.config.name}
+      </Text>
+      <Each of={choices} key={(choice) => String(choice.value)}>
+        {(choice) => (
+          <BaseButton
+            selected={choice().value === props.config.currentValue}
+            onPress={() => {
+              open.set(false);
+              void chooseModelConfig(props.config.id, choice().value);
+              focusComposer();
+            }}
+            class={`${uiHeight(32)} flex-row items-center gap-2 rounded-md corner-squircle px-2 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+          >
+            <Text class={`${uiType("base")} text-foreground`}>{choice().name}</Text>
+            <Text class={`flex-1 truncate ${uiType("xs")} text-subtle`}>{choice().description ?? ""}</Text>
+            <View class="w-4 items-center">{choice().value === props.config.currentValue ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
+          </BaseButton>
+        )}
+      </Each>
+    </Popover>
+  );
+}
+
+/** Every model-adjacent selector the active engine reported, beside the model itself as ACP asks. */
+export function ModelConfigPickers(props: { onOpen?: () => void }) {
+  return (
+    <Each of={sessionState()?.modelConfigs ?? []} key={(config) => config.id}>
+      {(config) => <ModelConfigPicker config={config()} onOpen={props.onOpen} />}
+    </Each>
   );
 }
 

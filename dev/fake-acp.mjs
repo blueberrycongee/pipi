@@ -36,6 +36,7 @@ let seq = 0;
 let clientReqId = 1000;
 const clientPending = new Map(); // our outgoing request id → resolve
 let inflightPrompt = undefined; // { id, sessionId, cancelled }
+let elicitation = false;
 // "engine": the turn died, the RPC loop lives — list/cancel still answer, the
 // prompt does not. "full": every later request vanishes.
 let wedged = undefined;
@@ -138,6 +139,21 @@ function idle(sessionId, u) {
 }
 
 function backgroundTurn(sessionId, text) {
+  if (/ask-chat/i.test(text)) {
+    const job1 = `bg_${seq++}`;
+    const askId = `call_ask_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId: job1, title: "job 1", kind: "execute", status: "in_progress", rawInput: { CommandLine: "job 1", WaitMsBeforeAsync: 10000 } });
+    setTimeout(() => {
+      idle(sessionId, { sessionUpdate: "tool_call_update", toolCallId: job1, status: "completed", content: [{ type: "content", content: { type: "text", text: "job 1 done" } }] });
+      idle(sessionId, { sessionUpdate: "tool_call", toolCallId: askId, name: "ask_question", title: "Run ask_question", kind: "other", status: "in_progress" });
+      idle(sessionId, { sessionUpdate: "tool_call_update", toolCallId: askId, name: "ask_question", title: "Run ask_question", kind: "other", status: "pending" });
+      idle(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\nContinue?\n- [1] Yes\n- [2] No\n" } });
+      idle(sessionId, { sessionUpdate: "usage_update", used: 9300, size: 1048576 });
+    }, WAKE_MS);
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Waiting for the job." } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 9000, size: 1048576 });
+    return "end_turn";
+  }
   if (/crash/i.test(text)) {
     const job1 = `bg_${seq++}`;
     update(sessionId, { sessionUpdate: "tool_call", toolCallId: job1, title: "job 1", kind: "execute", status: "in_progress", rawInput: { CommandLine: "job 1", WaitMsBeforeAsync: 10000 } });
@@ -444,6 +460,53 @@ async function runTurn(sessionId, text) {
     return "end_turn";
   }
   if (AGY && /background/i.test(text)) return backgroundTurn(sessionId, text);
+  if (AGY && /ask chat/i.test(text)) {
+    const toolCallId = `call_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId, name: "ask_question", title: "Run ask_question", kind: "other", status: "in_progress" });
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId, name: "ask_question", title: "Run ask_question", kind: "other", status: "pending" });
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\nWhich option?\n- [1] Alpha\n- [2] Beta\n" } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 1500, size: 262144 });
+    // Mirror agy emitting a late failed status update for the chat-fallback ask_question after end_turn.
+    setTimeout(() => {
+      idle(sessionId, { sessionUpdate: "tool_call_update", toolCallId, name: "ask_question", title: "Run ask_question", kind: "other", status: "failed" });
+    }, 60);
+    return "end_turn";
+  }
+  if (AGY && /ask form/i.test(text)) {
+    const toolCallId = `call_${seq++}`;
+    update(sessionId, { sessionUpdate: "tool_call", toolCallId, title: "Run ask_question", kind: "other", status: "in_progress" });
+    const id = clientReqId++;
+    const result = await new Promise((resolve) => {
+      elicitation = true;
+      clientPending.set(id, resolve);
+      send({
+        jsonrpc: "2.0",
+        id,
+        method: "elicitation/create",
+        params: {
+          sessionId, toolCallId, mode: "form", message: "The agent has 2 questions.",
+          requestedSchema: {
+            type: "object",
+            properties: {
+              q1: { type: "string", title: "Which fruit should we use?", oneOf: [{ const: "1", title: "Apple" }, { const: "2", title: "Pear" }] },
+              q1_other: { type: "string", title: "Other" },
+              q2: { type: "array", title: "Which toppings do you want?", items: { anyOf: [{ const: "1", title: "Honey" }, { const: "2", title: "Yogurt" }] } },
+              q2_other: { type: "string", title: "Other" },
+            },
+          },
+        },
+      });
+      if (text.includes("withdraw")) {
+        setTimeout(() => send({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: id } }), 120);
+      }
+    });
+    elicitation = false;
+    if (!inflightPrompt) return "cancelled";
+    update(sessionId, { sessionUpdate: "tool_call_update", toolCallId, status: "completed" });
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Form response: ${JSON.stringify(result)}` } });
+    update(sessionId, { sessionUpdate: "usage_update", used: 1500, size: 262144 });
+    return "end_turn";
+  }
   if (AGY && /ask me/i.test(text)) {
     // agy's fixed-choice questions arrive as a permission request whose
     // toolCallId starts `interaction_` — options are answers, not approvals.
@@ -567,6 +630,7 @@ async function handle(msg) {
     case "session/prompt": {
       const s = sessions.get(p.sessionId);
       if (!s) return replyErr(msg.id, -32602, "unknown session");
+      if (elicitation) return replyErr(msg.id, -32602, "the running prompt is waiting for a permission or question answer");
       const text = (p.prompt || []).map((c) => c?.text || "").join("\n");
       if (inflightPrompt) {
         if (AGY) {

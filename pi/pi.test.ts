@@ -3,7 +3,7 @@ import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } f
 import { PiClient, type Transport } from "./client";
 import { DaemonClient } from "./daemon";
 import { createLineSplitter } from "./jsonl";
-import { firstVisualRowDiff, type Row, sameVisualRows, Transcript, toolSummary, withoutHandoff, withoutImageNotes } from "./transcript";
+import { firstVisualRowDiff, type Row, sameVisualRows, Transcript, toolSummary, withoutPreamble, withoutImageNotes } from "./transcript";
 import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, describeToolsSummary, displayRowIds, elapsedSeconds, spokenDuration, stableDisplayRows, type TurnHeaderRow } from "./turns";
 
 test("splits records on LF only, across chunks, keeping U+2028", () => {
@@ -1350,7 +1350,7 @@ test("stageUser shows the user bubble immediately, preserves its row and id on e
     "",
     "[Image: original 1914x2040, displayed at 1876x2000. Multiply coordinates by 1.02 to map to original image.]",
   ].join("\n");
-  expect(withoutHandoff(withoutImageNotes(echoedWire))).toBe("你好，先显示气泡");
+  expect(withoutPreamble(withoutImageNotes(echoedWire))).toBe("你好，先显示气泡");
 
   t.apply({ type: "message_start", message: { role: "user", content: echoedWire, timestamp: 20 } });
   expect(t.hasStagedUser()).toBe(false);
@@ -1772,4 +1772,31 @@ test("unwraps JSON provider error envelopes into readable text", () => {
     tone: "error",
     text: "passthrough stream idle timeout after 120s waiting for next chunk (api_error)",
   });
+});
+
+test("the personal agent's persona block never shows in the person's bubble, live or reloaded", () => {
+  const wire = [
+    '<pipi-persona name="Pip" dir="/home/me/.pipi/persona">',
+    "You are Pip.",
+    '<persona file="PERSONA.md">',
+    "# Pip",
+    "</persona>",
+    '<memory-index file="MEMORY.md" bytes="9" shown="9">',
+    "# Memory",
+    "</memory-index>",
+    "</pipi-persona>",
+    "",
+    "<pipi-persona> is what I typed",
+  ].join("\n");
+  expect(withoutPreamble(wire)).toBe("<pipi-persona> is what I typed");
+  expect(withoutPreamble("<pipi-persona> is what I typed")).toBe("<pipi-persona> is what I typed");
+
+  const live = new Transcript();
+  const id = live.stageUser("<pipi-persona> is what I typed", 0);
+  live.apply({ type: "message_start", message: { role: "user", content: wire, timestamp: 1 } });
+  expect(live.rows()).toEqual([{ kind: "user", id, text: "<pipi-persona> is what I typed", images: 0 }]);
+
+  const reloaded = new Transcript();
+  reloaded.load([{ role: "user", content: wire, timestamp: 1 }] as never);
+  expect(reloaded.rows().map((r) => ("text" in r ? r.text : r.kind))).toEqual(["<pipi-persona> is what I typed"]);
 });

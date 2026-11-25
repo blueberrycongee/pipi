@@ -1,5 +1,18 @@
 import type { Lang } from "../lib/i18n";
-import type { AgentMessage, AssistantMessage, AssistantMessageEvent, ImageContent, SessionEvent, TextContent, ToolResult, ToolResultMessage } from "./protocol";
+import { mediaItemFromProtocolBlock, type MediaItem } from "../lib/media";
+import type {
+  AgentMessage,
+  AssistantMessage,
+  AssistantMessageEvent,
+  AudioContent,
+  ImageContent,
+  MediaResourceContent,
+  SessionEvent,
+  TextContent,
+  ToolResult,
+  ToolResultBlock,
+  ToolResultMessage,
+} from "./protocol";
 
 /**
  * The transcript: a session's messages as the rows the chat shows.
@@ -14,6 +27,7 @@ export type Row =
   | { kind: "user"; id: string; text: string; images: number; imageBlocks?: ImageContent[]; queued?: boolean }
   | ({ kind: "text"; id: string; text: string; streaming: boolean; /** The prose of a message that called no tools: the turn's answer. Known once the message ended. */ final?: boolean } & TurnStamp)
   | ({ kind: "thinking"; id: string; text: string; streaming: boolean; redacted: boolean; durationMs?: number } & TurnStamp)
+  | ({ kind: "media"; id: string; title?: string; items: MediaItem[] } & TurnStamp)
   | ToolRow
   | { kind: "bash"; id: string; command: string; output: string; running: boolean; exitCode?: number; cancelled: boolean; truncated: boolean }
   | { kind: "notice"; id: string; tone: "info" | "warning" | "error"; title: string; text: string }
@@ -28,8 +42,8 @@ export interface TurnStamp {
   turnStart?: boolean;
 }
 
-const isTurnRow = (row: Row): row is Extract<Row, { kind: "text" | "thinking" | "tool" }> =>
-  row.kind === "text" || row.kind === "thinking" || row.kind === "tool";
+const isTurnRow = (row: Row): row is Extract<Row, { kind: "text" | "thinking" | "tool" | "media" }> =>
+  row.kind === "text" || row.kind === "thinking" || row.kind === "tool" || row.kind === "media";
 
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -119,6 +133,10 @@ export function sameVisualRow(a: Row, b: Row): boolean {
       const bth = b as Extract<Row, { kind: "thinking" }>;
       return a.text === bth.text && a.streaming === bth.streaming && a.redacted === bth.redacted;
     }
+    case "media": {
+      const bm = b as Extract<Row, { kind: "media" }>;
+      return a.title === bm.title && sameJsonValue(a.items, bm.items);
+    }
     case "tool": {
       const btool = b as ToolRow;
       return (
@@ -126,6 +144,8 @@ export function sameVisualRow(a: Row, b: Row): boolean {
         a.status === btool.status &&
         a.output === btool.output &&
         a.images === btool.images &&
+        (a.imageBlocks?.length ?? 0) === (btool.imageBlocks?.length ?? 0) &&
+        (a.resources?.length ?? 0) === (btool.resources?.length ?? 0) &&
         Boolean(a.background) === Boolean(btool.background) &&
         sameJsonValue(a.args, btool.args) &&
         sameJsonValue(a.details, btool.details)
@@ -194,6 +214,8 @@ const signature = (row: Row): string => {
     case "text":
     case "thinking":
       return `${row.kind}\n${row.text}`;
+    case "media":
+      return `media\n${row.title ?? ""}\n${canonicalJson(row.items)}`;
     case "tool":
       return `tool\n${row.callId ?? row.id}\n${row.name}\n${canonicalJson(row.args)}`;
     case "bash":
@@ -228,6 +250,8 @@ export interface ToolRow extends TurnStamp {
   status: "call" | "queued" | "running" | "done" | "error";
   output: string;
   images: number;
+  imageBlocks?: ImageContent[];
+  resources?: (AudioContent | MediaResourceContent)[];
   details?: unknown;
   durationMs?: number;
   background?: boolean;
@@ -235,7 +259,7 @@ export interface ToolRow extends TurnStamp {
   incompleteArg?: string;
 }
 
-const textOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
+const textOf = (content: string | ToolResultBlock[] | undefined) =>
   typeof content === "string"
     ? content
     : (content ?? [])
@@ -243,13 +267,22 @@ const textOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
         .map((block) => block.text)
         .join("\n");
 
-const imagesOf = (content: string | (TextContent | ImageContent)[] | undefined) =>
+const imagesOf = (content: string | ToolResultBlock[] | undefined) =>
   typeof content === "string" ? 0 : (content ?? []).filter((block) => block.type === "image").length;
 
-const imageBlocksOf = (content: string | (TextContent | ImageContent)[] | undefined): ImageContent[] =>
+const imageBlocksOf = (content: string | ToolResultBlock[] | undefined): ImageContent[] =>
   typeof content === "string"
     ? []
     : (content ?? []).filter((block): block is ImageContent => block.type === "image" && typeof block.data === "string" && block.data.length > 0);
+
+const resourcesOf = (content: string | ToolResultBlock[] | undefined): (AudioContent | MediaResourceContent)[] =>
+  typeof content === "string"
+    ? []
+    : (content ?? []).filter(
+        (block): block is AudioContent | MediaResourceContent =>
+          (block.type === "audio" && typeof block.data === "string" && block.data.length > 0) ||
+          (block.type === "resource" && (typeof block.uri === "string" || typeof block.data === "string")),
+      );
 
 /** One `<pipi-message from="s_x" title="…" agent="…" status="…">…</pipi-message>` envelope the daemon delivers. */
 const PIPPI_MESSAGE = /<pipi-message from="([^"]*)" title="([^"]*)" agent="([^"]*)" status="([^"]*)">([\s\S]*?)<\/pipi-message>/g;
@@ -299,6 +332,8 @@ export function withoutImageNotes(text: string): string {
 }
 
 const HANDOFF_PREFIX = /^<conversation_handoff\b[^>]*>[\s\S]*?<\/conversation_handoff>\n\nUser message:\n/;
+/** What the daemon opens a fresh conversation with the personal agent with (`withPersona` in `sidecar/pipi-daemon.mjs`). */
+const PERSONA_PREFIX = /^<pipi-persona\b[^>]*>[\s\S]*?<\/pipi-persona>\n\n/;
 
 interface StagedUserEntry {
   row: Extract<Row, { kind: "user" }>;
@@ -308,9 +343,13 @@ interface StagedUserEntry {
   dropAt?: number;
 }
 
-/** Strips a prepended Portable Context Handoff block so the user bubble shows only what the person wrote. */
-export function withoutHandoff(text: string): string {
-  return text.startsWith("<conversation_handoff") ? text.replace(HANDOFF_PREFIX, "") : text;
+/**
+ * Strips the context pipi prepends to a prompt — the personal agent's persona,
+ * a Portable Context Handoff — so the user bubble shows only what the person wrote.
+ */
+export function withoutPreamble(text: string): string {
+  const said = text.startsWith("<pipi-persona") ? text.replace(PERSONA_PREFIX, "") : text;
+  return said.startsWith("<conversation_handoff") ? said.replace(HANDOFF_PREFIX, "") : said;
 }
 
 /**
@@ -900,6 +939,17 @@ export class Transcript {
     this.version++;
   }
 
+  /** A user's answer to an agent's question, kept as their bubble though it never rode the wire. */
+  recordAnswer(text: string) {
+    const clean = withoutPreamble(withoutImageNotes(text));
+    if (!clean) return;
+    this.#closeTurn();
+    this.#reportFailure();
+    this.#flushResults();
+    this.#push({ kind: "user", id: this.#id("u"), text: clean, images: 0 });
+    this.version++;
+  }
+
   /** Adds a summary divider row (such as a Portable Context Handoff or multi-agent synthesis). */
   summary(title: string, text = "") {
     this.#push({ kind: "summary", id: this.#id("handoff"), title, text });
@@ -908,7 +958,7 @@ export class Transcript {
 
   /** Stages an outgoing user message so its bubble appears on send, ahead of the agent's echo. */
   stageUser(rawText: string, images: number | readonly ImageContent[] = 0, queued = false): string | undefined {
-    const text = withoutHandoff(withoutImageNotes(rawText));
+    const text = withoutPreamble(withoutImageNotes(rawText));
     const imageCount = typeof images === "number" ? images : images.length;
     const imageBlocks =
       typeof images === "number"
@@ -1030,7 +1080,7 @@ export class Transcript {
       // The entries left over, in the order the queue will deliver them; the first `spare - unmatchedWire` stand already.
       const left: string[] = [];
       for (const raw of wireItems) {
-        const text = withoutHandoff(withoutImageNotes(raw));
+        const text = withoutPreamble(withoutImageNotes(raw));
         const n = cover.get(text) ?? 0;
         if (n <= 0) continue;
         cover.set(text, n - 1);
@@ -1154,7 +1204,7 @@ export class Transcript {
   #queueCover(texts: readonly string[]) {
     const cover = new Map<string, number>();
     for (const raw of texts) {
-      const text = withoutHandoff(withoutImageNotes(raw));
+      const text = withoutPreamble(withoutImageNotes(raw));
       cover.set(text, (cover.get(text) ?? 0) + 1);
     }
     return cover;
@@ -1329,7 +1379,29 @@ export class Transcript {
 
   #result(result: ToolResult | undefined, row: ToolRow) {
     if (!result) return {};
-    return { output: textOf(result.content) || row.output, images: imagesOf(result.content), details: result.details ?? row.details };
+    const imageBlocks = imageBlocksOf(result.content);
+    const resources = resourcesOf(result.content);
+    return {
+      output: textOf(result.content) || row.output,
+      images: imagesOf(result.content),
+      ...(imageBlocks.length ? { imageBlocks } : {}),
+      ...(resources.length ? { resources } : {}),
+      details: result.details ?? row.details,
+    };
+  }
+
+  /** The row a live block writes next: prose an answer bubble cut goes on below it, not silently appended above. */
+  #openRow(id: string, kind: "text" | "thinking") {
+    const row = this.#get(id);
+    const at = row ? this.#index.get(id) : undefined;
+    if (row?.kind === kind && at !== undefined && this.#rows.slice(at + 1).some((entry) => entry.kind === "user")) {
+      this.#rows.splice(at, 1);
+      this.#index.clear();
+      this.#rows.forEach((entry, index) => this.#index.set(entry.id, index));
+      this.#push(row);
+      return this.#get(id);
+    }
+    return row;
   }
 
   /** One content block's progress in the live assistant message. */
@@ -1343,7 +1415,7 @@ export class Transcript {
         this.#set({ kind: "text", id, text: "", streaming: true });
         break;
       case "text_delta": {
-        const row = this.#get(id);
+        const row = this.#openRow(id, "text");
         this.#set({ kind: "text", id, text: (row?.kind === "text" ? row.text : "") + event.delta, streaming: true });
         break;
       }
@@ -1356,7 +1428,7 @@ export class Transcript {
         this.#set({ kind: "thinking", id, text: "", streaming: true, redacted: false });
         break;
       case "thinking_delta": {
-        const row = this.#get(id);
+        const row = this.#openRow(id, "thinking");
         this.#set({ kind: "thinking", id, text: (row?.kind === "thinking" ? row.text : "") + event.delta, streaming: true, redacted: false });
         break;
       }
@@ -1406,6 +1478,14 @@ export class Transcript {
         });
         break;
       }
+      case "media_block": {
+        const item = mediaItemFromProtocolBlock(event.block, id);
+        if (item) {
+          live.rowIds.set(event.contentIndex, id);
+          this.#set({ kind: "media", id, items: [item] });
+        }
+        break;
+      }
     }
   }
 
@@ -1443,6 +1523,9 @@ export class Transcript {
         } else {
           this.#removeRow(id);
         }
+      } else if (block.type === "image" || block.type === "audio" || block.type === "resource") {
+        const item = mediaItemFromProtocolBlock(block, id);
+        if (item) this.#set({ kind: "media", id, items: [item] });
       } else if (block.type === "toolCall") {
         // The block's own call is the one streamed at its content index, if
         // there was one; anything else — history, a call never streamed — is
@@ -1562,6 +1645,12 @@ export class Transcript {
           if (block.streaming === true) live.thinkingSince.set(index, Date.now());
           this.#set({ kind: "thinking", id, text: block.thinking, streaming: block.streaming === true, redacted: !!block.redacted });
         }
+      } else if (block.type === "image" || block.type === "audio" || block.type === "resource") {
+        const item = mediaItemFromProtocolBlock(block, id);
+        if (item) {
+          live.rowIds.set(index, id);
+          this.#set({ kind: "media", id, items: [item] });
+        }
       } else if (block.type === "toolCall") {
         const rowId = this.#mintToolId(block.id);
         live.toolIds.set(index, rowId);
@@ -1583,10 +1672,14 @@ export class Transcript {
   /** A tool's result applied to its call's row: its output, images and outcome. */
   #applyToolResult(row: ToolRow, message: ToolResultMessage): ToolRow {
     const { background: _bg, ...rest } = row;
+    const imageBlocks = imageBlocksOf(message.content);
+    const resources = resourcesOf(message.content);
     return {
       ...rest,
       output: textOf(message.content) || row.output,
       images: imagesOf(message.content),
+      ...(imageBlocks.length ? { imageBlocks } : {}),
+      ...(resources.length ? { resources } : {}),
       details: message.details ?? row.details,
       status: message.isError ? "error" : "done",
     };
@@ -1614,7 +1707,7 @@ export class Transcript {
     }
     switch (message.role) {
       case "user": {
-        const text = withoutHandoff(withoutImageNotes(textOf(message.content)));
+        const text = withoutPreamble(withoutImageNotes(textOf(message.content)));
         const images = imagesOf(message.content);
         const imageBlocks = imageBlocksOf(message.content);
         const deliveries = images ? undefined : pippiDeliveries(text);

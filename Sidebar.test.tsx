@@ -647,3 +647,41 @@ test("starting a new session from a saved session detaches onto a fresh draft wi
   await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
   await app.waitUntil(() => app.texts().includes("Here is the plan."));
 });
+
+test("Pip's pinned row opens the one personal agent, whose folder of notes never joins the projects", async () => {
+  const app = await launch("multi");
+  await app.waitFor("text:What are we building?");
+  const PIP = "id:sidebar-pip >> text:Pip";
+  expect(app.count(PIP)).toBe(1);
+  expect(weight(app, PIP)).toBeLessThan(500);
+
+  await app.press("id:sidebar-pip");
+  await app.waitUntil(() => weight(app, PIP) > 400);
+  expect(app.count("id:sidebar-workspaces >> text:persona")).toBe(0);
+  expect(app.count(RECENT_DRAFT)).toBe(0);
+  expect(app.count(DRAFT)).toBe(0);
+
+  // Talking to Pip leaves it Pip, not its first words.
+  await app.type("label:Message", "remember the sidebar check");
+  await app.submit("label:Message");
+  await app.waitFor("text:remember the sidebar check");
+  expect(app.count("id:tab-0 >> text:Pip")).toBe(1);
+  expect(app.count("id:tab-0 >> text:remember the sidebar check")).toBe(0);
+
+  // Away and back: the same Pip, not a second one.
+  await app.press("id:sidebar-recents >> text:Fix QuickJS GC mark phase");
+  await app.waitUntil(() => weight(app, PIP) < 500 && weight(app, "id:sidebar-recents >> text:Fix QuickJS GC mark phase") > 400);
+  await app.press("id:sidebar-pip");
+  await app.waitUntil(() => weight(app, PIP) > 400);
+  expect(app.texts().filter((t) => t.includes("already runs as"))).toEqual([]);
+  expect(app.count("id:sidebar-workspaces >> text:persona")).toBe(0);
+
+  // A new session started from Pip works in a project, not in Pip's notes.
+  await app.press("id:sidebar-new-session");
+  await app.type("label:Message", "work started from pip");
+  await app.submit("label:Message");
+  await app.waitUntil(() => app.count("id:sidebar-recents >> text:work started from pip") === 1);
+  expect(app.count("id:sidebar-workspaces >> text:work started from pip")).toBe(1);
+  expect(app.count("id:sidebar-workspaces >> text:persona")).toBe(0);
+  expect(app.count(PIP)).toBe(1);
+});

@@ -89,6 +89,73 @@ test("switches sessions and starts a new one", async () => {
   await app.waitFor("text:What are we building?");
 });
 
+test("a chat runs in the app's own folder: listed in Recent, never a workspace", async () => {
+  const dir = `/tmp/pipi-chat-${Date.now()}`;
+  const app = await launch("welcome", { storage: { "harness.scenario": "welcome", "harness.dataDir": dir } });
+  await app.waitFor("text:What are we building?");
+  await app.press("id:sidebar-new-chat");
+  await app.waitFor("text:What's on your mind?");
+  expect(app.texts()).toContain("Pi · Chat");
+  await app.type("label:Message", "make a plan");
+  await app.submit("label:Message");
+  await app.waitFor("text:Here is the plan.");
+  await app.waitFor("id:sidebar-recents >> text:make a plan");
+  expect(app.count("id:sidebar-workspaces >> text:make a plan")).toBe(0);
+  const prefs = JSON.parse(app.storage()["pipi.prefs.v1"]);
+  expect(prefs.workspaces ?? []).not.toContain(`${dir}/chat`);
+  expect(prefs.activeWorkspace).not.toBe(`${dir}/chat`);
+
+  // Another chat from a chat is a chat; a new session from a chat, even an empty one, is back in the project.
+  await app.press("id:sidebar-new-chat");
+  await app.waitFor("text:What's on your mind?");
+  await app.press("id:sidebar-new-session");
+  await app.waitFor("text:What are we building?");
+  expect(app.texts()).toContain("Pi · ~");
+  expect(app.count("id:sidebar-recents >> text:make a plan")).toBe(1);
+});
+
+test("a blank tab comes back in the folder it was left in", async () => {
+  const app = await launch("welcome", { storage: { "harness.scenario": "welcome", "harness.dataDir": `/tmp/pipi-chat-tab-${Date.now()}` } });
+  await app.waitFor("text:What are we building?");
+  await app.press("id:sidebar-new-chat");
+  await app.waitFor("text:What's on your mind?");
+  await app.press("id:tab-new");
+  await app.waitFor("text:What are we building?");
+  await app.press("id:tab-0");
+  await app.waitFor("text:What's on your mind?");
+  await app.press("id:tab-1");
+  await app.waitFor("text:What are we building?");
+  await app.press("id:tab-0");
+  await app.waitFor("text:What's on your mind?");
+
+  // Moved from the chat to a project in the folder picker, the tab stays in the project.
+  await app.press("text:Pi · Chat");
+  await app.press("text:pip >> nth=1");
+  await app.waitFor("text:What are we building?");
+  await app.press("id:tab-1");
+  await app.press("id:tab-0");
+  await app.waitFor("text:What are we building?");
+  expect(app.texts()).toContain("Pi · ~");
+});
+
+test("the blank tab a closed chat leaves stays a chat", async () => {
+  const app = await launch("welcome", { storage: { "harness.scenario": "welcome", "harness.dataDir": `/tmp/pipi-chat-close-${Date.now()}` } });
+  await app.waitFor("text:What are we building?");
+  await app.press("id:sidebar-new-chat");
+  await app.type("label:Message", "make a plan");
+  await app.submit("label:Message");
+  await app.waitFor("text:Here is the plan.");
+  await app.press("id:tab-0 >> label:Close tab");
+  await app.waitFor("text:What's on your mind?");
+
+  await app.rightClick("id:sidebar-recents >> text:make a plan");
+  await app.chooseMenuItem("Open in New Tab");
+  await app.waitFor("id:tab-1");
+  await app.waitFor("text:Here is the plan.");
+  await app.press("id:tab-0");
+  await app.waitFor("text:What's on your mind?");
+});
+
 test("without a provider, leads to the agent's providers and connects one", async () => {
   const app = await launch("connect");
   await app.waitFor("text:Connect a model to begin");
@@ -428,6 +495,45 @@ test("shows tool permission confirmation inline above the composer while keeping
   await app.press("text:Deny");
   await app.waitFor("text:Understood, skipped the shell command.");
   expect(app.texts()).toContain("Here is the plan.");
+});
+
+test("answers an Antigravity form in place, leaving the chat draft untouched", async () => {
+  const app = await launch("history");
+  await app.waitFor("text:Here is the plan.");
+  await app.type("label:Message", "ask a question");
+  await app.submit("label:Message");
+  await app.waitFor("text:Antigravity asks");
+  await app.waitFor("text:Which fruit should we use for the recipe?");
+  await app.type("label:Message", "a separate chat draft");
+  await app.waitFor("label:Queue");
+  await app.type("label:Custom answer for Which fruit should we use for the recipe?", "Mango");
+  await app.scroll("id:question-fields", 220);
+  await app.press("text:Honey");
+  await app.press("text:Yogurt");
+  // The draft is never the answer's vehicle: it stays exactly as typed.
+  expect(app.value("label:Message")).toBe("a separate chat draft");
+  // The card's own reply sends the picks and records them as the user's bubble.
+  await app.press("text:Reply");
+  await app.waitFor('text:Answers received: {"q1_other":"Mango","q2":["1","2"]}');
+  const texts = app.texts();
+  expect(texts).toContain("Which fruit should we use for the recipe?: Mango\nWhich toppings do you want?: Honey, Yogurt");
+  expect(app.value("label:Message")).toBe("a separate chat draft");
+  await app.waitUntil(() => !app.shows("id:question-form"));
+});
+
+test("a blocked question reappears on its own session and can be skipped there", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  await app.type("label:Message", "ask a question");
+  await app.submit("label:Message");
+  await app.waitFor("text:Antigravity asks");
+  await app.press("id:sidebar-workspaces >> text:Refactor the transcript reducer");
+  await app.waitFor("text:Here is the plan.");
+  expect(app.shows("id:question-form")).toBe(false);
+  await app.press("id:sidebar-workspaces >> text:ask a question");
+  await app.waitFor("text:Antigravity asks");
+  await app.press("label:Skip questions");
+  await app.waitFor("text:Question declined.");
 });
 
 test("shows what is sent during a run in the conversation alone, and takes each message back from its own bubble", async () => {

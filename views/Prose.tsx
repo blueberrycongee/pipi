@@ -16,11 +16,12 @@
 //    chunk is fading (`veilClock`). A span inside a `<Text>` is a run of its
 //    attributed string, not a view, so it takes no native animated color.
 
-import { computed, createAnimatedValue, Image, openUrl, reduceMotion, Scroll, signal, Text, token, View } from "nsh";
+import { computed, createAnimatedValue, openUrl, reduceMotion, Scroll, signal, Text, token, View } from "nsh";
 import type { AnimatedValue, JSX, TextStyle } from "nsh";
 import { Button as BaseButton, TextView } from "nsh/base";
 import type { TextViewBlock, TextViewDocument, TextViewImage, TextViewInline, TextViewListItem } from "nsh/base";
 import { tr } from "../lib/i18n";
+import { extractBlockMedia, resolveMediaTarget, type MediaItem } from "../lib/media";
 import { mendStreamingMarkdown, PENDING_LINK_URL } from "../lib/mend";
 import { clearPacers, pacedStreamText } from "../lib/stream-pacer";
 import {
@@ -37,6 +38,8 @@ import {
   type RowVeil,
   type VeilChunk,
 } from "../lib/veil";
+import { openLocalFile, workspacePath } from "../store/app";
+import { backend } from "../store/backend";
 import { Icon } from "../ui/Icon";
 import { EASING } from "../ui/motion";
 import { FOCUS_RING, HOVER_REVEAL, PRESS } from "../ui/styles";
@@ -44,6 +47,7 @@ import { tip } from "../ui/Tip";
 import { readingType, codeType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
 import { openZoom } from "../ui/Zoom";
+import { MediaGallery, openMediaZoom } from "./Media";
 
 /** Shared typography classes for `TextView` fallback blocks (alerts, math, settled code). */
 export const proseClasses = computed(() => ({
@@ -76,19 +80,43 @@ const zoomTableClasses = computed(() => ({
   tableHeaderCell: `${readingType("sm")} font-semibold text-muted-foreground`,
 }));
 
+function openProseLink(url: string) {
+  const resolved = resolveMediaTarget(url, workspacePath(), backend().home());
+  if (resolved?.path) {
+    void openLocalFile(resolved.path);
+    return;
+  }
+  void openUrl(url);
+}
+
 /** Opens a table in the window's zoom layer: a snapshot rendered through `TextView`, wide tables scroll inside it. */
 function zoomTable(block: Extract<TextViewBlock, { type: "table" }>) {
   openZoom({
-    render: () => <TextView document={{ blocks: [block] }} classes={zoomTableClasses()} selectable links="open" />,
+    render: () => <TextView document={{ blocks: [block] }} classes={zoomTableClasses()} selectable links="report" onLinkPress={({ url }) => openProseLink(url)} />,
   });
 }
 
 /** Opens an image in the same zoom layer (`TextView`'s `onImagePress`). */
 function zoomImage(image: TextViewImage) {
-  openZoom({
-    title: image.title || image.alt,
-    render: () => <Image src={image.src} class="max-w-full" style={{ objectFit: "contain" }} accessibilityLabel={image.alt} />,
-  });
+  const resolved = resolveMediaTarget(image.src, workspacePath(), backend().home());
+  const item: MediaItem = resolved
+    ? {
+        id: `tv-img:${image.src}`,
+        kind: "image",
+        title: image.title || image.alt || resolved.title,
+        ...(resolved.path ? { path: resolved.path } : {}),
+        ...(resolved.src ? { src: resolved.src } : {}),
+        ...(resolved.remoteUrl ? { remoteUrl: resolved.remoteUrl } : {}),
+        ...(resolved.mimeType ? { mimeType: resolved.mimeType } : {}),
+        ...(resolved.data ? { data: resolved.data } : {}),
+      }
+    : {
+        id: `tv-img:${image.src}`,
+        kind: "image",
+        title: image.title || image.alt || "image",
+        src: image.src,
+      };
+  openMediaZoom(item);
 }
 
 /** A block's hover-revealed expand button: a floating chip at its top-right corner that opens it in the zoom layer. */
@@ -381,7 +409,7 @@ function renderVeiledInlines(content: readonly TextViewInline[], chunks: VeilChu
         <Text
           class={cls}
           style={[runVeiledStyle(run, undefined, undefined), size]}
-          onPress={clickableUrl ? () => void openUrl(clickableUrl) : undefined}
+          onPress={clickableUrl ? () => openProseLink(clickableUrl) : undefined}
         >
           {run.text}
         </Text>,
@@ -400,7 +428,7 @@ function renderVeiledInlines(content: readonly TextViewInline[], chunks: VeilChu
         <Text
           class={cls}
           style={[runVeiledStyle(run, chunks, hit?.chunk, hit ? start + a - hit.chunk.start : undefined), size]}
-          onPress={clickableUrl ? () => void openUrl(clickableUrl) : undefined}
+          onPress={clickableUrl ? () => openProseLink(clickableUrl) : undefined}
         >
           {run.text.slice(a, b)}
         </Text>,
@@ -682,7 +710,8 @@ function FallbackTextViewBlock(props: { block: TextViewBlock; settled: boolean }
       document={{ blocks: [props.block] }}
       classes={proseClasses()}
       selectable
-      links="open"
+      links="report"
+      onLinkPress={({ url }) => openProseLink(url)}
       codeBlockScrollbar={false}
       tableScrollbar={false}
       codeBlockActions={props.settled ? [{ id: "copy", label: tr("Copy code", "复制代码") }] : undefined}
@@ -1018,9 +1047,23 @@ export function ProseBlock(props: { row: ProseRow }) {
     return node ? { opacity: node } : undefined;
   };
 
+  const paraMedia = () => {
+    const b = item();
+    if (!props.row.block || b.type !== "paragraph") return undefined;
+    const res = extractBlockMedia(b, workspacePath(), backend().home(), `md:${props.row.rowId}:${index()}`);
+    return res.mode === "none" ? undefined : res;
+  };
+  const asMediaOnly = () => {
+    const res = paraMedia();
+    return res?.mode === "pure" ? res.items : undefined;
+  };
   const asPara = () => {
     const b = item();
-    return props.row.block && b.type === "paragraph" && isSimpleInline(b.content) ? b : undefined;
+    if (!props.row.block || b.type !== "paragraph") return undefined;
+    const res = paraMedia();
+    if (res?.mode === "pure") return undefined;
+    const target = res?.strippedBlock ?? b;
+    return isSimpleInline(target.content) ? { block: target, media: res?.items ?? [] } : undefined;
   };
   const asHeading = () => {
     const b = item();
@@ -1063,111 +1106,143 @@ export function ProseBlock(props: { row: ProseRow }) {
   return (
     <If
       when={props.row.block}
-      else={<TextView document={{ blocks: [], footnotes: props.row.footnotes ?? [] }} classes={proseClasses()} selectable links="open" codeBlockScrollbar={false} tableScrollbar={false} />}
+      else={
+        <TextView
+          document={{ blocks: [], footnotes: props.row.footnotes ?? [] }}
+          classes={proseClasses()}
+          selectable
+          links="report"
+          onLinkPress={({ url }) => openProseLink(url)}
+          codeBlockScrollbar={false}
+          tableScrollbar={false}
+        />
+      }
     >
       <View style={fadeStyle()}>
         <If
-          when={asPara()}
+          when={asMediaOnly()}
           else={
             <If
-              when={asHeading()}
+              when={asPara()}
               else={
                 <If
-                  when={asList()}
+                  when={asHeading()}
                   else={
                     <If
-                      when={asQuote()}
+                      when={asList()}
                       else={
                         <If
-                          when={asTable()}
+                          when={asQuote()}
                           else={
                             <If
-                              when={asFallbackTable()}
+                              when={asTable()}
                               else={
-                                <If when={asStreamingCode()} else={<FallbackTextViewBlock block={item()} settled={!props.row.tail} />}>
-                                  {(codeBlock) => <StreamingCodeCard code={codeBlock()?.code ?? ""} chunks={chunksOf(`code:${index()}`)} />}
+                                <If
+                                  when={asFallbackTable()}
+                                  else={
+                                    <If
+                                      when={asStreamingCode()}
+                                      else={
+                                        <View class="gap-2">
+                                          <FallbackTextViewBlock block={paraMedia()?.strippedBlock ?? item()} settled={!props.row.tail} />
+                                          <If when={paraMedia()?.mode === "mixed"}>
+                                            <MediaGallery items={paraMedia()!.items} />
+                                          </If>
+                                        </View>
+                                      }
+                                    >
+                                      {(codeBlock) => <StreamingCodeCard code={codeBlock()?.code ?? ""} chunks={chunksOf(`code:${index()}`)} />}
+                                    </If>
+                                  }
+                                >
+                                  {(tableBlock) => (
+                                    <View class="group relative">
+                                      <FallbackTextViewBlock block={tableBlock()} settled={!props.row.tail} />
+                                      <If when={!props.row.tail}>
+                                        <ExpandButton onPress={() => zoomTable(tableBlock())} />
+                                      </If>
+                                    </View>
+                                  )}
                                 </If>
                               }
                             >
-                              {(tableBlock) => (
-                                <View class="group relative">
-                                  <FallbackTextViewBlock block={tableBlock()} settled={!props.row.tail} />
-                                  <If when={!props.row.tail}>
-                                    <ExpandButton onPress={() => zoomTable(tableBlock())} />
-                                  </If>
-                                </View>
-                              )}
+                              {(tableBlock) => <VeiledTableView block={tableBlock()} blockIdx={index} settled={!props.row.tail} chunks={chunksMap} />}
                             </If>
                           }
                         >
-                          {(tableBlock) => <VeiledTableView block={tableBlock()} blockIdx={index} settled={!props.row.tail} chunks={chunksMap} />}
+                          {(quote) => (
+                            <View class="gap-1.5 border-l-2 border-brand/35 pl-3.5" selectable>
+                              <Each of={quote().children} key="index">
+                                {(qChild, k) => (
+                                  <View>
+                                    <If when={qChild().type === "paragraph" ? (qChild() as Extract<TextViewBlock, { type: "paragraph" }>) : undefined}>
+                                      {(qp) => (
+                                        <Text class={`${readingType()} leading-relaxed italic`}>
+                                          {renderVeiledInlines(qp().content, chunksOf(`bq:${index()}:${k()}`), "muted")}
+                                        </Text>
+                                      )}
+                                    </If>
+                                    <If when={qChild().type === "list" ? (qChild() as Extract<TextViewBlock, { type: "list" }>) : undefined}>
+                                      {(qList) => (
+                                        <VeiledListView
+                                          block={qList()}
+                                          prefix={`bq:${index()}:L${k()}`}
+                                          depth={0}
+                                          baseTone="muted"
+                                          chunks={chunksMap}
+                                        />
+                                      )}
+                                    </If>
+                                  </View>
+                                )}
+                              </Each>
+                            </View>
+                          )}
                         </If>
                       }
                     >
-                      {(quote) => (
-                        <View class="gap-1.5 border-l-2 border-brand/35 pl-3.5" selectable>
-                          <Each of={quote().children} key="index">
-                            {(qChild, k) => (
-                              <View>
-                                <If when={qChild().type === "paragraph" ? (qChild() as Extract<TextViewBlock, { type: "paragraph" }>) : undefined}>
-                                  {(qp) => (
-                                    <Text class={`${readingType()} leading-relaxed italic`}>
-                                      {renderVeiledInlines(qp().content, chunksOf(`bq:${index()}:${k()}`), "muted")}
-                                    </Text>
-                                  )}
-                                </If>
-                                <If when={qChild().type === "list" ? (qChild() as Extract<TextViewBlock, { type: "list" }>) : undefined}>
-                                  {(qList) => (
-                                    <VeiledListView
-                                      block={qList()}
-                                      prefix={`bq:${index()}:L${k()}`}
-                                      depth={0}
-                                      baseTone="muted"
-                                      chunks={chunksMap}
-                                    />
-                                  )}
-                                </If>
-                              </View>
-                            )}
-                          </Each>
-                        </View>
+                      {(listBlock) => (
+                        <VeiledListView
+                          block={listBlock()}
+                          prefix={`li:${index()}`}
+                          depth={0}
+                          baseTone="fg"
+                          chunks={chunksMap}
+                        />
                       )}
                     </If>
                   }
                 >
-                  {(listBlock) => (
-                    <VeiledListView
-                      block={listBlock()}
-                      prefix={`li:${index()}`}
-                      depth={0}
-                      baseTone="fg"
-                      chunks={chunksMap}
-                    />
-                  )}
+                  {(heading) => {
+                    const key = () => `h:${index()}`;
+                    return (
+                      <View selectable>
+                        <Text role="header" accessibilityLevel={heading().level} class={headingClasses()[heading().level]}>
+                          {renderVeiledInlines(heading().content, chunksOf(key()), "fg")}
+                        </Text>
+                      </View>
+                    );
+                  }}
                 </If>
               }
             >
-              {(heading) => {
-                const key = () => `h:${index()}`;
+              {(para) => {
+                const key = () => `p:${index()}`;
                 return (
-                  <View selectable>
-                    <Text role="header" accessibilityLevel={heading().level} class={headingClasses()[heading().level]}>
-                      {renderVeiledInlines(heading().content, chunksOf(key()), "fg")}
-                    </Text>
+                  <View class="gap-2">
+                    <View selectable>
+                      <Text class={`${readingType()} leading-relaxed`}>{renderVeiledInlines(para().block.content, chunksOf(key()), "fg")}</Text>
+                    </View>
+                    <If when={para().media.length > 0}>
+                      <MediaGallery items={para().media} />
+                    </If>
                   </View>
                 );
               }}
             </If>
           }
         >
-          {(para) => {
-            const key = () => `p:${index()}`;
-            return (
-              <View selectable>
-                <Text class={`${readingType()} leading-relaxed`}>{renderVeiledInlines(para().content, chunksOf(key()), "fg")}</Text>
-              </View>
-            );
-          }}
+          {(items) => <MediaGallery items={items()} class="py-1.5" />}
         </If>
       </View>
     </If>

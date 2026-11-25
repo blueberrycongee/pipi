@@ -27,6 +27,7 @@ const FINGERPRINT_FILES = [
   "launch-pi.mjs",
   "pipi-orchestrator-extension.mjs",
   "pipi-mcp-stdio.mjs",
+  "acp-form.mjs",
   "agent-usage.mjs",
   "env-paths.mjs",
   "session-index.mjs",
@@ -146,7 +147,7 @@ async function probeAndMaybeUpgrade(conn, data, home, kind) {
 
   const upgradeReqId = `u_up_${Date.now()}`;
   const sessions = Array.isArray(hello.sessions) ? hello.sessions : [];
-  const hasRunning = sessions.some((s) => s?.status === "working" || s?.status === "blocked");
+  const hasRunning = sessions.some((s) => s?.loaded !== false && (s?.status === "working" || s?.status === "blocked"));
 
   const replyPromise = waitMessage((m) => m?.id === upgradeReqId, 1500);
   channel.send({ id: upgradeReqId, type: "shutdown_if_idle" });

@@ -249,6 +249,12 @@ async function runSingleTurn(promptText) {
     const target = promptText.split("pingpong-start:")[1].trim();
     await callMcp("session_send", { session: target, message: "pingpong-mode first" });
     reply = "started-pingpong";
+  } else if (promptText === "present-relative") {
+    const mcpRes = await callMcp("present_files", {
+      title: "Session outputs",
+      files: [{ path: "preview.png", caption: "2x2 square" }, { path: "missing.mp4" }],
+    });
+    reply = JSON.stringify(mcpRes?.result?.structuredContent ?? mcpRes?.result ?? {});
   } else if (promptText.startsWith("watch:")) {
     const clearMs = Number(promptText.slice(6)) || 0;
     emit({ type: "pipi_background_watch", active: true });
@@ -608,7 +614,7 @@ test("1, 2 & 9: daemon owns sessions across detach/reattach, replays blocked dia
   });
   assert.equal(badAuth.status, 401);
 
-  // Valid token: notifications return 202 empty body, tools/list returns all 6 tools with standard inputSchema
+  // Valid token: notifications return 202 empty body, tools/list returns all 8 tools with standard inputSchema
   const notifRes = await fetch(extMcp.url, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${extMcp.token}` },
@@ -624,10 +630,57 @@ test("1, 2 & 9: daemon owns sessions across detach/reattach, replays blocked dia
   assert.equal(toolsRes.status, 200);
   const toolsJson = await toolsRes.json();
   const names = toolsJson.result.tools.map((tool) => tool.name);
-  assert.deepEqual(names, ["agents_list", "sessions_list", "session_read", "session_send", "session_start", "session_stop"]);
+  assert.deepEqual(names, ["agents_list", "workspaces_list", "sessions_list", "session_read", "session_send", "session_start", "session_stop", "present_files"]);
   for (const tool of toolsJson.result.tools) {
     assert.ok(tool.inputSchema && tool.inputSchema.type === "object", `${tool.name} must expose standard MCP inputSchema`);
   }
+
+  // present_files resolves paths (both absolute on external token and relative against session caller cwd), reads PNG size/dimensions, and reports missing files cleanly
+  const pngPath = path.join(workDir, "preview.png");
+  const pngBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mP8z8BQz0AEwDiqAAAWBAQCAQIDAgAAAABJRU5ErkJggg==", "base64");
+  fs.writeFileSync(pngPath, pngBytes);
+  const presentRes = await fetch(extMcp.url, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${extMcp.token}` },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "present_files",
+        arguments: {
+          title: "Rendered outputs",
+          files: [{ path: pngPath, caption: "2x2 square" }, { path: path.join(workDir, "missing.mp4") }],
+        },
+      },
+    }),
+  });
+  assert.equal(presentRes.status, 200);
+  const presentJson = await presentRes.json();
+  const presented = presentJson.result.structuredContent;
+  assert.equal(presented.pipiMedia, true);
+  assert.equal(presented.title, "Rendered outputs");
+  assert.equal(presented.missingCount, 1);
+  assert.equal(presented.items[0].kind, "image");
+  assert.equal(presented.items[0].width, 2);
+  assert.equal(presented.items[0].height, 2);
+  assert.equal(presented.items[0].size, pngBytes.length);
+  assert.equal(presented.items[0].exists, true);
+  assert.equal(presented.items[1].kind, "video");
+  assert.equal(presented.items[1].exists, false);
+
+  await ctrl1.call("attach", { session: { id: sid, cwd: workDir, agentId: "pi", driver: "pi" } });
+  ctrl1.events.length = 0;
+  await ctrl1.call("send", { sessionId: sid, message: "present-relative" });
+  await ctrl1.waitUntil(() => ctrl1.sessions.get(sid)?.status === "idle" && ctrl1.events.some((e) => e.type === "out" && e.line?.includes("agent_settled")));
+  const relRead = await ctrl1.readMessages(sid, 2);
+  const relPresented = JSON.parse(relRead.messages.at(-1).text);
+  assert.equal(relPresented.pipiMedia, true);
+  assert.equal(relPresented.missingCount, 1);
+  assert.equal(relPresented.items[0].path, pngPath);
+  assert.equal(relPresented.items[0].exists, true);
+  assert.equal(relPresented.items[1].exists, false);
+  await ctrl1.call("detach", { sessionId: sid });
 
   // Test stdio MCP proxy (`pipi-mcp-stdio.mjs`) & Pi extension (`pipi-orchestrator-extension.mjs`)
   const proxy = spawn(process.execPath, [MCP_STDIO_SCRIPT], {
@@ -648,7 +701,7 @@ test("1, 2 & 9: daemon owns sessions across detach/reattach, replays blocked dia
   const agentsPayload = JSON.parse(proxyLine.result.content[0].text);
   assert.ok(Array.isArray(agentsPayload.agents) && agentsPayload.agents.some((a) => a.id === "pi"));
 
-  // Pi extension mirrors all 6 tools and wires `/pipi-runtime-mode`
+  // Pi extension mirrors all 8 tools and wires `/pipi-runtime-mode`
   const registeredTools = [];
   const registeredCommands = new Map();
   process.env.PIPI_ORCHESTRATOR_URL = extMcp.url;
@@ -669,7 +722,7 @@ test("1, 2 & 9: daemon owns sessions across detach/reattach, replays blocked dia
     delete process.env.PIPI_ORCHESTRATOR_URL;
     delete process.env.PIPI_ORCHESTRATOR_TOKEN;
   }
-  assert.equal(registeredTools.length, 6);
+  assert.equal(registeredTools.length, 8);
   assert.ok(registeredCommands.has("pipi-runtime-mode"));
 
   // Focus 9: engines without MCP bridge (`opencode`) must NOT receive orchestrator credentials
@@ -1669,4 +1722,129 @@ test("connectDaemon upgrades a stale idle daemon on UI connect, preserves runnin
 
   ui2.close();
   ui.close();
+});
+
+test("the personal agent: one per home, opens each fresh conversation with PERSONA.md and MEMORY.md, and survives a restart", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-persona-"));
+  const homeDir = path.join(tmp, "home");
+  const personaDir = path.join(homeDir, "persona");
+  const mockBin = writeMockAgent(tmp);
+  const ctrl = await openControl(homeDir, { HOME: tmp });
+  let after;
+  t.after(() => {
+    ctrl.client.close();
+    after?.client.close();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+  const runCli = async (args) => {
+    const { stdout } = await execFileAsync(process.execPath, [CLI_SCRIPT, "--home", homeDir, ...args], { env: { ...process.env, HOME: tmp } });
+    return stdout.trim();
+  };
+  const lastAnswer = async (id) => (await ctrl.readMessages(id)).lastAnswer ?? "";
+
+  // First use seeds the persona's home (private to the person) and starts it there, named by its PERSONA.md.
+  const id = await runCli(["pip"]);
+  assert.match(id, /^s_/);
+  const info = ctrl.sessions.get(id) ?? (await ctrl.waitUntil(() => ctrl.sessions.get(id)));
+  assert.equal(info.persona, true);
+  assert.equal(info.cwd, personaDir);
+  assert.equal(info.title, "Pip");
+  assert.equal(info.parentId, undefined);
+  const persona = fs.readFileSync(path.join(personaDir, "PERSONA.md"), "utf8");
+  assert.match(persona, /^# Pip$/m);
+  assert.ok(fs.existsSync(path.join(personaDir, "MEMORY.md")));
+  if (process.platform !== "win32") assert.equal(fs.statSync(path.join(personaDir, "MEMORY.md")).mode & 0o077, 0);
+
+  // Pi names its file before the conversation exists: that is still a fresh conversation.
+  await ctrl.waitUntil(() => ctrl.sessions.get(id)?.file);
+  // A slash command keeps the start of its prompt; the block waits for the next one.
+  await runCli(["pip", "/skill:recall"]);
+  await ctrl.waitUntil(async () => (await lastAnswer(id)) === "echo:/skill:recall");
+  await runCli(["pip", "echo:hello"]);
+  await ctrl.waitUntil(async () => (await lastAnswer(id)).endsWith("echo:hello"));
+  const first = await lastAnswer(id);
+  assert.ok(first.startsWith("echo:<pipi-persona"), "the first chat prompt opens with the persona block");
+  assert.ok(first.includes("<persona file=\"PERSONA.md\">") && first.includes("<memory-index file=\"MEMORY.md\""));
+  assert.ok(first.endsWith("</pipi-persona>\n\necho:hello"), "the person's words follow the block unchanged");
+
+  // The same conversation goes on without it; a second persona is refused.
+  assert.equal(await runCli(["pip", "echo:again"]), id);
+  await ctrl.waitUntil(async () => (await lastAnswer(id)).includes("echo:again"));
+  assert.equal(await lastAnswer(id), "echo:echo:again");
+  await assert.rejects(ctrl.call("start_session", { input: { persona: true, agentId: "pi" } }), /already runs as/);
+
+  // A fresh conversation reads the files again: what the person renamed and what Pip noted.
+  fs.writeFileSync(path.join(personaDir, "PERSONA.md"), "# Mochi\n\nMochi is calm.\n");
+  const memory = `# Memory\n\n- Jiahe prefers Chinese.\n${"- filler line for the cap\n".repeat(1000)}- the newest line\n`;
+  fs.writeFileSync(path.join(personaDir, "MEMORY.md"), memory);
+  ctrl.client.send({ type: "in", sessionId: id, line: JSON.stringify({ id: "n1", type: "new_session" }) });
+  await ctrl.waitUntil(() => !ctrl.sessions.get(id)?.file);
+  ctrl.client.send({ type: "in", sessionId: id, line: JSON.stringify({ id: "p1", type: "prompt", message: "echo:fresh" }) });
+  await ctrl.waitUntil(async () => (await lastAnswer(id)).endsWith("echo:fresh"));
+  await ctrl.waitUntil(() => ctrl.sessions.get(id)?.file);
+  const saved = fs.readFileSync(ctrl.sessions.get(id).file, "utf8");
+  assert.ok(saved.includes('name=\\"Mochi\\"') && saved.includes("You are Mochi.") && saved.includes("Mochi is calm."));
+  assert.ok(saved.includes("Jiahe prefers Chinese."));
+  assert.ok(saved.includes(`bytes=\\"${Buffer.byteLength(memory)}\\"`), "the index says how big the file is");
+  assert.ok(!saved.includes("the newest line"), "only the head of a long MEMORY.md is handed over");
+  assert.equal(fs.readFileSync(path.join(personaDir, "MEMORY.md"), "utf8"), memory, "the file itself is never cut");
+
+  // The registry keeps who the personal agent is across a daemon restart.
+  const inst1 = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+  ctrl.client.close();
+  process.kill(inst1.pid, "SIGTERM");
+  await new Promise((resolve) => {
+    const poll = setInterval(() => {
+      try {
+        process.kill(inst1.pid, 0);
+      } catch {
+        clearInterval(poll);
+        resolve();
+      }
+    }, 25);
+  });
+  after = await openControl(homeDir, { HOME: tmp });
+  assert.equal(after.sessions.get(id)?.persona, true);
+  assert.match(await runCli(["pip"]), new RegExp(`^${id}\\t`));
+});
+
+test("workspaces_list names the app's open projects and the folders sessions ran in, never the personal agent's notes", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-workspaces-"));
+  const homeDir = path.join(tmp, "home");
+  const openProject = path.join(tmp, "open-project");
+  const ranIn = path.join(tmp, "ran-in");
+  for (const dir of [openProject, ranIn]) fs.mkdirSync(dir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+  const ctrl = await openControl(homeDir, { HOME: tmp });
+  t.after(() => {
+    ctrl.client.close();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+  await ctrl.call("workspaces", { paths: [openProject, ranIn] });
+  const { session: worker } = await ctrl.call("start_session", { input: { title: "work", agentId: "pi", cwd: ranIn } });
+  const { session: pip } = await ctrl.call("start_session", { input: { persona: true, agentId: "pi" } });
+  await ctrl.waitUntil(() => ctrl.sessions.get(pip.id));
+
+  const ext = await ctrl.call("external_token");
+  const res = await fetch(ext.url, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${ext.token}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "workspaces_list", arguments: {} } }),
+  });
+  const { workspaces } = JSON.parse((await res.json()).result.content[0].text);
+  assert.deepEqual(
+    workspaces.map((w) => [w.path, w.name, w.open, w.sessions]),
+    [
+      [ranIn, "ran-in", true, 1],
+      [openProject, "open-project", true, 0],
+    ],
+  );
+  assert.ok(workspaces[0].lastActive >= worker.createdAt);
+  assert.ok(!workspaces.some((w) => w.path === pip.cwd), "the personal agent's folder is not a project");
 });

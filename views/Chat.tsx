@@ -11,15 +11,18 @@ import type { Mood } from "../mascot/geometry";
 import { Pip } from "../mascot/Pip";
 import {
   activeAgent,
+  attachLocalPath,
   chooseWorkspace,
   composerAttachments,
   composerDocs,
   composerDraft,
+  composerFiles,
   conversationKey,
   currentActivity,
   currentDaemonSession,
   headingDaemonSession,
   hasModel,
+  isChatFolder,
   isDraftAhead,
   isLeavingSession,
   isRunning,
@@ -28,6 +31,7 @@ import {
   newSessionInWorkspace,
   pendingDialog,
   pipMood,
+  placeLabel,
   restartPi,
   scrollToEndTick,
   sendAnchorTick,
@@ -44,6 +48,7 @@ import {
 } from "../store/app";
 import { backend } from "../store/backend";
 import { recentWorkspaces } from "../store/prefs";
+import { openNewChatTab } from "../store/tabs";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import { DURATION, EASING, enterStagger, keepLast, markRowsSeen, popupHiddenStyle, popupLeavingStyle, popupStyle, PATIENCE_MS, Presence, SPRING } from "../ui/motion";
@@ -94,6 +99,7 @@ function isChatActive() {
  */
 function activityLabel(said: boolean) {
   const dialog = pendingDialog();
+  if (dialog?.method === "form") return tr("Waiting for your answer", "等待你的回答");
   if (dialog) return tr("Waiting for confirmation", "等待确认");
   // A blocked session is waiting before its dialog replay lands: the daemon's
   // word is earlier than the attach's, and "thinking" would be a lie it tells.
@@ -268,7 +274,7 @@ function WelcomeProject(props: { onActiveChange?: (active: boolean) => void }) {
   const buildProjects = () => {
     const active = current();
     const rest = recentWorkspaces().filter((path) => path !== active);
-    return active ? [active, ...rest] : rest;
+    return active && !isChatFolder(active) ? [active, ...rest] : rest;
   };
   const shownCurrent = signal(untracked(current));
   const shownProjects = signal<string[]>(untracked(buildProjects));
@@ -317,14 +323,14 @@ function WelcomeProject(props: { onActiveChange?: (active: boolean) => void }) {
       trigger={
         <BaseButton
           accessibilityLabel={tr("Project this session works in", "会话所在项目")}
-          tooltip={open() || closing() ? undefined : tip(tildePath(current(), home))}
+          tooltip={open() || closing() ? undefined : tip(placeLabel(current()))}
           class={`${uiHeight(28)} flex-row items-center gap-1.5 ${PRESS} ${FOCUS_RING} ${
             // Over a wallpaper the words cannot stand on the picture: they get the composer's glass, as a capsule.
             wallpaper() ? "rounded-full border-[0.5px] border-hairline bg-card/65 pl-3 pr-2.5 hover:bg-card/85 dark:bg-card/58 dark:hover:bg-card/75" : "rounded-md corner-squircle px-1.5 hover:bg-accent"
           }`}
           style={wallpaper() ? GLASS_REGULAR : undefined}
         >
-          <Text class={`max-w-80 truncate ${uiType("sm")} text-muted-foreground ${wallpaper() ? "" : "underline"}`}>{`${activeAgent().name} · ${tildePath(current(), home)}`}</Text>
+          <Text class={`max-w-80 truncate ${uiType("sm")} text-muted-foreground ${wallpaper() ? "" : "underline"}`}>{`${activeAgent().name} · ${placeLabel(current())}`}</Text>
           <Icon name="chevronDown" size={12} tone="subtle" />
         </BaseButton>
       }
@@ -348,6 +354,18 @@ function WelcomeProject(props: { onActiveChange?: (active: boolean) => void }) {
         </Each>
       </Scroll>
       <View class="mx-1 h-px bg-border" />
+      <BaseButton
+        selected={isChatFolder(shownCurrent())}
+        onPress={() => closeAndRun(() => void openNewChatTab())}
+        class={`mt-1 ${uiMinHeight(36)} flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
+      >
+        <Icon name="message" size={15} tone={isChatFolder(shownCurrent()) ? "foreground" : "muted-foreground"} />
+        <View class="min-w-0 flex-1">
+          <Text class={`truncate ${uiType("base")} text-foreground`}>{tr("Chat", "闲聊")}</Text>
+          <Text class={`truncate ${uiType("xs")} text-subtle`}>{tr("No project folder", "不在任何项目里")}</Text>
+        </View>
+        <View class="w-4 shrink-0 items-center">{isChatFolder(shownCurrent()) ? <Icon name="check" size={14} tone="brand-text" /> : null}</View>
+      </BaseButton>
       <BaseButton
         onPress={() => closeAndRun(() => void chooseWorkspace())}
         class={`mt-1 ${uiMinHeight(36)} flex-row items-center gap-2.5 rounded-md corner-squircle px-2 py-1 ${PRESS} hover:bg-accent focus:bg-accent active:bg-accent`}
@@ -388,7 +406,9 @@ function HeroStage(props: { mode: () => "welcome" | "starting"; fading?: () => b
   const title = () =>
     props.mode() === "starting"
       ? tr(`Waking ${agentName()}…`, `正在唤醒 ${agentName()}…`)
-      : tr("What are we building?", "今天要构建什么？");
+      : isChatFolder(workspacePath())
+        ? tr("What's on your mind?", "想聊点什么？")
+        : tr("What are we building?", "今天要构建什么？");
   return (
     <Stage around title={title} mood={stageMood}>
       <If when={Boolean(workspacePath()) && (props.mode() === "welcome" || pickerActive())}>
@@ -821,6 +841,7 @@ export function Chat() {
         keepMounted: isTurnClosing,
       },
       processOf,
+      { cwd: workspacePath(), home: backend().home() },
     );
     let merged = projected;
     const snapEntries = Object.entries(recallingUserSnapshots());
@@ -844,16 +865,30 @@ export function Chat() {
     // never leaves before a next text row takes it (one commit: a seat lost and
     // a seat gained is no height at all), so no seat's leaving ever pulls the
     // rows around it.
+    const stabilized = watching ? stable(merged) : merged;
     const lastRowId = merged.at(-1)?.id;
-    const rows = (watching ? stable(merged) : merged).flatMap((row): ChatRow[] =>
-      row.kind !== "text"
-        ? [row]
-        : row.final
-          ? [...proseRows(row), replyActions(row)]
-          : row.id === lastRowId
-            ? [...proseRows(row), heldActions(row)]
-            : proseRows(row),
-    );
+    const rows: ChatRow[] = [];
+    for (let idx = 0; idx < stabilized.length; idx++) {
+      const row = stabilized[idx];
+      if (row.kind !== "text") {
+        rows.push(row);
+        continue;
+      }
+      if (row.final) {
+        rows.push(...proseRows(row));
+        while (idx + 1 < stabilized.length) {
+          const next = stabilized[idx + 1];
+          if (next.kind !== "media") break;
+          idx++;
+          rows.push(next);
+        }
+        rows.push(replyActions(row));
+      } else if (row.id === lastRowId) {
+        rows.push(...proseRows(row), heldActions(row));
+      } else {
+        rows.push(...proseRows(row));
+      }
+    }
     // The rows a turn's fold shows, in order (commentary is a row per block, each the turn's its reply is).
     const folded = new Map<string, string>();
     for (const row of rows) {
@@ -985,7 +1020,7 @@ export function Chat() {
       const from = slideNow() + (middle ? way : -way);
       // Sending a multi-line draft or attachment from Welcome clears the composer in the same frame it docks:
       // compensate `stand` by the composer's height drop so `bottom-full` hero content stays pinned while fading out.
-      const shrink = !middle && heroFigure > FIGURE_REST && !composerDraft() && !composerAttachments().length && !composerDocs().length ? heroFigure - FIGURE_REST : 0;
+      const shrink = !middle && heroFigure > FIGURE_REST && !composerDraft() && !composerAttachments().length && !composerDocs().length && !composerFiles().length ? heroFigure - FIGURE_REST : 0;
       travel = undefined;
       // Up: the stage is where it will be, and the composer comes to it. Down: it stays where it was.
       stand.set(middle ? 0 : -(way + shrink));
@@ -1544,9 +1579,27 @@ export function Chat() {
     });
   });
 
+  const onDroppedFiles = (uris: readonly string[]) => {
+    for (const raw of uris) {
+      const s = raw.trim();
+      let decoded = s;
+      if (s.startsWith("file://")) {
+        const stripped = s.replace(/^file:\/\/localhost/i, "").replace(/^file:\/\//i, "");
+        try {
+          decoded = decodeURIComponent(stripped);
+        } catch {
+          decoded = stripped;
+        }
+        if (/^\/[A-Za-z]:\//.test(decoded)) decoded = decoded.slice(1);
+      }
+      if (decoded) void attachLocalPath(decoded);
+    }
+  };
+
   return (
     <View
       class="relative flex-1"
+      onFileDrop={(e) => onDroppedFiles(e.uris)}
       onMouseMove={selecting() ? onSelectMove : undefined}
       onMouseLeave={selecting() ? onSelectLeave : undefined}
       onMouseUp={selecting() ? endSelecting : undefined}

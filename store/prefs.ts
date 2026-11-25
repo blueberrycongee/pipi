@@ -93,6 +93,8 @@ interface Prefs {
    * path → rank (same timestamp domain as `modified`, which it overrides).
    */
   sessionRanks: Record<string, Record<string, number>>;
+  /** Standings a drag gave documents in 文档, keyed by file path (same timestamp domain as `modified`, which it overrides). */
+  docRanks: Record<string, number>;
   /** Sidebar functional groups folded away: `"workspaces"`, `"recents"`, `"docs"`, `"archived"`. */
   collapsedGroups: string[];
   /** Custom folder for Markdown documents; when unset, `<dataDir>/docs` is used. */
@@ -179,6 +181,7 @@ const DEFAULTS: Prefs = {
   collapsedWorkspaces: [],
   recentRanks: {},
   sessionRanks: {},
+  docRanks: {},
   collapsedGroups: ["archived"],
   archivedSessions: {},
   autoArchiveDays: 0,
@@ -359,6 +362,7 @@ export async function loadPrefs() {
         collapsedWorkspaces: Array.isArray(parsed.collapsedWorkspaces) ? parsed.collapsedWorkspaces : [],
         recentRanks: normalizeRanks(parsed.recentRanks),
         sessionRanks: normalizeRankMap(parsed.sessionRanks),
+        docRanks: normalizeRanks(parsed.docRanks),
         collapsedGroups,
         docsFolder: typeof parsed.docsFolder === "string" && parsed.docsFolder.trim() ? parsed.docsFolder.trim().replace(/\/+$/, "") : undefined,
         archivedSessions: normalizeArchivedSessions(parsed.archivedSessions),
@@ -412,8 +416,18 @@ export async function loadPrefs() {
 }
 
 function change(patch: Partial<Prefs>) {
+  const before = prefs().workspaces;
   prefs.set({ ...prefs(), ...patch });
   Storage.setItem(KEY, JSON.stringify(prefs())).catch(() => undefined);
+  if (prefs().workspaces !== before) for (const listener of workspacesListeners) listener();
+}
+
+const workspacesListeners = new Set<() => void>();
+
+/** Subscribes to changes of the open projects list. */
+export function onWorkspacesChange(listener: () => void): () => void {
+  workspacesListeners.add(listener);
+  return () => workspacesListeners.delete(listener);
 }
 
 function applyAppearance(appearance: Appearance) {
@@ -439,6 +453,7 @@ export const collapsedWorkspaces = () => prefs().collapsedWorkspaces;
 export const recentRankOverrides = () => prefs().recentRanks;
 const NO_RANKS: Record<string, number> = {};
 export const sessionRankOverrides = (cwd: string) => prefs().sessionRanks[cwd] ?? NO_RANKS;
+export const docRankOverrides = () => prefs().docRanks;
 export const isWorkspaceCollapsed = (path: string) => prefs().collapsedWorkspaces.includes(path);
 export const isGroupCollapsed = (id: string) => prefs().collapsedGroups.includes(id);
 export const archivedSessions = () => prefs().archivedSessions;
@@ -713,6 +728,18 @@ export function setRecentRankOverrides(next: Record<string, number>) {
 
 export function setSessionRankOverrides(cwd: string, next: Record<string, number>) {
   change({ sessionRanks: { ...prefs().sessionRanks, [cwd]: next } });
+}
+
+export function setDocRankOverrides(next: Record<string, number>) {
+  change({ docRanks: next });
+}
+
+/** Drops a deleted document's drag rank, so a new note given its path does not inherit the place. */
+export function forgetDocRank(path: string) {
+  if (!(path in prefs().docRanks)) return;
+  const docRanks = { ...prefs().docRanks };
+  delete docRanks[path];
+  change({ docRanks });
 }
 
 export function forgetWorkspace(path: string) {

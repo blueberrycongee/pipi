@@ -33,7 +33,7 @@ import {
 } from "nsh/base";
 import { Menu, type MenuItem } from "nsh/desktop";
 import { compactPath, tildePath } from "../lib/format";
-import { topBarHeight } from "../lib/layout";
+import { DOC_COLUMN, topBarHeight } from "../lib/layout";
 import { activeLanguage, tr } from "../lib/i18n";
 import { currentView, showChat, wallpaper } from "../store/app";
 import { backend } from "../store/backend";
@@ -117,7 +117,7 @@ interface SlashState {
  */
 const editorClasses = computed(() => ({
   root: "flex-1",
-  content: `mx-auto w-full max-w-180 px-10 ${readingType()} text-foreground`,
+  content: `${DOC_COLUMN} ${readingType()} text-foreground`,
   placeholder: "text-subtle",
   caret: "bg-brand",
   selection: "bg-brand/15 dark:bg-brand/25",
@@ -881,7 +881,7 @@ function DocFoot(props: { doc: MarkdownDoc; picked: () => boolean; pickedWords: 
 
   return (
     <View class="h-11 shrink-0 justify-center">
-      <View class="mx-auto w-full max-w-180 flex-row items-center gap-3 px-10">
+      <View class={`${DOC_COLUMN} flex-row items-center gap-3`}>
         <View class="min-w-0 flex-1 flex-row items-center" style={{ opacity: statusOpacity }}>
           <BaseButton
             onPress={() => void revealDoc(props.doc.path)}

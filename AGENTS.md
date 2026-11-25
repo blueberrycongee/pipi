@@ -35,8 +35,9 @@ multi-agent orchestration, and settings.
   virtual `Transport` so `PiClient` speaks the same protocol while the
   daemon owns the processes — detach never kills, and a session blocked on
   an approval replays its dialog to whoever attaches next. Agents inside
-  sessions get the same six tools (`agents_list`, `sessions_list`,
-  `session_read`, `session_send`, `session_start`, `session_stop`) over a
+  sessions get the same eight tools (`agents_list`, `workspaces_list`,
+  `sessions_list`, `session_read`, `session_send`, `session_start`,
+  `session_stop`, `present_files`) over a
   per-session-token HTTP MCP endpoint — Pi through
   `sidecar/pipi-orchestrator-extension.mjs` (which mirrors the daemon's
   tool list), Claude/Codex/ACP through the `sidecar/pipi-mcp-stdio.mjs`
@@ -63,6 +64,12 @@ multi-agent orchestration, and settings.
   evenly down to a floor, past which it scrolls, and a close with the
   pointer in the strip holds their width until the pointer leaves, so a run
   of closes keeps its close button under it.
+- A chat needs no project. 新闲聊 (under 新会话, and 闲聊 in the welcome
+  folder picker) starts a session in `<dataDir>/chat/` (`chatFolder` in
+  `store/app.ts`): an empty folder of the app's own, under no repository,
+  so no project's `AGENTS.md`/`CLAUDE.md` rides along. It is never
+  remembered as a workspace; its sessions are listed in 最近 only, and a
+  新会话 from a chat goes back to the last project.
 - Documents are the strip's other surface (`store/docs.ts`,
   `views/DocEditor.tsx`): a page of the person's own words — an article or
   note the agents help polish, a long brief the composer is too small and too
@@ -232,6 +239,14 @@ multi-agent orchestration, and settings.
   zoom layer (`ui/Zoom.tsx`, the one preview surface — a `TextView` image
   press lands there too); Escape or its close button leaves it
   (`--target macos` films `.nsh/shots/zoom-*.png`)
+- `nsh test Media.test.tsx --target macos` — inline media in the message stream
+  (`views/Media.tsx`, `lib/media.ts`): local images/galleries, video/audio
+  players, PDF/deliverable cards, safe remote-URL cards, user `<attachment>`
+  files (paperclip/drop/paste), and `present_files` + tool `ImageContent`
+  surfacing outside collapsed turn folds (`--target macos` shoots
+  `.nsh/shots/media-*.png`; `nsh test lib/media.test.ts` unit-tests parsing
+  and resolution; `node --test sidecar/external-media.test.mjs` covers Claude,
+  Codex, and ACP media/structuredContent forwarding)
 - `nsh test WallpaperLook.test.tsx --target macos` — the app under a wallpaper,
   every surface it reaches, in `.nsh/shots/wallpaper-*.png` (`harness.wallpaper`
   lays one; name any image in the test's `PICTURE`)

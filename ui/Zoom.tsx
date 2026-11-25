@@ -18,8 +18,12 @@ import { uiType } from "./typography";
 export interface ZoomContent {
   /** A caption in the strip over the preview (a picture's name); a table needs none. */
   title?: string;
+  /** Optional metadata beside/under the title (dimensions, file size). */
+  subtitle?: string;
   /** Extra classes on the panel over the default roomy sheet. */
   panelClass?: string;
+  /** Optional header actions placed next to the close button (Open, Show in Finder). */
+  actions?: () => JSX.Element;
   render: () => JSX.Element;
 }
 
@@ -50,10 +54,18 @@ export function ZoomLayer() {
       panelClass={`w-full max-w-240 min-h-0 ${shown()?.panelClass ?? ""}`}
     >
       <View class="min-h-0 w-full">
-        <View class="flex-row items-center justify-end gap-3 pl-4 pr-2.5 pt-2.5">
-          <If when={shown()?.title}>
-            {(title) => <Text class={`min-w-0 flex-1 truncate ${uiType("sm")} font-medium text-muted-foreground`}>{title()}</Text>}
+        <View class="flex-row items-center justify-end gap-2 pl-4 pr-2.5 pt-2.5">
+          <If when={shown()?.title || shown()?.subtitle}>
+            <View class="min-w-0 flex-1 flex-row items-baseline gap-2">
+              <If when={shown()?.title}>
+                {(title) => <Text class={`min-w-0 shrink truncate ${uiType("sm")} font-medium text-foreground`}>{title()}</Text>}
+              </If>
+              <If when={shown()?.subtitle}>
+                {(sub) => <Text class={`shrink-0 ${uiType("xs")} tabular-nums text-subtle`}>{sub()}</Text>}
+              </If>
+            </View>
           </If>
+          {shown()?.actions?.()}
           <IconButton icon="x" size="sm" label={tr("Close preview", "关闭预览")} onPress={closeZoom} />
         </View>
         <Scroll class="min-h-0 max-h-140" contentClass="px-5 pb-5 pt-3">

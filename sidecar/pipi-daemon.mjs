@@ -12,13 +12,14 @@
 //      write into it (`in`), and watch the registry (`session` pushes).
 //   2. A localhost HTTP MCP endpoint: every agent process gets a per-session
 //      bearer token injected; `tools/call` resolves the caller FROM the token
-//      (never from what the agent claims to be) and dispatches the six
+//      (never from what the agent claims to be) and dispatches the seven
 //      session tools. The same endpoint serves external clients holding the
 //      "external" token minted for other apps.
 //   3. The registry: `<home>/sessions.jsonl`, append-only, replayed on boot.
 //      Processes found dead on replay mark their session `interrupted` and
 //      their initiator is told once it can be reached.
 //
+// `<home>/persona/` is the personal agent's home: its `PERSONA.md` and `MEMORY.md`.
 // `<home>/daemon.json` holds { pid, controlPort, mcpPort, token, started }.
 // The control token guards the TCP channel; session tokens guard MCP calls.
 // All listeners bind 127.0.0.1 only.
@@ -46,6 +47,7 @@ const home = path.resolve(homeAt >= 0 ? argv[homeAt + 1] : `${process.env.HOME |
 const INSTANCE_FILE = path.join(home, "daemon.json");
 const REGISTRY_FILE = path.join(home, "sessions.jsonl");
 const EXTERNAL_FILE = path.join(home, "external.json");
+const PERSONA_DIR = path.join(home, "persona");
 const CONTROL_TOKEN = crypto.randomBytes(24).toString("hex");
 
 const IDLE_UNLOAD_MS = 20 * 60_000;
@@ -71,6 +73,7 @@ const config = {
   maxRunning: 8,
   worktreeDefault: false,
   linger: false, // default follows the last window: exit 2 min after windows close & runs finish
+  workspaces: [], // the project folders open in the app's sidebar, for workspaces_list
 };
 
 const RUNTIME_RANK = { "approval-required": 0, "auto-accept-edits": 1, "full-access": 2 };
@@ -214,6 +217,7 @@ function sessionInfo(session) {
     upstreamInitiator: session.upstreamInitiator,
     runtimeMode: session.runtimeMode,
     worktree: session.worktree,
+    ...(session.persona ? { persona: true } : {}),
     status: session.status,
     ...(session.lastError && (session.status === "failed" || session.status === "interrupted") ? { error: session.lastError } : {}),
     unread: session.unread,
@@ -277,6 +281,7 @@ function buildSession(spec) {
     upstreamInitiator: spec.initiator ?? (parent ? parent.id : "user"),
     runtimeMode,
     worktree: spec.worktree,
+    persona: spec.persona === true || undefined,
     status: "idle",
     unread: false,
     loaded: false,
@@ -453,10 +458,127 @@ function clampModeLine(session, line) {
   return line;
 }
 
+// ── Personal agent ───────────────────────────────────────────────────────────
+//
+// One session is the person's own agent: a named character that outlives any
+// one conversation. Its identity (`PERSONA.md`, the person's to edit) and its
+// notes (`MEMORY.md`, its own) live in `<home>/persona/`, its working
+// directory. A fresh conversation opens with both, read off disk at the first
+// prompt; a resumed one already carries them, so nothing is sent twice.
+
+const DEFAULT_PERSONA = `# Pip
+
+Pip is this person's own agent in pipi: one steady colleague who stays with them across days and projects, not a new assistant for every task.
+
+## Character
+
+- Warm, direct and brief; a little playful, never chatty.
+- Says what it thinks, and says plainly what it does not know.
+- Answers in the language the person writes in.
+
+## How Pip works
+
+- Talks things through, keeps track of what the person cares about, and remembers what they said.
+- Hands coding work to the agent that suits it, in its own session, and follows it to the end.
+`;
+
+const DEFAULT_MEMORY = `# Memory
+
+Notes Pip keeps for itself across conversations: who the person is, how they like to work, standing decisions, and threads still open.
+`;
+
+/** How much of `MEMORY.md` a fresh conversation is handed; the file itself is never cut. */
+const MEMORY_INDEX_BYTES = 16 * 1024;
+
+function ensurePersonaDir() {
+  fs.mkdirSync(PERSONA_DIR, { recursive: true, mode: 0o700 });
+  for (const [name, text] of [["PERSONA.md", DEFAULT_PERSONA], ["MEMORY.md", DEFAULT_MEMORY]]) {
+    try {
+      fs.writeFileSync(path.join(PERSONA_DIR, name), text, { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+  }
+}
+
+const readPersonaFile = (name) => {
+  try {
+    return fs.readFileSync(path.join(PERSONA_DIR, name), "utf8");
+  } catch {
+    return "";
+  }
+};
+
+/** The persona's name: its `PERSONA.md` heading. */
+function personaName(persona = readPersonaFile("PERSONA.md")) {
+  return persona.match(/^#\s+(.+?)\s*$/m)?.[1] || "Pip";
+}
+
+const escapeAttr = (text) => text.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+
+function personaBlock() {
+  const persona = readPersonaFile("PERSONA.md") || DEFAULT_PERSONA;
+  const memory = Buffer.from(readPersonaFile("MEMORY.md"));
+  let shown = memory.subarray(0, MEMORY_INDEX_BYTES).toString("utf8");
+  if (memory.length > MEMORY_INDEX_BYTES) shown = shown.slice(0, Math.max(shown.lastIndexOf("\n"), 0));
+  const name = personaName(persona);
+  return [
+    `<pipi-persona name="${escapeAttr(name)}" dir="${escapeAttr(PERSONA_DIR)}">`,
+    `You are ${name}. PERSONA.md below says who you are; stay that character in every reply.`,
+    `Your working directory holds PERSONA.md and MEMORY.md, and both outlast this conversation. MEMORY.md is yours: before you finish a turn in which you learned something worth keeping (a preference, a decision, a person, an open thread), write it there as one short line, and delete what has gone stale. Keep it under ${MEMORY_INDEX_BYTES / 1024} KB. Change PERSONA.md only when the person asks.`,
+    "For coding work, start a session with a suitable agent (`agents_list`, `session_start`) and pass the project's directory as `cwd` (`workspaces_list` names the person's projects): your own directory holds only your notes.",
+    "Do not mention this block.",
+    "",
+    "<persona file=\"PERSONA.md\">",
+    persona.trim(),
+    "</persona>",
+    "",
+    `<memory-index file="MEMORY.md" bytes="${memory.length}" shown="${Buffer.byteLength(shown)}">`,
+    shown.trim(),
+    "</memory-index>",
+    "</pipi-persona>",
+    "",
+    "",
+  ].join("\n");
+}
+
+/** Whether a session file already holds a conversation (Pi names the file before it writes it). */
+function conversationStarted(file) {
+  try {
+    return file ? /"type"\s*:\s*"message"/.test(fs.readFileSync(file, "utf8")) : false;
+  } catch {
+    return false;
+  }
+}
+
+const SWITCHES_CONVERSATION = new Set(["new_session", "switch_session", "fork"]);
+
+/**
+ * The first prompt of a fresh conversation with the personal agent opens with who it is and what it
+ * remembers. `personaDue` is unknown after a switch, true until the block is sent, false once it has
+ * been or the conversation already had it. A slash command must stay at the start of its prompt, so
+ * the block waits for the next one.
+ */
+function withPersona(session, line) {
+  if (!session.persona) return line;
+  let record;
+  try {
+    record = JSON.parse(line);
+  } catch {
+    return line;
+  }
+  if (SWITCHES_CONVERSATION.has(record?.type)) session.personaDue = undefined;
+  if (record?.type !== "prompt" || typeof record.message !== "string") return line;
+  session.personaDue ??= !conversationStarted(session.file);
+  if (!session.personaDue || record.message.startsWith("/")) return line;
+  session.personaDue = false;
+  return JSON.stringify({ ...record, message: `${personaBlock()}${record.message}` });
+}
+
 function writeLine(session, rawLine) {
   const proc = session.proc;
   if (!proc || proc.killed) return false;
-  const line = clampModeLine(session, rawLine);
+  const line = withPersona(session, clampModeLine(session, rawLine));
   try {
     proc.stdin.write(`${line}\n`);
     return true;
@@ -875,10 +997,12 @@ function observeRecord(session, record) {
       break;
     case "extension_ui_request":
       if (typeof record.id === "string") {
-        if (record.method !== "notify" && record.method !== "setStatus" && record.method !== "setWidget" && record.method !== "setTitle" && record.method !== "set_editor_text") {
+        if (record.method === "dismiss") {
+          removePendingDialog(session, record.id);
+        } else if (record.method !== "notify" && record.method !== "setStatus" && record.method !== "setWidget" && record.method !== "setTitle" && record.method !== "set_editor_text") {
           session.pendingDialogs.set(record.id, record);
           setStatus(session, "blocked");
-          notifyBlocked(session);
+          notifyBlocked(session, record.method);
         }
       }
       break;
@@ -1009,6 +1133,12 @@ function learnTitle(session, message) {
   pushSession(session);
 }
 
+function removePendingDialog(session, id) {
+  if (session.pendingDialogs.delete(id) && session.pendingDialogs.size === 0 && session.status === "blocked") {
+    setStatus(session, "working");
+  }
+}
+
 function observeWrite(session, line) {
   let record;
   try {
@@ -1020,14 +1150,14 @@ function observeWrite(session, line) {
   // a daemon bookkeeping write must not pass for it. Only records coming out
   // of the process (observeRecord) move it.
   if (record.type === "extension_ui_response" && typeof record.id === "string") {
-    session.pendingDialogs.delete(record.id);
-    if (session.pendingDialogs.size === 0 && session.status === "blocked") setStatus(session, "working");
+    removePendingDialog(session, record.id);
     return;
   }
   if (record.type === "new_session") {
     session.pendingQueue = { steering: [], followUp: [] };
     setFile(session, undefined);
-    if (session.title !== "New session" || session.titleLocked) {
+    // Pip stays Pip across its conversations.
+    if (!session.persona && (session.title !== "New session" || session.titleLocked)) {
       session.title = "New session";
       session.titleLocked = false;
       persist({ type: "session_update", id: session.id, info: { title: session.title, titleLocked: false } });
@@ -1214,7 +1344,7 @@ function flushDeliveries(session) {
   persistDeliveries(session);
 }
 
-function notifyBlocked(session) {
+function notifyBlocked(session, method) {
   if (session.blockedNotified) return;
   session.blockedNotified = true;
   const initiator = session.initiator;
@@ -1228,20 +1358,26 @@ function notifyBlocked(session) {
   }
   const target = sessions.get(initiator);
   if (target) {
+    const needs = method === "form" ? "an answer" : "approval";
     deliverMessage(
       target,
-      envelope(session, `${session.title} (${session.agentName}) is waiting for approval — open the session in pipi to continue.`, "blocked"),
+      envelope(session, `${session.title} (${session.agentName}) is waiting for ${needs} — open the session in pipi to continue.`, "blocked"),
       returnInitiatorFor(target, session.id),
     );
   }
 }
 
-// ── The six session tools ────────────────────────────────────────────────────
+// ── The seven session tools ───────────────────────────────────────────────────
 
 const SESSION_TOOLS = [
   {
     name: "agents_list",
     description: "List the coding agents pipi can start, and which of them can themselves drive sessions.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "workspaces_list",
+    description: "List the project folders this person works in — the ones open in pipi and the ones sessions ran in — most recent first. Pass one as `cwd` to session_start.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -1304,7 +1440,166 @@ const SESSION_TOOLS = [
     description: "Abort a session's current run, along with every session still working under it.",
     inputSchema: { type: "object", properties: { session: { type: "string", description: "Session id (yours or a descendant's)." } }, required: ["session"] },
   },
+  {
+    name: "present_files",
+    description:
+      "Display images, videos, audio, PDFs, or other deliverable files inline in the pipi conversation stream so the user can preview, play, or open them directly.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        files: {
+          type: "array",
+          description: "Files to display (paths relative to your working directory, absolute paths, or URLs).",
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "Local file path or URL." },
+              title: { type: "string", description: "Optional display title." },
+              caption: { type: "string", description: "Optional short caption." },
+            },
+            required: ["path"],
+          },
+        },
+        title: { type: "string", description: "Optional heading for this group of files." },
+      },
+      required: ["files"],
+    },
+  },
 ];
+
+const MEDIA_RASTER_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "heic", "heif", "avif"]);
+const MEDIA_VIDEO_EXTS = new Set(["mp4", "mov", "m4v", "webm", "mkv", "avi", "ogv"]);
+const MEDIA_AUDIO_EXTS = new Set(["mp3", "wav", "m4a", "aac", "ogg", "flac", "opus", "caf", "aiff"]);
+const MEDIA_DOC_EXTS = new Set([
+  "pdf", "md", "markdown", "mdown", "txt", "rtf", "csv", "tsv", "json", "yaml", "yml",
+  "xml", "html", "htm", "svg", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pages", "numbers", "key",
+]);
+const MEDIA_ARCHIVE_EXTS = new Set(["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "dmg", "pkg"]);
+const MEDIA_MIME_BY_EXT = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+  mp4: "video/mp4", mov: "video/quicktime", m4v: "video/x-m4v", webm: "video/webm", mkv: "video/x-matroska",
+  mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", aac: "audio/aac", ogg: "audio/ogg", flac: "audio/flac",
+  pdf: "application/pdf", md: "text/markdown", json: "application/json", html: "text/html", svg: "image/svg+xml",
+  zip: "application/zip",
+};
+
+function classifyPresentedKind(filePath) {
+  const ext = path.extname(filePath).slice(1).toLowerCase();
+  if (MEDIA_RASTER_EXTS.has(ext)) return "image";
+  if (MEDIA_VIDEO_EXTS.has(ext)) return "video";
+  if (MEDIA_AUDIO_EXTS.has(ext)) return "audio";
+  if (MEDIA_DOC_EXTS.has(ext)) return "document";
+  if (MEDIA_ARCHIVE_EXTS.has(ext)) return "archive";
+  return "file";
+}
+
+function sniffImageDimensions(buf) {
+  if (!buf || buf.length < 10) return undefined;
+  if (buf.length >= 24 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    const w = buf.readUInt32BE(16);
+    const h = buf.readUInt32BE(20);
+    return w > 0 && h > 0 ? { width: w, height: h } : undefined;
+  }
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) {
+    const w = buf.readUInt16LE(6);
+    const h = buf.readUInt16LE(8);
+    return w > 0 && h > 0 ? { width: w, height: h } : undefined;
+  }
+  if (buf.length >= 30 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") {
+    const chunk = buf.toString("ascii", 12, 16);
+    if (chunk === "VP8 " && buf[23] === 0x9d && buf[24] === 0x01 && buf[25] === 0x2a) {
+      return { width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
+    }
+    if (chunk === "VP8L" && buf[20] === 0x2f) {
+      const bits = buf.readUInt32LE(21);
+      return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
+    }
+    if (chunk === "VP8X") {
+      return {
+        width: (buf[24] | (buf[25] << 8) | (buf[26] << 16)) + 1,
+        height: (buf[27] | (buf[28] << 8) | (buf[29] << 16)) + 1,
+      };
+    }
+  }
+  if (buf[0] === 0xff && buf[1] === 0xd8) {
+    let pos = 2;
+    while (pos + 4 < buf.length) {
+      while (pos < buf.length && buf[pos] !== 0xff) pos++;
+      while (pos < buf.length && buf[pos] === 0xff) pos++;
+      if (pos >= buf.length) break;
+      const marker = buf[pos++];
+      if (marker === 0xd9 || marker === 0xda) break;
+      if ((marker >= 0xd0 && marker <= 0xd8) || marker === 0x01) continue;
+      if (pos + 2 > buf.length) break;
+      const len = buf.readUInt16BE(pos);
+      if (len < 2 || pos + len > buf.length) break;
+      if (((marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7)) && len >= 7) {
+        const h = buf.readUInt16BE(pos + 3);
+        const w = buf.readUInt16BE(pos + 5);
+        return w > 0 && h > 0 ? { width: w, height: h } : undefined;
+      }
+      pos += len;
+    }
+  }
+  return undefined;
+}
+
+async function resolvePresentedFile(entry, baseCwd) {
+  const obj = typeof entry === "string" ? { path: entry } : entry && typeof entry === "object" ? entry : {};
+  const raw = typeof obj.path === "string" ? obj.path.trim() : "";
+  if (!raw) return undefined;
+  const title = typeof obj.title === "string" && obj.title.trim() ? obj.title.trim() : undefined;
+  const caption = typeof obj.caption === "string" && obj.caption.trim() ? obj.caption.trim() : undefined;
+  if (/^https?:\/\//i.test(raw)) {
+    const clean = raw.split(/[?#]/)[0];
+    const ext = path.extname(clean).slice(1).toLowerCase();
+    return {
+      remoteUrl: raw,
+      kind: classifyPresentedKind(clean),
+      title: title || path.basename(clean) || raw,
+      ...(caption ? { caption } : {}),
+      ...(MEDIA_MIME_BY_EXT[ext] ? { mimeType: MEDIA_MIME_BY_EXT[ext] } : {}),
+      exists: true,
+    };
+  }
+  let local = raw.split("#")[0];
+  if (/^file:\/\//i.test(local)) {
+    try {
+      local = decodeURIComponent(local.slice("file://".length).replace(/^localhost(?=\/)/i, ""));
+      if (/^\/[A-Za-z]:[/\\]/.test(local)) local = local.slice(1);
+    } catch {}
+  } else if (local === "~" || local.startsWith("~/") || local.startsWith("~\\")) {
+    local = local === "~" ? os.homedir() : path.join(os.homedir(), local.slice(2));
+  }
+  const resolved = path.isAbsolute(local) ? path.normalize(local) : path.resolve(baseCwd || process.cwd(), local);
+  const ext = path.extname(resolved).slice(1).toLowerCase();
+  const kind = classifyPresentedKind(resolved);
+  const mimeType = MEDIA_MIME_BY_EXT[ext];
+  const st = await fsp.stat(resolved).catch(() => undefined);
+  const exists = Boolean(st && st.isFile());
+  let dims;
+  if (exists && (ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif" || ext === "webp")) {
+    let fh;
+    try {
+      fh = await fsp.open(resolved, "r");
+      const buf = Buffer.alloc(Math.min(st.size, 65536));
+      const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+      dims = sniffImageDimensions(buf.subarray(0, bytesRead));
+    } catch {} finally {
+      await fh?.close().catch(() => undefined);
+    }
+  }
+  return {
+    path: resolved,
+    kind,
+    title: title || path.basename(resolved) || resolved,
+    ...(caption ? { caption } : {}),
+    ...(mimeType ? { mimeType } : {}),
+    ...(exists ? { size: st.size } : {}),
+    ...(dims ? { width: dims.width, height: dims.height } : {}),
+    exists,
+  };
+}
 
 const supportsTools = (driver) => driver !== "opencode" && driver !== "cursor";
 
@@ -1349,6 +1644,33 @@ function budgetMessages(messages, maxBytes = READ_BYTE_BUDGET) {
   return { messages: picked, truncated };
 }
 
+/**
+ * The folders work happens in: the app's open projects, then every folder a
+ * session ran in (a worktree counts as the project it branched from). The
+ * personal agent's own folder holds its notes, not a project, so it is left out.
+ */
+function knownWorkspaces() {
+  const known = new Map();
+  const note = (dir, open) => {
+    if (typeof dir !== "string" || !dir || dir === PERSONA_DIR) return undefined;
+    let entry = known.get(dir);
+    if (!entry) {
+      entry = { path: dir, name: path.basename(dir) || dir, open, sessions: 0, lastActive: 0 };
+      known.set(dir, entry);
+    }
+    entry.open ||= open;
+    return entry;
+  };
+  for (const dir of config.workspaces) note(dir, true);
+  for (const session of sessions.values()) {
+    const entry = note(session.worktree?.baseCwd || session.cwd, false);
+    if (!entry) continue;
+    entry.sessions += 1;
+    entry.lastActive = Math.max(entry.lastActive, session.lastActive || 0);
+  }
+  return [...known.values()].sort((a, b) => b.lastActive - a.lastActive || Number(b.open) - Number(a.open));
+}
+
 async function callSessionTool(caller, name, args = {}, options = {}) {
   switch (name) {
     case "agents_list": {
@@ -1380,6 +1702,8 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
           : { authority: "user" },
       };
     }
+    case "workspaces_list":
+      return { workspaces: knownWorkspaces() };
     case "sessions_list": {
       // Default is the caller's own tree; "project" widens to its workspace, "all" to every session.
       const scope = args.scope === "project" ? "project" : args.scope === "all" ? "all" : "tree";
@@ -1539,6 +1863,16 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
       }
       await stopTree(target);
       return { id: target.id, stopped: true };
+    }
+    case "present_files": {
+      const rawList = Array.isArray(args.files) ? args.files : typeof args.path === "string" ? [args.path] : [];
+      if (!rawList.length) throw new Error("files must be a non-empty array");
+      const baseCwd = caller?.cwd || process.cwd();
+      const items = (await Promise.all(rawList.map((entry) => resolvePresentedFile(entry, baseCwd)))).filter(Boolean);
+      if (!items.length) throw new Error("no valid files provided");
+      const missingCount = items.filter((item) => item.exists === false).length;
+      const title = typeof args.title === "string" && args.title.trim() ? args.title.trim() : undefined;
+      return { pipiMedia: true, ...(title ? { title } : {}), items, missingCount };
     }
     default:
       throw new Error(`unknown tool "${name}"`);
@@ -1830,6 +2164,12 @@ async function controlOp(conn, msg) {
       }
       return;
     }
+    case "workspaces": {
+      // The app's open projects, for workspaces_list; the standby pool needs no restart for them.
+      if (Array.isArray(msg.paths)) config.workspaces = msg.paths.filter((dir) => typeof dir === "string" && dir);
+      if (id) respond(conn, id, "ok", {});
+      return;
+    }
     case "mark_read": {
       const session = sessions.get(msg.sessionId);
       if (session) {
@@ -1913,7 +2253,13 @@ async function controlOp(conn, msg) {
             binaryPath: input.binaryPath,
           };
         }
-        const cwd = input.cwd || parent?.cwd || process.cwd();
+        if (input.persona === true) {
+          if (parent) throw new Error("the personal agent answers to the user, not to a session");
+          const held = [...sessions.values()].find((s) => s.persona);
+          if (held) throw new Error(`the personal agent already runs as ${held.id}`);
+          ensurePersonaDir();
+        }
+        const cwd = input.persona === true ? PERSONA_DIR : input.cwd || parent?.cwd || process.cwd();
         // A child's mode never exceeds its parent's — the same clamp agents get.
         const parentCeiling = parent ? minMode(ancestorCeiling(parent), parent.runtimeMode) : undefined;
         const rawMode = parent
@@ -1922,9 +2268,11 @@ async function controlOp(conn, msg) {
             ? "full-access"
             : clampMode("full-access", input.runtimeMode);
         const runtimeMode = fitAgentModes(rawMode, agent.supportedRuntimeModes);
+        const title = input.persona === true ? personaName() : input.title;
         const session = createSession({
-          title: input.title,
-          titleLocked: Boolean(input.title),
+          title,
+          titleLocked: Boolean(title),
+          persona: input.persona === true,
           agentId: agent.id,
           agentName: agent.name,
           driver: agent.driver,
@@ -2102,7 +2450,7 @@ let shutdownDaemon = () => process.exit(0);
 
 function hasActiveRuns() {
   for (const s of sessions.values()) {
-    if (s.status === "working" || s.status === "blocked" || s.backgroundWatch || s.deliverQueue.length > 0 || s.starting) return true;
+    if ((s.loaded && (s.status === "working" || s.status === "blocked" || s.backgroundWatch)) || s.deliverQueue.length > 0 || s.starting) return true;
   }
   return false;
 }
@@ -2324,7 +2672,12 @@ async function mcpHandle(req, res) {
           if (!config.allowAgentTools) throw new Error("session tools are disabled in Settings → Sessions");
           // Identity comes strictly from the bearer token, never from request arguments.
           const result = await callSessionTool(caller.session ?? undefined, name, msg.params?.arguments ?? {}, { external: Boolean(caller.external) });
-          reply({ result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] } });
+          reply({
+            result: {
+              content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+              ...(result && typeof result === "object" ? { structuredContent: result } : {}),
+            },
+          });
         } catch (toolError) {
           reply({
             result: {

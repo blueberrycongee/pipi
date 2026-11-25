@@ -1,8 +1,8 @@
 {
   "name": "pipi",
   "id": "dev.pipi.app",
-  "version": "0.2.27",
-  "build": 12,
+  "version": "0.2.28",
+  "build": 13,
   "icon": "icon.png",
   "theme": "theme.json",
   "updater": {
@@ -103,6 +103,7 @@
       "write": ["${homeDir}", "${dataDir}", "/"]
     },
     "clipboard": true,
+    "audio": true,
     "openUrl": { "schemes": ["https", "http", "mailto"] }
   }
 }

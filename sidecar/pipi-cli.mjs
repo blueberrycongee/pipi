@@ -5,6 +5,7 @@
 //   pipi start --agent claude --title "T" --cwd . "task"   start a session (prints its id)
 //   pipi send <id> "message"           message a session (queues while it works)
 //   pipi read <id>                     a session's state and last answer
+//   pipi pip ["message"]               talk to your personal agent (started on first use)
 //   pipi stop <id>                     abort its run (and its children's)
 //   pipi wait <id>                     block until the session settles; print the answer
 //   pipi mcp-config                    print an MCP server config for agents not launched by pipi
@@ -25,6 +26,7 @@ const USAGE = `usage:
   pipi start --agent <id> --title <title> [--cwd <dir>] [--worktree] [--mode <mode>] <task>
   pipi send <session> <message>
   pipi read <session>
+  pipi pip [--agent <id>] [<message>]
   pipi stop <session>
   pipi wait <session>
   pipi mcp-config
@@ -130,6 +132,20 @@ async function main() {
       if (!id || !words.length) fail(new Error("usage: pipi send <session> <message>"));
       await call("send", { sessionId: id, message: words.join(" ") });
       print("sent");
+      break;
+    }
+    case "pip": {
+      const message = f._.join(" ").trim();
+      const held = (await call("list")).sessions.find((s) => s.persona);
+      if (!held) {
+        const res = await call("start_session", { input: { persona: true, agentId: f.agent || "pi", ...(message ? { message } : {}) } });
+        print(res.session.id);
+      } else if (message) {
+        await call("send", { sessionId: held.id, message });
+        print(held.id);
+      } else {
+        print(`${held.id}\t${held.status}\t${held.agentName}\t${held.title}`);
+      }
       break;
     }
     case "read": {

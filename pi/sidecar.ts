@@ -11,6 +11,7 @@ import { stdinWriter } from "./stdin";
 
 // Keep all sidecar Node helpers referenced as URL assets so `nsh package` ships
 // every `sidecar/*.mjs` file inside `Contents/Resources/nsh/assets/sidecar/`.
+import acpFormAsset from "../sidecar/acp-form.mjs?url";
 import agentUsageAsset from "../sidecar/agent-usage.mjs?url";
 import daemonClientAsset from "../sidecar/daemon-client.mjs?url";
 import daemonLinkAsset from "../sidecar/daemon-link.mjs?url";
@@ -28,6 +29,7 @@ import usageStatsAsset from "../sidecar/usage-stats.mjs?url";
 import worktreeAsset from "../sidecar/worktree.mjs?url";
 
 void [
+  acpFormAsset,
   agentUsageAsset,
   daemonClientAsset,
   daemonLinkAsset,

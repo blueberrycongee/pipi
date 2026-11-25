@@ -12,6 +12,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { formAnswerText, formContent, parseAcpForm } from "./acp-form.mjs";
 import {
   acpCostPart,
   acpMetaSample,
@@ -30,7 +31,7 @@ import {
   toUsage,
   ZERO_USAGE,
 } from "./agent-usage.mjs";
-import { agentAuthEnv, childEnv, ensureDir, externalSessionsDir, resolveBinary, shellForCommand, spawnBinary } from "./env-paths.mjs";
+import { agentAuthEnv, childEnv, ensureDir, externalSessionsDir, resolveAgentApiKey, resolveBinary, shellForCommand, spawnBinary } from "./env-paths.mjs";
 import { titleWords } from "./session-index.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -228,7 +229,7 @@ function recordUsageEntry(usage, kind) {
   addInto(sessionUsage, fromUsage(usage));
 }
 
-// Pending UI approval promises (for ACP `session/request_permission`)
+// Bridge dialog id → the agent's outstanding JSON-RPC request and its response encoder.
 const pendingUiRequests = new Map();
 
 function emit(record) {
@@ -438,6 +439,7 @@ async function loadExternalSession(targetPath) {
   if (typeof header?.thinkingLevel === "string" && header.thinkingLevel) {
     thinkingLevel = header.thinkingLevel;
     thinkingLevelSet = true;
+    acpThinkingWanted = header.thinkingLevel;
   }
   if (header?.type === "pipi_external_session" && (header.version ?? 1) < 2) dropLegacyUsage(loadedMessages);
   resetSessionUsage();
@@ -483,9 +485,10 @@ async function loadExternalSession(targetPath) {
 
 const EXTERNAL_ORCHESTRATION_PROMPT = `
 You are running inside pipi with session tools (via the \`pipi\` MCP server when available):
-- Call \`agents_list\` to see the coding agents you can start sessions with and whether they can drive sessions themselves.
+- Call \`agents_list\` to see the coding agents you can start sessions with and whether they can drive sessions themselves, and \`workspaces_list\` for the person's project folders.
 - Call \`session_start\` to open a child session on a task — it runs on its own and its answer is delivered back to you when it finishes. Never wait on it.
 - Call \`sessions_list\`, \`session_read\`, \`session_send\`, and \`session_stop\` to inspect, message, or stop sessions in your tree.
+- When you create or want to show the user images, videos, audio, PDFs, or other deliverable files, call \`present_files\` (or link them with Markdown \`![alt](path)\` / \`[name](path)\`) so pipi renders native previews directly in the conversation.
 `.trim();
 
 // ── Streaming Turn Execution per Driver ─────────────────────────────────────
@@ -541,8 +544,6 @@ function interruptActiveTurn() {
   abortRequested = true;
   acpWakeSleepWake?.();
   bumpAcpDeferred();
-  for (const [, resolve] of pendingUiRequests) resolve(false);
-  pendingUiRequests.clear();
   if (driver === "acp") {
     // Antigravity's `session/cancel` kills running background commands and
     // subagents: when steering after the prompt already settled (held open on
@@ -552,6 +553,7 @@ function interruptActiveTurn() {
     // `session/cancel` is dropped by settleActiveTurn's stall timeout
     // (dropAcpPeer), and the next turn re-attaches via session/load.
     if (acpStream && !preserveAgyWork) acpNotify("session/cancel", { sessionId: acpSessionId });
+    cancelAcpDialogs();
   } else if (activeChild) {
     signalAgent("SIGTERM");
   }
@@ -955,6 +957,8 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
           ? {
               kind: meta.kind,
               title: meta.title,
+              rawName: meta.rawName,
+              isMcp: !!meta.isMcp,
               rawInput: meta.rawInput,
               startedAfterPromptSettled: !!meta.startedAfterPromptSettled,
             }
@@ -969,6 +973,8 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       if (!info || !patch) return;
       if (patch.kind !== undefined) info.kind = patch.kind;
       if (patch.title !== undefined) info.title = patch.title;
+      if (patch.rawName !== undefined) info.rawName = patch.rawName;
+      if (patch.isMcp !== undefined) info.isMcp = !!patch.isMcp;
       if (patch.rawInput !== undefined) info.rawInput = patch.rawInput;
     },
     /** True when the open assistant message ends on non-empty prose (a completed reply before a wake). */
@@ -981,19 +987,47 @@ function makeTurnStreamHelper(turnEpoch = sessionEpoch, { turnStart = false } = 
       return false;
     },
     /** `known`: the call's `{name, startedAt}` when an earlier turn started it (a background task finishing now). */
-    toolEnd(id, outputText, isError, known = undefined) {
+    toolEnd(id, output, isError, known = undefined) {
       const info = openTools.get(id) || known;
       const name = info?.name || "tool";
       const durationMs = info ? Math.max(1, Date.now() - info.startedAt) : 1;
       openTools.delete(id);
-      const content = [{ type: "text", text: outputText || "" }];
-      const toolMsg = { role: "toolResult", toolCallId: id, toolName: name, content, isError: !!isError, timestamp: Date.now() };
+      const isObj = output && typeof output === "object" && !Array.isArray(output);
+      const outputText = isObj ? (typeof output.text === "string" ? output.text : "") : typeof output === "string" ? output : "";
+      const extraBlocks = isObj && Array.isArray(output.blocks) ? output.blocks.filter((b) => b && b.type !== "text") : [];
+      const details = isObj && output.details !== undefined ? output.details : undefined;
+      const content = [
+        ...(outputText || extraBlocks.length === 0 ? [{ type: "text", text: outputText }] : []),
+        ...extraBlocks,
+      ];
+      const toolMsg = {
+        role: "toolResult",
+        toolCallId: id,
+        toolName: name,
+        content,
+        ...(details !== undefined ? { details } : {}),
+        isError: !!isError,
+        timestamp: Date.now(),
+      };
       if (sessionEpoch === turnEpoch) {
         clearStaleBackgroundTools(messages, id);
         messages.push(toolMsg);
       }
-      emitTurn({ type: "tool_execution_end", toolCallId: id, toolName: name, result: { content }, isError: !!isError, durationMs });
+      const result = { content, ...(details !== undefined ? { details } : {}) };
+      emitTurn({ type: "tool_execution_end", toolCallId: id, toolName: name, result, isError: !!isError, durationMs });
       emitTurn({ type: "message_end", message: toolMsg });
+    },
+    mediaBlock(block) {
+      if (!block || typeof block !== "object" || block.type === "text") return;
+      clearRetry(true);
+      openMsg();
+      closeThink();
+      closeText();
+      trailingThoughts = "";
+      const idx = nextIdx++;
+      blocks.push(block);
+      blockIdx.push(idx);
+      emitTurn({ type: "message_update", usage: zeroUsage, assistantMessageEvent: { type: "media_block", contentIndex: idx, block } });
     },
     /** What the turn said and called, and the calls still running when it ended (background tasks). */
     seen() {
@@ -1414,8 +1448,7 @@ async function runClaudeTurn(bin, promptText, images = [], turnEpoch = sessionEp
     } else if (rec.type === "user" && Array.isArray(rec.message?.content)) {
       for (const b of rec.message.content) {
         if (b.type === "tool_result" && b.tool_use_id) {
-          const txt = typeof b.content === "string" ? b.content : Array.isArray(b.content) ? b.content.map((p) => p?.text || "").join("\n") : "";
-          stream.toolEnd(b.tool_use_id, txt, !!b.is_error);
+          stream.toolEnd(b.tool_use_id, normalizeToolResultPayload(b.content), !!b.is_error);
         }
       }
     } else if (rec.type === "result") {
@@ -1506,7 +1539,10 @@ async function runCodexTurn(bin, promptText, turnEpoch = sessionEpoch) {
         if (t === "item.completed") stream.toolEnd(id, changes.map((c) => `${c.kind || "edit"}: ${c.path || ""}`).join("\n"), false);
       } else if (item.type === "mcp_tool_call") {
         stream.toolStart(id, item.tool || "mcp", item.arguments || {});
-        if (t === "item.completed") stream.toolEnd(id, JSON.stringify(item.error || item.result || ""), !!item.error);
+        if (t === "item.completed") {
+          if (item.error) stream.toolEnd(id, JSON.stringify(item.error), true);
+          else stream.toolEnd(id, normalizeMcpResultPayload(item.result), false);
+        }
       }
     } else if (t === "turn.completed") {
       completed = true;
@@ -1607,33 +1643,140 @@ function resolveAcpArgs(bin) {
   return extra;
 }
 
-function formatAcpToolContent(content, rawOutput) {
-  if (typeof content === "string" && content) return content;
-  if (content && typeof content === "object" && !Array.isArray(content)) {
-    if (typeof content.text === "string") return content.text;
-    if (content.content && typeof content.content.text === "string") return content.content.text;
+function normalizeMediaBlock(item) {
+  if (!item || typeof item !== "object") return undefined;
+  const inner = item.type === "content" && item.content && typeof item.content === "object" ? item.content : item;
+  if (inner.type === "image") {
+    const data = typeof inner.data === "string" ? inner.data : typeof inner.source?.data === "string" ? inner.source.data : "";
+    const mimeType = String(inner.mimeType || inner.source?.media_type || "image/png");
+    if (data) return { type: "image", data, mimeType };
+    if (typeof inner.uri === "string" && inner.uri) {
+      return { type: "resource", uri: inner.uri, mimeType, ...(inner.name ? { name: inner.name } : {}) };
+    }
+    return undefined;
   }
-  if (Array.isArray(content)) {
-    const parts = [];
-    for (const item of content) {
-      if (!item || typeof item !== "object") continue;
-      if (item.type === "text" && typeof item.text === "string") {
-        parts.push(item.text);
-      } else if (item.type === "content" && item.content?.type === "text" && typeof item.content.text === "string") {
-        parts.push(item.content.text);
-      } else if (item.type === "diff") {
-        const oldLines = typeof item.oldText === "string" && item.oldText ? item.oldText.split("\n") : [];
-        const newLines = typeof item.newText === "string" && item.newText ? item.newText.split("\n") : [];
-        const header = item.path ? `--- a/${item.path}\n+++ b/${item.path}` : "--- a/file\n+++ b/file";
-        const body = [...oldLines.map((l) => `-${l}`), ...newLines.map((l) => `+${l}`)].slice(0, 400).join("\n");
-        parts.push(`${header}\n${body}`);
+  if (inner.type === "audio") {
+    const data = typeof inner.data === "string" ? inner.data : typeof inner.source?.data === "string" ? inner.source.data : "";
+    const mimeType = String(inner.mimeType || inner.source?.media_type || "audio/mpeg");
+    if (data) return { type: "audio", data, mimeType };
+    if (typeof inner.uri === "string" && inner.uri) {
+      return { type: "resource", uri: inner.uri, mimeType, ...(inner.name ? { name: inner.name } : {}) };
+    }
+    return undefined;
+  }
+  if (inner.type === "resource_link" && typeof inner.uri === "string" && inner.uri) {
+    return {
+      type: "resource",
+      uri: inner.uri,
+      ...(typeof inner.name === "string" && inner.name ? { name: inner.name } : {}),
+      ...(typeof inner.title === "string" && inner.title ? { title: inner.title } : {}),
+      ...(typeof inner.mimeType === "string" && inner.mimeType ? { mimeType: inner.mimeType } : {}),
+      ...(typeof inner.size === "number" ? { size: inner.size } : {}),
+    };
+  }
+  if (inner.type === "resource") {
+    const res = inner.resource && typeof inner.resource === "object" ? inner.resource : inner;
+    const uri = typeof res.uri === "string" ? res.uri : "";
+    const data = typeof res.blob === "string" ? res.blob : typeof res.data === "string" ? res.data : undefined;
+    const mimeType = typeof res.mimeType === "string" ? res.mimeType : undefined;
+    const text = typeof res.text === "string" ? res.text : undefined;
+    if (!uri && !data) return undefined;
+    return {
+      type: "resource",
+      uri,
+      ...(typeof res.name === "string" && res.name ? { name: res.name } : {}),
+      ...(typeof res.title === "string" && res.title ? { title: res.title } : {}),
+      ...(mimeType ? { mimeType } : {}),
+      ...(typeof res.size === "number" ? { size: res.size } : {}),
+      ...(data ? { data } : {}),
+      ...(text !== undefined ? { text } : {}),
+    };
+  }
+  return undefined;
+}
+
+function normalizeToolResultPayload(content, structured = undefined) {
+  if (typeof content === "string") return { text: content, blocks: [], ...(structured !== undefined ? { details: structured } : {}) };
+  if (!Array.isArray(content)) {
+    const single = normalizeMediaBlock(content);
+    if (single) return { text: "", blocks: [single], ...(structured !== undefined ? { details: structured } : {}) };
+    return { text: "", blocks: [], ...(structured !== undefined ? { details: structured } : {}) };
+  }
+  const textParts = [];
+  const blocks = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text" && typeof part.text === "string") {
+      textParts.push(part.text);
+      continue;
+    }
+    const media = normalizeMediaBlock(part);
+    if (media) {
+      blocks.push(media);
+      if (media.type === "resource" && typeof media.text === "string" && !media.uri) textParts.push(media.text);
+    }
+  }
+  return { text: textParts.join("\n"), blocks, ...(structured !== undefined ? { details: structured } : {}) };
+}
+
+function normalizeMcpResultPayload(result) {
+  if (typeof result === "string") return result;
+  if (!result || typeof result !== "object") return "";
+  if (Array.isArray(result.content) || result.structuredContent !== undefined) {
+    return normalizeToolResultPayload(result.content ?? [], result.structuredContent);
+  }
+  return JSON.stringify(result);
+}
+
+function extractAcpToolResult(content, rawOutput) {
+  const details = rawOutput && typeof rawOutput === "object" && rawOutput.structuredContent !== undefined ? rawOutput.structuredContent : undefined;
+  const blocks = [];
+  const parts = [];
+  const pushItem = (item) => {
+    if (!item || typeof item !== "object") return;
+    if (item.type === "text" && typeof item.text === "string") {
+      parts.push(item.text);
+      return;
+    }
+    if (item.type === "content" && item.content?.type === "text" && typeof item.content.text === "string") {
+      parts.push(item.content.text);
+      return;
+    }
+    if (item.type === "diff") {
+      const oldLines = typeof item.oldText === "string" && item.oldText ? item.oldText.split("\n") : [];
+      const newLines = typeof item.newText === "string" && item.newText ? item.newText.split("\n") : [];
+      const header = item.path ? `--- a/${item.path}\n+++ b/${item.path}` : "--- a/file\n+++ b/file";
+      const body = [...oldLines.map((l) => `-${l}`), ...newLines.map((l) => `+${l}`)].slice(0, 400).join("\n");
+      parts.push(`${header}\n${body}`);
+      return;
+    }
+    const media = normalizeMediaBlock(item);
+    if (media) blocks.push(media);
+  };
+
+  if (typeof content === "string" && content) parts.push(content);
+  else if (Array.isArray(content)) content.forEach(pushItem);
+  else if (content && typeof content === "object") pushItem(content);
+
+  if (rawOutput && typeof rawOutput === "object" && Array.isArray(rawOutput.content)) {
+    for (const item of rawOutput.content) {
+      if (item?.type === "text" && typeof item.text === "string" && parts.length === 0) parts.push(item.text);
+      else {
+        const media = normalizeMediaBlock(item);
+        if (media) blocks.push(media);
       }
     }
-    if (parts.length > 0) return parts.join("\n\n");
   }
-  if (typeof rawOutput === "string") return rawOutput;
-  if (rawOutput && typeof rawOutput === "object") return JSON.stringify(rawOutput, null, 2);
-  return "";
+
+  let text = parts.join("\n\n");
+  if (!text && blocks.length === 0) {
+    if (typeof rawOutput === "string") text = rawOutput;
+    else if (rawOutput && typeof rawOutput === "object") text = JSON.stringify(rawOutput, null, 2);
+  }
+  if (blocks.length > 0 || details !== undefined) {
+    return { text, blocks, ...(details !== undefined ? { details } : {}) };
+  }
+  return text;
 }
 
 // ── Persistent ACP session ──────────────────────────────────────────────────
@@ -1667,7 +1810,9 @@ let acpModes = undefined; // {currentModeId, availableModes}
 let acpSessionCaps = undefined; // agentCapabilities.sessionCapabilities ({resume, list, close})
 let acpModelValues = undefined; // `${provider}/${modelId}` → opaque config-option value
 let acpModelConfigCurrent = undefined; // last-known currentValue of the model select
-let acpEffortConfig = undefined; // advertised `reasoning_effort` select {id, values, hasProviderDefault, currentValue}
+let acpEffortConfig = undefined; // advertised `reasoning_effort`/`thought_level` select {id, values, hasProviderDefault, currentValue}
+let acpModelConfigs = []; // advertised ACP `model_config` selectors (speed and siblings), sanitized for SessionState
+let acpThinkingWanted = undefined; // the user's abstract pick, kept even when a model clamps it (max → high)
 let acpUsage = undefined; // last `usage_update` {used, size}
 let acpAgentInfo = undefined; // initialize's agentInfo {name, title, version}
 let acpAuthMethods = []; // initialize's authMethods — authenticate when required
@@ -1730,6 +1875,7 @@ const isFinalToolStatus = (status) => status === "completed" || status === "fail
 const ANTIGRAVITY_SCHEDULE_TITLES = new Set(["Run schedule", "Running schedule"]);
 const ANTIGRAVITY_SWARM_WAIT_TITLES = new Set(["Run swarm_wait", "Running swarm_wait", "Run swarm_wait?"]);
 const ANTIGRAVITY_SWARM_TITLES = new Set(["Run swarm", "Running swarm", "Run swarm?"]);
+const ANTIGRAVITY_ASK_QUESTION_TITLES = new Set(["Run ask_question", "Running ask_question", "Run ask_question?"]);
 const AGY_SWARM_PASSIVE_ROLE = /^Swarm Worker \((?:monitor|narrator)(?:-\d+)?\)$/i;
 const ANTIGRAVITY_SUBAGENT_TITLES = new Set([
   "Running start_subagent",
@@ -1775,14 +1921,30 @@ function isDaemonToolInput(rawInput) {
   return Boolean(rawInput && typeof rawInput === "object" && rawInput.IsDaemon === true);
 }
 
+function isAntigravityAskQuestion(info) {
+  if (!info) return false;
+  if (info.isMcp === true || info._meta?.is_mcp_tool_call === true) return false;
+  if (info.rawName === "ask_question" || info.name === "ask_question") return true;
+  const title = typeof info.title === "string" ? info.title : "";
+  if (!ANTIGRAVITY_ASK_QUESTION_TITLES.has(title)) return false;
+  return info.kind === undefined || info.kind === "other";
+}
+
+function isAskQuestionOnlyToolCalls(calls) {
+  return Array.isArray(calls) && calls.length > 0 && calls.every((c) => c?.name === "ask_question");
+}
+
 /**
  * Antigravity keeps non-daemon shell commands and scheduled wakes running after
  * `session/prompt` returns `end_turn`, replying by itself when they finish.
  * A daemon (`IsDaemon: true`) may run indefinitely, so it does not hold the turn.
+ * `ask_question` waits on the user, never on a background job — even if it fell
+ * back to asking in chat during a post-settle wake.
  */
 function antigravityToolOutlivesPrompt(info) {
   if (!info) return false;
   if (isDaemonToolInput(info.rawInput)) return false;
+  if (isAntigravityAskQuestion(info)) return false;
   if (info.startedAfterPromptSettled) return true;
   if (info.title && ANTIGRAVITY_SCHEDULE_TITLES.has(info.title)) return true;
   return info.kind === "execute";
@@ -2006,7 +2168,7 @@ function agySwarmChildWorking(root, childId) {
   if (lastStep.status === "ERROR" || lastStep.status === "CANCELLED") return false;
   if (lastStep.type === "SYSTEM_MESSAGE") return true;
   if (lastStep.type === "PLANNER_RESPONSE") {
-    return Array.isArray(lastStep.tool_calls) && lastStep.tool_calls.length > 0;
+    return Array.isArray(lastStep.tool_calls) && lastStep.tool_calls.length > 0 && !isAskQuestionOnlyToolCalls(lastStep.tool_calls);
   }
   if (lastStep.type === "GENERIC") {
     const content = typeof lastStep.content === "string" ? lastStep.content : "";
@@ -2240,7 +2402,7 @@ function agyTranscriptState(acpId) {
         const done = step?.status === "DONE" || step?.status === "ERROR" || step?.status === "CANCELLED";
         if (!done) return { state: "working", stepIndex };
         const hasTools = Array.isArray(step?.tool_calls) && step.tool_calls.length > 0;
-        if (step?.type === "PLANNER_RESPONSE" && !hasTools) return { state: "settled", stepIndex };
+        if (step?.type === "PLANNER_RESPONSE" && (!hasTools || isAskQuestionOnlyToolCalls(step.tool_calls))) return { state: "settled", stepIndex };
         return { state: "working", stepIndex };
       } catch {
         return { state: "working", stepIndex: Number.MAX_SAFE_INTEGER };
@@ -2427,7 +2589,7 @@ function clearAcpBackground() {
  * after `acpStream` attaches, so it is never missed.
  */
 function ensureAcpWakeTurn() {
-  if (acpWakeTurn || isStreaming || acpStream || sessionChange || acpEnsurePromise || acpAttaching || !acpChild || !acpSessionId) return;
+  if (acpWakeTurn || isStreaming || acpStream || sessionChange || acpReset || acpAttaching || !acpChild || !acpSessionId) return;
   isStreaming = true;
   const epoch = sessionEpoch;
   let drainNext;
@@ -2487,13 +2649,18 @@ async function runAcpWakeTurn(epoch) {
   const aborted = abortRequested && !wasSteer;
   const errored = !aborted && !wasSteer && Boolean(wakeError);
   if (!aborted && !errored) {
+    if (isAntigravityAcp()) {
+      for (const [id, info] of stream.seen().open) {
+        if (isAntigravityAskQuestion(info)) stream.toolEnd(id, "", false);
+      }
+    }
     // Calls the wake left running keep their background mark; the next burst ends them.
     for (const [id, info] of stream.seen().open) acpBackgroundTools.set(String(id), info);
   }
   stream.finish(
     aborted ? "aborted" : errored ? "error" : "stop",
     errored ? (wakeError instanceof Error ? wakeError.message : String(wakeError)) : undefined,
-    { keepOpenTools: !aborted && !errored },
+    { keepOpenTools: !aborted && !errored && stream.seen().open.length > 0 },
   );
   if (aborted || errored) clearAcpBackground();
   acpWakeTurn = undefined;
@@ -2665,6 +2832,96 @@ function acpModelValueParts(value) {
 }
 
 /**
+ * Devin's ACP model values are family/default carriers (`swe-2-1-medium`); the
+ * effective effort lives in the separate `thought_level` selector. Its display
+ * names often bake that default effort (or Ultrafast placement) into the words,
+ * so the client strips only the effort words — never static `Thinking` models,
+ * which are distinct legacy variants.
+ */
+function isDevinAcp() {
+  const info = `${acpAgentInfo?.name || ""} ${acpAgentInfo?.title || ""}`;
+  return agentId === "devin" || /affogato|devin/i.test(info);
+}
+
+function devinModelDisplayName(name) {
+  const effort = "(?:None|Minimal|Low|Medium|High|XHigh|Extra High|Max)";
+  return String(name || "")
+    .replace(new RegExp(`\\s+${effort}(?: Thinking)?(?=\\s*(?:\\+|\\)|$))`, "g"), "")
+    .replace(new RegExp(`\\s+${effort}(?=\\s+(?:Ultrafast|1M)\\b)`, "g"), "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+/** Devin writes its no-reasoning rung as `none`; pipi's canonical no-reasoning level is `off`. */
+function acpCanonicalEffort(value) {
+  return value === "none" ? "off" : value;
+}
+
+/** The engine's advertised thought ladder in pipi's vocabulary, excluding the empty provider-default sentinel. */
+function acpEffortLevels() {
+  const out = [];
+  for (const raw of acpEffortConfig?.values || []) {
+    if (!raw) continue;
+    const level = acpCanonicalEffort(raw);
+    if (!out.includes(level)) out.push(level);
+  }
+  return out;
+}
+
+/** Marks the current model's reasoning support from the selector the session just advertised; other models stay unknown rather than inheriting it. */
+function syncAcpModelReasoning() {
+  const levels = acpEffortLevels();
+  const reasoning = levels.some((level) => level !== "off");
+  for (const model of availableModels) {
+    const current = currentModel && model.id === currentModel.id && model.provider === currentModel.provider;
+    model.reasoning = current ? reasoning : false;
+    if (current && levels.length) model.effortLevels = levels;
+    else delete model.effortLevels;
+  }
+  if (currentModel) {
+    currentModel.reasoning = reasoning;
+    if (levels.length) currentModel.effortLevels = levels;
+    else delete currentModel.effortLevels;
+  }
+}
+
+/** Session state says what the engine is actually using, even when the user's abstract pick was clamped. */
+function syncAcpThinkingFromEngine() {
+  const raw = acpEffortConfig?.currentValue;
+  const next = raw ? acpCanonicalEffort(raw) : "off";
+  if (next !== thinkingLevel) {
+    thinkingLevel = next;
+    emit({ type: "thinking_level_changed", level: next });
+  }
+}
+
+/** ACP `model_config` selectors (Devin's speed, context-size knobs on other agents), in the order the agent gave them. */
+function adoptAcpModelConfigs(options) {
+  const next = [];
+  for (const opt of options || []) {
+    if (!opt || opt.category !== "model_config" || !opt.id) continue;
+    if (opt.type === "boolean") {
+      next.push({ id: String(opt.id), name: String(opt.name || opt.id), ...(opt.description ? { description: String(opt.description) } : {}), type: "boolean", currentValue: opt.currentValue === true });
+      continue;
+    }
+    if (!Array.isArray(opt.options)) continue;
+    const choices = acpSelectChoices(opt)
+      .filter((choice) => typeof choice?.value === "string" && choice.value)
+      .map((choice) => ({ value: String(choice.value), name: String(choice.name || choice.value), ...(choice.description ? { description: String(choice.description) } : {}) }));
+    if (!choices.length) continue;
+    next.push({
+      id: String(opt.id),
+      name: String(opt.name || opt.id),
+      ...(opt.description ? { description: String(opt.description) } : {}),
+      type: "select",
+      currentValue: String(opt.currentValue ?? ""),
+      options: choices,
+    });
+  }
+  acpModelConfigs = next;
+}
+
+/**
  * Adopts a `configOptions` model select — flat for Devin-style agents, provider-grouped
  * for DeepSeek Harness — and keeps the opaque option values for `set_config_option`.
  */
@@ -2673,19 +2930,23 @@ function adoptModelConfigOption(modelOpt) {
   const choices = acpSelectChoices(modelOpt);
   const discovered = [];
   const values = new Map();
+  const devin = isDevinAcp();
   for (const choice of choices) {
     if (typeof choice?.value !== "string" || !choice.value) continue;
     const parts = acpModelValueParts(choice.value);
     const provider = String(choice.group || parts.provider || agentId);
     const id = String(parts.model);
     values.set(`${provider}/${id}`, choice.value);
+    const images = choice?._meta?.["cognition.ai/supportsImages"] !== false;
+    const rawName = String(choice.name || id);
     discovered.push({
       id,
-      name: String(choice.name || id),
+      name: devin ? devinModelDisplayName(rawName) : rawName,
       api: "acp",
       provider,
       reasoning: false,
-      input: ["text", "image"],
+      input: images ? ["text", "image"] : ["text"],
+      ...(devin && id.startsWith("fusion-") ? { group: "Fusion" } : {}),
       cost: zeroCost,
     });
   }
@@ -2702,6 +2963,7 @@ function adoptModelConfigOption(modelOpt) {
 /** Devin's dialect / DeepSeek Harness: models, effort and modes are `configOptions` selects, not `models`/`modes`. */
 function adoptConfigOptions(options) {
   if (!Array.isArray(options)) return;
+  adoptAcpModelConfigs(options);
   const modelOpt = options.find((o) => o && (o.category === "model" || o.id === "model") && Array.isArray(o.options) && o.options.length);
   if (modelOpt) adoptModelConfigOption(modelOpt);
   const effortOpt = options.find((o) => o && (o.id === "reasoning_effort" || o.category === "thought_level") && Array.isArray(o.options));
@@ -2713,13 +2975,15 @@ function adoptConfigOptions(options) {
       hasProviderDefault: choices.some((c) => String(c?.value ?? "") === ""),
       currentValue: String(effortOpt.currentValue ?? ""),
     };
-    // No user pick on record: follow the session's own effort (the agent's
-    // remembered default) rather than forcing pipi's initial "medium" onto it.
-    if (!thinkingLevelSet && acpEffortConfig.currentValue) {
-      thinkingLevel = acpEffortConfig.currentValue;
-    }
-    if (!modelOpt) emit({ type: "models_changed" });
+  } else {
+    // A model with no reasoning ladder (Adaptive, older static variants) removes
+    // the selector outright; keeping the previous model's ladder here was the
+    // clearest way to offer levels the engine would reject.
+    acpEffortConfig = undefined;
   }
+  syncAcpModelReasoning();
+  syncAcpThinkingFromEngine();
+  if (!modelOpt) emit({ type: "models_changed" });
   const modeOpt = options.find((o) => o && o.category === "mode" && Array.isArray(o.options) && o.options.length);
   if (modeOpt) {
     acpModeConfigId = modeOpt.id || "mode";
@@ -2755,6 +3019,9 @@ async function pushAcpModel() {
     if (value !== acpModelConfigCurrent) {
       const res = await acpRequest("session/set_config_option", { sessionId: acpSessionId, configId: acpModelConfigId, value }, 10_000).catch(() => undefined);
       if (res?.configOptions) adoptConfigOptions(res.configOptions);
+      // Devin resets thought_level to the newly selected model's default. Put the
+      // user's abstract pick back (clamped to what this model advertises).
+      await pushAcpEffort();
     }
   } else if (acpSpecModels) {
     await acpRequest("session/set_model", { sessionId: acpSessionId, modelId: currentModel.id }, 10_000).catch(() => undefined);
@@ -2766,20 +3033,45 @@ function acpEffortValueFor(level) {
   const cfg = acpEffortConfig;
   if (!cfg) return undefined;
   if (cfg.values.includes(level)) return level;
-  // "off" may be an explicit choice (DeepSeek) or the empty provider-default value.
-  if (level === "off") return cfg.hasProviderDefault ? "" : undefined;
-  if (level === "minimal") return cfg.values[0];
-  if (level === "medium") return cfg.values.includes("medium") ? "medium" : cfg.values[Math.floor((cfg.values.length - 1) / 2)];
-  if (level === "high" || level === "max" || level === "xhigh") return cfg.values[cfg.values.length - 1];
-  return undefined;
+  if (level === "off") {
+    if (cfg.values.includes("none")) return "none";
+    return cfg.hasProviderDefault ? "" : undefined;
+  }
+  const order = ["minimal", "low", "medium", "high", "xhigh", "max"];
+  const wanted = order.indexOf(level);
+  if (wanted < 0) return undefined;
+  let best;
+  for (const raw of cfg.values) {
+    const canonical = acpCanonicalEffort(raw);
+    const rank = order.indexOf(canonical);
+    if (!raw || canonical === "off" || rank < 0) continue;
+    const distance = Math.abs(rank - wanted);
+    if (!best || distance < best.distance || (distance === best.distance && rank > best.rank)) best = { raw, rank, distance };
+  }
+  return best?.raw;
 }
 
 async function pushAcpEffort() {
   const cfg = acpEffortConfig;
   if (!acpSessionId || acpReset || !cfg) return;
-  const value = acpEffortValueFor(thinkingLevel);
-  if (value === undefined || value === cfg.currentValue) return;
-  const res = await acpRequest("session/set_config_option", { sessionId: acpSessionId, configId: cfg.id, value }, 10_000).catch(() => undefined);
+  const wanted = acpThinkingWanted ?? (thinkingLevelSet ? thinkingLevel : undefined);
+  if (!wanted) return;
+  const value = acpEffortValueFor(wanted);
+  if (value === undefined) return;
+  if (value !== cfg.currentValue) {
+    const res = await acpRequest("session/set_config_option", { sessionId: acpSessionId, configId: cfg.id, value }, 10_000).catch(() => undefined);
+    if (res?.configOptions) adoptConfigOptions(res.configOptions);
+  }
+  syncAcpThinkingFromEngine();
+}
+
+/** Pushes one ACP `model_config` selector (speed/context/…), using the config's own wire type. */
+async function pushAcpModelConfig(configId, value) {
+  const cfg = acpModelConfigs.find((item) => item.id === configId);
+  if (!acpSessionId || acpReset || !cfg) throw new Error(`Model config not found: ${configId}`);
+  const params = { sessionId: acpSessionId, configId, value };
+  if (cfg.type === "boolean") params.type = "boolean";
+  const res = await acpRequest("session/set_config_option", params, 10_000);
   if (res?.configOptions) adoptConfigOptions(res.configOptions);
 }
 
@@ -2806,68 +3098,118 @@ async function pushAcpMode() {
   acpModes.currentModeId = hit.id;
 }
 
-/** Forwards an ACP `session/request_permission` to pipi's native confirm dialog (or auto-answers). */
-async function handleAcpPermission(msg) {
-  // A detached permission/question request after prompt settlement opens a wake
-  // turn first (T3's `wakeOnDetachedRequest`) so the prompt and its reply run live.
+function showAcpDialog(requestId, dialog, resultOf) {
+  const id = `acp_ui_${crypto.randomUUID()}`;
+  pendingUiRequests.set(id, { requestId, resultOf });
+  bumpAcpDeferred();
+  emit({ type: "extension_ui_request", id, ...dialog });
+}
+
+function finishAcpDialog(id, answer, reply = true) {
+  const pending = pendingUiRequests.get(id);
+  if (!pending) return;
+  pendingUiRequests.delete(id);
+  if (reply) {
+    acpWrite({ jsonrpc: "2.0", id: pending.requestId, result: pending.resultOf(answer ?? { cancelled: true }) });
+  }
+  // Other windows and later attachments must see the dismissal too.
+  emit({ type: "extension_ui_request", id, method: "dismiss" });
+  if (answer && acpDeferred && isAntigravityAcp()) acpDeferred.replyOpen = true;
+  bumpAcpDeferred();
+}
+
+function cancelAcpDialogs(reply = true) {
+  for (const id of pendingUiRequests.keys()) finishAcpDialog(id, undefined, reply);
+}
+
+function handleAcpElicitation(msg) {
+  const params = msg.params;
+  const fields = params?.mode === "form" && parseAcpForm(params.requestedSchema, { antigravity: isAntigravityAcp() });
+  if (!fields || !acpSessionId || params.sessionId !== acpSessionId || params.requestId != null || typeof params.message !== "string") {
+    acpWrite({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Expected a supported elicitation form for the current session" } });
+    return;
+  }
+  if (abortRequested || acpReset || acpAttaching || sessionChange) {
+    acpWrite({ jsonrpc: "2.0", id: msg.id, result: { action: "cancel" } });
+    return;
+  }
+  ensureAcpWakeTurn();
+  showAcpDialog(msg.id, {
+    method: "form",
+    agent: config.customAgent?.name || AGENT_NAMES[agentId] || acpAgentInfo?.title || agentId,
+    title: typeof params.requestedSchema.title === "string" ? params.requestedSchema.title.trim() : "",
+    message: params.message,
+    fields,
+  }, (answer) => {
+    if (answer.cancelled === true) return { action: "cancel" };
+    if (answer.declined === true) return { action: "decline" };
+    const content = formContent(fields, answer.answers);
+    if (content === undefined) return { action: "cancel" };
+    // The reply rides the elicitation response, off the wire: keep the person's
+    // own bubble in history too, or a reopening client loses what they said.
+    const said = formAnswerText(fields, answer.answers);
+    if (said) {
+      messages.push({ role: "user", content: [{ type: "text", text: said }], timestamp: Date.now() });
+      void saveExternalSession().catch(() => undefined);
+    }
+    return { action: "accept", content };
+  });
+}
+
+const acpPermissionResult = (choice) => ({ outcome: choice ? { outcome: "selected", optionId: choice.optionId } : { outcome: "cancelled" } });
+
+/** Forwards ACP permissions and Antigravity's legacy fixed-choice questions. */
+function handleAcpPermission(msg) {
+  if (abortRequested || sessionChange) {
+    acpWrite({ jsonrpc: "2.0", id: msg.id, result: acpPermissionResult() });
+    return;
+  }
   if (!acpAttaching && !acpStream && isAntigravityAcp()) ensureAcpWakeTurn();
   // Agents may send a partial `toolCall` — DeepSeek Harness only carries `toolCallId`,
   // so enrich from the `tool_call` update that preceded the request.
   const tc = msg.params?.toolCall || {};
   const known = tc.toolCallId !== undefined ? acpRecentTools.get(String(tc.toolCallId)) : undefined;
-  const title = tc.title || known?.title || "Allow external agent action?";
+  const title = tc.title || known?.title;
   const rawInput = tc.rawInput !== undefined ? tc.rawInput : known?.rawInput;
   const toolKind = String(tc.kind || known?.kind || "").toLowerCase();
-  const norm = normalizeToolName(title);
+  const norm = normalizeToolName(title ?? "");
   const isEditOnly = ["edit", "write", "read", "search", "grep", "find", "ls"].includes(toolKind) || ["read", "write", "edit", "grep", "find", "ls"].includes(norm);
-  const opts = msg.params?.options || [];
+  const opts = Array.isArray(msg.params?.options) ? msg.params.options : [];
   const pick = (prefix) => opts.find((o) => o.kind === prefix) || opts.find((o) => o.kind?.startsWith(prefix));
-  const resumeReplyAfterAnswer = () => {
+  // Legacy agy sends answers as permission options, even in full-access mode.
+  if (String(tc.toolCallId || "").startsWith("interaction_")) {
+    const options = opts.map((o) => String(o.name || o.optionId));
+    // The question the agent is really asking rides in the tool call's input —
+    // a bare "Run ask_question" title is a tool name, not something to read.
+    const asked =
+      [rawInput?.question, rawInput?.message, rawInput?.title, rawInput?.text, rawInput?.prompt]
+        .find((v) => typeof v === "string" && v.trim())?.trim() ||
+      (title && !/^(run |use |call )?(ask[_-]?(user|question)|question)/i.test(title.trim()) ? title : undefined) ||
+      "Choose an option";
+    showAcpDialog(msg.id, { method: "select", title: asked, options }, ({ value, cancelled }) => {
+      if (cancelled || typeof value !== "string") return acpPermissionResult();
+      return acpPermissionResult(opts.find((o) => o.optionId === value) || opts[options.indexOf(value)]);
+    });
+    return;
+  }
+  const allow = pick("allow_once") || pick("allow") || opts[0];
+  if (runtimeMode === "full-access" || (runtimeMode === "auto-accept-edits" && isEditOnly)) {
+    acpWrite({ jsonrpc: "2.0", id: msg.id, result: acpPermissionResult(allow ?? { optionId: "allow" }) });
     if (acpDeferred && isAntigravityAcp()) {
       acpDeferred.replyOpen = true;
       bumpAcpDeferred();
     }
-  };
-  // agy's fixed-choice questions ride the same channel with `interaction_*` ids:
-  // not approvals, and an answer is required even in full-access. Ask the user —
-  // never auto-pick an arbitrary option or fabricate an `allow` that is not there.
-  if (String(tc.toolCallId || "").startsWith("interaction_")) {
-    const uiId = `acp_ask_${msg.id}`;
-    const answer = await new Promise((resolve) => {
-      pendingUiRequests.set(uiId, resolve);
-      bumpAcpDeferred();
-      emit({ type: "extension_ui_request", id: uiId, method: "select", title, options: opts.map((o) => String(o.name || o.optionId)) });
-    });
-    const value = answer?.value;
-    const chosen = value === undefined ? undefined : opts.find((o) => o.optionId === value) || opts.find((o) => String(o.name || o.optionId) === value);
-    acpWrite({
-      jsonrpc: "2.0",
-      id: msg.id,
-      result: { outcome: chosen ? { outcome: "selected", optionId: chosen.optionId } : { outcome: "cancelled" } },
-    });
-    resumeReplyAfterAnswer();
     return;
   }
-  if (runtimeMode === "full-access" || (runtimeMode === "auto-accept-edits" && isEditOnly)) {
-    const allowOpt = pick("allow_once") || pick("allow") || opts[0];
-    acpWrite({ jsonrpc: "2.0", id: msg.id, result: { outcome: { outcome: "selected", optionId: allowOpt?.optionId || "allow" } } });
-    resumeReplyAfterAnswer();
-    return;
-  }
-  const uiId = `acp_perm_${msg.id}`;
-  const answer = await new Promise((resolve) => {
-    pendingUiRequests.set(uiId, resolve);
-    bumpAcpDeferred();
-    emit({ type: "extension_ui_request", id: uiId, method: "confirm", title, message: JSON.stringify(rawInput ?? {}, null, 2).slice(0, 1200) });
+  const reject = pick("reject_once") || pick("reject");
+  showAcpDialog(msg.id, {
+    method: "confirm",
+    title: title || "Allow external agent action?",
+    message: JSON.stringify(rawInput ?? {}, null, 2).slice(0, 1200),
+  }, ({ cancelled, confirmed }) => {
+    if (cancelled) return acpPermissionResult();
+    return acpPermissionResult(confirmed === true ? allow : reject);
   });
-  const confirmed = answer === true || answer?.confirmed === true;
-  const chosen = confirmed ? pick("allow_once") || pick("allow") || opts[0] : pick("reject_once") || pick("reject") || opts.at(-1);
-  acpWrite({
-    jsonrpc: "2.0",
-    id: msg.id,
-    result: { outcome: chosen ? { outcome: "selected", optionId: chosen.optionId } : { outcome: "cancelled" } },
-  });
-  resumeReplyAfterAnswer();
 }
 
 /**
@@ -2900,9 +3242,19 @@ function handleAcpUpdate(u, params = undefined) {
   const isReplay = acpAttaching || params?._meta?.isReplay === true || u?._meta?.isReplay === true;
   if (!isReplay) acpLastEventAt = Date.now();
   const replaying = isReplay && ACP_CONTENT_UPDATES.has(kind);
+  // A stray post-settle `tool_call_update` for `ask_question` (when agy fell back
+  // to asking in chat and later marks the call failed/closed) is not an autonomous
+  // wake reply — opening a wake turn for it would hold Pip running for 2 minutes.
+  const isStrayAskQuestionUpdate =
+    kind === "tool_call_update" &&
+    !acpStream &&
+    isAntigravityAcp() &&
+    u.toolCallId !== undefined &&
+    !acpBackgroundTools.has(String(u.toolCallId)) &&
+    isAntigravityAskQuestion({ ...acpRecentTools.get(String(u.toolCallId)), ...u });
   // Content while no turn is open is the agent working on its own (agy wakes a
   // finished daemon/timer and streams it): open a wake turn for it.
-  if (!replaying && !acpStream && ACP_CONTENT_UPDATES.has(kind)) ensureAcpWakeTurn();
+  if (!replaying && !acpStream && !isStrayAskQuestionUpdate && ACP_CONTENT_UPDATES.has(kind)) ensureAcpWakeTurn();
   if (kind === "user_message_chunk") {
     // agy echoes the prompt as it takes it: what came before the echo is a turn it ran while idle.
     if (!replaying) acpStream?.split();
@@ -2917,23 +3269,42 @@ function handleAcpUpdate(u, params = undefined) {
     }
   } else if (kind === "agent_message_chunk") {
     if (!replaying) {
-      const text = textOf(u.content);
-      const retry = parseAcpRetryNotice(text);
-      if (retry) acpStream?.retry(retry.attempt, retry.maxAttempts, retry.errorMessage);
-      else acpStream?.textDelta(text);
+      const contentList = Array.isArray(u.content) ? u.content : u.content ? [u.content] : [];
+      let handledText = "";
+      for (const item of contentList) {
+        const text = typeof item === "string" ? item : typeof item?.text === "string" ? item.text : "";
+        if (text) {
+          handledText += text;
+          const retry = parseAcpRetryNotice(text);
+          if (retry) acpStream?.retry(retry.attempt, retry.maxAttempts, retry.errorMessage);
+          else acpStream?.textDelta(text);
+          continue;
+        }
+        const media = normalizeMediaBlock(item);
+        if (media) acpStream?.mediaBlock?.(media);
+      }
       if (acpDeferred) {
-        if (!retry && text.trim().length > 0) acpDeferred.swarmWaiting = false;
+        const retry = handledText ? parseAcpRetryNotice(handledText) : undefined;
+        if (!retry && (handledText.trim().length > 0 || contentList.some((c) => normalizeMediaBlock(c)))) acpDeferred.swarmWaiting = false;
         acpDeferred.replyOpen = true;
         bumpAcpDeferred();
       }
     }
   } else if (kind === "tool_call") {
     const id = String(u.toolCallId ?? `t_${Date.now()}`);
-    acpRecentTools.set(id, { title: u.title || u.kind || "tool", kind: u.kind, rawInput: u.rawInput });
+    acpRecentTools.set(id, {
+      title: u.title || u.kind || "tool",
+      kind: u.kind,
+      rawName: u.name,
+      isMcp: u._meta?.is_mcp_tool_call === true,
+      rawInput: u.rawInput,
+    });
     if (!replaying) {
       acpStream?.toolStart(id, u.title || u.kind || "tool", acpToolArgs(u), {
         kind: u.kind,
         title: u.title,
+        rawName: u.name,
+        isMcp: u._meta?.is_mcp_tool_call === true,
         rawInput: u.rawInput,
         startedAfterPromptSettled: Boolean(acpDeferred?.promptSettled),
       });
@@ -2953,7 +3324,7 @@ function handleAcpUpdate(u, params = undefined) {
         }
       }
       if (isFinalToolStatus(u.status)) {
-        acpStream?.toolEnd(id, formatAcpToolContent(u.content, u.rawOutput), u.status === "failed", acpBackgroundTools.get(id));
+        acpStream?.toolEnd(id, extractAcpToolResult(u.content, u.rawOutput), u.status === "failed", acpBackgroundTools.get(id));
         if (acpStream) acpBackgroundTools.delete(id);
       }
       if (acpDeferred) {
@@ -2964,10 +3335,12 @@ function handleAcpUpdate(u, params = undefined) {
   } else if (kind === "tool_call_update") {
     const id = String(u.toolCallId);
     const known = u.toolCallId !== undefined ? acpRecentTools.get(id) : undefined;
-    if (known && (u.title || u.kind !== undefined || u.rawInput !== undefined)) {
+    if (known && (u.title || u.kind !== undefined || u.name !== undefined || u.rawInput !== undefined)) {
       acpRecentTools.set(id, {
         title: u.title || known.title,
         kind: u.kind !== undefined ? u.kind : known.kind,
+        rawName: u.name !== undefined ? u.name : known.rawName,
+        isMcp: u._meta?.is_mcp_tool_call !== undefined ? u._meta.is_mcp_tool_call === true : known.isMcp,
         rawInput: u.rawInput !== undefined ? u.rawInput : known.rawInput,
       });
     }
@@ -2975,6 +3348,8 @@ function handleAcpUpdate(u, params = undefined) {
       acpStream?.toolMeta?.(id, {
         ...(u.kind !== undefined ? { kind: u.kind } : {}),
         ...(u.title !== undefined ? { title: u.title } : {}),
+        ...(u.name !== undefined ? { rawName: u.name } : {}),
+        ...(u._meta?.is_mcp_tool_call !== undefined ? { isMcp: u._meta.is_mcp_tool_call === true } : {}),
         ...(u.rawInput !== undefined ? { rawInput: u.rawInput } : {}),
       });
       const mergedTool = { ...known, ...u };
@@ -3001,7 +3376,7 @@ function handleAcpUpdate(u, params = undefined) {
         }
       }
       if (isFinalToolStatus(u.status)) {
-        acpStream?.toolEnd(u.toolCallId, formatAcpToolContent(u.content, u.rawOutput), u.status === "failed", acpBackgroundTools.get(id));
+        acpStream?.toolEnd(u.toolCallId, extractAcpToolResult(u.content, u.rawOutput), u.status === "failed", acpBackgroundTools.get(id));
         if (acpStream) acpBackgroundTools.delete(id);
       }
       if (acpDeferred) {
@@ -3089,10 +3464,15 @@ function spawnAcp(bin) {
           } else if (msg.method === "session/update" && msg.params?.update) {
             handleAcpUpdate(msg.params.update, msg.params);
           } else if (msg.method === "session/request_permission" && msg.id !== undefined) {
-            void handleAcpPermission(msg);
+            handleAcpPermission(msg);
+          } else if (msg.method === "elicitation/create" && msg.id !== undefined) {
+            handleAcpElicitation(msg);
+          } else if (msg.method === "$/cancel_request" && msg.id === undefined) {
+            for (const [id, pending] of pendingUiRequests) {
+              if (pending.requestId === msg.params?.requestId) finishAcpDialog(id);
+            }
           } else if (msg.id !== undefined && typeof msg.method === "string") {
-            // Client-side methods we do not implement (fs/*, terminal/*, elicitation/*)
-            // still get an answer — a silent drop would hang the agent's call forever.
+            // Reply to unsupported client-side methods so the agent can continue.
             acpWrite({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `Method not implemented: ${msg.method}` } });
           }
         } catch {}
@@ -3121,8 +3501,7 @@ function spawnAcp(bin) {
       w.reject(new Error(message));
     }
     acpPending.clear();
-    for (const [, resolve] of pendingUiRequests) resolve(false);
-    pendingUiRequests.clear();
+    cancelAcpDialogs(false);
   };
   child.on("error", drop);
   child.on("close", drop);
@@ -3155,8 +3534,7 @@ function dropAcpPeer(reason = "ACP agent reset") {
     w.reject(new Error(detail));
   }
   acpPending.clear();
-  for (const [, resolve] of pendingUiRequests) resolve(false);
-  pendingUiRequests.clear();
+  cancelAcpDialogs(false);
   if (child) {
     try {
       if (process.platform === "win32") child.kill();
@@ -3222,19 +3600,23 @@ async function negotiateAcpRound(bin, epoch) {
     spawnAcp(bin);
     let init;
     try {
-      // ACP v2: the agent answers the highest version it supports. Capabilities
-      // are honest — no client fs/terminal handlers exist, and `session.notices`
-      // is what v2 agents like agy push post-settle session updates through.
+      // Advertise the form capability under both ACP initialization names.
+      // agy 1.5.15 negotiates v1 and reads `clientCapabilities`.
+      const elicitation = { form: {} };
+      const clientInfo = { name: "pipi", version: "0.1.0" };
       init = await acpRequest(
         "initialize",
         {
           protocolVersion: 2,
+          capabilities: { elicitation },
+          info: clientInfo,
           clientCapabilities: {
             fs: { readTextFile: false, writeTextFile: false },
             terminal: false,
-            session: { notices: {} },
+            session: { notices: {}, configOptions: { boolean: {} } },
+            elicitation,
           },
-          clientInfo: { name: "pipi", version: "0.1.0" },
+          clientInfo,
         },
         30_000,
       );
@@ -3264,6 +3646,7 @@ async function negotiateAcpRound(bin, epoch) {
     }
     acpUsage = undefined;
     acpEffortConfig = undefined;
+    acpModelConfigs = [];
     acpModelValues = undefined;
     acpModelConfigCurrent = undefined;
     acpModelConfigId = undefined;
@@ -3301,7 +3684,15 @@ async function negotiateAcpRound(bin, epoch) {
         sess = await acpRequest("session/new", newParams, 30_000).catch(async (err) => {
           // AUTH_REQUIRED (-32000) or a text match: authenticate once, then retry.
           if (!acpAuthMethods.length || !(err?.acpCode === -32000 || /auth/i.test(String(err?.message || "")))) throw err;
-          await acpRequest("authenticate", { methodId: acpAuthMethods[0].id }, 60_000);
+          const authParams = { methodId: acpAuthMethods[0].id };
+          // Devin intentionally ignores its CLI credentials in ACP mode; a key the
+          // user saved in pipi must be offered on the authenticate call itself.
+          if (isDevinAcp()) {
+            const envVar = config.customAgent?.envVar || BUILTIN_ENV_VARS[agentId];
+            const key = envVar ? resolveAgentApiKey(agentId, envVar)?.key : undefined;
+            if (key) authParams._meta = { api_key: key };
+          }
+          await acpRequest("authenticate", authParams, 60_000);
           return acpRequest("session/new", newParams, 30_000);
         });
         begun = true;
@@ -3498,7 +3889,7 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
         steerPromise.then(() => ({ kind: "steer" })),
       ]);
       if (step.kind === "steer") {
-        if (abortRequested || sessionEpoch !== turnEpoch || !acpChild) continue;
+        if (abortRequested || sessionEpoch !== turnEpoch || !acpChild || pendingUiRequests.size > 0) continue;
         const nextSteer = dequeueNextTurn();
         if (!nextSteer) continue;
         emitTurn({
@@ -3548,10 +3939,11 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
     // Antigravity returns `end_turn` while background commands, scheduled wakes,
     // detached subagents, or unread inbox wakes are still pending. Hold the turn
     // open until they finish and their follow-up replies settle.
-    if (isAntigravityAcp() && !abortRequested && stopReason === "stop") {
+    const agy = isAntigravityAcp();
+    if (!abortRequested && stopReason === "stop" && (agy || pendingUiRequests.size > 0)) {
       deferred.promptSettled = true;
       const deferredWork = hasAcpDeferredWork(deferred);
-      const pendingReply = !deferredWork && agyHasPendingReply(acpId);
+      const pendingReply = agy && !deferredWork && agyHasPendingReply(acpId);
       if (deferredWork || pendingReply) {
         if (stream.hasTrailingText()) {
           stream.checkpoint({ keepOpenTools: true, startNextTurn: true });
@@ -3565,6 +3957,15 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
     const wasSteer = steerInterrupt;
     const aborted = abortRequested && !wasSteer;
     const finalStop = aborted ? "aborted" : stopReason;
+    // When agy falls back to asking in chat, `Run ask_question` stays `pending`
+    // across `end_turn` — it is waiting on the user's next message, not a running
+    // background job. Close it cleanly so it never leaks into `acpBackgroundTools`
+    // or pins `pipi_background_watch` active.
+    if (!aborted && finalStop === "stop" && agy) {
+      for (const [id, info] of stream.seen().open) {
+        if (isAntigravityAskQuestion(info)) stream.toolEnd(id, "", false);
+      }
+    }
     // Calls still open at the answer (daemons, or commands surviving a steer)
     // stay tracked so a later wake or turn can finish them by id.
     const keepOpenTools = !aborted && stream.seen().open.length > 0;
@@ -3574,9 +3975,11 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
     syncBackgroundWatch();
   } catch (err) {
     const aborted = abortRequested && !steerInterrupt;
+    if (pendingUiRequests.size > 0 && !abortRequested) acpNotify("session/cancel", { sessionId: acpId });
     clearAcpBackground();
     stream.finish(aborted ? "aborted" : "error", !aborted ? (err instanceof Error ? err.message : String(err)) || acpStderrTail() : undefined);
   } finally {
+    cancelAcpDialogs();
     if (acpDeferred === deferred) acpDeferred = undefined;
     if (acpStream === stream) acpStream = undefined;
     syncBackgroundWatch();
@@ -3707,13 +4110,17 @@ async function handleCommand(cmd) {
         autoCompactionEnabled,
         messageCount: messages.length,
         pendingMessageCount: queuedSteering.length + queuedFollowUp.length,
+        modelConfigs: acpModelConfigs,
       };
     case "get_available_models":
       await discoverCatalog();
       return { models: availableModels };
     case "get_available_thinking_levels":
       await discoverCatalog();
-      if (driver === "acp" && acpEffortConfig?.values?.length) return { levels: [...new Set(["off", ...acpEffortConfig.values])] };
+      if (driver === "acp") {
+        const efforts = acpEffortLevels();
+        return { levels: efforts.length ? efforts : ["off"] };
+      }
       if (driver === "claude" && currentModel?.reasoning) {
         const efforts = Array.isArray(currentModel.effortLevels) && currentModel.effortLevels.length ? currentModel.effortLevels : ["low", "medium", "high"];
         return { levels: [...new Set(["off", ...efforts])] };
@@ -3765,7 +4172,9 @@ async function handleCommand(cmd) {
       const text = String(cmd.message || "");
       const images = imageBlocks(cmd.images);
       if (isStreaming) {
-        if (cmd.streamingBehavior === "followUp") {
+        // ACP can reject any prompt while it waits for an answer. Hold ordinary
+        // messages (including steers from another session) until the turn ends.
+        if (cmd.streamingBehavior === "followUp" || pendingUiRequests.size > 0) {
           queuedFollowUp.push({ text, images });
         } else {
           queuedSteering.push({ text, images });
@@ -3845,14 +4254,19 @@ async function handleCommand(cmd) {
       const found = availableModels.find((m) => m.id === cmd.modelId && m.provider === cmd.provider) || availableModels.find((m) => m.id === cmd.modelId);
       if (!found) throw new Error(`Model not found: ${cmd.provider}/${cmd.modelId}`);
       currentModel = found;
-      if (driver === "acp") void pushAcpModel();
+      if (driver === "acp") await pushAcpModel();
       return found;
     }
     case "set_thinking_level":
       thinkingLevel = cmd.level || "medium";
       thinkingLevelSet = true;
-      if (driver === "acp") void pushAcpEffort();
+      acpThinkingWanted = thinkingLevel;
+      if (driver === "acp") await pushAcpEffort();
       emit({ type: "thinking_level_changed", level: thinkingLevel });
+      return undefined;
+    case "set_model_config":
+      if (driver !== "acp") throw new Error(`unsupported command "${cmd.type}"`);
+      await pushAcpModelConfig(String(cmd.configId || ""), cmd.value);
       return undefined;
     case "set_session_name":
       sessionName = String(cmd.name || "").trim() || undefined;
@@ -3930,11 +4344,7 @@ process.stdin.on("data", (chunk) => {
       try {
         const parsed = JSON.parse(line);
         if (parsed.type === "extension_ui_response" && parsed.id) {
-          const waiter = pendingUiRequests.get(parsed.id);
-          if (waiter) {
-            pendingUiRequests.delete(parsed.id);
-            waiter(parsed);
-          }
+          finishAcpDialog(parsed.id, parsed);
         } else {
           Promise.resolve(handleCommand(parsed))
             .then((data) => emit({ id: parsed.id, type: "response", command: parsed.type, success: true, data }))

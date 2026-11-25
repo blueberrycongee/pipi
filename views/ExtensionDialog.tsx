@@ -7,8 +7,9 @@ import { Button } from "../ui/Button";
 import { TextField } from "../ui/Controls";
 import { Icon, type IconName } from "../ui/Icon";
 import { FloatingLayer, keepLast, Reveal } from "../ui/motion";
-import { FIELD_SURFACE, FOCUS_RING, GLASS_REGULAR, POPUP, PRESS } from "../ui/styles";
+import { FIELD_SURFACE, FOCUS_RING, PRESS } from "../ui/styles";
 import { uiMinHeight, uiType } from "../ui/typography";
+import { QuestionForm } from "./QuestionForm";
 
 const TOOL_ICONS: Record<string, IconName> = {
   bash: "terminal",
@@ -213,7 +214,7 @@ export function ExtensionPrompt() {
     if (dialog) answerDialog(dialog.id, { value: text() });
   };
 
-  const of = <M extends "select" | "confirm" | "input">(method: M) => {
+  const of = <M extends "select" | "confirm" | "input" | "form">(method: M) => {
     const dialog = shownDialog();
     return dialog?.method === method ? (dialog as Extract<NonNullable<typeof dialog>, { method: M }>) : undefined;
   };
@@ -223,10 +224,12 @@ export function ExtensionPrompt() {
       <If when={shownDialog()}>
         <View
           role="region"
-          accessibilityLabel={tr("Confirmation prompt", "确认提示")}
-          class={`mb-2.5 gap-2.5 rounded-2xl corner-squircle p-3.5 ${POPUP}`}
-          style={GLASS_REGULAR}
+          accessibilityLabel={shownDialog()?.method === "form" ? tr("Agent questions", "智能体提问") : tr("Confirmation prompt", "确认提示")}
+          class={`mx-4 -mb-2 gap-2.5 overflow-hidden rounded-t-2xl corner-squircle border-[0.5px] border-b-0 border-hairline bg-card/85 p-3.5 dark:bg-card/75`}
         >
+        <If when={of("form")}>
+          {(dialog) => <QuestionForm request={dialog()} onAnswer={answerDialog} />}
+        </If>
         <If when={of("confirm")}>
           {(dialog) => {
             const info = () => describeConfirm(dialog().title, dialog().message);
@@ -268,7 +271,7 @@ export function ExtensionPrompt() {
           {(dialog) => (
             <View class="gap-2">
               <View class="flex-row items-center gap-2">
-                <Icon name="info" size={15} tone="brand-text" />
+                <Icon name="message" size={15} tone="brand-text" />
                 <Text class={`min-w-0 flex-1 truncate ${uiType("base")} font-semibold text-foreground`} role="header">
                   {dialog().title}
                 </Text>
@@ -349,7 +352,7 @@ export function ExtensionDialog() {
     if (dialog) answerDialog(dialog.id, { value: text() });
   };
   const modalOpen = () => !!pendingDialog() && !hasInlinePrompt();
-  const of = <M extends "select" | "confirm" | "input" | "editor">(method: M) => {
+  const of = <M extends "select" | "confirm" | "input" | "editor" | "form">(method: M) => {
     if (!modalOpen()) return undefined;
     const dialog = pendingDialog();
     return dialog?.method === method ? (dialog as Extract<typeof dialog, { method: M }>) : undefined;
@@ -357,6 +360,9 @@ export function ExtensionDialog() {
   return (
     <FloatingLayer open={modalOpen()} onClose={cancelPendingDialog} closeLabel={tr("Close", "关闭")} panelClass="w-full max-w-110">
       <View class="gap-4 p-5">
+        <If when={of("form")}>
+          {(dialog) => <QuestionForm request={dialog()} onAnswer={answerDialog} />}
+        </If>
         <If when={of("confirm")}>
           {(dialog) => {
             const info = () => describeConfirm(dialog().title, dialog().message);

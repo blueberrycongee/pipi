@@ -369,6 +369,53 @@ test("an interaction_ question reaches the user as a select, and the picked answ
   assert.equal(textOf(run), "You picked opt_b.", "the picked option's own id is what the agent gets");
 });
 
+test("Antigravity form answers retain wire ids and a steer waits for the answer and turn to finish", async (t) => {
+  const bridge = startBridge(t);
+  await bridge.prompt("ask form");
+  await bridge.waitFor(() => bridge.records.some((r) => r.method === "form"), 8000, "question form");
+  const form = bridge.records.find((r) => r.method === "form");
+  assert.deepEqual(form.fields.map((field) => [field.id, field.kind, field.other?.id]), [
+    ["q1", "choice", "q1_other"], ["q2", "multiChoice", "q2_other"],
+  ]);
+  assert.equal(form.fields[0].label, "Which fruit should we use?");
+  assert.deepEqual(form.fields[0].options[1], { value: "2", label: "Pear" });
+  const init = JSON.parse(fs.readFileSync(bridge.acpLog, "utf8").split("\n")[0]);
+  assert.deepEqual(init.params.clientCapabilities.elicitation, { form: {} });
+  assert.deepEqual(init.params.capabilities.elicitation, { form: {} });
+
+  const steer = await bridge.send({ type: "steer", message: "then run the next prompt" });
+  assert.equal(steer.data.disposition, "queued");
+  const { data: state } = await bridge.send({ type: "get_state" });
+  assert.equal(state.isStreaming, true);
+  assert.equal(bridge.methods().filter((method) => method === "session/prompt").length, 1);
+
+  const answers = { q1_other: "Mango", q2: ["2", "1"], q2_other: "Granola", unasked: "ignore this key" };
+  bridge.write({ type: "extension_ui_response", id: form.id, answers });
+  await bridge.settles(1);
+  const [first, next] = runs(bridge.records);
+  assert.match(textOf(first), /Form response: \{"action":"accept","content":\{"q1_other":"Mango","q2":\["2","1"\],"q2_other":"Granola"\}\}/);
+  assert.ok(next.some((r) => r.type === "message_end" && r.message?.role === "user" && r.message.content[0].text === "then run the next prompt"));
+  assert.equal(bridge.methods().includes("session/cancel"), false);
+});
+
+test("declining or withdrawing a form dismisses it and resolves its ACP request", async (t) => {
+  const bridge = startBridge(t);
+  await bridge.prompt("ask form");
+  await bridge.waitFor(() => bridge.records.some((r) => r.method === "form"));
+  const first = bridge.records.find((r) => r.method === "form");
+  bridge.write({ type: "extension_ui_response", id: first.id, declined: true });
+  await bridge.settles(1);
+  assert.ok(bridge.records.some((r) => r.method === "dismiss" && r.id === first.id));
+  assert.match(textOf(runs(bridge.records)[0]), /Form response: \{"action":"decline"\}/);
+
+  await bridge.prompt("ask form withdraw");
+  await bridge.settles(2);
+  const last = bridge.records.findLast((r) => r.method === "form");
+  assert.notEqual(last.id, first.id);
+  assert.ok(bridge.records.some((r) => r.method === "dismiss" && r.id === last.id));
+  assert.match(textOf(runs(bridge.records)[1]), /Form response: \{"action":"cancel"\}/);
+});
+
 test("changing sessions on Antigravity never sends session/close to tear down the worker", async (t) => {
   const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "60000" });
   await bridge.prompt("start a background daemon");
@@ -546,4 +593,63 @@ test("reloading an Antigravity session backfills replies finished while disconne
     .filter((m) => m.role === "assistant")
     .map((m) => m.content.filter((b) => b.type === "text").map((b) => b.text).join(""));
   assert.deepEqual(secondTexts, ["Swarm started.", "Swarm completed while disconnected: all 53 tests pass."]);
+});
+
+test("ask_question chat fallback closes cleanly without leaking backgroundWatch or opening a hanging wake turn", async (t) => {
+  const bridge = startBridge(t, { PIPI_SESSION_ID: "s_ask_chat" });
+  await bridge.prompt("ask chat");
+  await bridge.settles(1, 5000);
+  const { data: msgs } = await bridge.send({ type: "get_messages" });
+  const assistant = msgs.messages.find((m) => m.role === "assistant");
+  const askCall = assistant?.content.find((b) => b.type === "toolCall");
+  assert.equal(askCall?.name, "Run ask_question");
+  assert.equal(askCall?.background, undefined, "chat-fallback ask_question must not be marked background");
+  const watches = bridge.records.filter((r) => r.type === "pipi_background_watch");
+  assert.notEqual(watches.at(-1)?.active, true, "chat-fallback ask_question must not pin backgroundWatch active");
+  // Wait past the late failed tool_call_update (60ms) and confirm it does not open a hanging wake turn.
+  await new Promise((r) => setTimeout(r, 250));
+  const { data: state } = await bridge.send({ type: "get_state" });
+  assert.equal(state.isStreaming, false, "late ask_question tool_call_update must not open a hanging wake turn");
+  assert.equal(bridge.records.filter((r) => r.type === "agent_start").length, 1);
+});
+
+test("ask_question chat fallback during a post-settle wake settles instead of hanging waitAcpDeferred", async (t) => {
+  const bridge = startBridge(t, { FAKE_ACP_WAKE_MS: "150", PIPI_ACP_DEFERRED_FINALIZE_MS: "150" });
+  await bridge.prompt("background ask-chat");
+  await bridge.settles(1, 5000);
+  const [run] = runs(bridge.records);
+  assert.deepEqual(assistantTexts(run), ["Waiting for the job.", "\nContinue?\n- [1] Yes\n- [2] No\n"]);
+  const { data: state } = await bridge.send({ type: "get_state" });
+  assert.equal(state.isStreaming, false);
+});
+
+test("parseAcpForm accepts multi-select array items combining type string with anyOf", async () => {
+  const { parseAcpForm } = await import("./acp-form.mjs");
+  const fields = parseAcpForm(
+    {
+      type: "object",
+      properties: {
+        q1: {
+          type: "array",
+          title: "Pick sizes",
+          items: {
+            type: "string",
+            anyOf: [
+              { const: "1", title: "small" },
+              { const: "2", title: "medium" },
+            ],
+          },
+        },
+        q1_other: { type: "string", title: "Other" },
+      },
+    },
+    { antigravity: true },
+  );
+  assert.ok(fields && fields.length === 1);
+  assert.equal(fields[0].kind, "multiChoice");
+  assert.deepEqual(fields[0].options, [
+    { value: "1", label: "small", description: undefined },
+    { value: "2", label: "medium", description: undefined },
+  ]);
+  assert.equal(fields[0].other?.id, "q1_other");
 });

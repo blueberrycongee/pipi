@@ -17,10 +17,14 @@ import {
   daemonSessionOfId,
   daemonSessionTitle,
   detachDoc,
+  docOpener,
   docRefText,
+  ensureChatFolder,
   findKnownSessionSummary,
+  isChatFolder,
   isRunning,
   isSwitching,
+  lastProject,
   newSession,
   newSessionInWorkspace,
   openDaemonSession,
@@ -55,7 +59,7 @@ import {
   refreshNotes,
   syncDocs,
 } from "./docs";
-import { prefsReady, setGroupCollapsed, setOpenTabs, storedOpenTabs } from "./prefs";
+import { forgetDocRank, prefsReady, setGroupCollapsed, setOpenTabs, storedOpenTabs } from "./prefs";
 
 /**
  * The tab bar's working set: which surfaces are open, in which order. A tab
@@ -98,6 +102,16 @@ export const openTabs = () => tabs();
 
 /** Which draft tab is active when the chat view shows an unstarted new session. */
 const activeDraftRef = signal<string | undefined>(undefined);
+/** The draft tabs that hold a chat, so coming back to one starts it in the chat folder again. */
+const chatDrafts = new Set<string>();
+
+/** Marks the draft tab on screen by the folder it is in now, as it is left. */
+function noteDraftFolder() {
+  const ref = activeDraftRef();
+  if (ref === undefined) return;
+  if (isChatFolder(activeProjectPath())) chatDrafts.add(ref);
+  else chatDrafts.delete(ref);
+}
 /** Last active tab on the strip (remembered while Settings is open so sidebar clicks replace it). */
 let lastActiveId: string | undefined;
 let draftSeq = 0;
@@ -130,7 +144,7 @@ function isCurrentChatUnstarted(): boolean {
   const pending = pendingSession();
   if (pending) return !pending.file && !pending.daemonId;
   const ds = currentDaemonSession();
-  if (ds && (ds.parentId || ds.initiator === "external" || ds.status !== "idle" || ds.unread)) return false;
+  if (ds && (ds.parentId || ds.persona || ds.initiator === "external" || ds.status !== "idle" || ds.unread)) return false;
   if (transcriptRows().length > 0 || (sessionState()?.messageCount ?? 0) > 0 || isRunning()) return false;
   const file = sessionState()?.sessionFile;
   if (file && findKnownSessionSummary(file)) return false;
@@ -408,8 +422,8 @@ export function chatTabTitle(tab: OpenTab): string {
     const summary = findKnownSessionSummary(file);
     if (summary) {
       // A daemon child's sidebar row hangs under its tree as the daemon's name
-      // for it — a task's given title — not its file's first words.
-      if (ds?.parentId) return daemonSessionTitle(ds);
+      // for it — a task's given title — not its file's first words; Pip is Pip.
+      if (ds?.parentId || ds?.persona) return daemonSessionTitle(ds);
       // A saved conversation's name is stable even while its daemon is running
       // and reports a transient title from the latest prompt.
       return sessionTitle(summary, file.split("/").pop() ?? file);
@@ -426,6 +440,7 @@ export function chatTabTitle(tab: OpenTab): string {
 
 /** Shows a tab: its chat session attaches, or its document opens. */
 export function selectTab(tab: OpenTab) {
+  noteDraftFolder();
   if (tab.kind === "doc") {
     ensureDoc(tab.ref);
     showDoc(tab.ref);
@@ -434,7 +449,9 @@ export function selectTab(tab: OpenTab) {
   if (isDraftRef(tab.ref)) {
     activeDraftRef.set(tab.ref);
     showChat();
-    void newSession();
+    if (chatDrafts.has(tab.ref)) void ensureChatFolder().then(newSessionInWorkspace);
+    else if (isChatFolder(activeProjectPath())) void newSessionInWorkspace(lastProject());
+    else void newSession();
     return;
   }
   activeDraftRef.set(undefined);
@@ -487,7 +504,10 @@ export function openDaemonSessionTab(sessionId: string, options?: { newTab?: boo
  */
 export function openNewSessionTab(options?: { newTab?: boolean; cwd?: string }) {
   let result: ReturnType<typeof newSession> | ReturnType<typeof newSessionInWorkspace>;
+  // A new session from a chat goes back to the project last worked in.
+  const cwd = options?.cwd ?? (isChatFolder(activeProjectPath()) ? lastProject() : undefined);
   batch(() => {
+    noteDraftFolder();
     const list = tabs();
     if (options?.newTab) {
       const ref = nextDraftRef();
@@ -505,14 +525,25 @@ export function openNewSessionTab(options?: { newTab?: boolean; cwd?: string }) 
         activeDraftRef.set(ref);
       }
     }
-    if (options?.cwd) {
-      result = newSessionInWorkspace(options.cwd);
+    const ref = activeDraftRef();
+    if (ref !== undefined) {
+      if (isChatFolder(cwd)) chatDrafts.add(ref);
+      else chatDrafts.delete(ref);
+    }
+    if (cwd) {
+      result = newSessionInWorkspace(cwd);
     } else {
       showChat();
       result = newSession();
     }
   });
   return result!;
+}
+
+/** Starts a chat with no project (`chatFolder`), here or in a brand-new tab like `openNewSessionTab`. */
+export async function openNewChatTab(options?: { newTab?: boolean }) {
+  const cwd = await ensureChatFolder();
+  return openNewSessionTab({ newTab: options?.newTab, cwd });
 }
 
 /** Cycles the strip by `delta` tabs (⌘⇧]'s). */
@@ -879,6 +910,12 @@ docRefText.read = (ref) => {
   return docText(ref.path) || ref.text;
 };
 
+docOpener.open = async (path) => {
+  if (!(docAt(path) || (await fs.exists(path).catch(() => false)))) return false;
+  openDocTab(path, { newTab: true });
+  return true;
+};
+
 /**
  * While agents work, the open documents look at their files: one asked to
  * rewrite a paragraph writes the file, and the document takes it in as it
@@ -903,6 +940,7 @@ export async function deleteNote(path: string) {
     // The close flushes a last save: the file must go after it, not before.
     await closeDoc(path);
   }
+  forgetDocRank(path);
   await deleteNoteFile(path);
 }
 

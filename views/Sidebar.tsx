@@ -27,11 +27,12 @@ import { type SessionSummary, sessionTitle } from "../pi/sessions";
 import { AgentLogo } from "../ui/AgentLogo";
 import {
   activeAgentId,
-  activeProjectPath,
+  activeProjectPath as openFolderPath,
   archivedSessionItems,
   archiveDaemonSession,
   archiveSession,
   availableAgents,
+  chatFolder,
   childSessionsOf,
   childSessionsOfDaemon,
   childSessionsOfOpen,
@@ -48,14 +49,17 @@ import {
   daemonSessions,
   daemonSessionTitle,
   daemonTreePlace,
+  isChatFolder,
   isDaemonTaskSession,
   isDraftAhead,
+  isPersonaFolder,
   isRunning,
   isSessionRunning,
   isSessionUnread,
   leaveSettings,
   openWorkspace,
   pendingSession,
+  placeLabel,
   projectCwdOf,
   removeDaemonSession,
   removeSession,
@@ -81,12 +85,14 @@ import {
   newDocTab,
   openDaemonSessionTab,
   openDocTab,
+  openNewChatTab,
   openNewSessionTab,
   openSessionTab,
   pickDocTab,
   saveDocAs,
 } from "../store/tabs";
 import {
+  docRankOverrides,
   isGroupCollapsed,
   isSessionArchived,
   isWorkspaceCollapsed,
@@ -94,6 +100,7 @@ import {
   recentWorkspaces,
   reorderWorkspaces,
   sessionRankOverrides,
+  setDocRankOverrides,
   setGroupCollapsed,
   setRecentRankOverrides,
   setSessionRankOverrides,
@@ -107,6 +114,7 @@ import { animateNextLayout, delayedFade, EASING, Presence, Reveal } from "../ui/
 import { FOCUS_RING, HOVER_REVEAL, PRESS, WALLPAPER_FROST } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { uiHeight, uiIconSize, uiRowHeight, uiType } from "../ui/typography";
+import { PipRow } from "./PipRow";
 
 /** A row inside an expanded workspace folder: a saved session. */
 type FolderItem = { id: string; session?: SessionSummary; child?: DaemonSession };
@@ -118,6 +126,8 @@ type RecentItem = { id: string; session?: SessionSummary; child?: DaemonSession;
 
 /** How many sessions 最近 lists before its footer offers to show the rest. */
 const RECENT_LIMIT = 100;
+/** How many documents 文档 lists before its footer offers to show the rest. */
+const DOCS_LIMIT = 10;
 const REPO_URL = "https://github.com/blueberrycongee/pipi";
 const ICON_SLOT = "size-5 shrink-0 items-center justify-center";
 /** Trailing 24pt slot (`right-1` inside `px-2`) centered vertically on the row's dynamic height. */
@@ -133,6 +143,11 @@ const leftControls = () => platform.os === "macos" || titleBar().left > 0;
 /** True when the platform's primary modifier (⌘ on macOS, Ctrl elsewhere) was held on a press. */
 const isModPress = (e?: { modifiers?: { platform?: boolean; control?: boolean } }) =>
   Boolean(platform.os === "macos" ? e?.modifiers?.platform : e?.modifiers?.control);
+/** The open project folder; Pip's folder of notes is no project, so with Pip open none is. */
+const activeProjectPath = () => {
+  const cwd = openFolderPath();
+  return isPersonaFolder(cwd) ? "" : cwd;
+};
 const ROW_PRESS = `${PRESS} ${FOCUS_RING} hover:bg-sidebar-accent group-hover:bg-sidebar-accent active:bg-sidebar-accent`;
 /**
  * The pointer rests while rows slide under it — a draft row opening or closing
@@ -158,9 +173,12 @@ let explicitDraftGroup: GroupId | undefined;
 const projects = computed(() => {
   const active = activeProjectPath();
   const list = recentWorkspaces();
-  if (!active) return list;
+  if (!active || isChatFolder(active)) return list;
   return list.includes(active) ? list : [active, ...list];
 });
+
+/** The folders 最近 gathers sessions from: every open project, and the chat folder. */
+const recentFolders = computed(() => [...projects(), chatFolder()]);
 
 const titleOf = (session: SessionSummary) => sessionTitle(session, tr("New session", "新会话"));
 
@@ -203,6 +221,7 @@ const listSteady = () => sidecarPhase().name === "ready" || pendingSession() !==
 const singleEmpty = computed(
   () =>
     projects().length === 1 &&
+    !isChatFolder(activeProjectPath()) &&
     savedSessions().length === 0 &&
     notes().length === 0 &&
     archivedSessionItems().length === 0 &&
@@ -732,6 +751,7 @@ function orderedIds(list: string): string[] {
       .filter((item) => !item.id.startsWith("recent-child:"))
       .map(recentKey);
   }
+  if (list === "docs") return shownDocs().map((note) => note.path);
   const cwd = list.slice(3);
   return sortedFolderSessions(cwd).map((s) => s.path);
 }
@@ -751,6 +771,7 @@ function sortedFolderSessions(cwd: string): SessionSummary[] {
 /** The standing `id` sorts by in `list` right now: its drag rank when it has one, else the natural. */
 function standingOfId(list: string, id: string): number {
   if (list === "recents") return recentRankOverrides()[id] ?? recentStanding.get(id) ?? 0;
+  if (list === "docs") return docRankOverrides()[id] ?? docStanding.get(id) ?? 0;
   const cwd = list.slice(3);
   const ranks = sessionRankOverrides(cwd);
   return ranks[id] ?? sessionsOf(cwd).find((s) => s.path === id)?.modified ?? 0;
@@ -785,6 +806,12 @@ function writeOrder(list: string, moved: string, ordered: string[]) {
     reorderWorkspaces(ordered);
   } else if (list === "recents") {
     setRecentRankOverrides(nextRanks(ordered, moved, list, recentRankOverrides()));
+  } else if (list === "docs") {
+    // The fold's hidden documents stand below the shown ones: a drop at the bottom lands above them.
+    const hidden = allDocs()
+      .map((note) => note.path)
+      .filter((path) => !ordered.includes(path));
+    setDocRankOverrides(nextRanks([...ordered, ...hidden], moved, list, docRankOverrides()));
   } else {
     const cwd = list.slice(3);
     setSessionRankOverrides(cwd, nextRanks(ordered, moved, list, sessionRankOverrides(cwd)));
@@ -1027,10 +1054,10 @@ const createdOf = (item: RecentItem) => item.session?.created ?? item.child?.cre
  */
 const allRecents = computed<RecentItem[]>(() => {
   const active = activeProjectPath();
-  const open = new Set(projects());
+  const open = new Set(recentFolders());
   const seen = new Set<string>();
   const summaries: { session: SessionSummary; cwd: string }[] = [];
-  for (const cwd of projects()) {
+  for (const cwd of recentFolders()) {
     const list = sessionsOf(cwd);
     for (const session of list) {
       if (seen.has(session.path)) continue;
@@ -1085,6 +1112,34 @@ const allRecents = computed<RecentItem[]>(() => {
 const recentsExpanded = signal(false);
 const recents = computed<RecentItem[]>(() => (recentsExpanded() ? allRecents() : allRecents().slice(0, RECENT_LIMIT)));
 
+/**
+ * Where each document stands in 文档: its last write as of the first time the
+ * list showed it, as `recentStanding` keeps 最近's sessions. A document being
+ * written, by the person or an agent, keeps its place instead of leaping to the
+ * top with every save; a new one lands on top, by its own time; a drag's rank
+ * stands over both. The order is taken anew, by last write, when the app next
+ * starts.
+ */
+const docStanding = new Map<string, number>();
+const docStandOf = (note: NoteSummary) => {
+  const ranked = docRankOverrides()[note.path];
+  if (ranked !== undefined) return ranked;
+  const known = docStanding.get(note.path);
+  if (known !== undefined) return known;
+  docStanding.set(note.path, note.modified);
+  return note.modified;
+};
+const allDocs = computed<NoteSummary[]>(() => {
+  const listed = notes();
+  // A path gone from the list stands anew when a note takes it again (`newDocPath` reuses a deleted note's name).
+  const paths = new Set(listed.map((note) => note.path));
+  for (const path of docStanding.keys()) if (!paths.has(path)) docStanding.delete(path);
+  return [...listed].sort((a, b) => docStandOf(b) - docStandOf(a) || a.path.localeCompare(b.path));
+});
+/** What 文档 shows: its first slice until the footer expands it, then everything. */
+const docsExpanded = signal(false);
+const shownDocs = computed<NoteSummary[]>(() => (docsExpanded() ? allDocs() : allDocs().slice(0, DOCS_LIMIT)));
+
 /** Daemon sessions with a row in 最近 right now: nested under its roots, or under the draft's row. */
 const recentDaemonRows = computed(() => {
   const ids = new Set<string>();
@@ -1114,7 +1169,7 @@ const daemonShownInRecents = (ds: DaemonSession) => !isGroupCollapsed("recents")
  */
 function ownsActiveSession(group: GroupId, sessionPath: string, cwd: string): boolean {
   if (isSessionArchived(sessionPath)) return group === "archived";
-  const inWorkspaces = !isGroupCollapsed("workspaces") && !isWorkspaceCollapsed(cwd);
+  const inWorkspaces = !isGroupCollapsed("workspaces") && !isWorkspaceCollapsed(cwd) && !isChatFolder(cwd);
   const inRecents = !isGroupCollapsed("recents") && recentSessionPaths().has(sessionPath);
   const owner: GroupId =
     chosenGroups()[sessionPath] === "recents" && inRecents ? "recents" : inWorkspaces ? "workspaces" : inRecents ? "recents" : "workspaces";
@@ -1151,7 +1206,7 @@ function ownsDaemonRow(group: GroupId, ds: DaemonSession): boolean {
 
 /** Which group highlights the open draft session when both 工作区 and 最近 list it (the mark follows `active`, not the owner). */
 function ownsDraftSession(group: GroupId, cwd: string): boolean {
-  const inWorkspaces = !isGroupCollapsed("workspaces") && !isWorkspaceCollapsed(cwd);
+  const inWorkspaces = !isGroupCollapsed("workspaces") && !isWorkspaceCollapsed(cwd) && !isChatFolder(cwd);
   const inRecents = !isGroupCollapsed("recents") && hasRecentDraft();
   const owner: GroupId =
     draftGroup() === "recents" && inRecents ? "recents" : inWorkspaces ? "workspaces" : inRecents ? "recents" : "workspaces";
@@ -1261,6 +1316,13 @@ function startNewSessionFromRecents(newTab = false) {
   explicitDraftGroup = "recents";
   draftGroup.set("recents");
   void openNewSessionTab({ newTab });
+}
+
+function startNewChat(newTab = false) {
+  setGroupCollapsed("recents", false);
+  explicitDraftGroup = "recents";
+  draftGroup.set("recents");
+  void openNewChatTab({ newTab });
 }
 
 function startNewSessionIn(cwd: string, newTab = false) {
@@ -1593,7 +1655,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
           void openNewSessionTab({ newTab: true, cwd: target && target !== activeProjectPath() ? target : undefined });
         }}
         tooltip={tip(
-          props.group === "recents" ? `${engine().name} · ${tildePath(shownCwd(), home)}` : engine().name,
+          props.group === "recents" ? `${engine().name} · ${placeLabel(shownCwd())}` : engine().name,
           undefined,
           "right",
         )}
@@ -1658,7 +1720,7 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
         onMouseUp={(e: MouseEvent) => {
           if (e.button === "middle") openRow(true);
         }}
-        tooltip={tip(`${engine().name} · ${tildePath(props.cwd, home)}`, undefined, "right")}
+        tooltip={tip(`${engine().name} · ${placeLabel(props.cwd)}`, undefined, "right")}
         class={calm(sessionRowClass(Boolean(props.indent), running() || unread() || blocked() || failed(), true, 0, keepCue()))}
       >
         <EngineMark id={engine().id} available={engine().available} />
@@ -1784,7 +1846,7 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
           if (e.button === "middle") openDaemonRow(true);
         }}
         tooltip={tip(
-          `${engine().name} · ${tildePath(session().cwd, home)}${session().worktree?.branch ? ` · ${session().worktree!.branch}` : ""}${
+          `${engine().name} · ${placeLabel(session().cwd)}${session().worktree?.branch ? ` · ${session().worktree!.branch}` : ""}${
             file() ? "" : ` · ${statusLabel(session().status)}`
           }`,
           undefined,
@@ -2068,14 +2130,23 @@ function NoteRow(props: { note: NoteSummary }) {
       e.pagePosition,
     );
   };
+  const openRow = (newTab: boolean) => {
+    touchHeld = false;
+    disarmMouseDrag();
+    openDocTab(props.note.path, { newTab });
+  };
   return (
-    <View class={hoverGroup()} onContextMenu={menu}>
+    <DropRow list="docs" id={props.note.path} onContextMenu={menu}>
       <View
         role="button"
         accessibilityState={{ selected: selected() }}
-        onPress={(e: PressEvent) => openDocTab(props.note.path, { newTab: isModPress(e) })}
+        onPress={(e: PressEvent) => openRow(isModPress(e))}
+        onPressDown={(e: PressEvent) => {
+          if (!isModPress(e)) armMouseDrag({ list: "docs", id: props.note.path }, e.pagePosition.y);
+        }}
+        onPressUp={endMouseDrag}
         onMouseUp={(e: MouseEvent) => {
-          if (e.button === "middle") openDocTab(props.note.path, { newTab: true });
+          if (e.button === "middle") openRow(true);
         }}
         tooltip={tip(tildePath(props.note.path, home), undefined, "right")}
         class={calm(sessionRowClass(false, false, false))}
@@ -2085,7 +2156,7 @@ function NoteRow(props: { note: NoteSummary }) {
         </View>
         <Text class={sessionTitleClass(selected())}>{docTabTitle(props.note.path)}</Text>
       </View>
-    </View>
+    </DropRow>
   );
 }
 
@@ -2160,6 +2231,7 @@ function SidebarTree() {
       }}
       onMouseUp={endMouseDrag}
     >
+      <PipRow />
       <Scroll
         ref={(ref) => {
           sidebarScroll = ref;
@@ -2255,10 +2327,23 @@ function SidebarTree() {
             },
           }}
         >
-          <View testID="sidebar-docs">
-            <Each of={notes()} key={(note) => note.path}>
+          <View testID="sidebar-docs" ref={(ref) => registerDropList("docs", ref)}>
+            <Each of={shownDocs()} key={(note) => note.path}>
               {(note) => <NoteRow note={note()} />}
             </Each>
+            <If when={allDocs().length > DOCS_LIMIT}>
+              <BaseButton
+                testID="sidebar-docs-more"
+                onPress={() => {
+                  animateSidebarList();
+                  docsExpanded.update((on) => !on);
+                }}
+                accessibilityLabel={docsExpanded() ? tr("Show less", "收起") : tr("Show more", "展开更多")}
+                class={`${uiHeight(28)} w-full min-w-0 flex-row items-center rounded-md corner-squircle pl-8 pr-2.5 ${ROW_PRESS}`}
+              >
+                <Text class={`truncate ${uiType("sm")} text-subtle`}>{docsExpanded() ? tr("Show less", "收起") : tr("Show more", "展开更多")}</Text>
+              </BaseButton>
+            </If>
           </View>
         </FunctionalGroup>
         <Reveal open={archivedSessionItems().length > 0}>
@@ -2341,7 +2426,7 @@ export function Sidebar() {
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
         </If>
       </View>
-      <View class={`shrink-0 flex-row items-center gap-1 pb-2 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
+      <View class={`shrink-0 flex-row items-center gap-1 pl-2 ${leftControls() ? "pr-2" : "pr-2.5"}`}>
         <View
           role="button"
           testID="sidebar-new-session"
@@ -2361,6 +2446,24 @@ export function Sidebar() {
         <If when={!leftControls()}>
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />
         </If>
+      </View>
+      <View class="shrink-0 px-2 pb-2">
+        <View
+          role="button"
+          testID="sidebar-new-chat"
+          onPress={(e: PressEvent) => startNewChat(isModPress(e))}
+          onMouseUp={(e: MouseEvent) => {
+            if (e.button === "middle") startNewChat(true);
+          }}
+          accessibilityLabel={tr("New chat", "新闲聊")}
+          tooltip={tip(tr("New chat — no project folder", "新闲聊 · 不在任何项目里"), undefined, "right")}
+          class={`${uiHeight(32)} flex-row items-center gap-1.5 rounded-md corner-squircle px-2.5 ${ROW_PRESS}`}
+        >
+          <View class={ICON_SLOT}>
+            <Icon name="message" size={uiIconSize(14)} tone="muted-foreground" />
+          </View>
+          <Text class={`${uiType("base")} text-sidebar-foreground`}>{tr("New chat", "新闲聊")}</Text>
+        </View>
       </View>
       <SidebarTree />
       <View class="border-t border-sidebar-border px-2 py-1">

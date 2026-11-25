@@ -191,6 +191,85 @@ test("a document whose tab is closed stays in Documents, a press away", async ()
   await app.waitUntil(() => mentions(app, "2 words"));
 });
 
+/** The given titles in the order 文档 lists them. */
+const docsOrder = (app: Launched, titles: string[]) => {
+  const texts = app.texts();
+  const rows = texts.slice(texts.indexOf("Documents") + 1);
+  return titles.filter((title) => rows.includes(title)).sort((a, b) => rows.indexOf(a) - rows.indexOf(b));
+};
+
+/** A new document, written and saved under the given words. */
+async function writeNote(app: Launched, words: string) {
+  await app.waitFor("text:What are we building?");
+  await app.hover("id:sidebar-docs-action");
+  await app.press("id:sidebar-docs-action");
+  await app.waitFor(`${DOCS} >> text:Untitled`);
+  await app.waitFor(EDITOR);
+  await app.type(EDITOR, words);
+  await app.waitFor(`${DOCS} >> text:${words}`);
+  await app.wait(1200);
+}
+
+test("a document being written keeps its place in Documents; a new one lands on top", async () => {
+  const app = await launch();
+  await writeNote(app, "Alpha notes");
+  await writeNote(app, "Beta notes");
+  expect(docsOrder(app, ["Alpha notes", "Beta notes"])).toEqual(["Beta notes", "Alpha notes"]);
+
+  // Writing on in the older one saves it, and it stays where it stood.
+  await app.press(`${DOCS} >> text:Alpha notes`);
+  await app.waitUntil(() => mentions(app, "2 words"));
+  await app.type(EDITOR, " and more");
+  await app.waitUntil(() => mentions(app, "4 words"));
+  await app.wait(1500);
+  expect(docsOrder(app, ["Alpha notes and more", "Beta notes"])).toEqual(["Beta notes", "Alpha notes and more"]);
+
+  await app.hover("id:sidebar-docs-action");
+  await app.press("id:sidebar-docs-action");
+  await app.waitFor(`${DOCS} >> text:Untitled`);
+  expect(docsOrder(app, ["Untitled", "Alpha notes and more", "Beta notes"])).toEqual(["Untitled", "Beta notes", "Alpha notes and more"]);
+});
+
+test("dragging a document reorders Documents; a tap still opens it", async () => {
+  const app = await launch({ clock: {} });
+  await writeNote(app, "Alpha notes");
+  await writeNote(app, "Beta notes");
+  const titles = ["Alpha notes", "Beta notes"];
+  expect(docsOrder(app, titles)).toEqual(["Beta notes", "Alpha notes"]);
+
+  await app.dragAndHold(`${DOCS} >> text:Beta notes`, { x: 30, y: 40 });
+  expect(app.count("id:sidebar-drag-lift")).toBe(1);
+  expect(app.count("id:sidebar-drop-line")).toBe(1);
+  await app.drop();
+  await app.wait(100);
+  expect(docsOrder(app, titles)).toEqual(["Alpha notes", "Beta notes"]);
+  expect(JSON.parse(app.storage()["pipi.prefs.v1"]).docRanks).toBeTruthy();
+
+  // Saving the dragged one does not undo the drag.
+  await app.press(`${DOCS} >> text:Beta notes`);
+  await app.type(EDITOR, " again");
+  await app.wait(1500);
+  expect(docsOrder(app, ["Alpha notes", "Beta notes again"])).toEqual(["Alpha notes", "Beta notes again"]);
+});
+
+test("Documents shows its first ten and a footer for the rest, like Recent", async () => {
+  const dir = freshDir();
+  const files: Record<string, string> = {};
+  for (let i = 1; i <= 12; i++) files[`${dir}/docs/doc-${String(i).padStart(2, "0")}.md`] = `# Doc ${i}\n\nBody ${i}.\n`;
+  const app = await launch({ dir, files });
+  await app.waitFor("id:sidebar-docs-more");
+  const shown = () => Array.from({ length: 12 }, (_, i) => `Doc ${i + 1}`).filter((t) => app.count(`${DOCS} >> text:${t}`) > 0).length;
+  expect(shown()).toBe(10);
+  expect(app.count("id:sidebar-docs-more >> text:Show more")).toBe(1);
+
+  await app.press("id:sidebar-docs-more");
+  await app.waitUntil(() => shown() === 12);
+  expect(app.count("id:sidebar-docs-more >> text:Show less")).toBe(1);
+
+  await app.press("id:sidebar-docs-more");
+  await app.waitUntil(() => shown() === 10);
+});
+
 test("a document nobody wrote in leaves nothing behind", async () => {
   const app = await launch();
   await newNote(app);

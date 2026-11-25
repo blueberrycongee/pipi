@@ -27,6 +27,25 @@ export interface ImageContent {
   mimeType: string;
 }
 
+export interface AudioContent {
+  type: "audio";
+  data: string;
+  mimeType: string;
+}
+
+export interface MediaResourceContent {
+  type: "resource";
+  uri: string;
+  name?: string;
+  title?: string;
+  mimeType?: string;
+  size?: number;
+  data?: string;
+  text?: string;
+}
+
+export type ToolResultBlock = TextContent | ImageContent | AudioContent | MediaResourceContent;
+
 export interface ThinkingContent {
   type: "thinking";
   thinking: string;
@@ -67,7 +86,7 @@ export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "
 
 export interface AssistantMessage {
   role: "assistant";
-  content: (TextContent | ThinkingContent | ToolCall)[];
+  content: (TextContent | ThinkingContent | ToolCall | ImageContent | AudioContent | MediaResourceContent)[];
   provider: string;
   model: string;
   usage: Usage;
@@ -82,7 +101,7 @@ export interface ToolResultMessage {
   role: "toolResult";
   toolCallId: string;
   toolName: string;
-  content: (TextContent | ImageContent)[];
+  content: ToolResultBlock[];
   details?: unknown;
   isError: boolean;
   timestamp: number;
@@ -147,12 +166,30 @@ export interface Model {
   baseUrl?: string;
   reasoning: boolean;
   input: string[];
+  /** Optional display grouping the host UI prefers over the provider (ACP fusion pairings, for example). */
+  group?: string;
   /** Only set when the engine itself reports them — never assumed per catalog. */
   effortLevels?: string[];
   /** Only set when the engine itself reports it — never assumed per catalog. */
   contextWindow?: number;
   maxTokens?: number;
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+}
+
+export interface SessionModelConfigChoice {
+  value: string;
+  name: string;
+  description?: string;
+}
+
+/** An ACP `model_config` session selector (speed/quality and sibling knobs), surfaced beside the model picker. */
+export interface SessionModelConfig {
+  id: string;
+  name: string;
+  description?: string;
+  type: "select" | "boolean" | string;
+  currentValue: string | boolean;
+  options?: SessionModelConfigChoice[];
 }
 
 export interface PiTreeEntry extends Record<string, unknown> {
@@ -175,6 +212,8 @@ export interface SessionState {
   autoCompactionEnabled: boolean;
   messageCount: number;
   pendingMessageCount: number;
+  /** Engine-reported model-adjacent session selectors (ACP `model_config`, e.g. speed). */
+  modelConfigs?: SessionModelConfig[];
 }
 
 export interface SessionStats {
@@ -232,6 +271,7 @@ export interface Commands {
   get_available_models: { args: {}; data: { models: Model[] } };
   set_thinking_level: { args: { level: ThinkingLevel }; data: undefined };
   get_available_thinking_levels: { args: {}; data: { levels: ThinkingLevel[] } };
+  set_model_config: { args: { configId: string; value: string | boolean }; data: undefined };
   set_steering_mode: { args: { mode: QueueMode }; data: undefined };
   set_follow_up_mode: { args: { mode: QueueMode }; data: undefined };
   compact: { args: { customInstructions?: string }; data: CompactionResult };
@@ -275,12 +315,13 @@ export type AssistantMessageEvent =
   | { type: "toolcall_start"; contentIndex: number; id: string; toolName: string }
   | { type: "toolcall_delta"; contentIndex: number; delta: string }
   | { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall }
+  | { type: "media_block"; contentIndex: number; block: ImageContent | AudioContent | MediaResourceContent }
   | { type: "start" }
   | { type: "done" }
   | { type: "error" };
 
 export interface ToolResult {
-  content?: (TextContent | ImageContent)[];
+  content?: ToolResultBlock[];
   details?: unknown;
 }
 
@@ -309,8 +350,49 @@ export type SessionEvent =
   | { type: "bash_execution_update"; id?: string; delta: string }
   | { type: "extension_error"; extensionPath: string; event: string; error: string };
 
-/** A request from an extension's `ctx.ui` (`docs/pi/rpc-extension-ui.md`). */
+export type FormValue = string | string[];
+export type FormValues = Record<string, FormValue>;
+export type FormContent = Record<string, string | string[] | number | boolean>;
+
+interface FormTextBounds {
+  minLength?: number;
+  maxLength?: number;
+}
+
+export type FormField = {
+  id: string;
+  label: string;
+  description?: string;
+  required: boolean;
+  initial?: FormValue;
+} & (
+  | (FormTextBounds & { kind: "text" })
+  | { kind: "number"; integer: boolean; minimum?: number; maximum?: number }
+  | {
+      kind: "choice" | "multiChoice";
+      options: { value: string; label: string; description?: string }[];
+      boolean?: boolean;
+      minItems?: number;
+      maxItems?: number;
+      other?: FormTextBounds & { id: string; initial?: string };
+    }
+);
+
+/** A bridge-owned form; Pi extensions continue to use their documented methods. */
+export interface ExtensionUiForm {
+  type: "extension_ui_request";
+  id: string;
+  method: "form";
+  agent: string;
+  title: string;
+  message: string;
+  fields: FormField[];
+}
+
+/** Pi's `ctx.ui` protocol (`docs/pi/rpc-extension-ui.md`) plus bridge forms and dismissals. */
 export type ExtensionUiRequest =
+  | ExtensionUiForm
+  | { type: "extension_ui_request"; id: string; method: "dismiss" }
   | { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number }
   | { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
   | { type: "extension_ui_request"; id: string; method: "input"; title: string; placeholder?: string; timeout?: number }
@@ -321,7 +403,7 @@ export type ExtensionUiRequest =
   | { type: "extension_ui_request"; id: string; method: "setTitle"; title: string }
   | { type: "extension_ui_request"; id: string; method: "set_editor_text"; text: string };
 
-/** The dialog requests: the ones that block Pi until the client answers. */
-export type ExtensionUiDialog = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
+/** The requests that block an agent until the client answers. */
+export type ExtensionUiDialog = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" | "form" }>;
 
-export type ExtensionUiAnswer = { value: string } | { confirmed: boolean } | { cancelled: true };
+export type ExtensionUiAnswer = { value: string } | { confirmed: boolean } | { cancelled: true } | { declined: true } | { answers: FormValues };
