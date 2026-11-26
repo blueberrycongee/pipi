@@ -14,7 +14,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE = path.join(__dirname, "external-agent.mjs");
 const FAKE = path.join(__dirname, "..", "dev", "fake-devin-acp.mjs");
 
-function startBridge(t) {
+function startBridge(t, extraEnv = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-devin-acp-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const config = {
@@ -24,7 +24,7 @@ function startBridge(t) {
     runtimeMode: "full-access",
     customAgent: { id: "devin", name: "Devin", command: process.execPath, args: [FAKE] },
   };
-  const env = { ...process.env, PI_CODING_AGENT_DIR: path.join(home, "agent"), FAKE_DEVIN_ACP_LOG: path.join(home, "fake.jsonl") };
+  const env = { ...process.env, PI_CODING_AGENT_DIR: path.join(home, "agent"), FAKE_DEVIN_ACP_LOG: path.join(home, "fake.jsonl"), ...extraEnv };
   delete env.PI_CODING_AGENT_SESSION_DIR;
   const child = spawn(process.execPath, [BRIDGE, JSON.stringify(config)], { cwd: home, env, stdio: ["pipe", "pipe", "ignore"] });
   t.after(() => child.kill());
@@ -58,7 +58,7 @@ function startBridge(t) {
     assert.equal(res.success, true, res.error);
     return res.data;
   };
-  return { ok };
+  return { ok, send };
 }
 
 test("Devin's model catalog is shown as model families, with image reach and fusion grouping honest", async (t) => {
@@ -122,4 +122,21 @@ test("Devin's none rung is pipi's off, and speed is a settable model_config", as
   assert.equal(state.model.reasoning, false);
   assert.deepEqual(state.modelConfigs, [], "speed disappears with the models that do not advertise it");
   assert.deepEqual((await bridge.ok({ type: "get_available_thinking_levels" })).levels, ["off"]);
+});
+
+test("set_model negotiates before the first catalog read, resolves Devin's max alias, and rejects unknown models", async (t) => {
+  const bridge = startBridge(t, { FAKE_DEVIN_DEFAULT_MODEL: "adaptive" });
+  const chosen = await bridge.ok({ type: "set_model", provider: "devin", modelId: "swe-2-1-max" });
+  assert.equal(chosen.id, "swe-2-1-medium");
+  let state = await bridge.ok({ type: "get_state" });
+  assert.equal(state.model.id, "swe-2-1-medium");
+  assert.equal(state.thinkingLevel, "max");
+  assert.ok(!state.model.id.includes("lightning"));
+  await bridge.ok({ type: "set_thinking_level", level: "high" });
+  assert.equal((await bridge.ok({ type: "get_state" })).thinkingLevel, "high");
+  const failure = await bridge.send({ type: "set_model", provider: "devin", modelId: "not-a-model" });
+  assert.equal(failure.success, false);
+  assert.match(failure.error, /Model not found/);
+  state = await bridge.ok({ type: "get_state" });
+  assert.equal(state.model.id, "swe-2-1-medium");
 });

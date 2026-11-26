@@ -164,6 +164,9 @@ export function meaningfulFormMessage(message, title, fields) {
   if (!clean) return "";
   if (GENERIC_FORM_MESSAGE.test(clean)) return "";
   if (typeof title === "string" && clean === title.trim()) return "";
-  if (Array.isArray(fields) && fields.length === 1 && clean === String(fields[0]?.label ?? "").trim()) return "";
+  if (Array.isArray(fields) && fields.length === 1) {
+    const field = fields[0];
+    if (clean === String(field?.label ?? "").trim() || clean === String(field?.description ?? "").trim()) return "";
+  }
   return clean;
 }

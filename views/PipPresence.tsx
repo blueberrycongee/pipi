@@ -1,5 +1,5 @@
-import { Animated, Canvas, cleanup, computed, createAnimatedValue, effect, Path2D, reduceMotion, signal, Text, token, untracked, View } from "nsh";
-import type { CanvasRenderingContext2D, CompositeAnimation, JSX, ViewRef } from "nsh";
+import { Canvas, cleanup, computed, createAnimatedValue, effect, Path2D, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
+import type { CanvasRenderingContext2D, JSX, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Popover } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { activeLanguage, tr } from "../lib/i18n";
@@ -40,7 +40,6 @@ import {
   popupHiddenStyle,
   popupLeavingStyle,
   popupStyle,
-  useBreathingOpacity,
   useSmsBubbleEntrance,
 } from "../ui/motion";
 import { FOCUS_RING, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
@@ -402,14 +401,8 @@ export function PipAvatarBadge(props: {
 
   const status = pipLiveStatus;
   const isBusy = () => Boolean(props.active) && status().active;
-  const haloOpacity = useBreathingOpacity(isBusy);
   const avatarSize = () => (props.active ? 19 : 18);
   const boxClass = () => "size-7";
-  const cornerDotClass = () => {
-    if (!props.active || !status().active) return "";
-    if (status().phase === "waiting_user" || status().phase === "retrying") return "bg-warning";
-    return "bg-brand";
-  };
 
   return (
     <Popover
@@ -443,17 +436,7 @@ export function PipAvatarBadge(props: {
           onPress={onToggle}
           class={`relative ${boxClass()} shrink-0 select-none items-center justify-center rounded-full border-[0.5px] border-hairline bg-card/90 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:border-hairline-hover hover:bg-card`}
         >
-          {/* Soft breathing cobalt halo while Pip is actively working */}
-          <If when={isBusy()}>
-            <View
-              class="pointer-events-none absolute -inset-0.5 rounded-full border border-brand/45"
-              style={{ opacity: haloOpacity }}
-            />
-          </If>
           <Pip size={avatarSize()} mood={props.active ? pipMood() : "idle"} still={!props.active} />
-          <If when={cornerDotClass()}>
-            <View class={`pointer-events-none absolute -bottom-0.5 -right-0.5 size-2 rounded-full border-[1.5px] border-background ${cornerDotClass()}`} />
-          </If>
         </View>
       }
     >
@@ -476,105 +459,7 @@ export function PipAvatarBadge(props: {
 }
 
 /**
- * Three smoothly bouncing & pulsing dots inside the iMessage typing bubble.
- * Driven entirely on the native UI compositor thread via staggered infinite keyframes.
- */
-function TypingDots() {
-  const dots = [0, 1, 2].map(() => ({
-    opacity: createAnimatedValue(0.36),
-    scale: createAnimatedValue(0.88),
-    translateY: createAnimatedValue(0),
-  }));
-
-  effect(() => {
-    const reduced = reduceMotion();
-    const running: CompositeAnimation[] = [];
-    if (reduced) {
-      const staticAlphas = [0.45, 0.72, 0.96];
-      dots.forEach((dot, idx) => {
-        void dot.opacity.stop();
-        void dot.scale.stop();
-        void dot.translateY.stop();
-        dot.opacity.set(staticAlphas[idx]);
-        dot.scale.set(1);
-        dot.translateY.set(0);
-      });
-      return;
-    }
-
-    dots.forEach((dot, idx) => {
-      const delay = idx * 165;
-      const anim = Animated.parallel([
-        Animated.keyframes(dot.opacity, {
-          keyframes: [
-            { offset: 0, value: 0.34, easing: "easeInOut" },
-            { offset: 0.28, value: 0.96, easing: "easeInOut" },
-            { offset: 0.62, value: 0.34, easing: "easeInOut" },
-            { offset: 1, value: 0.34 },
-          ],
-          duration: 1180,
-          delay,
-          iterations: "infinite",
-        }),
-        Animated.keyframes(dot.scale, {
-          keyframes: [
-            { offset: 0, value: 0.86, easing: "easeInOut" },
-            { offset: 0.28, value: 1.15, easing: "easeInOut" },
-            { offset: 0.62, value: 0.86, easing: "easeInOut" },
-            { offset: 1, value: 0.86 },
-          ],
-          duration: 1180,
-          delay,
-          iterations: "infinite",
-        }),
-        Animated.keyframes(dot.translateY, {
-          keyframes: [
-            { offset: 0, value: 0, easing: "easeInOut" },
-            { offset: 0.28, value: -2.4, easing: "easeInOut" },
-            { offset: 0.62, value: 0, easing: "easeInOut" },
-            { offset: 1, value: 0 },
-          ],
-          duration: 1180,
-          delay,
-          iterations: "infinite",
-        }),
-      ]);
-      void anim.start();
-      running.push(anim);
-    });
-
-    cleanup(() => {
-      for (const anim of running) anim.stop();
-      for (const dot of dots) {
-        void dot.opacity.stop();
-        void dot.scale.stop();
-        void dot.translateY.stop();
-      }
-    });
-  });
-
-  return (
-    <View class="flex-row items-center gap-[5px]">
-      {dots.map((dot) => (
-        <View
-          class="size-[7px] rounded-full bg-muted-foreground"
-          style={{
-            opacity: dot.opacity,
-            transform: [{ translateY: dot.translateY }, { scale: dot.scale }],
-          }}
-        />
-      ))}
-    </View>
-  );
-}
-
-/**
- * Bottom iMessage typing indicator row for Pip (personal agent) conversations:
- * Pip's live avatar paired with an authentic macOS Messages typing bubble (three
- * staggered pulsing dots + two trailing thought-dots) that pops in from bottom-left
- * while Pip is working and vanishes cleanly the instant the reply bubbles land.
- * Hovering either Pip's avatar or the typing bubble reveals the live status card.
- *
+ * Quiet working row for Pip conversations; the avatar and label share a live status card.
  * Reserves a constant 48pt (`h-12`) slot so starting and settling a run never
  * shifts the scroll content height.
  */
@@ -584,13 +469,11 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
   const shown = signal(alreadyWorking);
   const cardOpen = signal(false);
   const opacity = createAnimatedValue(alreadyWorking ? 1 : 0);
-  const translateY = createAnimatedValue(alreadyWorking ? 0 : 7);
-  const scale = createAnimatedValue(alreadyWorking ? 1 : 0.48);
-  const breathe = createAnimatedValue(1);
+  const label = signal("");
+  const waiting = signal(false);
   let exitTimer: ReturnType<typeof setTimeout> | undefined;
   let openTimer: ReturnType<typeof setTimeout> | undefined;
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
-  let breatheAnim: CompositeAnimation | null = null;
 
   const clearHoverTimers = () => {
     clearTimeout(openTimer);
@@ -629,68 +512,20 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
     const reduced = reduceMotion();
     untracked(() => {
       clearTimeout(exitTimer);
-      breatheAnim?.stop();
-      breatheAnim = null;
+      void opacity.stop();
       if (active) {
-        const entering = !shown();
         shown.set(true);
-        if (reduced) {
-          opacity.set(1);
-          translateY.set(0);
-          scale.set(1);
-          breathe.set(1);
-        } else if (entering) {
-          opacity.set(0);
-          translateY.set(7);
-          scale.set(0.48);
-          void opacity.keyframes([0, 1], { duration: 180, delay: 60, easing: EASING.entrance });
-          void translateY.keyframes(
-            [
-              { offset: 0, value: 7 },
-              { offset: 0.68, value: -1 },
-              { offset: 1, value: 0 },
-            ],
-            { duration: 240, delay: 60, easing: EASING.signature },
-          );
-          void scale.keyframes(
-            [
-              { offset: 0, value: 0.48 },
-              { offset: 0.66, value: 1.04 },
-              { offset: 1, value: 1 },
-            ],
-            { duration: 240, delay: 60, easing: EASING.signature },
-          );
-        } else {
-          void opacity.timing(1, { duration: 150, easing: EASING.entrance });
-          void translateY.timing(0, { duration: 180, easing: EASING.signature });
-          void scale.timing(1, { duration: 180, easing: EASING.signature });
-        }
-        if (!reduced) {
-          breatheAnim = Animated.keyframes(breathe, {
-            keyframes: [
-              { offset: 0, value: 1, easing: "easeInOut" },
-              { offset: 0.5, value: 1.022, easing: "easeInOut" },
-              { offset: 1, value: 1 },
-            ],
-            duration: 1800,
-            delay: entering ? 300 : 0,
-            iterations: "infinite",
-          });
-          void breatheAnim.start();
-        }
+        if (reduced) opacity.set(1);
+        else void opacity.timing(1, { duration: 160, easing: EASING.entrance });
       } else if (shown()) {
         clearHoverTimers();
         cardOpen.set(false);
-        breathe.set(1);
         if (reduced) {
           opacity.set(0);
-          scale.set(0.84);
           shown.set(false);
         } else {
-          void opacity.timing(0, { duration: 130, easing: EASING.exit });
-          void translateY.timing(4, { duration: 130, easing: EASING.exit });
-          void scale.timing(0.82, { duration: 130, easing: EASING.exit });
-          exitTimer = setTimeout(() => shown.set(false), 140);
+          void opacity.timing(0, { duration: 160, easing: EASING.exit });
+          exitTimer = setTimeout(() => shown.set(false), 160);
         }
       }
     });
@@ -699,21 +534,21 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
   cleanup(() => {
     clearTimeout(exitTimer);
     clearHoverTimers();
-    breatheAnim?.stop();
     void opacity.stop();
-    void translateY.stop();
-    void scale.stop();
-    void breathe.stop();
   });
 
   const status = pipLiveStatus;
-  const isWaitingChildrenOnly = () => !isRunning() && waitingCount() > 0 && status().phase === "waiting_sessions";
-  const isWaitingUser = () => status().phase === "waiting_user";
+  effect(() => {
+    if (isChatActive() && !isLeavingSession()) {
+      label.set(status().headline);
+      waiting.set(["waiting_sessions", "waiting_user", "retrying", "compacting"].includes(status().phase));
+    }
+  });
 
   return (
     <View ref={(node: ViewRef) => props.anchor?.(node)} class="h-12 w-full max-w-180 select-none justify-end self-center pb-1">
       <If when={shown()}>
-        <View class="flex-row items-end gap-3.5">
+        <View testID="pip-working-row" class="h-7 w-full flex-row items-center gap-3.5" style={{ opacity }}>
           <PipAvatarBadge
             active
             testID="pip-active-avatar"
@@ -722,37 +557,27 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
             onExternalToggle={handleToggle}
           />
           <View
-            testID="pip-typing-bubble"
+            testID="pip-working-label"
             role="button"
             accessibilityLabel={`${status().name}: ${status().headline}`}
             accessibilityState={{ busy: isChatActive() }}
             onMouseEnter={() => handleHover(true)}
             onMouseLeave={() => handleHover(false)}
             onPress={handleToggle}
-            style={{
-              transformOrigin: "left bottom",
-              opacity,
-              transform: [{ translateY }, { scale: scale.mul(breathe) }],
-            }}
-            class="relative mb-0.5"
+            class={`h-7 min-w-0 flex-1 justify-center items-start rounded-sm ${FOCUS_RING}`}
           >
-            {/* Iconic iMessage typing thought-tail dots at bottom-left */}
-            <View class="pointer-events-none absolute -bottom-[1px] -left-[2px] size-[8.5px] rounded-full bg-sms-incoming" />
-            <View class="pointer-events-none absolute -bottom-[4px] -left-[6px] size-[4.5px] rounded-full bg-sms-incoming" />
-            <View class="h-[34px] flex-row items-center justify-center gap-2 rounded-[18px] corner-squircle bg-sms-incoming px-3.5">
-              <If
-                when={isWaitingUser()}
-                else={
-                  <If when={isWaitingChildrenOnly()} else={<TypingDots />}>
-                    <View class="size-2.5 shrink-0 rounded-full border-[1.5px] border-input border-t-brand motion-safe:animate-spin" />
-                    <Text class={`${uiType("xs")} text-muted-foreground`}>{status().headline}</Text>
-                  </If>
-                }
-              >
-                <View class="size-2 shrink-0 rounded-full bg-warning" />
-                <Text class={`${uiType("xs")} text-muted-foreground`}>{status().headline}</Text>
-              </If>
-            </View>
+            <If
+              when={waiting()}
+              else={
+                <View testID="pip-typing-bubble" class="h-7 w-14 flex-row items-center justify-center gap-[5px] rounded-full bg-sms-incoming">
+                  <View class="size-[5px] rounded-full bg-muted-foreground/50" />
+                  <View class="size-[5px] rounded-full bg-muted-foreground/70" />
+                  <View class="size-[5px] rounded-full bg-muted-foreground/90" />
+                </View>
+              }
+            >
+              <Text testID="pip-waiting-label" class={`truncate ${uiType("xs")} text-muted-foreground`}>{label()}</Text>
+            </If>
           </View>
         </View>
       </If>
@@ -772,11 +597,13 @@ export function PipBubbleView(props: {
   processOpen?: () => boolean;
   onToggleProcess?: () => void;
 }) {
+  const historyOpen = signal(false);
+  let historyScroll: ScrollRef | null = null;
   const entrance = useSmsBubbleEntrance(
     () => props.row.id,
     () => "left",
     {
-      skip: () => isRowSeen(props.row.rowId),
+      skip: () => Boolean(props.row.edited) || isRowSeen(props.row.rowId),
       stagger: () => props.row.bubbleIndex,
     },
   );
@@ -835,6 +662,26 @@ export function PipBubbleView(props: {
           <View testID="pip-sms-bubble" style={entrance} class="max-w-[74%]">
             <PipBubbleBlocks row={props.row} />
           </View>
+        </If>
+        <If when={(props.row.versions?.length ?? 0) > 1}>
+          <Popover
+            open={historyOpen()}
+            onOpenChange={(event) => historyOpen.set(event.open)}
+            placement="top"
+            align="start"
+            closeOnEscape
+            closeOnPressOutside
+            popupClass={POPUP}
+            trigger={<View testID="pip-message-edited" role="button" accessibilityLabel={tr("Edited", "已编辑")} onPress={() => historyOpen.set(!historyOpen())} class="px-1 py-1 hover:opacity-80"><Text class={`${uiType("2xs")} text-subtle`}>{tr("Edited", "已编辑")}</Text></View>}
+          >
+            <Scroll ref={(ref) => { historyScroll = ref; }} testID="pip-edit-history" class="h-[280px] w-[360px]" contentClass="p-4">
+              <View selectable class="gap-3" onLayout={() => historyScroll?.scrollToEnd({ animated: false })}>
+              <Each of={props.row.versions?.slice(0, -1) ?? []} key={(_, index) => String(index)}>
+                {(version) => <View class="gap-1 border-b border-hairline pb-3"><Text class={`${uiType("2xs")} text-subtle`}>{new Date(version().at).toLocaleString()}</Text><Text class={`${uiType("sm")} text-muted-foreground`}>{version().content}</Text></View>}
+              </Each>
+              </View>
+            </Scroll>
+          </Popover>
         </If>
       </View>
     </View>

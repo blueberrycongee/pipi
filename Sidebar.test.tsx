@@ -648,6 +648,65 @@ test("starting a new session from a saved session detaches onto a fresh draft wi
   await app.waitUntil(() => app.texts().includes("Here is the plan."));
 });
 
+test("Pip's delegated sessions stand beside user sessions in both groups while coding descendants stay nested", async () => {
+  const now = Date.now();
+  const base = {
+    cwd: "/Users/pip", agentId: "pi", agentName: "Pi", driver: "pi",
+    runtimeMode: "full-access", status: "idle", unread: false, loaded: true,
+    createdAt: now, lastActive: now,
+  };
+  const app = await open("./Harness.tsx", {
+    width: 1180, height: 900, platform: "macos", reducedMotion: true,
+    storage: {
+      "harness.scenario": "welcome",
+      "harness.daemonSessions": JSON.stringify([
+        { ...base, id: "s_pip", persona: true, title: "Pip", titleLocked: true, cwd: "/Users/pip/.pipi/persona", depth: 0 },
+        { ...base, id: "s_saved", title: "Refactor the transcript reducer", file: "/sessions/two.jsonl", parentId: "s_pip", initiator: "s_pip", depth: 1 },
+        { ...base, id: "s_job", title: "Pip delegated job", cwd: "/Users/pip/.pipi-worktrees/job", worktree: { baseCwd: "/Users/pip" }, parentId: "s_pip", initiator: "s_pip", depth: 1, status: "blocked" },
+        { ...base, id: "s_nested", title: "Nested coding task", parentId: "s_saved", depth: 2, status: "failed" },
+      ]),
+    },
+  });
+  await app.waitFor("text:What are we building?");
+  for (const group of ["sidebar-workspaces", "sidebar-recents"]) {
+    expect(app.count(`id:${group} >> text:Refactor the transcript reducer`)).toBe(1);
+    expect(app.count(`id:${group} >> text:Pip delegated job`)).toBe(1);
+    expect(app.count(`id:${group} >> text:Nested coding task`)).toBe(1);
+    expect(app.count(`id:${group} >> text:Pip`)).toBe(0);
+    expect(app.count(`id:${group} >> id:sidebar-child-failed`)).toBe(1);
+    expect(app.count(`id:${group} >> id:sidebar-child-blocked`)).toBe(1);
+    const user = app.layout(`id:${group} >> text:Look around and tell me what this project is`)!;
+    const saved = app.layout(`id:${group} >> text:Refactor the transcript reducer`)!;
+    const job = app.layout(`id:${group} >> text:Pip delegated job`)!;
+    const nested = app.layout(`id:${group} >> text:Nested coding task`)!;
+    expect(saved.x).toBe(user.x);
+    expect(job.x).toBe(user.x);
+    expect(nested.x).toBeGreaterThan(saved.x);
+  }
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitFor("text:Here is the plan.");
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:Hey, what's up?");
+  for (const group of ["sidebar-workspaces", "sidebar-recents"]) {
+    expect(app.count(`id:${group} >> text:Pip delegated job`)).toBe(1);
+    expect(app.count(`id:${group} >> text:Pip`)).toBe(0);
+  }
+  await app.hover("id:sidebar-workspaces >> text:Refactor the transcript reducer");
+  await app.press("id:sidebar-workspaces >> label:Archive >> nth=1");
+  await app.waitUntil(() => app.count("id:sidebar-recents >> text:Refactor the transcript reducer") === 0);
+  for (const group of ["sidebar-workspaces", "sidebar-recents"]) {
+    expect(app.count(`id:${group} >> text:Nested coding task`)).toBe(0);
+    expect(app.count(`id:${group} >> text:Pip delegated job`)).toBe(1);
+  }
+  await app.waitFor("text:Archived");
+  const archived = "id:sidebar-archived >> text:Refactor the transcript reducer";
+  if (!app.count(archived)) await app.press("text:Archived");
+  await app.hover(archived);
+  await app.press("id:sidebar-archived >> label:Unarchive");
+  await app.waitUntil(() => app.count("id:sidebar-workspaces >> text:Refactor the transcript reducer") === 1);
+  expect(app.count("id:sidebar-recents >> text:Nested coding task")).toBe(1);
+});
+
 test("Pip's pinned row opens the one personal agent, whose folder of notes never joins the projects", async () => {
   const app = await launch("multi");
   await app.waitFor("text:What are we building?");

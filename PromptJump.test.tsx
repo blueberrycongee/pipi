@@ -108,3 +108,29 @@ test("a short reply keeps its prompt in view: no capsule", async () => {
   await app.wait(400);
   expect(app.shows(CAPSULE)).toBe(false);
 }, 60000);
+
+test("a persona conversation never floats its prompt, however far the reader scrolls", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:Hey, what's up?");
+
+  await app.type("label:Message", "make a long plan");
+  await app.submit("label:Message");
+  await app.waitFor("text:Part 24 of the plan", { timeout: 30000 });
+  await app.waitFor("label:Send", { timeout: 30000 });
+
+  // Up through the thread and back down: the capsule never appears either way.
+  for (let i = 0; i < 6; i++) {
+    await app.scroll("label:Conversation", -4000).catch(() => {});
+    await app.wait(300);
+    expect(app.shows(CAPSULE)).toBe(false);
+    expect(app.shows(CAPSULE_BELOW)).toBe(false);
+  }
+  for (let i = 0; i < 6; i++) {
+    await app.scroll("label:Conversation", 4000).catch(() => {});
+    await app.wait(300);
+    expect(app.shows(CAPSULE)).toBe(false);
+    expect(app.shows(CAPSULE_BELOW)).toBe(false);
+  }
+}, 90000);

@@ -425,6 +425,10 @@ export class DaemonClient {
     agentId: string;
     cwd?: string;
     persona?: boolean;
+    replacePersona?: string;
+    model?: string;
+    thinking?: ThinkingLevel;
+    modelConfigs?: Record<string, string | boolean>;
     message?: string;
     parentId?: string;
     runtimeMode?: RuntimeMode;

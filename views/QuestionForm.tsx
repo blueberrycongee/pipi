@@ -447,7 +447,7 @@ export function QuestionForm(props: {
                       onPress={() => pickOption(field(), option().value)}
                       class={`group ${uiMinHeight(props.compact ? 32 : 36)} flex-row items-center gap-2.5 rounded-xl corner-squircle border-[0.5px] px-2 py-1.5 ${PRESS} ${FOCUS_RING} ${
                         isPicked()
-                          ? "border-brand/25 bg-brand-soft/70"
+                          ? "border-hairline-hover bg-accent"
                           : isFocused()
                             ? "border-transparent bg-accent"
                             : "border-transparent hover:bg-accent/70 active:bg-accent"
@@ -513,11 +513,11 @@ export function QuestionForm(props: {
                       }
                     >
                       <View
-                        class={`${uiMinHeight(props.compact ? 34 : 38)} flex-row items-center gap-2.5 rounded-xl corner-squircle border-[0.5px] border-brand/35 bg-brand-soft/45 px-2 py-1.5`}
+                        class={`${uiMinHeight(props.compact ? 34 : 38)} flex-row items-center gap-2.5 rounded-xl corner-squircle border-[0.5px] border-hairline-hover bg-accent/70 px-2 py-1.5`}
                       >
                         <View
                           class={`size-5 shrink-0 items-center justify-center rounded-md corner-squircle ${
-                            hasText() ? "bg-brand" : "border-[0.5px] border-brand/40 bg-brand/15"
+                            hasText() ? "bg-brand" : "border-[0.5px] border-hairline-hover bg-muted/80"
                           }`}
                         >
                           <If when={hasText()} else={<Icon name="pencil" size={11} tone="brand-text" />}>

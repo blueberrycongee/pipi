@@ -8,6 +8,7 @@ import type {
   ImageContent,
   MediaResourceContent,
   SessionEvent,
+  MessageVersion,
   TextContent,
   ToolResult,
   ToolResultBlock,
@@ -25,7 +26,7 @@ import type {
 export type Row =
   /** `queued`: staged behind the agent's queue — on screen, but not sent into the run yet. */
   | { kind: "user"; id: string; text: string; images: number; imageBlocks?: ImageContent[]; queued?: boolean }
-  | ({ kind: "text"; id: string; text: string; streaming: boolean; /** The prose of a message that called no tools: the turn's answer. Known once the message ended. */ final?: boolean } & TurnStamp)
+  | ({ kind: "text"; id: string; text: string; streaming: boolean; editKey?: string; versions?: MessageVersion[]; /** The prose of a message that called no tools: the turn's answer. Known once the message ended. */ final?: boolean } & TurnStamp)
   | ({ kind: "thinking"; id: string; text: string; streaming: boolean; redacted: boolean; durationMs?: number } & TurnStamp)
   | ({ kind: "media"; id: string; title?: string; items: MediaItem[] } & TurnStamp)
   | ToolRow
@@ -37,6 +38,7 @@ export type Row =
 
 /** When the turn a row belongs to started, and on the turn's first row, how long the turn took once it is over. */
 export interface TurnStamp {
+  silentEdit?: boolean;
   t0?: number;
   turnMs?: number;
   turnStart?: boolean;
@@ -126,7 +128,7 @@ export function sameVisualRow(a: Row, b: Row): boolean {
     }
     case "text": {
       const bt = b as Extract<Row, { kind: "text" }>;
-      return a.text === bt.text && a.streaming === bt.streaming && Boolean(a.final) === Boolean(bt.final);
+      return a.text === bt.text && a.streaming === bt.streaming && Boolean(a.final) === Boolean(bt.final) && a.editKey === bt.editKey && sameJsonValue(a.versions, bt.versions);
     }
     case "thinking": {
       const bth = b as Extract<Row, { kind: "thinking" }>;
@@ -456,6 +458,8 @@ let seq = 0;
  * It holds no signals: the store takes `rows()` when `version` moved.
  */
 export class Transcript {
+  #editing = false;
+  #editText = new Map<string, string>();
   #rows: Row[] = [];
   #index = new Map<string, number>();
   /**
@@ -534,6 +538,8 @@ export class Transcript {
    * again) — nothing in it has stopped, and its last turn is not over.
    */
   load(messages: AgentMessage[], working = false) {
+    this.#editing = false;
+    this.#editText.clear();
     this.#rows = [];
     this.#staged = [];
     this.#index.clear();
@@ -565,6 +571,7 @@ export class Transcript {
         this.#turnStart = this.#now();
         this.#newTurn = true;
       }
+      if (message.role === "assistant") this.#editing = Boolean(message.silentEdit);
       if (message.role === "assistant" && message.stopReason === "pending") this.#pendingMessage(message);
       else this.#append(message);
     }
@@ -810,6 +817,20 @@ export class Transcript {
   /** Applies a session event. */
   apply(event: SessionEvent) {
     switch (event.type) {
+      case "agent_start":
+        this.#editing = false;
+        this.#editText.clear();
+        break;
+      case "message_edit": {
+        const targets = this.#rows.filter((row) => row.kind === "text" && row.editKey === event.key);
+        const first = targets[0];
+        if (first?.kind === "text" && event.versions.length > 1) {
+          this.#set({ ...first, text: event.versions.at(-1)!.content, versions: event.versions, streaming: false });
+          for (const row of targets.slice(1)) this.#removeRow(row.id);
+        }
+        this.#editing = true;
+        break;
+      }
       case "message_start":
         if (event.message.role === "assistant") {
           if (!event.message.turnStart && this.#staged.length) this.#commitStaged();
@@ -1236,6 +1257,8 @@ export class Transcript {
 
   /** Prepends historical rows (for example, keeping visible conversation rows across a harness switch). */
   seedRows(previous: readonly Row[]) {
+    this.#editing = false;
+    this.#editText.clear();
     this.#rows = [];
     this.#staged = [];
     this.#index.clear();
@@ -1338,6 +1361,7 @@ export class Transcript {
     if (row && isTurnRow(row) && row.turnMs === undefined && row.t0 !== undefined && now !== undefined) {
       this.#rows[first] = { ...row, turnMs: Math.max(0, now - row.t0) };
     }
+    if (this.#editing && row && isTurnRow(row)) this.#rows[first] = { ...this.#rows[first], silentEdit: true } as Row;
     this.#closed = row !== undefined && isTurnRow(row);
     this.#turnStart = undefined;
     this.#newTurn = false;
@@ -1438,6 +1462,18 @@ export class Transcript {
       }
     }
     const id = live.rowIds.get(event.contentIndex) ?? `${live.key}.${event.contentIndex}`;
+    if (this.#editing && (event.type === "text_start" || event.type === "text_delta" || event.type === "text_end")) {
+      live.rowIds.set(event.contentIndex, id);
+      const text = event.type === "text_start" ? "" : event.type === "text_end" ? event.content : (this.#editText.get(id) ?? "") + event.delta;
+      this.#editText.set(id, text);
+      const trimmed = text.trim().toLowerCase();
+      if (!trimmed || ["[edited]", "<no-reply/>"].some((marker) => marker.startsWith(trimmed))) {
+        this.#removeRow(id);
+      } else {
+        this.#set({ kind: "text", id, text, streaming: event.type !== "text_end" });
+      }
+      return;
+    }
     switch (event.type) {
       case "text_start":
         live.rowIds.set(event.contentIndex, id);
@@ -1524,6 +1560,7 @@ export class Transcript {
 
   /** The authoritative message replaces what was reconstructed from deltas, row by row. */
   #finish(message: AssistantMessage) {
+    if (this.#editing) message = { ...message, content: message.content.map((block) => block.type === "text" && /^(?:\[edited\]|<no-reply\s*\/>)$/i.test(block.text.trim()) ? { ...block, text: "" } : block) };
     const live = this.#live ?? { key: `m${++seq}`, rowIds: new Map(), toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
     this.#live = undefined;
     this.#blocks(message, live.key, true, live.toolIds, live.rowIds);
@@ -1547,7 +1584,7 @@ export class Transcript {
     message.content.forEach((block, index) => {
       const id = rowIds?.get(index) ?? `${key}.${index}`;
       if (block.type === "text") {
-        if (block.text.trim()) this.#set({ kind: "text", id, text: block.text, streaming: false, final: final(index) });
+        if (block.text.trim()) this.#set({ kind: "text", id, text: block.text, streaming: false, final: final(index), ...(index > lastStep ? { editKey: message.editKey, versions: message.versions } : {}) });
         else this.#removeRow(id);
       } else if (block.type === "thinking") {
         const before = this.#get(id);

@@ -137,14 +137,17 @@ async function main() {
     case "pip": {
       const message = f._.join(" ").trim();
       const held = (await call("list")).sessions.find((s) => s.persona);
-      if (!held) {
-        const res = await call("start_session", { input: { persona: true, agentId: f.agent || "pi", ...(message ? { message } : {}) } });
+      if (!held || (f.agent && f.agent !== held.agentId)) {
+        const res = await call("start_session", { input: { persona: true, replacePersona: held?.id, agentId: f.agent || "pi", model: f.model, thinking: f.thinking, ...(message ? { message } : {}) } });
         print(res.session.id);
-      } else if (message) {
-        await call("send", { sessionId: held.id, message });
-        print(held.id);
       } else {
-        print(`${held.id}\t${held.status}\t${held.agentName}\t${held.title}`);
+        if (f.model || f.thinking) await call("set_session_choices", { sessionId: held.id, input: { model: f.model, thinking: f.thinking } });
+        if (message) {
+          await call("send", { sessionId: held.id, message });
+          print(held.id);
+        } else {
+          print(`${held.id}\t${held.status}\t${held.agentName}\t${held.title}`);
+        }
       }
       break;
     }

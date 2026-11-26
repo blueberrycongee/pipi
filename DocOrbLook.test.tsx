@@ -42,7 +42,7 @@ const launch = (colorScheme: "light" | "dark", scenario = "stream", locale = "zh
 test("doc orb light showcase", async () => {
   const app = await launch("light", "stream", "zh-CN");
   await app.waitFor("id:sidebar-new-session");
-  await app.press("id:tab-0");
+  await app.press("id:sidebar-docs >> text:Launch plan");
   await app.waitFor("id:doc-editor");
   await app.wait(600);
   // 1. Resting circular floating orb
@@ -112,7 +112,7 @@ test("doc orb light showcase", async () => {
 test("doc orb dark showcase", async () => {
   const app = await launch("dark", "welcome", "zh-CN");
   await app.waitFor("id:sidebar-new-session");
-  await app.press("id:tab-0");
+  await app.press("id:sidebar-docs >> text:Launch plan");
   await app.waitFor("id:doc-editor");
   await app.wait(600);
   await app.screenshot(".nsh/shots/doc-orb-1-rest-dark.png");
@@ -143,7 +143,7 @@ test("doc orb dark showcase", async () => {
 test("doc orb hover holds steady over native macOS input without twitching", async () => {
   const app = await launch("light", "welcome", "zh-CN");
   await app.waitFor("id:sidebar-new-session");
-  await app.press("id:tab-0");
+  await app.press("id:sidebar-docs >> text:Launch plan");
   await app.waitFor("id:doc-editor");
   await app.waitFor("id:doc-orb");
   await app.wait(350);

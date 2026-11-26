@@ -87,6 +87,8 @@ import {
   onDaemonPrefsChange,
   onWorkspacesChange,
   preferredAgentId,
+  preferredPersonalAgentId,
+  setPreferredPersonalAgentId,
   preferredRuntimeMode,
   recentWorkspaces,
   rememberAutoRetry,
@@ -788,6 +790,27 @@ export function childSessionsOfDaemon(sessionId: string | undefined): DaemonSess
   return descendantSessionsOf(sessionId, true);
 }
 
+export function sidebarSessionParent(session: DaemonSession | undefined): string | undefined {
+  const parentId = session?.parentId;
+  return daemonSessionOfId(parentId)?.persona ? undefined : parentId;
+}
+
+export function sidebarSessionDepth(session: DaemonSession): number {
+  let depth = 0;
+  let cur = session;
+  const seen = new Set<string>([cur.id]);
+  let parentId = sidebarSessionParent(cur);
+  while (parentId && !seen.has(parentId)) {
+    seen.add(parentId);
+    depth++;
+    const parent = daemonSessionOfId(parentId);
+    if (!parent) break;
+    cur = parent;
+    parentId = sidebarSessionParent(cur);
+  }
+  return depth;
+}
+
 /**
  * Where a daemon session's subtree hangs in a list of saved files: `claimed`
  * is the nearest ancestor whose file is in `files` (the row its tree nests
@@ -801,7 +824,7 @@ export function daemonTreePlace(session: DaemonSession, files: ReadonlySet<strin
   while (cur.parentId && !seen.has(cur.parentId)) {
     seen.add(cur.parentId);
     const up = byId.get(cur.parentId);
-    if (!up) break;
+    if (!up || up.persona) break;
     if (up.file && files.has(up.file)) return { claimed: up, top: up };
     cur = up;
   }
@@ -815,7 +838,10 @@ export function isDaemonTaskSession(session: DaemonSession | undefined): boolean
 
 /** Whether a tree root earns a sidebar row of its own: work, a wait, an unread answer, a named job, or an outside caller. */
 export function daemonRootEarnsRow(session: DaemonSession): boolean {
-  return session.initiator === "external" || Boolean(session.titleLocked) || session.status !== "idle" || session.unread;
+  return !session.persona && (
+    Boolean(session.parentId && !sidebarSessionParent(session)) ||
+    session.initiator === "external" || Boolean(session.titleLocked) || session.status !== "idle" || session.unread
+  );
 }
 
 /** Sessions started under the session whose file is `path`, nested in the sidebar under it. */
@@ -845,7 +871,7 @@ export function projectCwdOf(cwd: string, session?: DaemonSession): string {
     while (cur?.parentId && !seen.has(cur.parentId)) {
       seen.add(cur.parentId);
       const up = byId.get(cur.parentId);
-      if (!up) break;
+      if (!up || up.persona) break;
       if (up.worktree?.baseCwd) return up.worktree.baseCwd;
       if (!up.cwd.includes("/.pipi-worktrees/")) return up.cwd;
       cur = up;
@@ -1064,7 +1090,7 @@ export const draftModel = computed<Model | undefined>(() => {
 /** Optimistic thinking depth for a fresh draft session shown ahead of the agent (`isDraftAhead`). */
 export const draftThinkingLevel = computed<ThinkingLevel | undefined>(() => {
   if (!isDraftAhead()) return undefined;
-  return storedSessionChoice(currentAgentId())?.thinkingLevel;
+  return storedSessionChoice(sessionChoiceKey())?.thinkingLevel;
 });
 
 /** The session's title: its name, else the start of its first message. */
@@ -1572,6 +1598,9 @@ function upsertDaemonSession(session: DaemonSession) {
     next[at] = session;
     return next;
   });
+  if (!prev && session.parentId && !sidebarSessionParent(session) && !isSessionArchived(session.file)) {
+    rememberProject(projectCwdOf(session.cwd, session));
+  }
   if (session.file && visitedByDaemon.has(session.id)) {
     const stashed = visitedByDaemon.get(session.id)!;
     visitedByDaemon.delete(session.id);
@@ -1746,14 +1775,43 @@ async function ensureDaemon(): Promise<DaemonClient | undefined> {
   return daemonStarting;
 }
 
+function sessionChoiceKey() {
+  return isPersonaSession() ? `persona:${currentAgentId()}` : currentAgentId();
+}
+
+let personalAgentStarting: Promise<string | undefined> | undefined;
+
 /** Pip's session id, starting Pip on the preferred agent the first time it is asked for. */
-export async function ensurePersonalAgent(): Promise<string | undefined> {
+export function ensurePersonalAgent(): Promise<string | undefined> {
+  if (!personalAgentStarting) personalAgentStarting = startPersonalAgent().finally(() => { personalAgentStarting = undefined; });
+  return personalAgentStarting;
+}
+
+async function startPersonalAgent(): Promise<string | undefined> {
   const held = personalAgent();
-  if (held) return held.id;
+  if (held) {
+    setPreferredPersonalAgentId(held.agentId);
+    return held.id;
+  }
   const daemon = await ensureDaemon();
   if (!daemon) return undefined;
+  const restored = personalAgent();
+  if (restored) {
+    setPreferredPersonalAgentId(restored.agentId);
+    return restored.id;
+  }
   try {
-    const session = await daemon.startSession({ persona: true, agentId: preferredAgentId(), runtimeMode: preferredRuntimeMode() });
+    const agentId = preferredPersonalAgentId();
+    const choice = storedSessionChoice(`persona:${agentId}`) ?? storedSessionChoice(agentId);
+    const session = await daemon.startSession({
+      persona: true,
+      agentId,
+      model: choice?.model && `${choice.model.provider}/${choice.model.id}`,
+      thinking: choice?.thinkingLevel,
+      modelConfigs: choice?.modelConfigs,
+      runtimeMode: preferredRuntimeMode(),
+    });
+    setPreferredPersonalAgentId(agentId);
     upsertDaemonSession(session);
     return session.id;
   } catch (error) {
@@ -2360,6 +2418,46 @@ export async function switchAgentHarness(nextAgentId: string) {
     return;
   }
 
+  const pip = currentDaemonSession();
+  if (pip?.persona) {
+    const daemon = await ensureDaemon();
+    if (!daemon) return;
+    if (busy()) return;
+    const previousRows = rows();
+    const handoff = buildPortableHandoff({ rows: previousRows, fromAgentName: activeAgent().name, toAgentName: target.name });
+    const choice = storedSessionChoice(`persona:${nextAgentId}`) ?? storedSessionChoice(nextAgentId);
+    const previousName = activeAgent().name;
+    busy.set(true);
+    try {
+      closeActive();
+      const session = await attempt(tr("Could not switch Pip's engine", "无法切换 Pip 引擎"), () => daemon.startSession({
+        persona: true,
+        replacePersona: pip.id,
+        agentId: nextAgentId,
+        model: choice?.model && `${choice.model.provider}/${choice.model.id}`,
+        thinking: choice?.thinkingLevel,
+        modelConfigs: choice?.modelConfigs,
+        runtimeMode: pip.runtimeMode,
+      }));
+      if (!session) {
+        await start(pip.cwd, pip.file, pip.agentId, undefined, pip.id);
+        return;
+      }
+      setPreferredPersonalAgentId(nextAgentId);
+      upsertDaemonSession(session);
+      pendingHandoff.set(handoff.formattedContext ? { fromAgent: previousName, toAgent: target.name, context: handoff.formattedContext } : undefined);
+      await start(session.cwd, undefined, nextAgentId, previousRows.length ? {
+        previousRows,
+        handoffTitle: tr(`Switched agent from ${previousName} to ${target.name}`, `已从 ${previousName} 切换至 ${target.name}`),
+        handoffDetail: "",
+      } : undefined, session.id);
+      focusComposer();
+    } finally {
+      busy.set(false);
+    }
+    return;
+  }
+
   const prevName = activeAgent().name;
   setPreferredAgentId(nextAgentId);
 
@@ -2912,7 +3010,7 @@ async function syncSession() {
  * keeps the model its own history recorded.
  */
 async function applySessionChoices(initialState?: SessionState, commit = true): Promise<SessionState | undefined> {
-  const choice = storedSessionChoice(currentAgentId());
+  const choice = storedSessionChoice(sessionChoiceKey());
   // Compare against the fresh session's own state without flashing intermediate defaults on screen.
   let known = initialState ?? (await request("get_state").catch(() => undefined));
   const wantedModel = choice?.model;
@@ -2933,6 +3031,13 @@ async function applySessionChoices(initialState?: SessionState, commit = true): 
       }
     }
   }
+  if (isPersonaSession()) {
+    for (const [configId, value] of Object.entries(choice?.modelConfigs ?? {})) {
+      if (!known?.modelConfigs?.some((cfg) => cfg.id === configId && cfg.currentValue !== value)) continue;
+      await request("set_model_config", { configId, value });
+      known = await request("get_state");
+    }
+  }
   if (!commit) return known;
   await refreshLevels();
   const resolved = await applyThinkingChoice(known, false);
@@ -2941,12 +3046,12 @@ async function applySessionChoices(initialState?: SessionState, commit = true): 
 }
 
 async function applyThinkingChoice(known: SessionState | undefined, commit = true): Promise<SessionState | undefined> {
-  const wantedLevel = storedSessionChoice(currentAgentId())?.thinkingLevel;
+  const wantedLevel = storedSessionChoice(sessionChoiceKey())?.thinkingLevel;
   if (!wantedLevel || !known) return known;
-  if (!levels().includes(wantedLevel) || wantedLevel === known.thinkingLevel) return known;
+  if ((!isPersonaSession() && !levels().includes(wantedLevel)) || wantedLevel === known.thinkingLevel) return known;
   await request("set_thinking_level", { level: wantedLevel }).catch(() => undefined);
-  const next = { ...known, thinkingLevel: wantedLevel };
-  if (commit && state()?.sessionId === known.sessionId) state.update((s) => s && { ...s, thinkingLevel: wantedLevel });
+  const next = isPersonaSession() ? await request("get_state") : { ...known, thinkingLevel: wantedLevel };
+  if (commit && state()?.sessionId === known.sessionId) state.update((s) => s && { ...s, thinkingLevel: next.thinkingLevel });
   return next;
 }
 
@@ -3554,7 +3659,8 @@ async function runAppCommand(text: string): Promise<boolean> {
   switch (command.name) {
     case "new":
       draft.set(rest);
-      await newSession();
+      if (isPersonaSession()) await changeSession(tr("Could not start a new conversation", "无法新建对话"), requestNewSession);
+      else await newSession();
       break;
     case "compact":
       // A run in progress refuses (and says so): the instructions stay to be sent again.
@@ -4658,22 +4764,26 @@ export async function copyMessage(text: string): Promise<boolean> {
 // ── Model and behavior ──────────────────────────────────────────────────────
 
 export async function chooseModel(model: Model) {
+  const mine = generation;
+  const key = sessionChoiceKey();
+  const persona = isPersonaSession();
   // During an optimistic new session or switch, remember the pick immediately so the
   // chip updates with zero wait and `finishFreshLaunch` applies it as soon as connected.
   if (phase().name === "starting" || isSwitching() || !client) {
-    rememberSessionChoice(currentAgentId(), { model: { provider: model.provider, id: model.id } });
+    rememberSessionChoice(key, { model: { provider: model.provider, id: model.id }, ...(persona ? { modelConfigs: {} } : {}) });
     return;
   }
   const chosen = await attempt(tr("Could not switch model", "无法切换模型"), () => request("set_model", { provider: model.provider, modelId: model.id }));
   if (!chosen) return;
-  rememberSessionChoice(currentAgentId(), { model: { provider: chosen.provider, id: chosen.id } });
+  rememberSessionChoice(key, { model: { provider: chosen.provider, id: chosen.id }, ...(persona ? { modelConfigs: {} } : {}) });
+  if (mine !== generation) return;
   state.update((s) => s && { ...s, model: chosen });
   await Promise.all([refreshLevels(), refreshState().catch(() => undefined), refreshStats()]);
 }
 
 export async function chooseThinkingLevel(level: ThinkingLevel) {
   if (phase().name === "starting" || isSwitching() || !client) {
-    rememberSessionChoice(currentAgentId(), { thinkingLevel: level });
+    rememberSessionChoice(sessionChoiceKey(), { thinkingLevel: level });
     return;
   }
   const applied = await attempt(tr("Could not change thinking", "无法更改思考深度"), async () => {
@@ -4683,7 +4793,7 @@ export async function chooseThinkingLevel(level: ThinkingLevel) {
   if (!applied) return;
   // The preference is the user's abstract pick; the session state is the engine's truth
   // (an ACP model may clamp max to the highest rung it actually offers).
-  rememberSessionChoice(currentAgentId(), { thinkingLevel: level });
+  rememberSessionChoice(sessionChoiceKey(), { thinkingLevel: level });
   const actual = await refreshState().catch(() => undefined);
   if (!actual) state.update((s) => s && { ...s, thinkingLevel: level });
 }
@@ -4695,6 +4805,10 @@ export async function chooseModelConfig(configId: string, value: string | boolea
     return true;
   });
   if (!applied) return;
+  if (isPersonaSession()) {
+    const key = sessionChoiceKey();
+    rememberSessionChoice(key, { modelConfigs: { ...storedSessionChoice(key)?.modelConfigs, [configId]: value } });
+  }
   await refreshState().catch(() => undefined);
 }
 

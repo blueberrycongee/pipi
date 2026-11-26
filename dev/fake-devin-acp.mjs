@@ -62,7 +62,7 @@ process.stdin.on("data", (chunk) => {
       reply(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: true, sessionCapabilities: { close: {} } }, agentInfo: { name: "affogato", title: "Devin Agent", version: "3000.14.30821" } });
     } else if (msg.method === "session/new") {
       const sessionId = `devin-fake-${++seq}`;
-      sessions.set(sessionId, { model: "swe-2-1-medium", effort: "medium", speed: "standard" });
+      sessions.set(sessionId, { model: process.env.FAKE_DEVIN_DEFAULT_MODEL || "swe-2-1-medium", effort: "medium", speed: "standard" });
       reply(msg.id, { sessionId, configOptions: configOptions(sessions.get(sessionId)) });
     } else if (msg.method === "session/set_config_option") {
       const s = sessions.get(p.sessionId);
@@ -90,6 +90,10 @@ process.stdin.on("data", (chunk) => {
           reply(msg.id, { configOptions: configOptions(s) });
         }
       } else replyErr(msg.id, -32602, "unknown config");
+    } else if (msg.method === "session/prompt") {
+      const s = sessions.get(p.sessionId);
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: p.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify({ ...s, prompt: p.prompt }) } } } });
+      reply(msg.id, { stopReason: "end_turn" });
     } else if (msg.method === "session/close" || msg.method === "session/delete") {
       reply(msg.id, {});
     } else {

@@ -14,7 +14,7 @@
 // so this extension needs no imports of its own and runs inside any `pi` install.
 const jsonSchema = (schema) => schema;
 
-const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls", "agents_list", "workspaces_list", "sessions_list", "session_read", "present_files"]);
+const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls", "agents_list", "workspaces_list", "sessions_list", "session_read", "present_files", "message_edit"]);
 const FILE_CHANGE_TOOLS = new Set(["edit", "write"]);
 
 let currentRuntimeMode = process.env.PIPI_RUNTIME_MODE || "full-access";

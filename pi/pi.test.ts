@@ -2000,3 +2000,25 @@ test("first-class presented_media blocks stream live, survive pending/reload, ke
     items: [{ path: "/repo/a.png", width: 640, height: 480, size: 2048 }],
   });
 });
+
+test("message_edit preserves the answer row and all versions, with no streamed confirmation bubble", () => {
+  const t = new Transcript();
+  t.load([{ role: "user", content: "hi", timestamp: 1 }, { role: "assistant", content: [{ type: "text", text: "original" }], timestamp: 2, editKey: "answer", stopReason: "stop" } as never]);
+  const id = t.rows()[1].id;
+  t.apply({ type: "agent_start" });
+  const versions = [{ content: "original", at: 2 }, { content: "latest\n\nMore progress.", at: 5 }];
+  t.apply({ type: "message_edit", key: "answer", versions });
+  expect(t.rows()[1]).toMatchObject({ id, text: versions[1].content, versions });
+  t.apply({ type: "message_start", message: { role: "assistant", content: [], turnStart: true } as never });
+  t.apply({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } });
+  for (const delta of ["<", "no-", "reply", "/>"]) {
+    t.apply({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } });
+    expect(t.rows().filter((r) => r.kind === "text")).toHaveLength(1);
+  }
+  t.apply({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "<no-reply/>" }], stopReason: "stop", timestamp: 6 } as never });
+  t.apply({ type: "agent_settled" });
+  expect(t.rows().filter((r) => r.kind === "text")).toHaveLength(1);
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  t.apply({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "A new decision." }], stopReason: "stop", timestamp: 7 } as never });
+  expect(t.rows().filter((r) => r.kind === "text")).toHaveLength(2);
+});

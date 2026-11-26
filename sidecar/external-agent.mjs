@@ -335,6 +335,7 @@ const PIPI_MCP_TOOLS = new Set([
   "session_send",
   "session_start",
   "session_stop",
+  "message_edit",
   "present_files",
 ]);
 
@@ -414,6 +415,7 @@ let flushed = undefined; // {key, messages, usage, bytes} — what the .jsonl ho
 let flushedState = undefined; // serialized .state.json contents last written
 let messagesDirty = false; // an already-written message changed in place
 let saveChain = Promise.resolve(); // saves never overlap
+let reportedSessionFile;
 
 function saveExternalSession() {
   const run = saveChain.then(() => saveExternalSessionNow(), () => saveExternalSessionNow());
@@ -504,6 +506,10 @@ async function saveExternalSessionNow() {
     messagesDirty = false;
   }
   await writeSessionState({ usageBaseline, context: header.context, modified: header.modified });
+  if (reportedSessionFile !== sessionFile) {
+    reportedSessionFile = sessionFile;
+    emit({ type: "pipi_session_file", file: sessionFile });
+  }
 }
 
 async function loadExternalSession(targetPath) {
@@ -3098,11 +3104,10 @@ function adoptModelConfigOption(modelOpt) {
   acpModelValues = values;
   acpModelConfigCurrent = String(modelOpt.currentValue ?? "");
   const wanted = matchInitialModel(discovered);
-  const kept = wanted || (currentModel && currentModel.id !== "default" ? discovered.find((m) => m.id === currentModel.id && m.provider === currentModel.provider) || discovered.find((m) => m.id === currentModel.id) : undefined);
   if (wanted) pendingInitialModel = undefined;
   availableModels.splice(0, availableModels.length, ...discovered);
   const cur = acpModelValueParts(acpModelConfigCurrent);
-  currentModel = kept || discovered.find((m) => m.id === cur.model && (!cur.provider || m.provider === cur.provider)) || discovered.find((m) => m.id === cur.model) || discovered[0];
+  currentModel = wanted || discovered.find((m) => m.id === cur.model && (!cur.provider || m.provider === cur.provider)) || discovered.find((m) => m.id === cur.model) || discovered[0];
   emit({ type: "models_changed" });
 }
 
@@ -3165,14 +3170,14 @@ async function pushAcpModel() {
     // only the right form for agents whose option values are bare ids (Devin dialect).
     const value = acpModelValues?.get(`${currentModel.provider}/${currentModel.id}`) ?? acpModelValues?.get(`${agentId}/${currentModel.id}`) ?? currentModel.id;
     if (value !== acpModelConfigCurrent) {
-      const res = await acpRequest("session/set_config_option", { sessionId: acpSessionId, configId: acpModelConfigId, value }, 10_000).catch(() => undefined);
+      const res = await acpRequest("session/set_config_option", { sessionId: acpSessionId, configId: acpModelConfigId, value }, 10_000);
       if (res?.configOptions) adoptConfigOptions(res.configOptions);
       // Devin resets thought_level to the newly selected model's default. Put the
       // user's abstract pick back (clamped to what this model advertises).
       await pushAcpEffort();
     }
   } else if (acpSpecModels) {
-    await acpRequest("session/set_model", { sessionId: acpSessionId, modelId: currentModel.id }, 10_000).catch(() => undefined);
+    await acpRequest("session/set_model", { sessionId: acpSessionId, modelId: currentModel.id }, 10_000);
   }
 }
 
@@ -3207,7 +3212,7 @@ async function pushAcpEffort() {
   const value = acpEffortValueFor(wanted);
   if (value === undefined) return;
   if (value !== cfg.currentValue) {
-    const res = await acpRequest("session/set_config_option", { sessionId: acpSessionId, configId: cfg.id, value }, 10_000).catch(() => undefined);
+    const res = await acpRequest("session/set_config_option", { sessionId: acpSessionId, configId: cfg.id, value }, 10_000);
     if (res?.configOptions) adoptConfigOptions(res.configOptions);
   }
   syncAcpThinkingFromEngine();
@@ -3901,7 +3906,12 @@ async function negotiateAcpRound(bin, epoch) {
       const learnedNativeId = nativeThreadId !== acpSessionId;
       nativeThreadId = acpSessionId;
       acpReset = false;
+      const restoredModel = currentModel;
+      const hadInitialModel = Boolean(pendingInitialModel);
       adoptSessionInfo(sess);
+      if (!hadInitialModel && restoredModel && restoredModel.id !== "default") {
+        currentModel = availableModels.find((m) => m.id === restoredModel.id && m.provider === restoredModel.provider) ?? currentModel;
+      }
       if (!begun && isAntigravityAcp()) {
         const beforeCount = messages.length;
         if (reconcileAgyTranscript(messages, acpSessionId)) {
@@ -4487,18 +4497,50 @@ async function handleCommand(cmd) {
       return { cancelled: false };
     case "set_model": {
       pendingInitialModel = undefined;
-      const found = availableModels.find((m) => m.id === cmd.modelId && m.provider === cmd.provider) || availableModels.find((m) => m.id === cmd.modelId);
+      if (driver === "acp") {
+        const bin = resolveDriverBinary();
+        if (!bin) throw new Error("ACP agent binary not found");
+        await ensureAcp(bin);
+      } else await discoverCatalog();
+      let found = availableModels.find((m) => m.id === cmd.modelId && m.provider === cmd.provider) || availableModels.find((m) => m.id === cmd.modelId);
+      let aliasEffort;
+      if (!found && driver === "acp" && isDevinAcp()) {
+        const match = String(cmd.modelId).match(/^(.+)-(minimal|low|medium|high|xhigh|max)$/);
+        if (match) {
+          found = availableModels.find((m) => m.provider === cmd.provider && m.id === `${match[1]}-medium`);
+          if (found) aliasEffort = match[2];
+        }
+      }
       if (!found) throw new Error(`Model not found: ${cmd.provider}/${cmd.modelId}`);
       currentModel = found;
-      if (driver === "acp") await pushAcpModel();
-      return found;
+      if (driver === "acp") {
+        await pushAcpModel();
+        if (aliasEffort) {
+          if (!acpEffortLevels().includes(aliasEffort)) throw new Error(`Thinking level not supported: ${aliasEffort}`);
+          acpThinkingWanted = aliasEffort;
+          thinkingLevelSet = true;
+          await pushAcpEffort();
+        }
+        if (currentModel?.id !== found.id || currentModel?.provider !== found.provider) throw new Error(`Engine did not select model: ${cmd.provider}/${cmd.modelId}`);
+      }
+      if (sessionFile) await saveExternalSession();
+      return currentModel;
     }
     case "set_thinking_level":
+      if (driver === "acp") {
+        const bin = resolveDriverBinary();
+        if (!bin) throw new Error("ACP agent binary not found");
+        await ensureAcp(bin);
+      }
       thinkingLevel = cmd.level || "medium";
       thinkingLevelSet = true;
       acpThinkingWanted = thinkingLevel;
-      if (driver === "acp") await pushAcpEffort();
+      if (driver === "acp") {
+        await pushAcpEffort();
+        syncAcpThinkingFromEngine();
+      }
       emit({ type: "thinking_level_changed", level: thinkingLevel });
+      if (sessionFile) await saveExternalSession();
       return undefined;
     case "set_model_config":
       if (driver !== "acp") throw new Error(`unsupported command "${cmd.type}"`);

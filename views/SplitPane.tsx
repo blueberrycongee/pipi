@@ -95,7 +95,7 @@ function DropZoneCard(props: { side: SplitSide; active: () => boolean }) {
       accessibilityLabel={label()}
       class={`items-center justify-center rounded-[18px] corner-squircle border-[1.5px] border-dashed transition-colors duration-150 ease-out-quint motion-reduce:transition-none ${
         props.active()
-          ? "border-brand bg-brand-soft/80 shadow-composer dark:bg-brand-soft/45 dark:shadow-composer-dark"
+          ? "border-hairline-hover bg-accent/80 shadow-composer dark:bg-accent/65 dark:shadow-composer-dark"
           : "border-border bg-card/88 shadow-popover dark:bg-card/82"
       }`}
       style={{
@@ -1021,7 +1021,7 @@ export function SplitPane() {
             {/* Slim split-pane header */}
             <View
               class={`h-9 shrink-0 flex-row items-center justify-between gap-2 border-b px-3 ${
-                isFocused() ? "border-brand/35" : "border-border/60"
+                isFocused() ? "border-hairline-hover" : "border-border/60"
               }`}
             >
               <View class="min-w-0 flex-1 flex-row items-center gap-1.5">

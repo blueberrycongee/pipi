@@ -41,6 +41,7 @@ import {
 } from "../lib/veil";
 import { openLocalFile, workspacePath } from "../store/app";
 import type { PipRowSlot } from "../pi/turns";
+import type { MessageVersion } from "../pi/protocol";
 import { backend } from "../store/backend";
 import { Icon } from "../ui/Icon";
 import { EASING } from "../ui/motion";
@@ -796,6 +797,8 @@ interface ProseEntry {
 /** One iMessage-style incoming SMS bubble projected from a settled Pip reply. */
 export interface PipBubbleRow {
   kind: "pip-bubble";
+  versions?: MessageVersion[];
+  edited?: boolean;
   id: string;
   /** The underlying transcript text row id (used to skip pop-in animation on loaded history). */
   rowId: string;
@@ -994,8 +997,8 @@ const EMPTY_CHUNKS: ReadonlyMap<string, VeilChunk[]> = new Map();
  * Projects a settled Pip reply into 1..N iMessage-style SMS bubble rows,
  * cached per transcript row id so unchanged bubbles keep exact object identity.
  */
-export function pipBubbleRows(row: { id: string; text: string; pip?: PipRowSlot }): PipBubbleRow[] {
-  const pipKey = pipSlotKey(row.pip);
+export function pipBubbleRows(row: { id: string; text: string; pip?: PipRowSlot; versions?: MessageVersion[] }): PipBubbleRow[] {
+  const pipKey = `${pipSlotKey(row.pip)}:${row.versions?.length ?? 0}`;
   const before = pipBubbleEntries.get(row.id);
   if (before && before.text === row.text && before.pipKey === pipKey) {
     return before.rows;
@@ -1027,6 +1030,7 @@ export function pipBubbleRows(row: { id: string; text: string; pip?: PipRowSlot 
       kind: "pip-bubble",
       id: `${row.id}#b${idx}`,
       rowId: row.id,
+      ...(row.versions ? { edited: true, ...(isLast ? { versions: row.versions } : {}) } : {}),
       bubbleIndex: idx,
       first: isFirst,
       last: isLast,

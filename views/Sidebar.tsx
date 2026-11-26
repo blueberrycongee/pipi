@@ -50,6 +50,8 @@ import {
   daemonSessions,
   daemonSessionTitle,
   daemonTreePlace,
+  sidebarSessionParent,
+  sidebarSessionDepth,
   isChatFolder,
   isDaemonTaskSession,
   isDraftAhead,
@@ -874,7 +876,10 @@ function orderedIds(list: string): string[] {
 function sortedFolderSessions(cwd: string): SessionSummary[] {
   const ranks = sessionRankOverrides(cwd);
   return sessionsOf(cwd)
-    .filter((session) => !daemonSessionByFile(session.path)?.parentId)
+    .filter((session) => {
+      const ds = daemonSessionByFile(session.path);
+      return !ds?.persona && !sidebarSessionParent(ds);
+    })
     .sort(
       (a, b) =>
         (ranks[b.path] ?? b.modified) - (ranks[a.path] ?? a.modified) || b.modified - a.modified || a.path.localeCompare(b.path),
@@ -1209,7 +1214,7 @@ const allRecents = computed<RecentItem[]>(
     for (const cwd of folders) {
       const list = sessionsOf(cwd);
       for (const session of list) {
-        if (seen.has(session.path)) continue;
+        if (seen.has(session.path) || daemonSessionByFile(session.path)?.persona) continue;
         seen.add(session.path);
         summaries.push({ session, cwd });
       }
@@ -1221,7 +1226,7 @@ const allRecents = computed<RecentItem[]>(
     // the list would otherwise drop. The open draft leads no row: the draft's does.
     const tops = new Map<string, DaemonSession>();
     for (const ds of daemonSessions()) {
-      if (ds.file && listed.has(ds.file)) continue;
+      if (ds.persona || (ds.file && listed.has(ds.file))) continue;
       // Archived from its tree: it is in 已归档, and leads no row here.
       if (isSessionArchived(ds.file)) continue;
       const { claimed, top } = daemonTreePlace(ds, listed);
@@ -1239,7 +1244,7 @@ const allRecents = computed<RecentItem[]>(
     const draftChildren = hasRecentDraft() ? new Set(childSessionsOfOpen().map((c) => c.id)) : new Set<string>();
     for (const { session, cwd } of summaries) {
       const ds = daemonSessionByFile(session.path);
-      if (ds?.parentId) {
+      if (ds && sidebarSessionParent(ds)) {
         const { claimed, top } = daemonTreePlace(ds, listed);
         // A daemon child belongs under its tree's row, not in the flat list — unless nothing above it takes a row here.
         if (claimed || tops.has(top.id) || draftChildren.has(ds.id)) continue;
@@ -2216,11 +2221,12 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
   const primary = computed(() => active() && ownsDaemonRow(props.group, session()));
   const selected = computed(() => primary() && activeViewName() === "chat");
   /** Whether the row hangs under its parent's — a tree top whose own tree hides takes a flat row of its own. */
-  const nested = computed(() => props.nested ?? Boolean(session().parentId));
+  const nested = computed(() => props.nested ?? Boolean(sidebarSessionParent(session())));
   /** A child steps one notch in from its parent's row: 最近's roots sit at the folder's level, 工作区's a rung deeper. */
   const rowDepth = computed(() => {
     if (!nested()) return 0;
-    return props.group === "recents" ? Math.max(0, session().depth - 1) : Math.max(1, session().depth);
+    const depth = sidebarSessionDepth(session());
+    return props.group === "recents" ? Math.max(0, depth - 1) : Math.max(1, depth);
   });
   /** Any settled/failed/interrupted daemon row (or one with a transcript file) can be archived out of the list. */
   const archivable = computed(() => file() !== undefined || !working());
@@ -2438,7 +2444,7 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; c
       const rows: FolderItem[] = [];
       const listed = new Set(folderSessions().map((s) => s.path));
       for (const ds of daemonSessions()) {
-        if (ds.parentId || (ds.file && listed.has(ds.file))) continue;
+        if (ds.persona || sidebarSessionParent(ds) || (ds.file && listed.has(ds.file))) continue;
         if (isSessionArchived(ds.file)) continue;
         if (projectCwdOf(ds.cwd, ds) !== props.cwd) continue;
         if (!daemonRootEarnsRow(ds)) continue;

@@ -248,7 +248,7 @@ export function CompareDialog() {
                   <BaseButton
                     selected={on()}
                     onPress={() => toggleParallel(agent().id)}
-                    class={`${uiHeight(32)} shrink-0 flex-row items-center gap-2 rounded-lg corner-squircle border px-3 ${PRESS} ${on() ? "border-brand bg-accent" : "border-border bg-card hover:bg-accent/50"}`}
+                    class={`${uiHeight(32)} shrink-0 flex-row items-center gap-2 rounded-lg corner-squircle border px-3 ${PRESS} ${on() ? "border-hairline-hover bg-accent" : "border-border bg-card hover:bg-accent/50"}`}
                   >
                     <Icon name={on() ? "check" : "agents"} size={14} tone={on() ? "brand-text" : "muted-foreground"} />
                     <Text class={`${uiType("sm")} font-medium text-foreground`}>{agent().name}</Text>

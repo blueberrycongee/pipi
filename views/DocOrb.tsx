@@ -1,7 +1,6 @@
 import {
   Animated,
   batch,
-  Canvas,
   cleanup,
   Clipboard,
   colorScheme,
@@ -52,7 +51,6 @@ import {
   popupStyle,
   Presence,
   Reveal,
-  useBreathingOpacity,
 } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
@@ -135,43 +133,12 @@ export function createDocOrbPointerBridge(): DocOrbPointerBridge {
   };
 }
 
-/** Smooth staggered breathing bar for skeletons (compositor-driven, honors reduceMotion). */
+/** Static neutral bar for skeletons. */
 function ShimmerBar(props: { width: `${number}%` | number; height?: number; delay?: number; class?: string }) {
-  const opacity = createAnimatedValue(0.65);
-  let anim: CompositeAnimation | null = null;
-
-  effect(() => {
-    const reduced = reduceMotion();
-    untracked(() => {
-      anim?.stop();
-      anim = null;
-      if (reduced) {
-        opacity.set(0.55);
-        return;
-      }
-      opacity.set(0.35);
-      anim = Animated.keyframes(opacity, {
-        keyframes: [
-          { offset: 0, value: 0.35, easing: "easeInOut" },
-          { offset: 0.5, value: 0.85, easing: "easeInOut" },
-          { offset: 1, value: 0.35 },
-        ],
-        duration: BREATH_MS,
-        delay: props.delay ?? 0,
-        iterations: "infinite",
-      });
-      void anim.start();
-    });
-  });
-  cleanup(() => {
-    anim?.stop();
-    void opacity.stop();
-  });
-
   return (
     <View
       class={`rounded-full bg-foreground/[0.08] dark:bg-foreground/[0.10] ${props.class ?? ""}`}
-      style={{ width: props.width, height: props.height ?? 10, opacity }}
+      style={{ width: props.width, height: props.height ?? 10, opacity: 0.6 }}
     />
   );
 }
@@ -213,7 +180,7 @@ export function DocSkeleton(props: { show: () => boolean }) {
 /** Soft cobalt linear wash matching the active theme token. */
 function brandLinearWash(direction: string, peakAlpha: number, midStop = false): string {
   colorScheme();
-  let hex = String(token("brand")).trim();
+  let hex = String(token("muted-foreground")).trim();
   if (hex.length === 4 && hex.startsWith("#")) {
     hex = `#${hex[1]}${hex[1]}${hex[2]}${hex[2]}${hex[3]}${hex[3]}`;
   }
@@ -231,7 +198,7 @@ function brandLinearWash(direction: string, peakAlpha: number, midStop = false):
 /** Descending cobalt refresh-curtain gradient with a luminous leading edge and soft glow halo below it. */
 function brandRefreshBeamWash(): string {
   const dark = colorScheme() === "dark";
-  let hex = String(token("brand")).trim();
+  let hex = String(token("muted-foreground")).trim();
   if (hex.length === 4 && hex.startsWith("#")) {
     hex = `#${hex[1]}${hex[1]}${hex[2]}${hex[2]}${hex[3]}${hex[3]}`;
   }
@@ -330,13 +297,13 @@ export function DocDraftingSkeleton(props: { show: () => boolean; hasContent?: (
         style={{ top: topBarHeight(), opacity: backdropOpacity, paddingTop: 52 }}
       >
         <View class={`${DOC_COLUMN} gap-4`} style={{ opacity: barsOpacity }}>
-          <ShimmerBar width="38%" height={24} delay={0} class="rounded-lg corner-squircle bg-brand/[0.11] dark:bg-brand/[0.16]" />
+          <ShimmerBar width="38%" height={24} delay={0} class="rounded-lg corner-squircle" />
           <View class="mt-2 gap-2.5">
             <ShimmerBar width="92%" height={11} delay={80} />
             <ShimmerBar width="84%" height={11} delay={160} />
             <ShimmerBar width="60%" height={11} delay={240} />
           </View>
-          <ShimmerBar width="26%" height={16} delay={180} class="mt-4 rounded-md corner-squircle bg-brand/[0.09] dark:bg-brand/[0.14]" />
+          <ShimmerBar width="26%" height={16} delay={180} class="mt-4 rounded-md corner-squircle" />
           <View class="gap-2.5">
             <ShimmerBar width="88%" height={11} delay={260} />
             <ShimmerBar width="74%" height={11} delay={340} />
@@ -534,7 +501,7 @@ export function DocActivityRibbon(props: { active: () => boolean }) {
       >
         <If
           when={!reduceMotion()}
-          else={<View class="h-full w-full bg-brand/35" />}
+          else={<View class="h-full w-full bg-muted-foreground/20" />}
         >
           <View
             class="h-full"
@@ -681,7 +648,7 @@ export function DocUpdatePill(props: { doc: MarkdownDoc }) {
               transform: [{ translateY }, { scale }],
             }}
           >
-            <Icon name="sparkle" size={13} tone="brand-text" class="shrink-0" />
+            <Icon name="sparkle" size={13} tone="muted-foreground" class="shrink-0" />
             <Text class={`${uiType("xs")} font-medium tabular-nums text-foreground`}>{label()}</Text>
             <If when={!props.doc.readOnly()}>
               <View class="h-3.5 w-px bg-border" />
@@ -709,68 +676,12 @@ export function DocUpdatePill(props: { doc: MarkdownDoc }) {
   );
 }
 
-/** Crisp rotating cobalt arc drawn around the resting orb while the AI is working in the background. */
-function OrbHalo(props: { active: () => boolean }) {
-  const angle = createAnimatedValue(0);
-  let spin: CompositeAnimation | null = null;
-
-  effect(() => {
-    const on = props.active();
-    const reduced = reduceMotion();
-    untracked(() => {
-      spin?.stop();
-      spin = null;
-      if (!on || reduced) {
-        angle.set(0);
-        return;
-      }
-      angle.set(0);
-      spin = Animated.keyframes(angle, {
-        keyframes: [
-          { offset: 0, value: 0, easing: "linear" },
-          { offset: 1, value: 360 },
-        ],
-        duration: 1100,
-        iterations: "infinite",
-      });
-      void spin.start();
-    });
-  });
-
-  cleanup(() => {
-    spin?.stop();
-    void angle.stop();
-  });
-
-  return (
-    <Presence show={props.active()} duration={160} scaleFrom={0.94} class="pointer-events-none absolute bottom-0 right-0">
-      <Canvas
-        style={{ width: ORB_SIZE, height: ORB_SIZE, rotate: angle }}
-        accessibilityElementsHidden
-        draw={(cx, { width, height }) => {
-          colorScheme();
-          const r = Math.min(width, height) / 2 - 1.25;
-          const cx0 = width / 2;
-          const cy0 = height / 2;
-          cx.strokeStyle = token("brand");
-          cx.lineWidth = 1.75;
-          cx.lineCap = "round";
-          cx.beginPath();
-          cx.arc(cx0, cy0, r, -Math.PI / 2, reduceMotion() ? Math.PI * 1.5 : -Math.PI / 2 + Math.PI * 0.62);
-          cx.stroke();
-        }}
-      />
-    </Presence>
-  );
-}
-
 /** Skeleton placeholder inside the floating reply card while waiting for the first prose token. */
 function ReplySkeleton(props: { label: () => string }) {
-  const breath = useBreathingOpacity(() => true);
   return (
     <View testID="doc-orb-skeleton" class="gap-2.5 py-0.5">
-      <View class="flex-row items-center gap-2" style={{ opacity: breath }}>
-        <Icon name="sparkle" size={13} tone="brand-text" class="shrink-0" />
+      <View class="flex-row items-center gap-2">
+        <Icon name="sparkle" size={13} tone="muted-foreground" class="shrink-0" />
         <View class="min-w-0 flex-1">
           <RollingText text={props.label} pace class={`${uiType("xs")} font-medium text-muted-foreground`} />
         </View>
@@ -1169,8 +1080,6 @@ function DocReplyCard(props: {
     return tr("Thinking…", "正在思考…");
   };
 
-  const breath = useBreathingOpacity(() => props.assistant.running());
-
   return (
     <If when={mounted()}>
       <View
@@ -1200,9 +1109,7 @@ function DocReplyCard(props: {
           <AgentLogo id={props.assistant.agentId()} size={14} tone="foreground" class="shrink-0" />
           <Text class={`min-w-0 shrink truncate ${uiType("xs")} font-medium text-foreground`}>{headerTitle()}</Text>
           <If when={Boolean(liveElapsed())}>
-            <View style={{ opacity: breath }}>
-              <Text class={`shrink-0 ${uiType("xs")} tabular-nums text-subtle`}>{liveElapsed()}</Text>
-            </View>
+            <Text class={`shrink-0 ${uiType("xs")} tabular-nums text-subtle`}>{liveElapsed()}</Text>
           </If>
           <View class="flex-1" />
           <View class="shrink-0 flex-row items-center gap-0.5">
@@ -2171,7 +2078,6 @@ export function DocFloatingOrb(props: {
 
   const showPlaceholder = () => !assistant.draft() && !composing();
   const showUnreadPearl = () => !expanded() && !assistant.running() && assistant.unread();
-  const showOrbHalo = () => !expanded() && assistant.running();
 
   return (
     <View
@@ -2237,9 +2143,6 @@ export function DocFloatingOrb(props: {
               borderCurve: "continuous",
             }}
           >
-            {/* Resting/working orbital cobalt progress halo anchored to the right Pip seat */}
-            <OrbHalo active={showOrbHalo} />
-
             {/* Bottom-right anchored fixed-width mini-composer stage: blooms up & left out of Pip with zero text squish */}
             <View
               class="shrink-0"

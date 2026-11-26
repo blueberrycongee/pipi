@@ -34,6 +34,7 @@ import { fileURLToPath } from "node:url";
 import { childEnv } from "./env-paths.mjs";
 import { sidecarFingerprint } from "./daemon-client.mjs";
 import { titleWords } from "./session-index.mjs";
+import { appendEdit, backgroundDelivery, editableMessage, editedMessage, editSnapshot, messageText, readEdits, silentEditReply } from "./message-edits.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON_FINGERPRINT = sidecarFingerprint(__dirname);
@@ -358,6 +359,7 @@ function persistDeliveries(session) {
 }
 
 function pushSession(session) {
+  if (session.removed) return;
   // A pooled standby is not a session yet: nothing outside may hear of it until an attach takes it.
   if (session.pooled) return;
   const info = sessionInfo(session);
@@ -516,26 +518,48 @@ function launchArgs(session) {
   };
 }
 
+async function applyLaunchChoices(session, input) {
+  try {
+    if (input.model) {
+      const slash = input.model.indexOf("/");
+      if (slash <= 0 || slash === input.model.length - 1) throw new Error("model must be provider/modelId");
+      await daemonCommand(session, "set_model", { provider: input.model.slice(0, slash), modelId: input.model.slice(slash + 1) }, 60_000, true);
+    }
+    for (const [configId, value] of Object.entries(input.modelConfigs ?? {})) {
+      await daemonCommand(session, "set_model_config", { configId, value }, 60_000, true);
+    }
+    if (input.thinking) await daemonCommand(session, "set_thinking_level", { level: input.thinking }, 60_000, true);
+    return !session.removed;
+  } catch (error) {
+    if (!session.removed) failSession(session, `could not apply session choices: ${error.message}`);
+    return false;
+  }
+}
+
 let internalSeq = 0;
-function daemonCommand(session, type, data, timeoutMs = 60_000) {
+function daemonCommand(session, type, data, timeoutMs = 60_000, checked = false) {
   const id = `${INTERNAL_PREFIX}${++internalSeq}`;
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    const finish = (value) => {
+      if (checked && value === undefined) reject(new Error(`${type}: agent did not answer`));
+      else resolve(value);
+    };
     const proc = session.proc;
     if (!proc || proc.killed) {
-      resolve(undefined);
+      finish(undefined);
       return;
     }
     const timer = setTimeout(() => {
-      if (session.internalPending.delete(id)) resolve(undefined);
+      if (session.internalPending.delete(id)) finish(undefined);
     }, timeoutMs);
     timer.unref?.();
-    session.internalPending.set(id, { resolve, timer });
+    session.internalPending.set(id, { resolve: finish, reject: checked ? reject : undefined, timer });
     try {
       proc.stdin.write(`${JSON.stringify({ id, type, ...data })}\n`);
     } catch {
       clearTimeout(timer);
       session.internalPending.delete(id);
-      resolve(undefined);
+      finish(undefined);
     }
   });
 }
@@ -640,6 +664,7 @@ function personaBlock() {
     `You are ${name}. PERSONA.md below says who you are; stay that character in every reply.`,
     `Your working directory holds PERSONA.md and MEMORY.md, and both outlast this conversation. MEMORY.md is yours: before you finish a turn in which you learned something worth keeping (a preference, a decision, a person, an open thread), write it there as one short line, and delete what has gone stale. Keep it under ${MEMORY_INDEX_BYTES / 1024} KB. Change PERSONA.md only when the person asks.`,
     "For coding work, start a session with a suitable agent (`agents_list`, `session_start`) and pass the project's directory as `cwd` (`workspaces_list` names the person's projects): your own directory holds only your notes.",
+    "Between user messages, prefer `message_edit` to update your last summary when background reports arrive, rather than sending repeated updates; send a new message for a new topic or a decision the person must make. After editing, finish with no text or exactly `<no-reply/>` when no additional reply is needed.",
     "Do not mention this block.",
     "",
     "<persona file=\"PERSONA.md\">",
@@ -700,7 +725,17 @@ function writeLine(session, rawLine) {
   }
 }
 
+function blockMessageEdit(session, text) {
+  if (!session.persona) return;
+  session.editRevision = (session.editRevision || 0) + 1;
+  session.editBlocked = true;
+  session.editUserEchoed = false;
+  session.editUserText = text;
+  persist({ type: "session_update", id: session.id, info: { editBlocked: true } });
+}
+
 function writePrompt(session, text, initiator) {
+  if (initiator === "user" && !backgroundDelivery({ content: text }) && !session.editBlocked) blockMessageEdit(session, text);
   session.initiator = initiator;
   session.turnAnswer = "";
   session.lastPromptText = text;
@@ -712,6 +747,7 @@ function writePrompt(session, text, initiator) {
 
 /** Spawns (or revives) the session's agent process (single-flight across concurrent callers). */
 async function startProcess(session) {
+  if (session.removed) return false;
   if (session.proc && !session.proc.killed) return true;
   if (session.starting) return session.starting;
   const p = (async () => {
@@ -1037,6 +1073,7 @@ function isEmptyDraft(session) {
 
 function removeSessionRecord(session) {
   if (!session || !sessions.has(session.id)) return false;
+  session.removed = true;
   dropPooled(session);
   killProcess(session);
   if (session.file && sessionsByFile.get(session.file) === session.id) {
@@ -1072,6 +1109,7 @@ function failSession(session, reason) {
 }
 
 function onSessionExit(session, code, signal, expected) {
+  if (session.removed) return;
   dropPooled(session);
   session.loaded = false;
   if (session.status === "working" || session.status === "blocked") {
@@ -1116,6 +1154,7 @@ function onSessionExit(session, code, signal, expected) {
 // ── Wire-level routing ───────────────────────────────────────────────────────
 
 function handleChildRecord(session, line) {
+  if (session.removed) return;
   let record;
   try {
     record = JSON.parse(line);
@@ -1127,9 +1166,14 @@ function handleChildRecord(session, line) {
     if (pending) {
       session.internalPending.delete(record.id);
       clearTimeout(pending.timer);
-      pending.resolve(record.success === false ? undefined : record.data);
+      if (record.success === false && pending.reject) pending.reject(new Error(record.error || "agent command failed"));
+      else pending.resolve(record.success === false ? undefined : record.data ?? null);
     }
     return; // daemon-internal chatter never reaches clients
+  }
+  if (record?.type === "pipi_session_file") {
+    if (typeof record.file === "string" && record.file) setFile(session, record.file);
+    return;
   }
   if (record?.type === "pipi_background_watch") {
     session.backgroundWatch = Boolean(record.active);
@@ -1150,6 +1194,19 @@ function handleChildRecord(session, line) {
       updateCatalog(session.agentId, { commands: record.data.commands });
     }
   }
+  if (record && session.persona) {
+    if (record.type === "agent_start") session.editingMessage = false;
+    if (record.type === "message_end" && record.message?.role === "assistant") {
+      if (session.editingMessage) {
+        record.message = { ...record.message, content: record.message.content.map((block) => block.type === "text" && silentEditReply(block.text) ? { ...block, text: "" } : block) };
+      }
+      record.message = { ...editedMessage(record.message, readEdits(session.file)), ...(session.editingMessage ? { silentEdit: true } : {}) };
+    }
+    if (record.type === "response" && record.command === "get_messages" && Array.isArray(record.data?.messages)) {
+      record.data.messages = editSnapshot(record.data.messages, readEdits(session.file));
+    }
+    line = JSON.stringify(record);
+  }
   if (record) observeRecord(session, record);
   for (const conn of session.attached) send(conn, { type: "out", sessionId: session.id, line });
 }
@@ -1168,6 +1225,8 @@ function observeRecord(session, record) {
     case "message_end": {
       const message = record.message;
       if (message?.role === "user") {
+        const said = messageText(message).replace(/^<pipi-persona\b[^>]*>[\s\S]*?<\/pipi-persona>\s*/, "");
+        if (typeof session.editUserText === "string" && session.editUserText && said.includes(session.editUserText)) session.editUserEchoed = true;
         learnTitle(session, message);
         if (!session.file) void discoverFile(session);
       }
@@ -1184,7 +1243,13 @@ function observeRecord(session, record) {
               .map((block) => block.text)
               .join("\n")
           : "";
-        if (text.trim()) session.pendingAnswer = text;
+        if (text.trim()) {
+          session.pendingAnswer = text;
+          if (session.editUserEchoed && session.editBlocked) {
+            session.editBlocked = false;
+            if (session.persona) persist({ type: "session_update", id: session.id, info: { editBlocked: false } });
+          }
+        }
       }
       break;
     }
@@ -1352,6 +1417,14 @@ function observeWrite(session, line) {
     removePendingDialog(session, record.id);
     return;
   }
+  if (SWITCHES_CONVERSATION.has(record.type) || record.type === "clone") {
+    session.editRevision = (session.editRevision || 0) + 1;
+    session.editingMessage = false;
+    session.editBlocked = false;
+    session.editUserEchoed = false;
+    session.editUserText = undefined;
+    if (session.persona) persist({ type: "session_update", id: session.id, info: { editBlocked: false } });
+  }
   if (record.type === "new_session") {
     session.pendingQueue = { steering: [], followUp: [] };
     setFile(session, undefined);
@@ -1381,6 +1454,7 @@ function observeWrite(session, line) {
   if (record.type === "prompt" || record.type === "steer" || record.type === "follow_up") {
     // A prompt written by an attached client (the UI) or the daemon itself.
     if (!String(record.id ?? "").startsWith(INTERNAL_PREFIX)) {
+      blockMessageEdit(session, record.message);
       session.initiator = "user";
       session.upstreamInitiator = "user";
       session.turnAnswer = "";
@@ -1492,6 +1566,7 @@ function deliverToInitiator(from, text, status, explicitTarget) {
 
 /** Puts a `<pipi-message>` into `target`: now if it can take it, queued otherwise. True when it queued. */
 function deliverMessage(target, text, initiator) {
+  if (initiator === "user" && !backgroundDelivery({ content: text })) blockMessageEdit(target, text);
   if (target.status === "failed" || target.status === "interrupted") {
     target.deliverQueue.push({ text, initiator });
     persistDeliveries(target);
@@ -1625,7 +1700,8 @@ const SESSION_TOOLS = [
         agent: { type: "string", description: "Agent id from agents_list." },
         cwd: { type: "string", description: "Working directory (defaults to yours)." },
         model: { type: "string", description: "Model as provider/modelId (defaults to the agent's current)." },
-        thinking: { type: "string", description: "Thinking level: off, minimal, low, medium, high, xhigh." },
+        thinking: { type: "string", description: "Thinking level advertised by the engine: off, minimal, low, medium, high, xhigh, max." },
+        modelConfigs: { type: "object", additionalProperties: { type: ["string", "boolean"] }, description: "Engine model settings by config id, e.g. Devin speed: standard or fast." },
         message: { type: "string", description: "The first task, self-contained." },
         worktree: { type: "boolean", description: "Give it an isolated git worktree." },
         runtimeMode: { type: "string", enum: ["inherit", "approval-required", "auto-accept-edits", "full-access"] },
@@ -1638,6 +1714,11 @@ const SESSION_TOOLS = [
     name: "session_stop",
     description: "Abort a session's current run, along with every session still working under it.",
     inputSchema: { type: "object", properties: { session: { type: "string", description: "Session id (yours or a descendant's)." } }, required: ["session"] },
+  },
+  {
+    name: "message_edit",
+    description: "Pip personal sessions only: replace your last completed assistant message in this conversation, only after the latest real user message. Use for consolidated background progress, not a new topic or decision. If rejected, send a normal new reply. After success, finish with no text or exactly <no-reply/> (or [edited]) to avoid a confirmation bubble; substantive new text is still sent normally.",
+    inputSchema: { type: "object", properties: { content: { type: "string", minLength: 1, description: "The complete replacement Markdown, not a diff." } }, required: ["content"], additionalProperties: false },
   },
   {
     name: "present_files",
@@ -1939,7 +2020,7 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
           if (page.nextCursor !== undefined) extra.cursor = page.nextCursor;
         }
       }
-      if (!target.loaded && target.file) {
+      if ((!target.loaded || !target.lastAnswer) && target.file) {
         const last = await readSessionFile(target.file).catch(() => undefined);
         const answer = truncateUtf8(target.lastAnswer || last?.answer || "", READ_BYTE_BUDGET);
         if (answer.truncated) anyTruncated = true;
@@ -2042,13 +2123,7 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
         const ok = await startProcess(session);
         if (!ok) return;
         if (session.status !== "working" && args.message) return;
-        if (typeof args.model === "string" && args.model.includes("/")) {
-          const slash = args.model.indexOf("/");
-          void daemonCommand(session, "set_model", { provider: args.model.slice(0, slash), modelId: args.model.slice(slash + 1) });
-        }
-        if (typeof args.thinking === "string" && args.thinking) {
-          void daemonCommand(session, "set_thinking_level", { level: args.thinking });
-        }
+        if (!(await applyLaunchChoices(session, args))) return;
         const text = envelope(caller ?? { id: "user", title: "you", agentName: "you" }, args.message, "idle");
         writePrompt(session, text, caller?.id ?? "user");
       })();
@@ -2062,6 +2137,29 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
       }
       await stopTree(target);
       return { id: target.id, stopped: true };
+    }
+    case "message_edit": {
+      if (!caller?.persona) throw new Error("message_edit is available only to Pip personal sessions");
+      if (typeof args.content !== "string" || !args.content.trim() || silentEditReply(args.content)) throw new Error("content must contain a non-empty replacement message");
+      if (Buffer.byteLength(args.content) > 256_000) throw new Error("replacement message exceeds 256 KB");
+      if (!caller.file || caller.editBlocked) throw new Error("No completed reply to the latest user message yet; send a new reply instead");
+      const file = caller.file;
+      const revision = caller.editRevision;
+      const snapshot = await daemonCommand(caller, "get_messages", {});
+      const message = editableMessage(snapshot?.messages || []);
+      if (!message || caller.file !== file || caller.editRevision !== revision || caller.editBlocked) throw new Error("No editable assistant message after the latest user message; send a new reply instead");
+      const latest = snapshot.messages.at(-1);
+      const entry = appendEdit(file, message, args.content, Date.now(), Math.max(latest?.timestamp || 0, message.timestamp + 1), snapshot.messages.findLast((item) => item.role === "user")?.timestamp);
+      caller.editingMessage = true;
+      caller.pendingAnswer = args.content;
+      caller.lastAnswer = args.content;
+      if (!caller.attached.size) caller.unread = true;
+      touch(caller);
+      pushSession(caller);
+      const updated = editedMessage(message, readEdits(file));
+      const line = JSON.stringify({ type: "message_edit", key: entry.key, versions: updated.versions });
+      for (const conn of caller.attached) send(conn, { type: "out", sessionId: caller.id, line });
+      return { edited: true };
     }
     case "present_files": {
       const rawList = Array.isArray(args.files) ? args.files : typeof args.path === "string" ? [args.path] : [];
@@ -2143,6 +2241,8 @@ async function readSessionFile(file, page) {
   let firstUser;
   let count = 0;
   const messages = [];
+  const edits = readEdits(file);
+  let previousUser;
   for (const line of lines) {
     let entry;
     try {
@@ -2152,7 +2252,8 @@ async function readSessionFile(file, page) {
     }
     if (entry?.type !== "message") continue;
     count++;
-    const message = entry.message;
+    if (entry.message?.role === "user") previousUser = entry.message;
+    const message = editSnapshot([previousUser, entry.message], edits)[1];
     if (message?.role === "user" && !firstUser) {
       firstUser = typeof message.content === "string" ? message.content : message.content?.find?.((b) => b?.type === "text")?.text;
     }
@@ -2444,6 +2545,14 @@ async function controlOp(conn, msg) {
       respond(conn, id, "agents", { agents: config.agents });
       return;
     }
+    case "set_session_choices": {
+      const session = sessions.get(msg.sessionId);
+      if (!session) return respondError(conn, id, "no such session");
+      if (!(await startProcess(session))) return respondError(conn, id, "agent could not start");
+      if (!(await applyLaunchChoices(session, msg.input ?? {}))) return respondError(conn, id, session.lastError || "could not apply session choices");
+      respond(conn, id, "session", { session: sessionInfo(session) });
+      return;
+    }
     case "start_session": {
       try {
         const input = msg.input ?? {};
@@ -2460,11 +2569,16 @@ async function controlOp(conn, msg) {
             binaryPath: input.binaryPath,
           };
         }
+        let replacedPersona;
         if (input.persona === true) {
           if (parent) throw new Error("the personal agent answers to the user, not to a session");
           const held = [...sessions.values()].find((s) => s.persona);
-          if (held) throw new Error(`the personal agent already runs as ${held.id}`);
+          if (held && input.replacePersona !== held.id) throw new Error(`the personal agent already runs as ${held.id}`);
+          if (input.replacePersona && !held) throw new Error("the personal agent changed; refresh before switching");
+          if (input.worktree) throw new Error("the personal agent cannot use a worktree");
           ensurePersonaDir();
+          replacedPersona = held;
+          if (held) removeSessionRecord(held);
         }
         const cwd = input.persona === true ? PERSONA_DIR : input.cwd || parent?.cwd || process.cwd();
         // A child's mode never exceeds its parent's — the same clamp agents get.
@@ -2491,6 +2605,18 @@ async function controlOp(conn, msg) {
           extraArgs: agent.extraArgs ?? config.overrides?.[agent.id]?.extraArgs ?? input.extraArgs,
           customAgent: agent.customAgent ?? config.customAgents?.find((c) => c.id === agent.id) ?? input.customAgent,
         });
+        if (replacedPersona) {
+          for (const child of sessions.values()) {
+            if (child.id === session.id) continue;
+            let changed = false;
+            for (const key of ["parentId", "initiator", "upstreamInitiator"]) {
+              if (child[key] !== replacedPersona.id) continue;
+              child[key] = session.id;
+              changed = true;
+            }
+            if (changed) pushSession(child);
+          }
+        }
         if (input.message) setStatus(session, "working");
         // Answer at once; worktree, spawn, model picks and the first prompt run in the background.
         respond(conn, id, "session", { session: sessionInfo(session) });
@@ -2508,13 +2634,7 @@ async function controlOp(conn, msg) {
           }
           if (!(await startProcess(session))) return;
           if (input.message && session.status !== "working") return;
-          if (typeof input.model === "string" && input.model.includes("/")) {
-            const slash = input.model.indexOf("/");
-            void daemonCommand(session, "set_model", { provider: input.model.slice(0, slash), modelId: input.model.slice(slash + 1) });
-          }
-          if (typeof input.thinking === "string" && input.thinking) {
-            void daemonCommand(session, "set_thinking_level", { level: input.thinking });
-          }
+          if (!(await applyLaunchChoices(session, input))) return;
           if (input.message) writePrompt(session, input.message, "user");
         })();
       } catch (error) {
@@ -3073,7 +3193,7 @@ async function loadRegistry() {
   persistQueue.length = 0;
   const lines = [];
   for (const session of sessions.values()) {
-    lines.push(JSON.stringify({ type: "session", info: { ...sessionInfo(session), token: session.token }, launch: session.launch }));
+    lines.push(JSON.stringify({ type: "session", info: { ...sessionInfo(session), token: session.token, editBlocked: session.editBlocked }, launch: session.launch }));
     if (session.deliverQueue.length) {
       lines.push(JSON.stringify({ type: "queue", to: session.id, items: session.deliverQueue }));
     }

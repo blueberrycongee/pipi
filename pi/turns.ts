@@ -1141,6 +1141,8 @@ export function buildDisplayRows(
       const id = `turn:${first.id}`;
       let messages: DisplayTextRow[] = answer.filter((m) => !m.streaming && m.text.trim().length > 0);
       let remainingProcess = process;
+      const edited = first.silentEdit || turnTools.some((tool) => normalizeMcpToolName(tool.name) === "message_edit" && tool.status === "done");
+      if (edited && messages.length === 0 && surfacedMedia.length === 0) continue;
       // Fallback for settled/interrupted turns that only wrote completed prose before tool calls
       // and ended without a separate final message: surface the prose so nothing is ever lost.
       if (messages.length === 0) {
@@ -1359,7 +1361,7 @@ function sameRow(a: DisplayRow, b: DisplayRow): boolean {
     );
   }
   if (a.kind === "text" && b.kind === "text") {
-    return a.text === b.text && a.streaming === b.streaming && a.final === b.final && samePipSlot(a.pip, b.pip);
+    return a.text === b.text && a.streaming === b.streaming && a.final === b.final && a.versions === b.versions && samePipSlot(a.pip, b.pip);
   }
   if (a.kind === "media" && b.kind === "media") {
     return (

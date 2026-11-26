@@ -106,8 +106,16 @@ export interface UserMessage {
 
 export type StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted" | "deferred";
 
+export interface MessageVersion {
+  content: string;
+  at: number;
+}
+
 export interface AssistantMessage {
   role: "assistant";
+  editKey?: string;
+  versions?: MessageVersion[];
+  silentEdit?: boolean;
   content: (TextContent | ThinkingContent | ToolCall | ProtocolMediaBlock)[];
   provider: string;
   model: string;
@@ -349,6 +357,7 @@ export interface ToolResult {
 
 /** The session events the client acts on (`docs/pi/json.md`). */
 export type SessionEvent =
+  | { type: "message_edit"; key: string; versions: MessageVersion[] }
   | { type: "agent_start" }
   | { type: "agent_end"; willRetry?: boolean }
   | { type: "agent_settled"; aborted?: boolean }

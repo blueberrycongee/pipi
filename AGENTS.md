@@ -35,9 +35,9 @@ multi-agent orchestration, and settings.
   virtual `Transport` so `PiClient` speaks the same protocol while the
   daemon owns the processes — detach never kills, and a session blocked on
   an approval replays its dialog to whoever attaches next. Agents inside
-  sessions get the same eight tools (`agents_list`, `workspaces_list`,
+  sessions get the same nine tools (`agents_list`, `workspaces_list`,
   `sessions_list`, `session_read`, `session_send`, `session_start`,
-  `session_stop`, `present_files`) over a
+  `session_stop`, `message_edit`, `present_files`) over a
   per-session-token HTTP MCP endpoint — Pi through
   `sidecar/pipi-orchestrator-extension.mjs` (which mirrors the daemon's
   tool list), Claude/Codex/ACP through the `sidecar/pipi-mcp-stdio.mjs`
@@ -77,6 +77,12 @@ multi-agent orchestration, and settings.
   sheet, its bottom meeting the sheet strip's own — the sidebar's rows
   start on the pane's first line, and the lights keep their air over
   新会话.
+- Sidebar hierarchy is separate from daemon ownership: `sidebarSessionParent`
+  and `sidebarSessionDepth` in `store/app.ts` stop at a `persona` parent, so
+  Pip's direct tasks are roots in Workspaces and Recent; coding descendants
+  still nest. Never clear their real `parentId`/`initiator` or rewrite daemon
+  `depth`: callback delivery, permission ceilings, and Pip's chips use that tree.
+  Pip itself stays only in the pinned row, and worktrees use `worktree.baseCwd`.
 - A chat needs no project. 闲聊 lives as a special built-in workspace inside
   工作区 (and in the welcome folder picker) — never crowding 新会话 at the
   sidebar's top — starting a session in `<dataDir>/chat/` (`chatFolder` in
@@ -138,6 +144,16 @@ multi-agent orchestration, and settings.
   `stdio: "inherit"`) because its SDK needs a Node/Bun host this QuickJS
   app is not; driving it as a sidecar isolates the agent process the same
   way the external-agent bridge does.
+- Pip's `message_edit` is daemon-owned and persona-only: it edits the last completed
+  answer after the latest real user message. The engine's log stays untouched;
+  `<sessionFile>.pipi-edits.jsonl` is its append-only, owner-private companion
+  journal, so copy both when moving a conversation. The daemon overlays it on
+  `get_messages` and `session_read` and emits live `message_edit` events;
+  `Transcript` preserves row ids and version arrays, and Pip's trailing bubble
+  opens a bounded history popover. Empty replies, `[edited]`, and `<no-reply/>`
+  after a successful edit add no confirmation bubble. Verify with `node --test
+  sidecar/message-edits.test.mjs sidecar/pipi-daemon.test.mjs` and `nsh test
+  PipChat.test.tsx` / `nsh test pi/pi.test.ts`.
 - Usage is what each engine reports, never an estimate.
   `sidecar/agent-usage.mjs` reads every engine's own figures (Claude
   Code's `result.modelUsage` and Codex's `turn.completed.usage` are the
@@ -247,6 +263,14 @@ multi-agent orchestration, and settings.
   into a long streaming reply, in `.nsh/shots/queue-*.png`: each a waiting
   bubble in the conversation with its own edit and remove, none over the
   composer; one taken back (`takeQueued`) leaves the others waiting
+- `nsh test PipMotion.test.tsx --target macos` — native pixel regression for Pip's
+  SMS entrances (outgoing, single and split incoming replies), with still frames
+  on recycled/history rows. `dev/PipMotionStage.tsx` uses the real `TranscriptRow`
+  inside a `List`. Persona SMS bubbles own their entrance: the outer row returns
+  `"delegate"` from `useRowEntrance`'s skip callback without consuming the seen ID;
+  only the inner `useSmsBubbleEntrance` claims it. Ordinary skipped rows still
+  mark seen. Pip's one-shot corner glide is intentionally distinct from the
+  coding transcript's opacity-only entrances.
 - `nsh test UserFold.test.tsx` — a sent message laid out past six lines folds
   to a fading preview; the chevron at the bubble's foot opens and closes it
   (`--target macos` films `.nsh/shots/userfold-*.png`)
@@ -574,3 +598,25 @@ that is taken, set `PORT`.
   real list. To see a streaming glitch, take screenshots in a loop
   (`app.screenshot`) and compare frames: one-frame faults do not show in
   `texts()`.
+
+## Personal agent engine choices
+
+- Pip's engine preference is `personalAgentId`; its per-engine model, thinking,
+  and model-config choices use `agentSessionChoices["persona:<agentId>"]`,
+  independently of coding sessions. `/new` inside Pip resets its conversation,
+  not its persona. Composer engine changes use the daemon's compare-and-replace
+  `start_session` input `replacePersona` (the current persona session id), retire
+  the old registry entry without deleting files, and inject persona/memory again
+  on the new engine's first prompt.
+- Launch model/config/thinking commands must finish successfully before the first
+  task is sent. ACP writes negotiate the catalog first; do not rely on a picker
+  having read it. For Devin's SWE-2.1 standard-speed Max, use
+  `model: "devin/swe-2-1-medium", thinking: "max"`; effort is a separate ACP
+  `thought_level`, while `lightning` identifies the Ultrafast variant. The bridge
+  accepts `swe-2-1-max` as a validated compatibility alias, not a static model id.
+- The external bridge reports `pipi_session_file` after its first successful file
+  save, before `agent_start`; the daemon consumes it privately and registers the
+  file immediately. Polling discovery remains a fallback for native Pi, not a
+  prerequisite for an external turn's file to appear in the registry.
+- Verify with `nsh test PipChat.test.tsx`, `nsh test App.test.tsx`, `nsh check .`,
+  and `node --test sidecar/acp-devin.test.mjs sidecar/pipi-daemon.test.mjs`.

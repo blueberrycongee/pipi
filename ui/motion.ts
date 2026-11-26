@@ -231,18 +231,15 @@ const SMS_OUTGOING_SPEC: LeanSpec<"opacity" | "translateX" | "translateY" | "sca
       { offset: 1, value: 1 },
     ],
     translateX: [
-      { offset: 0, value: 6 },
-      { offset: 0.68, value: -0.6 },
+      { offset: 0, value: 10 },
       { offset: 1, value: 0 },
     ],
     translateY: [
-      { offset: 0, value: 14 },
-      { offset: 0.68, value: -1.2 },
+      { offset: 0, value: 18 },
       { offset: 1, value: 0 },
     ],
     scale: [
-      { offset: 0, value: 0.86 },
-      { offset: 0.66, value: 1.018 },
+      { offset: 0, value: 0.94 },
       { offset: 1, value: 1 },
     ],
   },
@@ -259,22 +256,19 @@ const SMS_INCOMING_SPEC: LeanSpec<"opacity" | "translateX" | "translateY" | "sca
       { offset: 1, value: 1 },
     ],
     translateX: [
-      { offset: 0, value: -7 },
-      { offset: 0.66, value: 0.8 },
+      { offset: 0, value: -8 },
       { offset: 1, value: 0 },
     ],
     translateY: [
-      { offset: 0, value: 11 },
-      { offset: 0.66, value: -1.5 },
+      { offset: 0, value: 12 },
       { offset: 1, value: 0 },
     ],
     scale: [
-      { offset: 0, value: 0.78 },
-      { offset: 0.64, value: 1.024 },
+      { offset: 0, value: 0.96 },
       { offset: 1, value: 1 },
     ],
   },
-  duration: 260,
+  duration: 240,
   easing: EASING.signature,
 };
 
@@ -307,7 +301,7 @@ export function enableLiveRowEntrance() {
  * never a positional offset: streamed text settles through its own veil
  * (`skip()` true for `text` rows: no entrance at all). Recycled cells and
  * loaded history stay steady. */
-export function useRowEntrance(id: () => string, streaming?: () => boolean, skip?: () => boolean, crisp?: () => boolean) {
+export function useRowEntrance(id: () => string, streaming?: () => boolean, skip?: () => boolean | "delegate", crisp?: () => boolean) {
   const item = leanMotion(["opacity", "translateY"] as const);
   let lastId = "";
   effect(() => {
@@ -315,8 +309,9 @@ export function useRowEntrance(id: () => string, streaming?: () => boolean, skip
     untracked(() => {
       if (currentId === lastId) return;
       lastId = currentId;
-      if (!currentId || skip?.()) {
-        if (currentId) seenRowIds.add(currentId);
+      const skipped = skip?.();
+      if (!currentId || skipped) {
+        if (currentId && skipped !== "delegate") seenRowIds.add(currentId);
         item.reset();
         return;
       }
@@ -378,10 +373,9 @@ export function useSmsBubbleEntrance(
         item.reset();
         return;
       }
-      item.values.opacity.set(0);
-      item.values.translateX.set(isLeft ? -7 : 6);
-      item.values.translateY.set(isLeft ? 11 : 14);
-      item.values.scale.set(isLeft ? 0.78 : 0.86);
+      for (const channel of ["opacity", "translateX", "translateY", "scale"] as const) {
+        item.values[channel].set(spec.tracks[channel][0].value);
+      }
       item.play(spec, delay);
     });
   });

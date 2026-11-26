@@ -186,7 +186,7 @@ test("selection bubble quick-AI captures selection chip and replaces selection i
 
   await app.waitFor("id:doc-orb-replace");
   await app.press("id:doc-orb-replace");
-  await app.waitUntil(() => mentions(app, "Keep this. Refine this smoothly."), { timeout: 4000 });
+  await app.waitUntil(() => app.texts().join("").includes("Keep this. Refine this smoothly."), { timeout: 4000 });
   await app.waitFor("id:doc-update-pill");
   await app.press("id:doc-update-undo");
   await app.waitUntil(() => mentions(app, "Keep this. Polish that"), { timeout: 4000 });

@@ -791,7 +791,8 @@ export function Chat() {
   let viewSpan = -1;
   let measuringTop = false;
   const measureTop = () => {
-    if (measuringTop) return;
+    // Where the top sits only feeds `promptAway`, which a persona conversation never shows.
+    if (measuringTop || isPersonaSession()) return;
     const target = list;
     if (!target) return;
     measuringTop = true;
@@ -963,6 +964,9 @@ export function Chat() {
    * while older history is being read (`below`).
    */
   const promptAway = computed(() => {
+    // A personal conversation is one continuous thread: there is no task's
+    // question to jump back to, and the bubble is never offered there.
+    if (isPersonaSession()) return undefined;
     const top = topRow();
     if (top < 0) return undefined;
     const mode = scrollMode();
@@ -1689,6 +1693,8 @@ export function Chat() {
                     onMomentumStart={onInput}
                     onWheel={onWheel}
                     onViewableItemsChange={(info) => {
+                      // The visible range only feeds `promptAway`, which a persona conversation never shows.
+                      if (isPersonaSession()) return;
                       const items = info.viewableItems;
                       const first = items[0]?.index ?? -1;
                       const last = items[items.length - 1]?.index ?? -1;
@@ -1739,7 +1745,9 @@ export function Chat() {
             bottom={foot().end}
             onPress={jumpToLatest}
           />
-          <PromptJumpPill visible={promptAway() !== undefined} prompt={promptAway} top={horizonInset()} onPress={jumpToPrompt} />
+          <If when={!isPersonaSession()}>
+            <PromptJumpPill visible={promptAway() !== undefined} prompt={promptAway} top={horizonInset()} onPress={jumpToPrompt} />
+          </If>
         </If>
         <If when={screen() === "connect"}>
           <Connect />

@@ -55,7 +55,7 @@ import { docTabTitle, titleLine } from "../store/docs";
 import { openDocIfThere } from "../store/tabs";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
-import { EASING, isRowSeen, keepLast, Presence, useBreathingOpacity, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
+import { EASING, isRowSeen, keepLast, Presence, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
@@ -1106,7 +1106,6 @@ function DiffBadge(props: { stats?: DiffStats }) {
 }
 
 function ThinkingRow(props: { row: Extract<Row, { kind: "thinking" }>; defaultOpen?: boolean; compact?: boolean }) {
-  const breathOpacity = useBreathingOpacity(() => props.row.streaming);
   const fallback = () => Boolean(props.defaultOpen);
   const open = () => isOpen(props.row.id, fallback());
   const label = () => thinkingLabel(props.row, activeLanguage());
@@ -1128,7 +1127,7 @@ function ThinkingRow(props: { row: Extract<Row, { kind: "thinking" }>; defaultOp
   return (
     <Collapsible open={open() && hasBody()} reveal content={<ReasoningBody text={props.row.text} />}>
       <ProcessLine open={open() && hasBody()} onPress={hasBody() ? () => toggle(props.row.id, fallback()) : undefined}>
-        <RollingText id={() => props.row.id} text={label} class={text()} style={{ opacity: breathOpacity }} />
+        <RollingText id={() => props.row.id} text={label} class={text()} />
       </ProcessLine>
     </Collapsible>
   );
@@ -1297,7 +1296,6 @@ function ToolCallRow(props: { row: ToolRow; compact?: boolean }) {
 function ActivityView(props: { row: ActivityRow; maxHeight: number }) {
   const open = () => isOpen(props.row.id, false);
   const title = () => describeActivity(props.row, activeLanguage());
-  const breathOpacity = useBreathingOpacity(() => props.row.live === true);
   const only = () => (props.row.steps.length === 1 ? props.row.steps[0] : undefined);
   const onlySession = () => {
     const step = only();
@@ -1394,7 +1392,6 @@ function ActivityView(props: { row: ActivityRow; maxHeight: number }) {
             settled={() => !props.row.running}
             holdSettle={() => props.row.mayGrow === true}
             class={`min-w-0 shrink truncate ${uiType("sm")} text-muted-foreground`}
-            style={{ opacity: breathOpacity }}
           />
           <If when={!open()}>
             <DiffBadge stats={aggregateDiff()} />
@@ -1427,7 +1424,6 @@ function runningFor(ms: number): string {
 }
 
 function TurnHeaderView(props: { row: TurnHeaderRow }) {
-  const breathOpacity = useBreathingOpacity(() => props.row.live === true);
 
   // The timer turns over as each second of the turn completes, not a second
   // after the header happened to mount: an interval of its own phase reads up
@@ -1472,7 +1468,6 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
           id={() => props.row.id}
           text={() => describeTurn(props.row, activeLanguage())}
           class={`shrink-0 ${uiType("base")} ${props.row.running ? "font-medium text-foreground/85" : "text-subtle"}`}
-          style={{ opacity: breathOpacity }}
         />
         <If when={elapsed() !== undefined && (elapsed() ?? 0) >= 1000}>
           <Text class={`shrink-0 font-mono ${uiType("xs")} tabular-nums text-subtle`}>{runningFor(elapsed() ?? 0)}</Text>
@@ -1706,8 +1701,8 @@ export function TranscriptRow(props: { row: ChatRow; activityMaxHeight: number }
       if (fold.isFolding()) return true;
       // SMS bubbles (Pip incoming bubbles and outgoing user SMS bubbles) run their own
       // corner-anchored iMessage pop-in animation (`useSmsBubbleEntrance`).
-      if (props.row.kind === "pip-bubble") return true;
-      if (props.row.kind === "user" && props.row.sms) return true;
+      if (props.row.kind === "pip-bubble") return "delegate";
+      if (props.row.kind === "user" && props.row.sms) return "delegate";
       if (props.row.kind === "prose") {
         return !props.row.pip || isRowSeen(props.row.rowId);
       }

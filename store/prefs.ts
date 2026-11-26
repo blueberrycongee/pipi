@@ -75,6 +75,7 @@ export interface AgentSessionChoice {
   model?: { provider: string; id: string };
   /** Thinking depth: pipi's levels, or an ACP harness's own advertised effort value. */
   thinkingLevel?: ThinkingLevel;
+  modelConfigs?: Record<string, string | boolean>;
 }
 
 interface Prefs {
@@ -119,6 +120,7 @@ interface Prefs {
   autoRetry?: boolean;
   /** Default coding agent harness id (`"pi"`, `"claude"`, `"codex"`, `"opencode"`, `"cursor"`, or custom ACP id). */
   defaultAgentId: string;
+  personalAgentId?: string;
   /** Shared runtime permission ceiling (`"approval-required"`, `"auto-accept-edits"`, `"full-access"`). */
   runtimeMode: RuntimeMode;
   /** Whether parallel multi-agent orchestrations isolate each agent in its own Git worktree by default. */
@@ -324,8 +326,9 @@ function normalizeSessionChoices(raw: unknown): Record<string, AgentSessionChoic
         : undefined;
     // ACP harnesses may advertise effort values outside pipi's level union; keep any non-empty string.
     const thinkingLevel = typeof choice.thinkingLevel === "string" && choice.thinkingLevel ? (choice.thinkingLevel as ThinkingLevel) : undefined;
-    if (model || thinkingLevel) {
-      out[agentId] = { ...(model ? { model } : {}), ...(thinkingLevel ? { thinkingLevel } : {}) };
+    const modelConfigs = Object.fromEntries(Object.entries(choice.modelConfigs ?? {}).filter(([, v]) => typeof v === "string" || typeof v === "boolean"));
+    if (model || thinkingLevel || Object.keys(modelConfigs).length) {
+      out[agentId] = { ...(model ? { model } : {}), ...(thinkingLevel ? { thinkingLevel } : {}), ...(Object.keys(modelConfigs).length ? { modelConfigs } : {}) };
     }
   }
   return out;
@@ -517,6 +520,10 @@ export const storedCustomAgents = computed(() => prefs().customAgents);
 const storedSessionChoicesMap = computed(() => prefs().agentSessionChoices);
 export const storedSessionChoice = (agentId: string): AgentSessionChoice | undefined => storedSessionChoicesMap()[agentId];
 export const storedSessionChoices = (): Record<string, AgentSessionChoice> => storedSessionChoicesMap();
+export const preferredPersonalAgentId = computed(() => prefs().personalAgentId ?? preferredAgentId());
+export function setPreferredPersonalAgentId(agentId: string) {
+  change({ personalAgentId: agentId });
+}
 // The stored wallpaper/effect may name a dynamic kind the feature gate hides;
 // readers must agree with the render gate (`EffectSurface.canRender`), so the
 // accessors report such a config/effect as absent rather than let the shell

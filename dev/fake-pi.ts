@@ -1260,7 +1260,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     if (!initialHistorySessionId && s.agentId === "pi" && !s.file && (options.history?.length ?? 0) > 0) {
       initialHistorySessionId = s.id;
     }
-    const seedHistory = s.id === initialHistorySessionId && s.agentId === "pi" ? (options.history ?? []) : [];
+    const seedHistory = (s.id === initialHistorySessionId || s.persona) && s.agentId === "pi" ? (options.history ?? []) : [];
     const inner = transport(s.cwd, s.agentId, seedHistory, s.custom);
     wireDaemonSession(s, inner);
     return inner;
@@ -1521,11 +1521,12 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             pushDaemon(s);
           }
         },
-        async startSession(input: { title?: string; agentId: string; cwd?: string; persona?: boolean; message?: string; parentId?: string; runtimeMode?: RuntimeMode; worktree?: boolean }) {
+        async startSession(input: Parameters<DaemonClient["startSession"]>[0]) {
           const parent = input.parentId ? daemonSessions.get(input.parentId) : undefined;
           // As the real daemon does: `worktree` asks for an isolated branch under the given cwd.
           const held = input.persona ? [...daemonSessions.values()].find((known) => known.persona) : undefined;
-          if (held) throw new Error(`the personal agent already runs as ${held.id}`);
+          if (held && input.replacePersona !== held.id) throw new Error(`the personal agent already runs as ${held.id}`);
+          if (held) removeFakeDaemon(held);
           const cwd = input.persona ? FAKE_PERSONA_DIR : (input.cwd ?? "");
           const wt = input.worktree && api.createWorktree ? await api.createWorktree(cwd, input.agentId) : undefined;
           const s: FakeDaemonSession = {
@@ -1559,6 +1560,11 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           }
           s.loaded = true;
           pushDaemon(s);
+          if (input.model) {
+            const slash = input.model.indexOf("/");
+            daemonWrite(s, { type: "set_model", provider: input.model.slice(0, slash), modelId: input.model.slice(slash + 1) });
+          }
+          if (input.thinking) daemonWrite(s, { type: "set_thinking_level", level: input.thinking });
           if (input.message) daemonWrite(s, { type: "prompt", message: input.message });
           return daemonInfo(s);
         },

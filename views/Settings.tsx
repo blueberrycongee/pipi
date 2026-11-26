@@ -1407,7 +1407,7 @@ function General() {
                       role="radio"
                       selected={chosen()}
                       accessibilityLabel={name()}
-                      class={`w-19 items-center gap-1.5 rounded-lg corner-squircle border py-2.5 ${PRESS} ${FOCUS_RING} ${chosen() ? "border-brand bg-brand-soft" : "border-transparent hover:bg-accent"}`}
+                      class={`w-19 items-center gap-1.5 rounded-lg corner-squircle border py-2.5 ${PRESS} ${FOCUS_RING} ${chosen() ? "border-hairline-hover bg-accent" : "border-transparent hover:bg-accent"}`}
                     >
                       <Pip size={40} coat={id} mood={chosen() ? "happy" : "idle"} still={!chosen()} />
                       <Text class={`${uiType("xs")} ${chosen() ? "font-medium text-foreground" : "text-muted-foreground"}`}>{name()}</Text>

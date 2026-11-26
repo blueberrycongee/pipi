@@ -630,7 +630,7 @@ test("1, 2 & 9: daemon owns sessions across detach/reattach, replays blocked dia
   assert.equal(toolsRes.status, 200);
   const toolsJson = await toolsRes.json();
   const names = toolsJson.result.tools.map((tool) => tool.name);
-  assert.deepEqual(names, ["agents_list", "workspaces_list", "sessions_list", "session_read", "session_send", "session_start", "session_stop", "present_files"]);
+  assert.deepEqual(names, ["agents_list", "workspaces_list", "sessions_list", "session_read", "session_send", "session_start", "session_stop", "message_edit", "present_files"]);
   for (const tool of toolsJson.result.tools) {
     assert.ok(tool.inputSchema && tool.inputSchema.type === "object", `${tool.name} must expose standard MCP inputSchema`);
   }
@@ -722,7 +722,7 @@ test("1, 2 & 9: daemon owns sessions across detach/reattach, replays blocked dia
     delete process.env.PIPI_ORCHESTRATOR_URL;
     delete process.env.PIPI_ORCHESTRATOR_TOKEN;
   }
-  assert.equal(registeredTools.length, 8);
+  assert.equal(registeredTools.length, 9);
   assert.ok(registeredCommands.has("pipi-runtime-mode"));
 
   // Focus 9: engines without MCP bridge (`opencode`) must NOT receive orchestrator credentials
@@ -1792,6 +1792,15 @@ test("the personal agent: one per home, opens each fresh conversation with PERSO
   assert.ok(!saved.includes("the newest line"), "only the head of a long MEMORY.md is handed over");
   assert.equal(fs.readFileSync(path.join(personaDir, "MEMORY.md"), "utf8"), memory, "the file itself is never cut");
 
+  await ctrl.call("send", { sessionId: id, message: "spawn-child:PipDelegated:echo:done-for-pip" });
+  await ctrl.waitUntil(async () => (await lastAnswer(id)).includes("<pipi-message") && (await lastAnswer(id)).includes("done-for-pip"));
+  const delegated = [...ctrl.sessions.values()].find((s) => s.title === "PipDelegated");
+  assert.equal(delegated.parentId, id);
+  assert.equal(delegated.initiator, id);
+  assert.equal(delegated.depth, 1);
+  assert.equal(delegated.status, "idle");
+  assert.equal(delegated.persona, undefined);
+
   // The registry keeps who the personal agent is across a daemon restart.
   const inst1 = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
   ctrl.client.close();
@@ -1980,6 +1989,10 @@ rl.on("line", async (line) => {
   // 2. Final assistant message and persisted session JSONL both keep the exact `presented_media` block.
   const assistantEnd = records.find((r) => r.type === "message_end" && r.message?.role === "assistant");
   assert.ok(assistantEnd?.message?.content?.some((b) => b.type === "presented_media" && b.title === "Side-channel gallery"));
+  const fileAt = ctrl.events.findIndex((e) => e.type === "session" && e.session?.id === sid && e.session.file);
+  const startAt = ctrl.events.findIndex((e) => e.type === "out" && e.sessionId === sid && e.line?.includes('"type":"agent_start"'));
+  assert.ok(fileAt >= 0 && fileAt < startAt, "the persisted file must be registered before the first agent_start, not discovered by a later poll");
+  assert.ok(!records.some((r) => r.type === "pipi_session_file"), "file registration is daemon-internal");
   const sessionFile = ctrl.sessions.get(sid)?.file;
   assert.ok(sessionFile && fs.existsSync(sessionFile), "external session file should be written");
   const persisted = fs.readFileSync(sessionFile, "utf8");
@@ -2160,4 +2173,142 @@ process.stdin.on("data", (c) => {
     });
   });
   assert.ok(hello.catalogs?.["local-acp"]?.models?.some((m) => m.id === "pro-2"), "hello carries cached agent catalogs");
+});
+
+test("message_edit from a black-box ACP engine updates repeatedly, restores snapshots and rejects a new user boundary", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-message-edit-"));
+  const homeDir = path.join(tmp, "home");
+  const env = { HOME: tmp, PI_CODING_AGENT_DIR: path.join(tmp, "agent") };
+  const ctrl = await openControl(homeDir, env);
+  let after;
+  t.after(() => {
+    ctrl.client.close();
+    after?.client.close();
+    try { process.kill(JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid, "SIGTERM"); } catch {}
+  });
+  const binaryPath = path.join(__dirname, "..", "dev", "fake-edit-acp.mjs");
+  await ctrl.call("config", { allowAgentTools: true, agents: [{ id: "edit-acp", name: "EditACP", driver: "acp", binaryPath, available: true, enabled: true, supportedRuntimeModes: ["full-access"] }] });
+  const started = await ctrl.call("start_session", { input: { persona: true, agentId: "edit-acp", runtimeMode: "full-access" } });
+  const sid = started.session.id;
+  const ordinary = await ctrl.call("start_session", { input: { agentId: "edit-acp", cwd: tmp, runtimeMode: "full-access", message: "edit-summary" } });
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(ordinary.session.id)).lastAnswer === "Edit rejected; new reply.");
+  await ctrl.call("attach", { session: { id: sid } });
+  const run = async (message, id) => {
+    ctrl.events.length = 0;
+    ctrl.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id, type: "prompt", message }) });
+    await ctrl.waitUntil(() => ctrl.events.some((event) => event.type === "out" && event.sessionId === sid && event.line?.includes('"type":"agent_settled"')));
+  };
+  const records = () => ctrl.events.filter((event) => event.type === "out" && event.sessionId === sid).map((event) => JSON.parse(event.line));
+  const snapshot = async () => {
+    ctrl.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "snapshot", type: "get_messages" }) });
+    await ctrl.waitUntil(() => records().some((record) => record.id === "snapshot"));
+    return records().find((record) => record.id === "snapshot").data.messages;
+  };
+  await run("hello", "first");
+  const echoed = records().find((record) => record.type === "message_end" && record.message?.role === "user");
+  assert.equal(echoed.message.content.map((block) => block.text || "").join("\n").replace(/^<pipi-persona\b[^>]*>[\s\S]*?<\/pipi-persona>\s*/, ""), "hello");
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.file);
+  const file = ctrl.sessions.get(sid).file;
+  const envelope = '<pipi-message from="child" title="Worker" agent="ACP" status="idle">edit-summary</pipi-message>';
+  await run(envelope, "d_background");
+  const updates = records().filter((record) => record.type === "message_edit");
+  assert.equal(updates.length, 7, JSON.stringify(records()));
+  assert.equal(updates.at(-1).versions.length, 8);
+  assert.equal(updates.at(-1).versions[0].content, "Initial summary.");
+  assert.equal((await ctrl.readMessages(sid)).lastAnswer, "Consolidated progress 7.\n\nAll details together.");
+  const messages = await snapshot();
+  assert.equal(messages.filter((message) => message.versions).length, 1);
+  assert.equal(messages.find((message) => message.versions).versions.length, 8);
+  assert.ok(!messages.some((message) => message.content?.some?.((block) => block.text === "<no-reply/>")));
+  assert.equal(fs.readFileSync(`${file}.pipi-edits.jsonl`, "utf8").trim().split("\n").length, 7);
+  ctrl.events.length = 0;
+  ctrl.client.send({ type: "in", sessionId: ordinary.session.id, line: JSON.stringify({ id: "callback", type: "prompt", message: `deliver-to:${sid}` }) });
+  await ctrl.waitUntil(() => records().some((record) => record.type === "agent_settled"));
+  const repeated = records().filter((record) => record.type === "message_edit");
+  assert.equal(repeated.length, 7);
+  assert.equal(repeated.at(-1).versions.length, 15);
+  assert.ok(records().some((record) => record.type === "message_end" && record.message?.content?.some((block) => block.text === "Please review this decision.")));
+  assert.equal((await ctrl.readMessages(sid)).lastAnswer, "Please review this decision.");
+  await run("edit-summary", "new-user");
+  assert.equal(records().filter((record) => record.type === "message_edit").length, 0);
+  assert.ok(records().some((record) => record.type === "message_end" && record.message?.content?.some((block) => block.text === "Edit rejected; new reply.")));
+  await ctrl.call("detach", { sessionId: sid });
+  const activeAt = ctrl.sessions.get(sid).lastActive;
+  ctrl.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "d_unread_background", type: "prompt", message: envelope }) });
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.status === "idle" && ctrl.sessions.get(sid)?.lastActive > activeAt && ctrl.sessions.get(sid)?.unread === true);
+  assert.equal((await ctrl.readMessages(sid)).lastAnswer, "Consolidated progress 7.\n\nAll details together.");
+  const inst = JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8"));
+  ctrl.client.close();
+  process.kill(inst.pid, "SIGTERM");
+  await new Promise((resolve) => {
+    const timer = setInterval(() => { try { process.kill(inst.pid, 0); } catch { clearInterval(timer); resolve(); } }, 25);
+  });
+  after = await openControl(homeDir, env);
+  await after.call("attach", { session: { id: sid } });
+  after.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "replay", type: "get_messages" }) });
+  await after.waitUntil(() => after.events.some((event) => event.type === "out" && event.line?.includes('"id":"replay"')));
+  const replay = JSON.parse(after.events.find((event) => event.type === "out" && event.line?.includes('"id":"replay"')).line).data.messages;
+  assert.deepEqual(replay.find((message) => message.versions).versions, repeated.at(-1).versions);
+});
+
+test("Pip switches engines as a singleton and launch choices reach Devin before the first prompt", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-persona-engine-"));
+  const home = path.join(tmp, "home");
+  const ctrl = await openControl(home, { HOME: tmp, FAKE_DEVIN_DEFAULT_MODEL: "adaptive", FAKE_DEVIN_ACP_LOG: path.join(tmp, "devin.jsonl") });
+  t.after(() => {
+    ctrl.client.close();
+    try { process.kill(JSON.parse(fs.readFileSync(path.join(home, "daemon.json"), "utf8")).pid, "SIGTERM"); } catch {}
+  });
+  const mock = writeMockAgent(tmp);
+  await configureMockAgents(ctrl, mock);
+  const { session: original } = await ctrl.call("start_session", { input: { persona: true, agentId: "pi", message: "echo:original" } });
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(original.id)).lastAnswer?.includes("echo:original"));
+  const { session: delegated } = await ctrl.call("start_session", { input: { parentId: original.id, agentId: "pi", title: "Pip's child", cwd: tmp } });
+  const personaDir = original.cwd;
+  fs.writeFileSync(path.join(personaDir, "PERSONA.md"), "# Mochi\n\nKeep this identity.\n");
+  fs.writeFileSync(path.join(personaDir, "MEMORY.md"), "Remember the exact tea.\n");
+  const fakeDevin = { id: "devin", name: "Devin", command: process.execPath, args: [path.join(__dirname, "..", "dev", "fake-devin-acp.mjs")] };
+  await ctrl.call("config", { agents: [{ id: "devin", name: "Devin", driver: "acp", customAgent: fakeDevin }, { id: "pi", name: "Pi", driver: "pi", binaryPath: mock }] });
+  const { session: pip } = await ctrl.call("start_session", { input: { persona: true, replacePersona: original.id, agentId: "devin", model: "devin/swe-2-1-max", thinking: "max", message: "hello" } });
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(pip.id)).lastAnswer?.includes('"effort":"max"'));
+  const result = JSON.parse((await ctrl.readMessages(pip.id)).lastAnswer);
+  assert.equal(result.model, "swe-2-1-medium");
+  assert.equal(result.effort, "max");
+  assert.equal(result.speed, "standard");
+  assert.match(JSON.stringify(result.prompt), /pipi-persona/);
+  assert.match(JSON.stringify(result.prompt), /Keep this identity/);
+  assert.match(JSON.stringify(result.prompt), /Remember the exact tea/);
+  await new Promise((resolve) => setTimeout(resolve, 1700));
+  const list = (await ctrl.call("list")).sessions;
+  assert.equal(list.filter((s) => s.persona).length, 1);
+  assert.ok(!list.some((s) => s.id === original.id));
+  assert.equal(list.find((s) => s.id === delegated.id)?.parentId, pip.id);
+  assert.equal(fs.readFileSync(path.join(personaDir, "MEMORY.md"), "utf8"), "Remember the exact tea.\n");
+  await assert.rejects(ctrl.call("start_session", { input: { persona: true, replacePersona: original.id, agentId: "pi" } }), /already runs as/);
+  const ext = await ctrl.call("external_token");
+  const response = await fetch(ext.url, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${ext.token}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "session_start", arguments: { title: "exact Devin model", agent: "devin", cwd: tmp, model: "devin/swe-2-1-medium", thinking: "max", message: "verify config", detached: true } } }),
+  });
+  const reply = await response.json();
+  const childId = JSON.parse(reply.result.content[0].text).id;
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(childId)).lastAnswer?.includes('"effort":"max"'));
+  const child = JSON.parse((await ctrl.readMessages(childId)).lastAnswer);
+  assert.equal(child.model, "swe-2-1-medium");
+  assert.equal(child.speed, "standard");
+  assert.ok(!JSON.stringify(child.prompt).includes("pipi-persona"));
+  await ctrl.call("set_session_choices", { sessionId: pip.id, input: { model: "devin/gpt-6-sol-medium", modelConfigs: { speed: "fast" }, thinking: "high" } });
+  await ctrl.call("send", { sessionId: pip.id, message: "after config" });
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(pip.id)).lastAnswer?.includes('"speed":"fast"'));
+  const switched = JSON.parse((await ctrl.readMessages(pip.id)).lastAnswer);
+  assert.equal(switched.model, "gpt-6-sol-medium");
+  assert.equal(switched.effort, "high");
+  const savedHeader = JSON.parse(fs.readFileSync(ctrl.sessions.get(pip.id).file, "utf8").split("\n")[0]);
+  assert.equal(savedHeader.model.id, "gpt-6-sol-medium");
+  assert.equal(savedHeader.thinkingLevel, "high");
+  const { session: bad } = await ctrl.call("start_session", { input: { agentId: "devin", cwd: tmp, model: "devin/not-a-model", message: "must not run" } });
+  await ctrl.waitUntil(() => ctrl.sessions.get(bad.id)?.status === "failed");
+  assert.match(ctrl.sessions.get(bad.id).error, /Model not found/);
+  assert.equal((await ctrl.readMessages(bad.id)).lastAnswer, "");
 });
