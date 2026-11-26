@@ -101,6 +101,11 @@ function PipStatusCard(props: {
   onPointerEnter: () => void;
   onPointerLeave: () => void;
   onOpenSession: (id: string) => void;
+  /** Whether the hovered turn's process is unfolded in the stream. */
+  processOpen?: () => boolean;
+  /** Folds or unfolds the hovered turn's process into the stream. The card stays open:
+   * closing it under the pointer lands the pointer back on the avatar, which is a hover loop. */
+  onToggleProcess?: () => void;
 }) {
   const status = pipLiveStatus;
   const now = signal(Date.now());
@@ -145,6 +150,9 @@ function PipStatusCard(props: {
     if (meta.summary) parts.push(meta.summary);
     return parts.join(" · ");
   };
+
+  /** The one door to a settled turn's process lives here, on the avatar's card: the stream itself stays clean. */
+  const showProcessToggle = () => !status().active && props.turnMeta?.()?.hasDetails === true && props.onToggleProcess !== undefined;
 
   return (
     <View
@@ -229,9 +237,35 @@ function PipStatusCard(props: {
         </View>
       </If>
 
-      {/* Idle turn metadata (when hovering a delivered message's Pip avatar while Pip is at rest) */}
-      <If when={idleTurnLine()}>
-        <Text class={`border-t border-hairline pt-2 ${uiType("xs")} text-muted-foreground`}>{idleTurnLine()}</Text>
+      {/* Idle turn metadata (when hovering a delivered message's Pip avatar while Pip is at rest):
+          how long it took and what it did, plus the one door to its process in the stream. */}
+      <If when={idleTurnLine() || showProcessToggle()}>
+        <View class="gap-1 border-t border-hairline pt-2">
+          <If when={idleTurnLine()}>
+            <Text class={`${uiType("xs")} text-muted-foreground`}>{idleTurnLine()}</Text>
+          </If>
+          <If when={showProcessToggle()}>
+            <BaseButton
+              testID="pip-process-toggle"
+              onPress={() => props.onToggleProcess?.()}
+              accessibilityLabel={
+                (props.processOpen?.() ?? false) ? tr("Hide process", "收起过程") : tr("Show process", "查看过程")
+              }
+              class={`-ml-1.5 self-start flex-row items-center gap-1 rounded-md corner-squircle px-1.5 py-0.5 ${PRESS} ${FOCUS_RING} hover:bg-accent active:bg-accent`}
+            >
+              <View
+                class={`transition-transform duration-200 ease-out-quint motion-reduce:transition-none ${
+                  (props.processOpen?.() ?? false) ? "rotate-90" : ""
+                }`}
+              >
+                <Icon name="chevronRight" size={11} tone="subtle" />
+              </View>
+              <Text class={`${uiType("xs")} text-muted-foreground`}>
+                {(props.processOpen?.() ?? false) ? tr("Hide process", "收起过程") : tr("Show process", "查看过程")}
+              </Text>
+            </BaseButton>
+          </If>
+        </View>
       </If>
 
       {/* Quiet engine/model caption when idle */}
@@ -253,6 +287,10 @@ export function PipAvatarBadge(props: {
   rowId?: () => string;
   /** Optional metadata for a delivered turn (shown when hovering at rest). */
   turnMeta?: () => PipTurnMeta | undefined;
+  /** Whether this turn's process is unfolded in the stream (the card's toggle reads it). */
+  processOpen?: () => boolean;
+  /** Folds or unfolds this turn's process into the stream. */
+  onToggleProcess?: () => void;
   testID?: string;
 }) {
   const open = signal(false);
@@ -366,6 +404,8 @@ export function PipAvatarBadge(props: {
           open.set(false);
           void openDaemonSession(id);
         }}
+        processOpen={props.processOpen}
+        onToggleProcess={props.onToggleProcess}
       />
     </Popover>
   );
@@ -521,53 +561,14 @@ function PipSessionChip(props: { session: PipDelegatedSession }) {
   );
 }
 
-/** Quiet IM message footer: Copy action + optional low-presence collapsible process disclosure. */
+/** Quiet IM message footer: the Copy action, nothing else. A turn's process is the avatar card's to show. */
 export function PipFooterView(props: {
   row: PipFooterRow;
   renderCopy: (id: string, text: string) => JSX.Element;
-  onToggleProcess: (turnId: string, open: boolean) => void;
 }) {
-  const detailsLabel = () => {
-    const zh = activeLanguage() === "zh";
-    const steps = props.row.stepCount;
-    const stepText =
-      steps > 0
-        ? zh
-          ? `${steps} 步过程`
-          : `${steps} ${steps === 1 ? "step" : "steps"}`
-        : tr("Details", "过程记录");
-    if (props.row.durationMs !== undefined && props.row.durationMs >= 1000) {
-      return `${stepText} · ${spokenDuration(props.row.durationMs, zh)}`;
-    }
-    return stepText;
-  };
-
   return (
     <View class="h-6 select-none flex-row items-center gap-2">
-      <If when={props.row.text}>
-        <View class="-ml-1">{props.renderCopy(props.row.id, props.row.text)}</View>
-      </If>
-      <If when={props.row.hasDetails}>
-        <View
-          role="button"
-          testID="pip-process-toggle"
-          onPress={() => props.onToggleProcess(props.row.turnId, props.row.open)}
-          accessibilityState={{ expanded: props.row.open }}
-          accessibilityLabel={props.row.open ? tr("Hide details", "收起过程") : tr("Show details", "查看过程")}
-          class={`group h-5 flex-row items-center gap-1 rounded-md corner-squircle px-1.5 ${PRESS} ${FOCUS_RING} hover:bg-accent`}
-        >
-          <Text class={`${uiType("2xs")} text-subtle transition-colors duration-100 group-hover:text-muted-foreground`}>
-            {detailsLabel()}
-          </Text>
-          <View
-            class={`transition-transform duration-200 ease-out-quint motion-reduce:transition-none ${
-              props.row.open ? "rotate-90" : ""
-            }`}
-          >
-            <Icon name="chevronRight" size={11} tone="subtle" />
-          </View>
-        </View>
-      </If>
+      <View class="-ml-1">{props.renderCopy(props.row.id, props.row.text)}</View>
     </View>
   );
 }

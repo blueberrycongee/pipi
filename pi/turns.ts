@@ -99,7 +99,8 @@ export interface TurnHeaderRow {
 export interface PipTurnMeta {
   turnId: string;
   durationMs?: number;
-  stepCount: number;
+  /** There is a process behind the message the avatar's status card can unfold into the stream. */
+  hasDetails: boolean;
   summary?: string;
 }
 
@@ -130,13 +131,7 @@ export interface PipSessionsRow {
 export interface PipFooterRow {
   kind: "pip-footer";
   id: string;
-  turnId: string;
   text: string;
-  open: boolean;
-  hasDetails: boolean;
-  stepCount: number;
-  durationMs?: number;
-  summary?: string;
   pip?: PipRowSlot;
 }
 
@@ -1145,17 +1140,18 @@ export function buildDisplayRows(
 
       const delegated = extractDelegatedSessions(turnTools);
       const hasDetails = remainingProcess.length > 0;
-      if (messages.length === 0 && surfacedMedia.length === 0 && delegated.length === 0 && !hasDetails) continue;
+      // A turn with nothing to say takes no row: a run cut short before a word
+      // was written leaves no hollow seat behind.
+      if (messages.length === 0 && surfacedMedia.length === 0 && delegated.length === 0) continue;
 
       const summary = turnTools.length > 0 ? describeToolsSummary(turnTools, lang) : undefined;
-      const stepCount = turnTools.length || remainingProcess.length;
       const turnMeta: PipTurnMeta = {
         turnId: id,
         ...(durationMs !== undefined ? { durationMs } : {}),
-        stepCount,
+        hasDetails,
         ...(summary ? { summary } : {}),
       };
-      // Process details stay quietly collapsed by default; only an explicit user click opens them.
+      // The process stays out of the stream unless the reader unfolds it from the avatar's status card.
       const open = folds.chosen?.(id) ?? false;
       let leadPlaced = false;
       const claimSlot = (): PipRowSlot => {
@@ -1180,18 +1176,12 @@ export function buildDisplayRows(
       }
 
       const copyText = messages.map((m) => m.text).join("\n\n");
-      if (copyText || hasDetails) {
+      if (copyText) {
         out.push({
           kind: "pip-footer",
           id: `pipfoot:${first.id}`,
-          turnId: id,
           text: copyText,
-          open,
-          hasDetails,
-          stepCount,
-          ...(durationMs !== undefined ? { durationMs } : {}),
-          ...(summary ? { summary } : {}),
-          pip: leadPlaced ? { lead: false, indent: true, meta: turnMeta } : claimSlot(),
+          pip: { lead: false, indent: true, meta: turnMeta },
         });
       }
 
@@ -1277,7 +1267,7 @@ function samePipSlot(a?: PipRowSlot, b?: PipRowSlot): boolean {
     a.indent === b.indent &&
     a.meta?.turnId === b.meta?.turnId &&
     a.meta?.durationMs === b.meta?.durationMs &&
-    a.meta?.stepCount === b.meta?.stepCount &&
+    a.meta?.hasDetails === b.meta?.hasDetails &&
     a.meta?.summary === b.meta?.summary
   );
 }
@@ -1307,16 +1297,7 @@ function sameRow(a: DisplayRow, b: DisplayRow): boolean {
     );
   }
   if (a.kind === "pip-footer" && b.kind === "pip-footer") {
-    return (
-      a.turnId === b.turnId &&
-      a.text === b.text &&
-      a.open === b.open &&
-      a.hasDetails === b.hasDetails &&
-      a.stepCount === b.stepCount &&
-      a.durationMs === b.durationMs &&
-      a.summary === b.summary &&
-      samePipSlot(a.pip, b.pip)
-    );
+    return a.text === b.text && samePipSlot(a.pip, b.pip);
   }
   if (a.kind === "activity" && b.kind === "activity") return a.live === b.live && a.mayGrow === b.mayGrow && sameList(a.steps, b.steps);
   if (a.kind === "turn" && b.kind === "turn") {

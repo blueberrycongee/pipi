@@ -11,6 +11,8 @@
 
 pipi is a cross-platform native desktop app (no Electron) that gathers the coding agents already installed on your machine into one window. Sign-ins, subscriptions, API keys, and session history all carry over. If an agent runs in your terminal, pipi can drive it.
 
+> Note: pipi is still in its early days and may not be very stable — it's a toy project the author built to try out the [nsh](https://nsh.dev) framework.
+
 ## Highlights
 
 - Built-in support for **18 coding agents**, plus any ACP-compatible command

@@ -1296,6 +1296,7 @@ export function Chat() {
   cleanup(endSelecting);
 
   const foot = computed(() => footOf(figure()), { equals: (a, b) => a.end === b.end });
+  const activityMaxHeight = computed(() => Math.min(320, Math.max(0, (viewHeight() - topBarHeight() - foot().end) / 2)));
 
   // A released view holds its offset, so the list reports no scroll while the
   // reply grows under it, and the distance last reported goes stale: a reader
@@ -1700,7 +1701,7 @@ export function Chat() {
                       </If>
                     }
                   >
-                    {(row) => <TranscriptRow row={row()} />}
+                    {(row) => <TranscriptRow row={row()} activityMaxHeight={activityMaxHeight()} />}
                   </List>
                 );
               }}

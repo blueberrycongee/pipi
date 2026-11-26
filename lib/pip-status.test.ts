@@ -219,12 +219,13 @@ test("buildDisplayRows in persona mode hides in-flight streaming/tools and deliv
   expect(sessionsRow.kind === "pip-sessions" && sessionsRow.pip?.lead).toBe(false);
   expect(sessionsRow.kind === "pip-sessions" && sessionsRow.pip?.indent).toBe(true);
   const footer = pipSettled[3];
-  expect(footer.kind === "pip-footer" && footer.open).toBe(false);
-  expect(footer.kind === "pip-footer" && footer.hasDetails).toBe(true);
-  expect(footer.kind === "pip-footer" && footer.durationMs).toBe(4200);
+  expect(footer.kind === "pip-footer" && footer.text).toBe("All set! I started a session to fix the login tests.");
+  // The turn's metadata rides on the avatar's slot: the status card reads it, the stream carries no pill of it.
+  expect(footer.kind === "pip-footer" && footer.pip?.meta?.hasDetails).toBe(true);
+  expect(footer.kind === "pip-footer" && footer.pip?.meta?.durationMs).toBe(4200);
 
   // Explicitly opening the turn's process details reveals the underlying steps cleanly.
-  const turnId = footer.kind === "pip-footer" ? footer.turnId : "";
+  const turnId = footer.kind === "pip-footer" ? (footer.pip?.meta?.turnId ?? "") : "";
   const processOf = new Map<string, string>();
   const pipExpanded = buildDisplayRows(
     settledRows,

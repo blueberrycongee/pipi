@@ -2,9 +2,9 @@ import { batch, Clipboard, cleanup, createAnimatedValue, effect, keymap, Overlay
 import type { AnimatedValue, ContextMenuEvent, GestureResponderEvent, InputRef, MouseEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input } from "nsh/base";
 import { Menu, type MenuItem } from "nsh/desktop";
-import { basename } from "../lib/format";
-import { titleBarArea } from "../lib/layout";
+import { TITLE_BAR_HEIGHT, titleBarArea } from "../lib/layout";
 import { tr } from "../lib/i18n";
+import { Pip } from "../mascot/Pip";
 import type { DaemonSession } from "../pi/daemon";
 import {
   cancelRenaming,
@@ -12,8 +12,6 @@ import {
   currentParentSession,
   currentTitle,
   currentView,
-  gitWorkspaceInfo,
-  isChatFolder,
   isSwitching,
   isCurrentSessionArchived,
   isRenaming,
@@ -25,7 +23,6 @@ import {
   startRenaming,
   unarchiveCurrentSession,
   wallpaper,
-  workspacePath,
 } from "../store/app";
 import { docTabTitle, revealDoc } from "../store/docs";
 import { stripTabWidth, TAB_GAP, tabWidthBounds } from "../lib/strip-width";
@@ -123,7 +120,7 @@ function StatusMark(props: { session: () => DaemonSession | undefined }) {
     <If when={hasAny()}>
       <View class="relative mr-0.5 size-3.5 shrink-0 items-center justify-center">
         <Presence show={working() && !blocked()} accessibilityLabel={tr("Running in the background", "后台运行中")}>
-          <View class="size-[5px] rounded-full bg-brand" />
+          <Pip size={14} mood="work" />
         </Presence>
         <Presence
           show={blocked()}
@@ -1003,14 +1000,6 @@ export function TabBar() {
   const parent = () => currentParentSession();
   const worktree = () => currentDaemonSession()?.worktree;
   const chatActive = () => currentView().name === "chat";
-  const cwdName = () => {
-    const cwd = workspacePath();
-    return cwd && !isChatFolder(cwd) ? basename(cwd) : "";
-  };
-  const gitBranch = () => {
-    const info = gitWorkspaceInfo();
-    return info.isGitRepo && info.branch ? info.branch : "";
-  };
 
   return (
     <View
@@ -1018,7 +1007,7 @@ export function TabBar() {
       class={`absolute inset-x-0 top-0 z-20 flex-row items-center gap-1 pr-3 ${wallpaper() ? "" : HEADER_GLASS}`}
       style={{
         ...(wallpaper() ? undefined : GLASS_REGULAR),
-        height: titleBarArea().height || 44,
+        height: TITLE_BAR_HEIGHT,
         paddingLeft: sidebarOpen() ? 12 : (titleBarArea().left ? titleBarArea().left + 12 : 12),
       }}
       onMouseMove={(e: MouseEvent) => {
@@ -1141,15 +1130,6 @@ export function TabBar() {
               )}
             </If>
           </Presence>
-          <If when={!worktree() && !parent() && !isCurrentSessionArchived() && Boolean(cwdName())}>
-            <View class="shrink-0 flex-row items-center gap-1.5 pr-1">
-              <Text class={`max-w-36 truncate ${uiType("xs")} text-subtle`}>{cwdName()}</Text>
-              <If when={Boolean(gitBranch())}>
-                <Text class={`${uiType("2xs")} text-subtle/60`}>/</Text>
-                <Text class={`max-w-28 truncate font-mono ${uiType("2xs")} text-subtle/75`}>{gitBranch()}</Text>
-              </If>
-            </View>
-          </If>
         </View>
       </If>
     </View>

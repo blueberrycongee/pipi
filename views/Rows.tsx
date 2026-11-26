@@ -1062,26 +1062,27 @@ function ReasoningBody(props: { text: string }) {
   );
 }
 
-/** Output in a sunken, scrollable block: monospaced, selectable, bounded. */
-function Output(props: { text: string; command?: string; tone?: "error"; insetClass?: string }) {
+/** Grouped output scrolls with its steps; a standalone shell result owns its scroll. */
+function Output(props: { text: string; command?: string; tone?: "error"; insetClass?: string; standalone?: boolean }) {
   const shown = () => clip(props.text, 400);
+  const body = () => (
+    <View class="p-3">
+      <If when={props.command}>
+        <Text class={`font-mono ${codeType()} leading-relaxed text-subtle ${shown().text ? "pb-2" : ""}`}>{`$ ${props.command}`}</Text>
+      </If>
+      <If when={!props.command || !!shown().text}>
+        <Text class={`font-mono ${codeType()} leading-relaxed ${props.tone === "error" ? "text-destructive" : "text-muted-foreground"}`}>
+          {shown().text || tr("No output.", "无输出。")}
+        </Text>
+      </If>
+      <If when={shown().hidden > 0}>
+        <Text class={`pt-2 ${uiType("xs")} text-subtle`}>{tr(`${shown().hidden} more lines not shown`, `另有 ${shown().hidden} 行未显示`)}</Text>
+      </If>
+    </View>
+  );
   return (
     <View selectable class={`mb-1 mt-0.5 overflow-hidden rounded-lg corner-squircle border border-border bg-sunken ${props.insetClass ?? "ml-6"}`}>
-      <Scroll class="max-h-72" contentClass="p-3">
-        <View>
-          <If when={props.command}>
-            <Text class={`font-mono ${codeType()} leading-relaxed text-subtle ${shown().text ? "pb-2" : ""}`}>{`$ ${props.command}`}</Text>
-          </If>
-          <If when={!props.command || !!shown().text}>
-            <Text class={`font-mono ${codeType()} leading-relaxed ${props.tone === "error" ? "text-destructive" : "text-muted-foreground"}`}>
-              {shown().text || tr("No output.", "无输出。")}
-            </Text>
-          </If>
-        </View>
-        <If when={shown().hidden > 0}>
-          <Text class={`pt-2 ${uiType("xs")} text-subtle`}>{tr(`${shown().hidden} more lines not shown`, `另有 ${shown().hidden} 行未显示`)}</Text>
-        </If>
-      </Scroll>
+      {props.standalone ? <Scroll class="max-h-72">{body()}</Scroll> : body()}
     </View>
   );
 }
@@ -1212,7 +1213,7 @@ function ToolCallRow(props: { row: ToolRow; compact?: boolean }) {
  * settled. It unfolds to the reasoning or the call's output when it holds one
  * step, else to each step in the order they happened.
  */
-function ActivityView(props: { row: ActivityRow }) {
+function ActivityView(props: { row: ActivityRow; maxHeight: number }) {
   const open = () => isOpen(props.row.id, false);
   const title = () => describeActivity(props.row, activeLanguage());
   const breathOpacity = useBreathingOpacity(() => props.row.live === true);
@@ -1244,29 +1245,31 @@ function ActivityView(props: { row: ActivityRow }) {
       open={open() && hasBody()}
       reveal
       content={
-        <If
-          when={only()}
-          else={
-            <View class="mb-1 gap-0.5 py-0.5">
-              <Each of={props.row.steps} key={(step) => step.id}>
-                {(step) => (
-                  <If
-                    when={step().kind === "thinking" ? (step() as Extract<Row, { kind: "thinking" }>) : undefined}
-                    else={<ToolCallRow row={step() as ToolRow} compact />}
-                  >
-                    {(thinking) => <ThinkingRow row={thinking()} compact defaultOpen={props.row.tools.length === 0} />}
-                  </If>
-                )}
-              </Each>
-            </View>
-          }
-        >
-          {(step) => (
-            <If when={step().kind === "thinking" ? (step() as Extract<Row, { kind: "thinking" }>) : undefined} else={<ToolDetail row={step() as ToolRow} insetClass="ml-0" />}>
-              {(thinking) => <ReasoningBody text={thinking().text} />}
-            </If>
-          )}
-        </If>
+        <Scroll testID="activity-details" style={{ maxHeight: props.maxHeight }}>
+          <If
+            when={only()}
+            else={
+              <View class="mb-1 gap-0.5 py-0.5">
+                <Each of={props.row.steps} key={(step) => step.id}>
+                  {(step) => (
+                    <If
+                      when={step().kind === "thinking" ? (step() as Extract<Row, { kind: "thinking" }>) : undefined}
+                      else={<ToolCallRow row={step() as ToolRow} compact />}
+                    >
+                      {(thinking) => <ThinkingRow row={thinking()} compact defaultOpen={props.row.tools.length === 0} />}
+                    </If>
+                  )}
+                </Each>
+              </View>
+            }
+          >
+            {(step) => (
+              <If when={step().kind === "thinking" ? (step() as Extract<Row, { kind: "thinking" }>) : undefined} else={<ToolDetail row={step() as ToolRow} insetClass="ml-0" />}>
+                {(thinking) => <ReasoningBody text={thinking().text} />}
+              </If>
+            )}
+          </If>
+        </Scroll>
       }
     >
       <View class="flex-row items-center gap-1.5">
@@ -1391,7 +1394,7 @@ function BashRow(props: { row: Extract<Row, { kind: "bash" }> }) {
           ? tr("truncated", "已截断")
           : "";
   return (
-    <Collapsible open={open()} reveal content={<Output text={props.row.output} />}>
+    <Collapsible open={open()} reveal content={<Output text={props.row.output} standalone />}>
       <Disclosure open={open()} onPress={() => toggle(props.row.id, true)}>
         <LeadGlyph id={props.row.id} running={running()} error={error()} icon="terminal" />
         <RollingText
@@ -1567,7 +1570,7 @@ const SPACING: Record<ChatRow["kind"], string> = {
 };
 
 /** One row of the transcript. */
-export function TranscriptRow(props: { row: ChatRow }) {
+export function TranscriptRow(props: { row: ChatRow; activityMaxHeight: number }) {
   const pipSlot = (): PipRowSlot | undefined => ("pip" in props.row ? props.row.pip : undefined);
   const isPipProcess = () => isPersonaSession() && processTurns.has(props.row.id);
   const isStreamingRow = () =>
@@ -1575,7 +1578,8 @@ export function TranscriptRow(props: { row: ChatRow }) {
     (props.row.kind === "thinking" && props.row.streaming) ||
     (props.row.kind === "activity" && props.row.running);
   const fold = useProcessFold(() => props.row.id);
-  const inProcessRail = () =>
+  /** A row of a turn's process sits one indent in, its words aligned under the running header's own — the grouping is the indent and the quieter face, never a drawn line. */
+  const indentedProcess = () =>
     (props.row.kind === "activity" || props.row.kind === "thinking" || props.row.kind === "bash") && processTurns.has(props.row.id);
   const entrance = useRowEntrance(
     () => props.row.id,
@@ -1597,7 +1601,7 @@ export function TranscriptRow(props: { row: ChatRow }) {
     <>
       <If when={of("user")}>{(row) => <UserRow row={row()} />}</If>
       <If when={of("turn")}>{(row) => <TurnHeaderView row={row()} />}</If>
-      <If when={of("activity")}>{(row) => <ActivityView row={row()} />}</If>
+      <If when={of("activity")}>{(row) => <ActivityView row={row()} maxHeight={props.activityMaxHeight} />}</If>
       <If when={of("prose")}>{(row) => <ProseBlock row={row()} />}</If>
       <If when={of("media")}>{(row) => <MediaGallery title={row().title} items={row().items} />}</If>
       <If when={of("pip-sessions")}>{(row) => <PipSessionsView row={row()} />}</If>
@@ -1606,7 +1610,6 @@ export function TranscriptRow(props: { row: ChatRow }) {
           <PipFooterView
             row={row()}
             renderCopy={(id, text) => <CopyButton id={id} text={text} label={tr("Copy reply", "复制回复")} />}
-            onToggleProcess={(turnId, open) => toggleTurn(turnId, open, false)}
           />
         )}
       </If>
@@ -1625,7 +1628,7 @@ export function TranscriptRow(props: { row: ChatRow }) {
       reveal={fold.reveal()}
       content={
         <View class={`w-full max-w-180 self-center ${spacing()}${fold.open() ? "" : " pointer-events-none"}`} style={entrance}>
-          <View style={fold.style} class={!isPipProcess() && inProcessRail() ? "ml-[9px] border-l border-hairline pl-4" : undefined}>
+          <View style={fold.style} class={!isPipProcess() && indentedProcess() ? "pl-7" : undefined}>
             <If
               when={pipSlot()?.lead}
               else={
@@ -1645,7 +1648,18 @@ export function TranscriptRow(props: { row: ChatRow }) {
             >
               <View class="flex-row items-start gap-3">
                 <View class="w-7 shrink-0 pt-0.5">
-                  <PipAvatarBadge rowId={() => props.row.id} turnMeta={() => pipSlot()?.meta} />
+                  <PipAvatarBadge
+                    rowId={() => props.row.id}
+                    turnMeta={() => pipSlot()?.meta}
+                    processOpen={() => {
+                      const turnId = pipSlot()?.meta?.turnId;
+                      return turnId ? (chosen(turnId) ?? false) : false;
+                    }}
+                    onToggleProcess={() => {
+                      const turnId = pipSlot()?.meta?.turnId;
+                      if (turnId) toggleTurn(turnId, chosen(turnId) ?? false, false);
+                    }}
+                  />
                 </View>
                 <View class="min-w-0 flex-1">{renderBody()}</View>
               </View>

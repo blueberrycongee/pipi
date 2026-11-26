@@ -64,6 +64,15 @@ multi-agent orchestration, and settings.
   evenly down to a floor, past which it scrolls, and a close with the
   pointer in the strip holds their width until the pointer leaves, so a run
   of closes keeps its close button under it.
+- Everything across the window's top — the traffic lights, the sidebar's
+  hide button, the pills — centers on one line (`stripLine` in
+  `lib/layout.ts`): half the 44pt strip, plus the sheet's `SHEET_INSET`
+  when no wallpaper floats the sheet below the window's top. macOS keeps
+  its traffic lights centered in the title bar height it reports, so
+  dropping them onto the line (`controlsOffset` in nsh.json, re-aimed per
+  wallpaper by `Shell`'s effect) inflates that report to twice their
+  center — a number nothing may follow: the strips and `topBarHeight` are
+  the fixed `TITLE_BAR_HEIGHT`, never `titleBarArea().height`.
 - A chat needs no project. 闲聊 lives as a special built-in workspace inside
   工作区 (and in the welcome folder picker) — never crowding 新会话 at the
   sidebar's top — starting a session in `<dataDir>/chat/` (`chatFolder` in
@@ -241,6 +250,13 @@ multi-agent orchestration, and settings.
   zoom layer (`ui/Zoom.tsx`, the one preview surface — a `TextView` image
   press lands there too); Escape or its close button leaves it
   (`--target macos` films `.nsh/shots/zoom-*.png`)
+- `nsh test ZoomImage.test.tsx` — the zoom layer's image viewer
+  (`views/ZoomImage.tsx`, math in `lib/image-zoom.ts` with its own unit test)
+  on its stage (`dev/ZoomStage.tsx`): the pill steps and snaps onto the
+  picture's own pixels, a double press dives and returns at the point pressed,
+  a drag pans pixel-exact, the keys play from the open — headless never types
+  plain keys into views, so the key steps probe once and skip where silent
+  (`--target macos` films `.nsh/shots/zoomimg-*.png`)
 - `nsh test Media.test.tsx --target macos` — inline media in the message stream
   (`views/Media.tsx`, `lib/media.ts`): local images/galleries, video/audio
   players, PDF/deliverable cards, safe remote-URL cards, user `<attachment>`

@@ -89,21 +89,20 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
   await app.hover("id:sidebar-pip");
   await app.wait(300);
 
-  // Once settled, the complete IM message lands whole alongside Pip's message avatar and collapsed process toggle.
+  // Once settled, the complete IM message lands whole alongside Pip's message avatar.
+  // The stream itself carries no process pill: it stays clean, the steps stay hidden.
   await app.waitUntil(() => showsInChat(app, "Everything else is as it was, and the tests pass."), { timeout: 10_000 });
   expect(app.count("id:pip-message-avatar")).toBeGreaterThanOrEqual(1);
-  expect(app.count("id:pip-process-toggle")).toBe(1);
-  // Process steps stay hidden by default until explicitly expanded.
+  expect(app.count("id:pip-process-toggle")).toBe(0);
   expect(showsInChat(app, "The list follows by hand. Let me check the tests before changing it.")).toBe(false);
 
-  // Hovering the delivered message's Pip avatar opens the consistent status card (idle + turn summary).
+  // Hovering the delivered message's Pip avatar opens the consistent status card (idle + turn summary),
+  // which carries the one door to the turn's process.
   await app.hover("id:pip-message-avatar");
   await app.waitFor("id:pip-status-card");
   expect(app.count("id:pip-status-card >> text:Ready")).toBeGreaterThan(0);
 
-  // Move pointer away and click the low-presence process disclosure to expand & collapse underlying details.
-  await app.hover("id:sidebar-pip");
-  await app.wait(260);
+  // Pressing it unfolds the process into the stream while the card stays open; pressing it again folds it back.
   await app.press("id:pip-process-toggle");
   await app.waitUntil(() => showsInChat(app, "The list follows by hand. Let me check the tests before changing it."));
   await app.press("id:pip-process-toggle");

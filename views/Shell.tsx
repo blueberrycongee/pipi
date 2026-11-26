@@ -16,7 +16,7 @@ import {
 import { AlertDialog } from "nsh/base";
 import { Application, currentWindow, isAvailable, Menu, Window, type WindowRef } from "nsh/desktop";
 import { tr } from "../lib/i18n";
-import { bindWindow, titleBarArea } from "../lib/layout";
+import { bindWindow, SHEET_INSET, TITLE_BAR_HEIGHT, titleBarArea, trafficLightsOffset } from "../lib/layout";
 import { DYNAMIC_WALLPAPER_ENABLED } from "../lib/wallpaper";
 import {
   activeDaemonSessionCount,
@@ -723,6 +723,23 @@ export function Shell() {
     const unbindWindow = bindWindow(win);
     // In an effect, the menu follows what it reads: the sidebar's label, whether Stop applies.
     effect(applicationMenu);
+    // The traffic lights ride on the strip's line: over a wallpaper the sheet
+    // runs edge-to-edge and the line is the strip's own center; without one the
+    // sheet floats SHEET_INSET below the window's top and they follow it down.
+    // The write is untracked: the window's titleBar signal answers it, and a
+    // tracked read of it here would loop the effect.
+    effect(() => {
+      const sheetInset = wallpaper() ? 0 : SHEET_INSET;
+      untracked(() => {
+        win.set({
+          titleBar: {
+            style: "hidden",
+            height: TITLE_BAR_HEIGHT,
+            controlsOffset: trafficLightsOffset(sheetInset),
+          },
+        });
+      });
+    });
     // The close button always routes through `handleWindowClose` — on macOS it
     // flushes documents and hides the window so Dock reopen brings the same
     // session state straight back; elsewhere it confirms active runs before closing.

@@ -106,6 +106,7 @@ never does.
 | Welcome / waking / failure stage (`views/Chat.tsx`) | 96 (welcome) / 80 (waking, failure) | from `pipMood` |
 | Activity line under the transcript (`views/Chat.tsx`) | 22 | from `pipMood`; alone once the run has rows of its own, with words only for what no row says |
 | Running session, draft, child session, or collapsed running project in the sidebar (`views/Sidebar.tsx`) | 16 | work |
+| Running session in the tab strip (`views/TabBar.tsx`) | 14 | work |
 | Pip's own row, pinned above the sidebar's lists (`views/PipRow.tsx`) | 16, still | idle; work while it runs |
 | Empty single-folder sidebar (`views/Sidebar.tsx`) | 40, still | sleep |
 | Update card (`views/UpdateCard.tsx`) | 22 | `idle` / `work` / `happy` along the track |
@@ -544,6 +545,20 @@ need it.
   `alert`, or unread `brand` dot). Hover tooltips carry the engine name and
   workspace/branch; a row whose engine is gone greys the mark.
 - **tip()**: the tooltip.
+- **Zoom layer** (`ui/Zoom.tsx`): the window's one preview surface — what wants
+  more room than its place in the transcript gives it (a wide table, a
+  picture) — given whole in the glass sheet every floating surface shares, a
+  caption and its actions in the strip above. An image there is a viewer, not
+  a picture (`views/ZoomImage.tsx`): it opens exactly fitted, the wheel or a
+  pinch zooms at the pointer continuously, a drag pans what no longer fits, a
+  double press dives to the picture's own pixels and back at the point
+  pressed, and the pill at the foot steps out and in, says the scale and
+  resets — `+` / `−` / `0` and the arrows playing the same on the keyboard.
+  100% is the picture's own pixels, never the fit; steps snap onto it and the
+  fit as they cross, and no zoom or pan ever opens a gap inside the frame —
+  edges win over the anchor a gesture asked for. Transitions are a bounded
+  180ms, interruptible where they visibly are; gestures write compositor
+  values, so a stream of wheel ticks re-renders nothing but the readout.
 - **Reveal / Presence / FloatingLayer / ViewDeck** (`ui/Reveal.tsx`, re-exported from
   `ui/motion.ts`): the standardized enter + exit primitives for flow
   rows/sections and inline marks, plus `FloatingLayer` (in-window glass sheet
@@ -591,9 +606,17 @@ Status mark: `brand` spinner (running), quiet tool/step icon (done), red cross
 
 A turn is headed by its own line — what it is doing while it works, how long
 it took once over — and its process sits under it: open while the turn works,
-folded once it is over, however it ended and wherever the reader is then. A
-press on the header is the reader's say on the fold and holds from then on:
-through the run going on, the next message, and a change of session and back.
+folded once it is over, however it ended and wherever the reader is then. The
+process rows sit one indent in, the steps' words aligned under the running
+header's own and set in the smaller, quieter face — the grouping is the
+indent, the spacing and the fold, never a drawn line; what a step unfolds is
+contained by what it is (a sunken output, quiet prose on a hairline, a list of
+calls), not by a rail around it. Expanded activity details grow to fit, up to
+half the readable pane or 320pt, whichever is smaller. The steps and their
+outputs scroll together below the summary so its fold stays within reach.
+A press on the header is the reader's say on
+the fold and holds from then on: through the run going on, the next message,
+and a change of session and back.
 
 ## Voice
 

@@ -19,7 +19,7 @@ import type { AnimatedValue, ContextMenuEvent, GestureResponderEvent, JSX, Mouse
 import { AlertDialog, Button as BaseButton, Collapsible } from "nsh/base";
 import { Haptics, isAvailable as hapticsAvailable } from "nsh/mobile";
 import { Menu, type MenuItem } from "nsh/desktop";
-import { titleBarArea } from "../lib/layout";
+import { SHEET_INSET, TITLE_BAR_HEIGHT, titleBarArea } from "../lib/layout";
 import { basename, tildePath } from "../lib/format";
 import { tr } from "../lib/i18n";
 import { Pip } from "../mascot/Pip";
@@ -73,6 +73,7 @@ import {
   startRenaming,
   stopDaemonSession,
   unarchiveSession,
+  wallpaper,
   workspaceSessions,
 } from "../store/app";
 import { backend } from "../store/backend";
@@ -1557,7 +1558,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
             accessibilityLabel={tr("Running in the background", "后台运行中")}
             class="absolute inset-0 items-center justify-center"
           >
-            <View class="size-[5.5px] rounded-full bg-brand" />
+            <Pip size={16} mood="work" />
           </Presence>
           <Presence
             show={!startingHere() && collapsedUnread()}
@@ -1707,7 +1708,7 @@ function ChatWorkspaceRow(props: { first: boolean }) {
             accessibilityLabel={tr("Running in the background", "后台运行中")}
             class="absolute inset-0 items-center justify-center"
           >
-            <View class="size-[5.5px] rounded-full bg-brand" />
+            <Pip size={16} mood="work" />
           </Presence>
           <Presence
             show={!startingHere() && collapsedUnread()}
@@ -1838,7 +1839,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
       </View>
       <View class={TRAILING_SLOT} style={{ top: rowTrailingTop() }}>
         <Presence show={running()} testID="sidebar-draft-running" class="items-center justify-center">
-          <View class="size-[5.5px] rounded-full bg-brand" />
+          <Pip size={16} mood="work" />
         </Presence>
       </View>
     </View>
@@ -1905,7 +1906,7 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           accessibilityLabel={backgroundRunning() ? tr("Running in the background", "后台运行中") : undefined}
           class="items-center justify-center"
         >
-          <View class="size-[5.5px] rounded-full bg-brand" />
+          <Pip size={16} mood="work" />
         </Presence>
         <Presence
           show={blocked()}
@@ -2045,7 +2046,7 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
           accessibilityLabel={tr("Running in the background", "后台运行中")}
           class="items-center justify-center"
         >
-          <View class="size-[5.5px] rounded-full bg-brand" />
+          <Pip size={16} mood="work" />
         </Presence>
         <Presence
           show={blocked()}
@@ -2606,11 +2607,18 @@ export function Sidebar() {
     <View class={`size-full ${WALLPAPER_FROST ? "" : "bg-sidebar"}`}>
       {/* A title bar's height where window controls stand at the strip's left
          end — it carries the hide button; elsewhere a slim drag margin, and
-         the hide button rides on 新会话's row instead. */}
+         the hide button rides on 新会话's row instead. The padding centers the
+         button on the sheet strip's line rather than this strip's own: without
+         a wallpaper the sheet floats SHEET_INSET below the window's top, and
+         twice that padding re-centers the remaining room on its line. */}
       <View
         desktop={{ windowDrag: true }}
         class="shrink-0 flex-row items-center justify-end pr-2.5"
-        style={{ height: leftControls() ? titleBarArea().height || 44 : 12, paddingLeft: (titleBarArea().left || 0) + 14 }}
+        style={{
+          height: leftControls() ? TITLE_BAR_HEIGHT : 12,
+          paddingLeft: (titleBarArea().left || 0) + 14,
+          paddingTop: leftControls() && !wallpaper() ? SHEET_INSET * 2 : 0,
+        }}
       >
         <If when={leftControls()}>
           <IconButton icon="sidebar" label={tr("Hide sidebar", "隐藏侧边栏")} shortcut="mod+b" onPress={() => setSidebarOpen(false)} />

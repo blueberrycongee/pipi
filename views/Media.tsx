@@ -14,6 +14,7 @@ import { FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../
 import { tip } from "../ui/Tip";
 import { uiType } from "../ui/typography";
 import { isZoomOpen, openZoom } from "../ui/Zoom";
+import { ZoomImage } from "./ZoomImage";
 
 // ── File probe cache & single-playback coordination ───────────────────────────
 
@@ -215,16 +216,7 @@ export function openMediaZoom(item: MediaItem, startAtSeconds?: number) {
     title: item.title,
     subtitle,
     actions: () => <ZoomActions item={item} />,
-    render: () => (
-      <View class="w-full items-center justify-center">
-        <Image
-          src={src}
-          style={{ width: box.width, height: box.height, objectFit: "contain" }}
-          class="rounded-lg corner-squircle"
-          accessibilityLabel={item.title}
-        />
-      </View>
-    ),
+    render: () => <ZoomImage src={src} title={item.title} natural={natural} box={box} />,
   });
 }
 

@@ -924,7 +924,7 @@ function advanceDocVeil(
  */
 function pipSlotKey(pip?: PipRowSlot): string {
   if (!pip) return "";
-  return `${pip.lead ? 1 : 0}:${pip.indent ? 1 : 0}:${pip.meta?.turnId ?? ""}:${pip.meta?.durationMs ?? ""}:${pip.meta?.stepCount ?? ""}:${pip.meta?.summary ?? ""}`;
+  return `${pip.lead ? 1 : 0}:${pip.indent ? 1 : 0}:${pip.meta?.turnId ?? ""}:${pip.meta?.durationMs ?? ""}:${pip.meta?.hasDetails ? 1 : 0}:${pip.meta?.summary ?? ""}`;
 }
 
 export function proseRows(row: { id: string; text: string; streaming: boolean; pip?: PipRowSlot }): ProseRow[] {

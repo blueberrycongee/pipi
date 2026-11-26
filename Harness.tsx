@@ -117,7 +117,7 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
     fakeBackend({
       noModels: scenario === "connect",
       failStart: scenario === "failed",
-      history: scenario === "history" ? sampleHistory() : [],
+      history: scenario === "history" ? (JSON.parse((await Storage.getItem("harness.history")) ?? "null") ?? sampleHistory()) : [],
       sessions: scenario === "connect" || scenario === "failed" ? [] : sessions,
       workspaceSessions: scenario === "multi" || scenario === "multi-slow" ? workspaceSessions : undefined,
       daemonSessions: JSON.parse((await Storage.getItem("harness.daemonSessions")) ?? "null") ?? undefined,

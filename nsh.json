@@ -1,8 +1,8 @@
 {
   "name": "pipi",
   "id": "dev.pipi.app",
-  "version": "0.2.30",
-  "build": 15,
+  "version": "0.2.31",
+  "build": 16,
   "icon": "icon.png",
   "theme": "theme.json",
   "updater": {
@@ -13,7 +13,7 @@
   "window": {
     "title": "pipi",
     "defaultSize": { "width": 1180, "height": 780 },
-    "titleBar": { "style": "hidden", "height": 44, "controlsOffset": { "x": 16, "y": 14 } }
+    "titleBar": { "style": "hidden", "height": 44, "controlsOffset": { "x": 16, "y": 22.5 } }
   },
   "tailwind": {
     "fontSize": {
