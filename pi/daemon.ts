@@ -2,6 +2,16 @@ import { batch } from "nsh";
 import type { CustomAgentConfig, RuntimeMode, WorktreeInfo } from "../agents/types";
 import type { Exit, Transport } from "./client";
 import { createLineSplitter } from "./jsonl";
+import type { Model, SessionModelConfig, SlashCommand, ThinkingLevel } from "./protocol";
+
+/** Cached engine catalog shared across fresh sessions and windows by the session daemon. */
+export interface AgentCatalog {
+  models: Model[];
+  thinkingLevels: ThinkingLevel[];
+  modelConfigs?: SessionModelConfig[];
+  commands?: SlashCommand[];
+  updatedAt: number;
+}
 
 /**
  * One session as the daemon reports it: the registry entry every client
@@ -45,11 +55,13 @@ export interface DaemonAttachSpec {
   binaryPath?: string;
   extraArgs?: string[];
   customAgent?: CustomAgentConfig;
+  initialChoice?: { model?: { provider: string; id: string }; thinkingLevel?: ThinkingLevel };
 }
 
 export interface DaemonCallbacks {
   onSession(session: DaemonSession): void;
   onSessionRemoved?(sessionId: string): void;
+  onCatalog?(agentId: string, catalog: AgentCatalog): void;
   onExit?(): void;
 }
 
@@ -134,12 +146,24 @@ export class DaemonClient {
     switch (msg.type) {
       case "hello": {
         const list = (msg.sessions as DaemonSession[]) ?? [];
+        const catalogs = msg.catalogs && typeof msg.catalogs === "object" ? (msg.catalogs as Record<string, AgentCatalog>) : undefined;
         this.sessions = new Map(list.map((s) => [s.id, s]));
         batch(() => {
           for (const session of list) this.callbacks.onSession(session);
+          if (catalogs) {
+            for (const [agentId, catalog] of Object.entries(catalogs)) {
+              if (agentId && catalog) this.callbacks.onCatalog?.(agentId, catalog);
+            }
+          }
         });
         this._hello?.resolve();
         this._hello = undefined;
+        return;
+      }
+      case "catalog": {
+        if (typeof msg.agentId === "string" && msg.catalog && typeof msg.catalog === "object") {
+          this.callbacks.onCatalog?.(msg.agentId, msg.catalog as AgentCatalog);
+        }
         return;
       }
       case "session": {
@@ -420,8 +444,20 @@ export class DaemonClient {
     maxRunning?: number;
     worktreeDefault?: boolean;
     linger?: boolean;
+    sessionChoices?: Record<string, { model?: { provider: string; id: string }; thinkingLevel?: ThinkingLevel }>;
+    autoRetry?: boolean;
   }) {
     this.notify("config", config as Record<string, unknown>);
+  }
+
+  /** Asks the daemon to deeply prewarm a standby process for `spec` right away. */
+  prewarm(spec: DaemonAttachSpec) {
+    this.notify("prewarm", { session: spec });
+  }
+
+  /** Drops any cached catalog for `agentId` (after credentials or provider config change). */
+  clearCatalog(agentId: string) {
+    this.notify("clear_catalog", { agentId });
   }
 
   /** The project folders open in the sidebar, which `workspaces_list` names to agents. */

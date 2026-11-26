@@ -1986,3 +1986,178 @@ rl.on("line", async (line) => {
   assert.ok(persisted.includes('"type":"presented_media"'), "persisted JSONL must retain presented_media across reloads");
   assert.ok(persisted.includes('"title":"Side-channel gallery"'));
 });
+
+test("deep prewarm negotiates ACP standby with preferred model/effort, caches catalog on disk, and guards cloud ACPs", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-deep-prewarm-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  const workDir2 = path.join(tmp, "work-other");
+  fs.mkdirSync(workDir, { recursive: true });
+  fs.mkdirSync(workDir2, { recursive: true });
+  const acpLog = path.join(tmp, "acp-events.jsonl");
+  const devinLog = path.join(tmp, "devin-events.jsonl");
+
+  const writeAcpFixture = (name, logFile) => {
+    const file = path.join(tmp, name);
+    const code = `#!/usr/bin/env node
+import fs from "node:fs";
+const LOG = ${JSON.stringify(logFile)};
+const record = (m) => fs.appendFileSync(LOG, JSON.stringify(m) + "\\n");
+let seq = 0;
+const sessions = new Map();
+const MODELS = [{ group: "acme", name: "Acme", options: [
+  { value: JSON.stringify(["acme", "fast-1"]), name: "Fast 1" },
+  { value: JSON.stringify(["acme", "pro-2"]), name: "Pro 2" },
+]}];
+const EFFORTS = [
+  { value: "low", name: "Low" },
+  { value: "medium", name: "Medium" },
+  { value: "high", name: "High" },
+];
+const cfg = (s) => [
+  { id: "model", name: "Model", category: "model", type: "select", currentValue: s.model, options: MODELS },
+  { id: "reasoning_effort", name: "Reasoning Effort", category: "thought_level", type: "select", currentValue: s.effort, options: EFFORTS },
+];
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (c) => {
+  buf += c;
+  let nl = buf.indexOf("\\n");
+  while (nl !== -1) {
+    const line = buf.slice(0, nl).trim();
+    buf = buf.slice(nl + 1);
+    if (line) {
+      const msg = JSON.parse(line);
+      record({ pid: process.pid, method: msg.method });
+      if (msg.method === "initialize") {
+        send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 2, agentInfo: { name: "TestACP", version: "1.0" }, agentCapabilities: { loadSession: true, sessionCapabilities: { close: {} } } } });
+      } else if (msg.method === "session/new") {
+        const sid = "acp_" + (++seq);
+        const s = { model: JSON.stringify(["acme", "fast-1"]), effort: "medium" };
+        sessions.set(sid, s);
+        send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: sid, configOptions: cfg(s) } });
+      } else if (msg.method === "session/set_config_option") {
+        const s = sessions.get(msg.params.sessionId);
+        if (s) {
+          if (msg.params.configId === "model") s.model = msg.params.value;
+          if (msg.params.configId === "reasoning_effort") s.effort = msg.params.value;
+        }
+        send({ jsonrpc: "2.0", id: msg.id, result: { configOptions: s ? cfg(s) : [] } });
+      } else if (msg.id !== undefined) {
+        send({ jsonrpc: "2.0", id: msg.id, result: {} });
+      }
+    }
+    nl = buf.indexOf("\\n");
+  }
+});
+`;
+    fs.writeFileSync(file, code, { mode: 0o755 });
+    return file;
+  };
+
+  const localAcpBin = writeAcpFixture("local-acp.mjs", acpLog);
+  const devinAcpBin = writeAcpFixture("devin-acp.mjs", devinLog);
+
+  const ctrl = await openControl(homeDir, { HOME: tmp, PIPI_DAEMON_POOL_DELAY_MS: "60000" });
+  t.after(() => {
+    ctrl.client.close();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid, "SIGTERM");
+    } catch {}
+  });
+
+  await ctrl.call("config", {
+    agents: [
+      { id: "local-acp", name: "LocalACP", driver: "acp", binaryPath: localAcpBin, available: true },
+      { id: "devin", name: "Devin", driver: "acp", binaryPath: devinAcpBin, available: true },
+    ],
+    sessionChoices: {
+      "local-acp": { model: { provider: "acme", id: "pro-2" }, thinkingLevel: "high" },
+    },
+  });
+
+  const localSpec = {
+    cwd: workDir,
+    agentId: "local-acp",
+    agentName: "LocalACP",
+    driver: "acp",
+    runtimeMode: "full-access",
+    binaryPath: localAcpBin,
+  };
+
+  // 1. Explicit `prewarm` deeply negotiates local ACP (initialize + session/new + preferred model/effort)
+  // and caches the real catalog on disk + pushes `catalog` to UI clients without announcing a session.
+  await ctrl.call("prewarm", { session: localSpec });
+  await ctrl.waitUntil(() => {
+    const cat = ctrl.events.find((e) => e.type === "catalog" && e.agentId === "local-acp");
+    if (!cat) return undefined;
+    try {
+      const lines = fs.readFileSync(acpLog, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      return lines.some((l) => l.method === "session/set_config_option") ? cat : undefined;
+    } catch {
+      return undefined;
+    }
+  });
+  assert.equal(ctrl.sessions.size, 0, "prewarmed standby must remain invisible in session list");
+
+  // 2. Attaching adopts the deeply prewarmed standby: `get_state` ALREADY has preferred model & effort!
+  const attached = await ctrl.call("attach", { session: localSpec });
+  const sid = attached.session.id;
+  ctrl.client.send({ type: "in", sessionId: sid, line: JSON.stringify({ id: "gs1", type: "get_state" }) });
+  const gsOut = await ctrl.waitUntil(() => ctrl.events.find((e) => e.type === "out" && e.sessionId === sid && e.line?.includes('"id":"gs1"')));
+  const state = JSON.parse(gsOut.line).data;
+  assert.equal(state.model?.id, "pro-2", "standby already pre-applied preferred model before attach");
+  assert.equal(state.thinkingLevel, "high", "standby already pre-applied preferred thinking level before attach");
+  assert.equal(
+    ctrl.events.some((e) => e.type === "out" && e.line?.includes("pipi_catalog")),
+    false,
+    "internal pipi_catalog frames must never leak onto UI out streams",
+  );
+
+  // 3. A brand-new cold session in ANOTHER workspace (pool miss) hydrates immediately from `catalog-cache.json`.
+  const other = await ctrl.call("attach", { session: { ...localSpec, cwd: workDir2 } });
+  const sid2 = other.session.id;
+  ctrl.client.send({ type: "in", sessionId: sid2, line: JSON.stringify({ id: "gm2", type: "get_available_models" }) });
+  const gmOut = await ctrl.waitUntil(() => ctrl.events.find((e) => e.type === "out" && e.sessionId === sid2 && e.line?.includes('"id":"gm2"')));
+  const gmModels = JSON.parse(gmOut.line).data.models;
+  assert.ok(gmModels.some((m) => m.id === "pro-2"), "cold cross-workspace session hydrated models from shared disk cache");
+
+  // 4. Cloud ACP (`devin`) prewarm stops at `initialize` — never calls `session/new` until attached.
+  await ctrl.call("prewarm", {
+    session: {
+      cwd: workDir,
+      agentId: "devin",
+      agentName: "Devin",
+      driver: "acp",
+      runtimeMode: "full-access",
+      binaryPath: devinAcpBin,
+    },
+  });
+  await ctrl.waitUntil(() => {
+    try {
+      const lines = fs.readFileSync(devinLog, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      return lines.some((l) => l.method === "initialize") ? lines : undefined;
+    } catch {
+      return undefined;
+    }
+  });
+  await new Promise((r) => setTimeout(r, 200));
+  const devinMethods = fs
+    .readFileSync(devinLog, "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l).method);
+  assert.ok(devinMethods.includes("initialize"), "cloud ACP standby ran initialize");
+  assert.equal(devinMethods.includes("session/new"), false, "cloud ACP standby must not create a remote session before attach");
+
+  // 5. A newly connected UI client receives persisted catalogs in `hello`.
+  const conn2 = await connectDaemon({ home: homeDir, kind: "ui" });
+  t.after(() => conn2.close());
+  const hello = await new Promise((resolve) => {
+    conn2.onLine((msg) => {
+      if (msg.type === "hello") resolve(msg);
+    });
+  });
+  assert.ok(hello.catalogs?.["local-acp"]?.models?.some((m) => m.id === "pro-2"), "hello carries cached agent catalogs");
+});

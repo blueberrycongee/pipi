@@ -47,8 +47,11 @@ const home = path.resolve(homeAt >= 0 ? argv[homeAt + 1] : `${process.env.HOME |
 const INSTANCE_FILE = path.join(home, "daemon.json");
 const REGISTRY_FILE = path.join(home, "sessions.jsonl");
 const EXTERNAL_FILE = path.join(home, "external.json");
+const CATALOG_CACHE_FILE = path.join(home, "catalog-cache.json");
 const PERSONA_DIR = path.join(home, "persona");
 const CONTROL_TOKEN = crypto.randomBytes(24).toString("hex");
+/** Cloud-hosted ACP agents whose `session/new` may allocate remote sessions: prewarm stops at `initialize`. */
+const CLOUD_ACP_AGENTS = new Set(["devin"]);
 
 const IDLE_UNLOAD_MS = 20 * 60_000;
 const WINDOWLESS_EXIT_MS = Number(process.env.PIPI_DAEMON_IDLE_EXIT_MS) > 0 ? Number(process.env.PIPI_DAEMON_IDLE_EXIT_MS) : 2 * 60_000;
@@ -74,7 +77,113 @@ const config = {
   worktreeDefault: false,
   linger: false, // default follows the last window: exit 2 min after windows close & runs finish
   workspaces: [], // the project folders open in the app's sidebar, for workspaces_list
+  sessionChoices: {}, // per-agent last model/thinking choice, pre-applied onto fresh/standby sessions
+  autoRetry: undefined,
 };
+
+// ── Shared Catalog Cache (cross-process & persisted on disk) ─────────────────
+//
+// Models, thinking/effort levels, model configs, and slash commands are engine
+// metadata that barely changes between fresh sessions. Keeping one disk-backed
+// cache in the daemon lets new sessions and fresh windows show the real pickers
+// immediately and skip redundant probe processes (e.g. Claude `initialize`).
+const catalogCache = new Map(); // agentId -> { models, thinkingLevels, modelConfigs?, commands?, updatedAt }
+let catalogSaveTimer;
+
+function loadCatalogCache() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(CATALOG_CACHE_FILE, "utf8"));
+    if (parsed?.version !== 1 || !parsed.agents || typeof parsed.agents !== "object") return;
+    for (const [agentId, entry] of Object.entries(parsed.agents)) {
+      if (!agentId || !entry || typeof entry !== "object") continue;
+      const models = Array.isArray(entry.models) ? entry.models.filter((m) => m && typeof m.id === "string" && m.id) : [];
+      const thinkingLevels = Array.isArray(entry.thinkingLevels) ? entry.thinkingLevels.filter((l) => typeof l === "string" && l) : [];
+      if (!models.length && !thinkingLevels.length) continue;
+      catalogCache.set(agentId, {
+        models,
+        thinkingLevels: thinkingLevels.length ? thinkingLevels : ["off"],
+        ...(Array.isArray(entry.modelConfigs) && entry.modelConfigs.length ? { modelConfigs: entry.modelConfigs } : {}),
+        ...(Array.isArray(entry.commands) && entry.commands.length ? { commands: entry.commands } : {}),
+        updatedAt: Number(entry.updatedAt) || now(),
+      });
+    }
+  } catch {}
+}
+
+function flushCatalogCacheSync() {
+  if (!catalogSaveTimer) return;
+  clearTimeout(catalogSaveTimer);
+  catalogSaveTimer = undefined;
+  const payload = { version: 1, agents: Object.fromEntries(catalogCache.entries()) };
+  const tmp = `${CATALOG_CACHE_FILE}.tmp.${process.pid}`;
+  try {
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
+    fs.renameSync(tmp, CATALOG_CACHE_FILE);
+  } catch {}
+}
+
+function scheduleSaveCatalogCache() {
+  if (catalogSaveTimer) return;
+  catalogSaveTimer = setTimeout(() => {
+    catalogSaveTimer = undefined;
+    const payload = { version: 1, agents: Object.fromEntries(catalogCache.entries()) };
+    const tmp = `${CATALOG_CACHE_FILE}.tmp.${process.pid}`;
+    fsp
+      .mkdir(home, { recursive: true, mode: 0o700 })
+      .then(() => fsp.writeFile(tmp, JSON.stringify(payload), { mode: 0o600 }))
+      .then(() => fsp.rename(tmp, CATALOG_CACHE_FILE))
+      .catch(() => {});
+  }, 150);
+  catalogSaveTimer.unref?.();
+}
+
+function publicCatalogs() {
+  return Object.fromEntries(catalogCache.entries());
+}
+
+function updateCatalog(agentId, patch) {
+  if (!agentId || !patch || typeof patch !== "object") return;
+  const prev = catalogCache.get(agentId);
+  const nextModels =
+    Array.isArray(patch.models) && patch.models.length
+      ? patch.models.filter((m) => m && typeof m.id === "string" && m.id)
+      : prev?.models ?? [];
+  const nextLevels =
+    Array.isArray(patch.thinkingLevels) && patch.thinkingLevels.length
+      ? patch.thinkingLevels.filter((l) => typeof l === "string" && l)
+      : prev?.thinkingLevels ?? ["off"];
+  const nextModelConfigs = Array.isArray(patch.modelConfigs) ? patch.modelConfigs : prev?.modelConfigs;
+  const nextCommands = Array.isArray(patch.commands) ? patch.commands : prev?.commands;
+  if (!nextModels.length && nextLevels.length <= 1 && !nextCommands?.length) return;
+  // Never replace a real cached model list with the single pre-connect placeholder.
+  if (
+    prev?.models?.length > 1 &&
+    nextModels.length === 1 &&
+    nextModels[0]?.id === "default" &&
+    !nextModels[0]?.reasoning
+  ) {
+    return;
+  }
+  const next = {
+    models: nextModels,
+    thinkingLevels: nextLevels.length ? nextLevels : ["off"],
+    ...(nextModelConfigs?.length ? { modelConfigs: nextModelConfigs } : {}),
+    ...(nextCommands?.length ? { commands: nextCommands } : {}),
+    updatedAt: now(),
+  };
+  const sameData =
+    prev &&
+    JSON.stringify({ m: prev.models, l: prev.thinkingLevels, mc: prev.modelConfigs, c: prev.commands }) ===
+      JSON.stringify({ m: next.models, l: next.thinkingLevels, mc: next.modelConfigs, c: next.commands });
+  catalogCache.set(agentId, next);
+  scheduleSaveCatalogCache();
+  if (!sameData) {
+    for (const conn of controlClients) send(conn, { type: "catalog", agentId, catalog: next });
+  }
+}
+
+loadCatalogCache();
 
 const RUNTIME_RANK = { "approval-required": 0, "auto-accept-edits": 1, "full-access": 2 };
 const isRuntimeMode = (mode) => typeof mode === "string" && Object.prototype.hasOwnProperty.call(RUNTIME_RANK, mode);
@@ -293,6 +402,7 @@ function buildSession(spec) {
       extraArgs: spec.extraArgs,
       customAgent: spec.customAgent,
     },
+    initialChoice: spec.initialChoice,
     attached: new Set(),
     proc: undefined,
     starting: undefined,
@@ -384,6 +494,7 @@ function launchArgs(session) {
       cwd: session.cwd,
     };
   }
+  flushCatalogCacheSync();
   return {
     command: process.execPath,
     args: [
@@ -396,6 +507,8 @@ function launchArgs(session) {
         binaryPath,
         extraArgs,
         customAgent,
+        catalogCacheFile: CATALOG_CACHE_FILE,
+        ...(session.initialChoice ? { initialChoice: session.initialChoice } : {}),
         ...tools,
       }),
     ],
@@ -734,7 +847,7 @@ function killProcess(session) {
 // yet: unregistered, unpersisted and unannounced until an attach takes it —
 // and one not taken inside `POOL_TTL_MS` is simply put down again.
 const POOL_TTL_MS = Number(process.env.PIPI_DAEMON_POOL_TTL_MS) > 0 ? Number(process.env.PIPI_DAEMON_POOL_TTL_MS) : 4 * 60_000;
-const POOL_LIMIT = 2;
+const POOL_LIMIT = Number(process.env.PIPI_DAEMON_POOL_LIMIT) > 0 ? Number(process.env.PIPI_DAEMON_POOL_LIMIT) : 1;
 const pool = new Map();
 
 /** The launch-relevant shape of an attach spec: two specs adopt the same standby iff these match. */
@@ -784,13 +897,82 @@ function takePooled(spec) {
   return session;
 }
 
-/** Spawns a standby process for `spec` — the boot the next fresh session would otherwise wait on. */
+/**
+ * Deeply warms a standby process after `startProcess` succeeds:
+ * - Pi: fetches models/levels into the shared catalog cache and pre-applies the
+ *   user's remembered model, thinking level, and auto-retry setting.
+ * - Claude: ensures the catalog is loaded (instant when disk cache is fresh)
+ *   and pre-applies the remembered choice.
+ * - ACP: runs `initialize` for cloud-hosted agents (`CLOUD_ACP_AGENTS`), or full
+ *   `initialize` + `session/new` + model/mode/effort push for local/closable agents.
+ * Stops immediately if a client adopts the standby mid-flight so we never race it.
+ */
+async function prewarmStandby(session) {
+  if (!session.pooled || !session.proc || session.proc.killed) return;
+  const choice = session.initialChoice ?? config.sessionChoices?.[session.agentId];
+  if (session.driver === "pi") {
+    const [modelsRes, levelsRes] = await Promise.all([
+      daemonCommand(session, "get_available_models", {}, 15_000),
+      daemonCommand(session, "get_available_thinking_levels", {}, 15_000),
+    ]);
+    if (Array.isArray(modelsRes?.models) && modelsRes.models.length) {
+      updateCatalog(session.agentId, {
+        models: modelsRes.models,
+        ...(Array.isArray(levelsRes?.levels) && levelsRes.levels.length ? { thinkingLevels: levelsRes.levels } : {}),
+      });
+    }
+    if (!session.pooled || !session.proc || session.proc.killed) return;
+    if (typeof config.autoRetry === "boolean") {
+      void daemonCommand(session, "set_auto_retry", { enabled: config.autoRetry }, 5_000);
+    }
+    if (choice?.model && Array.isArray(modelsRes?.models)) {
+      const found =
+        modelsRes.models.find((m) => m.id === choice.model.id && m.provider === choice.model.provider) ||
+        modelsRes.models.find((m) => m.id === choice.model.id);
+      if (found) {
+        await daemonCommand(session, "set_model", { provider: found.provider, modelId: found.id }, 10_000);
+      }
+    }
+    if (!session.pooled || !session.proc || session.proc.killed) return;
+    if (typeof choice?.thinkingLevel === "string" && choice.thinkingLevel) {
+      const levels = Array.isArray(levelsRes?.levels) ? levelsRes.levels : [];
+      if (!levels.length || levels.includes(choice.thinkingLevel)) {
+        await daemonCommand(session, "set_thinking_level", { level: choice.thinkingLevel }, 10_000);
+      }
+    }
+    return;
+  }
+  if (session.driver === "claude" || session.driver === "acp") {
+    const mode = session.driver === "acp" && CLOUD_ACP_AGENTS.has(session.agentId) ? "init" : "full";
+    await daemonCommand(
+      session,
+      "prewarm",
+      { mode, ...(choice ? { initialChoice: choice } : {}) },
+      25_000,
+    );
+  }
+}
+
+/** Spawns and deeply warms a standby process for `spec` — the boot the next fresh session would otherwise wait on. */
 function warmPool(spec) {
   if (process.env.PIPI_DAEMON_POOL === "0") return;
   if (!spec.cwd || spec.parentId || spec.worktree) return;
   const key = poolKeyOf(spec);
-  if (pool.has(key) || pool.size >= POOL_LIMIT) return;
-  const session = buildSession({ ...spec, file: undefined, title: undefined, initiator: "user" });
+  if (pool.has(key)) return;
+  // Evict the oldest standby (LRU) when at capacity so switching projects or
+  // agents still warms the active target while keeping memory strictly bounded.
+  while (pool.size >= POOL_LIMIT) {
+    const oldestKey = pool.keys().next().value;
+    const oldest = pool.get(oldestKey);
+    pool.delete(oldestKey);
+    if (oldest) {
+      clearTimeout(oldest.timer);
+      killProcess(oldest.session);
+    }
+  }
+  const agentId = spec.agentId || "pi";
+  const initialChoice = spec.initialChoice ?? config.sessionChoices?.[agentId];
+  const session = buildSession({ ...spec, file: undefined, title: undefined, initiator: "user", initialChoice });
   session.pooled = true;
   const timer = setTimeout(() => {
     if (dropPooled(session)) killProcess(session);
@@ -798,15 +980,19 @@ function warmPool(spec) {
   timer.unref?.();
   pool.set(key, { session, timer });
   void startProcess(session).then((ok) => {
-    if (!ok) dropPooled(session);
+    if (!ok) {
+      dropPooled(session);
+      return;
+    }
+    void prewarmStandby(session);
   });
 }
 
 // A standby spawned in the same breath as an attach races the session it is
 // meant to serve: on a cold boot that is a second full agent process fighting
-// the first one's startup for CPU. `POOL_DELAY_MS` lets the attach settle
-// first — the latest attach's spec wins, so switching sessions does not warm
-// what was left behind. `PIPI_DAEMON_POOL_DELAY_MS=0` restores the old timing.
+// the first one's startup for CPU (and racing before `catalog-cache.json` lands).
+// `POOL_DELAY_MS` is the fallback timer; the UI sends `prewarm` as soon as the
+// active launch reaches ready so warm sessions refill immediately without racing.
 const POOL_DELAY_MS = Number(process.env.PIPI_DAEMON_POOL_DELAY_MS) >= 0 ? Number(process.env.PIPI_DAEMON_POOL_DELAY_MS) : 4_000;
 let poolWarmTimer;
 let pendingPoolSpec;
@@ -950,6 +1136,19 @@ function handleChildRecord(session, line) {
     if (session.backgroundWatch) touch(session);
     else checkWindowlessExit();
     return;
+  }
+  if (record?.type === "pipi_catalog") {
+    updateCatalog(record.agentId || session.agentId, record);
+    return;
+  }
+  if (record?.type === "response" && record.success !== false && record.data && typeof record.data === "object") {
+    if (record.command === "get_available_models" && Array.isArray(record.data.models) && record.data.models.length) {
+      updateCatalog(session.agentId, { models: record.data.models });
+    } else if (record.command === "get_available_thinking_levels" && Array.isArray(record.data.levels) && record.data.levels.length) {
+      updateCatalog(session.agentId, { thinkingLevels: record.data.levels });
+    } else if (record.command === "get_commands" && Array.isArray(record.data.commands)) {
+      updateCatalog(session.agentId, { commands: record.data.commands });
+    }
   }
   if (record) observeRecord(session, record);
   for (const conn of session.attached) send(conn, { type: "out", sessionId: session.id, line });
@@ -2055,7 +2254,8 @@ async function controlOp(conn, msg) {
           // `session` push carries it, as the old synchronous read did.
           spec.title = (await titleOfFile(spec.file)) || undefined;
         }
-        session = takePooled(spec) ?? createSession({ ...spec, initiator: "user" });
+        const initialChoice = !spec.file ? (spec.initialChoice ?? config.sessionChoices?.[spec.agentId || "pi"]) : undefined;
+        session = takePooled(spec) ?? createSession({ ...spec, initialChoice, initiator: "user" });
         created = true;
       }
       // Re-key fileless sessions the moment a file is named for them.
@@ -2380,8 +2580,33 @@ async function controlOp(conn, msg) {
       session.waiters.push(entry.waiter);
       return;
     }
+    case "prewarm": {
+      const spec = msg.session;
+      if (spec && typeof spec === "object" && spec.cwd) {
+        clearTimeout(poolWarmTimer);
+        poolWarmTimer = undefined;
+        pendingPoolSpec = undefined;
+        warmPool(spec);
+      }
+      if (id) respond(conn, id, "ok", {});
+      return;
+    }
+    case "clear_catalog": {
+      if (typeof msg.agentId === "string" && msg.agentId && catalogCache.delete(msg.agentId)) {
+        scheduleSaveCatalogCache();
+      }
+      if (id) respond(conn, id, "ok", {});
+      return;
+    }
     case "config": {
-      const { agents, overrides, customAgents, allowAgentTools, sendScope, maxDepth, maxRunning, worktreeDefault } = msg;
+      const prevLaunchSig = JSON.stringify({
+        agents: config.agents,
+        overrides: config.overrides,
+        customAgents: config.customAgents,
+        allowAgentTools: config.allowAgentTools,
+      });
+      const prevChoices = config.sessionChoices;
+      const { agents, overrides, customAgents, allowAgentTools, sendScope, maxDepth, maxRunning, worktreeDefault, sessionChoices, autoRetry } = msg;
       if (Array.isArray(agents)) config.agents = agents;
       if (overrides) config.overrides = overrides;
       if (Array.isArray(customAgents)) config.customAgents = customAgents;
@@ -2390,16 +2615,37 @@ async function controlOp(conn, msg) {
       if (typeof maxDepth === "number") config.maxDepth = maxDepth;
       if (typeof maxRunning === "number") config.maxRunning = maxRunning;
       if (typeof worktreeDefault === "boolean") config.worktreeDefault = worktreeDefault;
+      if (sessionChoices && typeof sessionChoices === "object") config.sessionChoices = sessionChoices;
+      if (typeof autoRetry === "boolean" || autoRetry === undefined) {
+        if ("autoRetry" in msg) config.autoRetry = autoRetry;
+      }
       if (typeof msg.linger === "boolean") {
         config.linger = msg.linger;
         checkWindowlessExit();
       }
-      // Standby processes were booted under the previous roster/tools config.
-      for (const entry of [...pool.values()]) {
-        clearTimeout(entry.timer);
-        killProcess(entry.session);
+      const nextLaunchSig = JSON.stringify({
+        agents: config.agents,
+        overrides: config.overrides,
+        customAgents: config.customAgents,
+        allowAgentTools: config.allowAgentTools,
+      });
+      if (nextLaunchSig !== prevLaunchSig) {
+        // Standby processes were booted under the previous roster/tools config.
+        for (const entry of [...pool.values()]) {
+          clearTimeout(entry.timer);
+          killProcess(entry.session);
+        }
+        pool.clear();
+      } else if (sessionChoices && typeof sessionChoices === "object") {
+        // Keep warm standbys alive when only model/effort preferences changed; update them in place.
+        for (const entry of pool.values()) {
+          const aid = entry.session.agentId;
+          if (JSON.stringify(prevChoices?.[aid]) !== JSON.stringify(config.sessionChoices?.[aid])) {
+            entry.session.initialChoice = config.sessionChoices?.[aid];
+            void prewarmStandby(entry.session);
+          }
+        }
       }
-      pool.clear();
       respond(conn, id, "ok", {});
       return;
     }
@@ -2529,7 +2775,12 @@ async function controlConnection(conn) {
         if (conn.kind === "ui") sawUiClient = true;
         controlClients.add(conn);
         checkWindowlessExit();
-        send(conn, { type: "hello", sessions: [...sessions.values()].map(sessionInfo), config: publicConfig() });
+        send(conn, {
+          type: "hello",
+          sessions: [...sessions.values()].map(sessionInfo),
+          config: publicConfig(),
+          catalogs: publicCatalogs(),
+        });
         continue;
       }
       void controlOp(conn, msg).catch((error) => {

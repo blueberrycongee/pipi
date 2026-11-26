@@ -45,6 +45,8 @@ let runtimeMode = config.runtimeMode || "full-access";
 const isSubagent = !!config.isSubagent;
 const orchestratorUrl = config.orchestratorUrl || process.env.PIPI_ORCHESTRATOR_URL || "";
 const orchestratorToken = config.orchestratorToken || process.env.PIPI_ORCHESTRATOR_TOKEN || "";
+const catalogCacheFile = typeof config.catalogCacheFile === "string" ? config.catalogCacheFile : "";
+const SHARED_CATALOG_TTL_MS = 10 * 60_000;
 
 const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const zeroUsage = ZERO_USAGE;
@@ -175,6 +177,60 @@ let thinkingLevel = "medium";
 // False until the user (or a loaded session's header) picks a thinking depth:
 // while unset, ACP sessions keep their own advertised effort instead of a pipi default.
 let thinkingLevelSet = false;
+/** Preferred model handed in by the daemon for a fresh/standby session; applied as soon as real models land. */
+let pendingInitialModel =
+  config.initialChoice?.model && typeof config.initialChoice.model.id === "string" && config.initialChoice.model.id
+    ? { provider: String(config.initialChoice.model.provider || ""), id: String(config.initialChoice.model.id) }
+    : undefined;
+/** True once the bridge seeded real models from the daemon's shared disk cache (so catalog reads never block). */
+let catalogSeededFromCache = false;
+/** Cached thinking levels from the daemon's shared disk cache, used until live ACP negotiation reports its own. */
+let cachedThinkingLevels = undefined;
+
+function matchInitialModel(list) {
+  if (!pendingInitialModel || !Array.isArray(list) || !list.length) return undefined;
+  return (
+    list.find((m) => m.id === pendingInitialModel.id && (!pendingInitialModel.provider || m.provider === pendingInitialModel.provider)) ||
+    list.find((m) => m.id === pendingInitialModel.id)
+  );
+}
+
+function currentThinkingLevelsForCatalog() {
+  if (driver === "acp") {
+    const efforts = acpEffortLevels();
+    if (efforts.length) return efforts;
+    if (Array.isArray(cachedThinkingLevels) && cachedThinkingLevels.length) return cachedThinkingLevels;
+    return ["off"];
+  }
+  if (driver === "claude") {
+    const reasoningModel = currentModel?.reasoning ? currentModel : availableModels.find((m) => m.reasoning);
+    if (reasoningModel) {
+      const efforts = Array.isArray(reasoningModel.effortLevels) && reasoningModel.effortLevels.length ? reasoningModel.effortLevels : ["low", "medium", "high"];
+      return [...new Set(["off", ...efforts])];
+    }
+  }
+  return currentModel?.reasoning ? ["off", "low", "medium", "high"] : ["off"];
+}
+
+/**
+ * Publishes the newly adopted real catalog to `pipi-daemon.mjs` (never emitted when
+ * running standalone without `catalogCacheFile`). The daemon caches it on disk and
+ * shares it across fresh sessions and windows.
+ */
+function emitCatalogSnapshot() {
+  if (!catalogCacheFile) return;
+  if (!availableModels.length) return;
+  // Never overwrite a real cached catalog with the single pre-connect placeholder.
+  if (availableModels.length === 1 && availableModels[0]?.id === "default" && !availableModels[0]?.reasoning && !agentCommands.length) return;
+  emit({
+    type: "pipi_catalog",
+    agentId,
+    models: availableModels,
+    thinkingLevels: currentThinkingLevelsForCatalog(),
+    ...(acpModelConfigs.length ? { modelConfigs: acpModelConfigs } : {}),
+    ...(agentCommands.length ? { commands: agentCommands } : {}),
+  });
+}
 let steeringMode = "one-at-a-time";
 let followUpMode = "one-at-a-time";
 let autoCompactionEnabled = true;
@@ -268,6 +324,7 @@ function adoptCommands(reported) {
   if (JSON.stringify(next) === JSON.stringify(agentCommands)) return;
   agentCommands = next;
   emit({ type: "commands_changed" });
+  emitCatalogSnapshot();
 }
 
 const PIPI_MCP_TOOLS = new Set([
@@ -1401,10 +1458,19 @@ function adoptClaudeModels(init) {
     discovered.push({ ...currentModel, input: ["text", "image"] });
   }
   const sig = (m) => `${m.provider}/${m.id}:${m.name}:${m.reasoning}`;
-  if (availableModels.length === discovered.length && availableModels.every((m, i) => sig(m) === sig(discovered[i]))) return;
-  availableModels.splice(0, availableModels.length, ...discovered);
-  currentModel = discovered.find((m) => m.id === currentModel?.id) || discovered[0];
-  emit({ type: "models_changed" });
+  const unchanged = availableModels.length === discovered.length && availableModels.every((m, i) => sig(m) === sig(discovered[i]));
+  if (!unchanged) {
+    availableModels.splice(0, availableModels.length, ...discovered);
+  }
+  const wanted = matchInitialModel(availableModels);
+  if (wanted) {
+    currentModel = wanted;
+    pendingInitialModel = undefined;
+  } else {
+    currentModel = availableModels.find((m) => m.id === currentModel?.id) || availableModels[0];
+  }
+  if (!unchanged) emit({ type: "models_changed" });
+  emitCatalogSnapshot();
 }
 
 /**
@@ -2876,10 +2942,13 @@ function adoptModels(list, currentId) {
     });
   }
   if (!discovered.length) return;
-  const kept = currentModel && currentModel.id !== "default" ? discovered.find((m) => m.id === currentModel.id) : undefined;
+  const wanted = matchInitialModel(discovered);
+  const kept = wanted || (currentModel && currentModel.id !== "default" ? discovered.find((m) => m.id === currentModel.id) : undefined);
+  if (wanted) pendingInitialModel = undefined;
   availableModels.splice(0, availableModels.length, ...discovered);
   currentModel = kept || discovered.find((m) => m.id === currentId) || discovered[0];
   emit({ type: "models_changed" });
+  emitCatalogSnapshot();
 }
 
 /** ACP v1 allows config-option selects to be grouped: entries may carry `{group, name, options: [...]}`. */
@@ -3028,7 +3097,9 @@ function adoptModelConfigOption(modelOpt) {
   if (!discovered.length) return;
   acpModelValues = values;
   acpModelConfigCurrent = String(modelOpt.currentValue ?? "");
-  const kept = currentModel && currentModel.id !== "default" ? discovered.find((m) => m.id === currentModel.id && m.provider === currentModel.provider) || discovered.find((m) => m.id === currentModel.id) : undefined;
+  const wanted = matchInitialModel(discovered);
+  const kept = wanted || (currentModel && currentModel.id !== "default" ? discovered.find((m) => m.id === currentModel.id && m.provider === currentModel.provider) || discovered.find((m) => m.id === currentModel.id) : undefined);
+  if (wanted) pendingInitialModel = undefined;
   availableModels.splice(0, availableModels.length, ...discovered);
   const cur = acpModelValueParts(acpModelConfigCurrent);
   currentModel = kept || discovered.find((m) => m.id === cur.model && (!cur.provider || m.provider === cur.provider)) || discovered.find((m) => m.id === cur.model) || discovered[0];
@@ -3056,9 +3127,11 @@ function adoptConfigOptions(options) {
     // clearest way to offer levels the engine would reject.
     acpEffortConfig = undefined;
   }
+  cachedThinkingLevels = undefined;
   syncAcpModelReasoning();
   syncAcpThinkingFromEngine();
   if (!modelOpt) emit({ type: "models_changed" });
+  emitCatalogSnapshot();
   const modeOpt = options.find((o) => o && o.category === "mode" && Array.isArray(o.options) && o.options.length);
   if (modeOpt) {
     acpModeConfigId = modeOpt.id || "mode";
@@ -3582,6 +3655,7 @@ function spawnAcp(bin) {
   const drop = (cause, signal) => {
     if (acpChild !== child) return;
     acpChild = undefined;
+    acpAgentInfo = undefined;
     acpSessionId = undefined;
     acpStream = undefined;
     acpWakeTurn = undefined;
@@ -3616,6 +3690,7 @@ const ACP_DISCOVERY_WAIT_MS = agentId === "antigravity" ? 8000 : 3500;
 function dropAcpPeer(reason = "ACP agent reset") {
   const child = acpChild;
   acpChild = undefined;
+  acpAgentInfo = undefined;
   acpSessionId = undefined;
   acpStream = undefined;
   acpWakeTurn = undefined;
@@ -3693,45 +3768,63 @@ async function ensureAcpSession(bin) {
 /** The pipi session epoch the ACP negotiation round in flight was started for. */
 let acpRoundEpoch = undefined;
 
+/** Single-flight ACP process spawn + `initialize` handshake (no `session/new` yet). */
+let acpInitPromise = undefined;
+
+function ensureAcpInitialized(bin) {
+  if (acpChild && acpAgentInfo !== undefined) return Promise.resolve();
+  if (!acpInitPromise) {
+    acpInitPromise = (async () => {
+      if (acpChild) return;
+      spawnAcp(bin);
+      let init;
+      try {
+        // Advertise the form capability under both ACP initialization names.
+        // agy 1.5.15 negotiates v1 and reads `clientCapabilities`.
+        const elicitation = { form: {} };
+        const clientInfo = { name: "pipi", version: "0.1.0" };
+        init = await acpRequest(
+          "initialize",
+          {
+            protocolVersion: 2,
+            capabilities: { elicitation },
+            info: clientInfo,
+            clientCapabilities: {
+              fs: { readTextFile: false, writeTextFile: false },
+              terminal: false,
+              session: { notices: {}, configOptions: { boolean: {} } },
+              elicitation,
+            },
+            clientInfo,
+          },
+          30_000,
+        );
+      } catch (err) {
+        dropAcpPeer("ACP initialize failed");
+        throw err;
+      }
+      acpLoadSession = !!init?.agentCapabilities?.loadSession;
+      acpSessionCaps = init?.agentCapabilities?.sessionCapabilities || undefined;
+      acpAgentInfo = init?.agentInfo || {};
+      acpAuthMethods = Array.isArray(init?.authMethods) ? init.authMethods : [];
+      acpModes = undefined;
+      acpModelConfigId = undefined;
+      acpModeConfigId = undefined;
+      acpSpecModels = false;
+      acpReset = true;
+    })().finally(() => {
+      acpInitPromise = undefined;
+    });
+  }
+  return acpInitPromise;
+}
+
 /** One handshake for the session open at `epoch`; `undefined` when a session change made it stale. */
 async function negotiateAcpRound(bin, epoch) {
   if (!acpChild) {
-    spawnAcp(bin);
-    let init;
-    try {
-      // Advertise the form capability under both ACP initialization names.
-      // agy 1.5.15 negotiates v1 and reads `clientCapabilities`.
-      const elicitation = { form: {} };
-      const clientInfo = { name: "pipi", version: "0.1.0" };
-      init = await acpRequest(
-        "initialize",
-        {
-          protocolVersion: 2,
-          capabilities: { elicitation },
-          info: clientInfo,
-          clientCapabilities: {
-            fs: { readTextFile: false, writeTextFile: false },
-            terminal: false,
-            session: { notices: {}, configOptions: { boolean: {} } },
-            elicitation,
-          },
-          clientInfo,
-        },
-        30_000,
-      );
-    } catch (err) {
-      dropAcpPeer("ACP initialize failed");
-      throw err;
-    }
-    acpLoadSession = !!init?.agentCapabilities?.loadSession;
-    acpSessionCaps = init?.agentCapabilities?.sessionCapabilities || undefined;
-    acpAgentInfo = init?.agentInfo || undefined;
-    acpAuthMethods = Array.isArray(init?.authMethods) ? init.authMethods : [];
-    acpModes = undefined;
-    acpModelConfigId = undefined;
-    acpModeConfigId = undefined;
-    acpSpecModels = false;
-    acpReset = true;
+    await ensureAcpInitialized(bin);
+  } else if (acpInitPromise) {
+    await acpInitPromise;
   }
   if (acpReset || !acpSessionId) {
     // Release the previous session on this peer when the agent supports it —
@@ -3829,8 +3922,7 @@ async function negotiateAcpRound(bin, epoch) {
         await saveExternalSession().catch(() => undefined);
       }
       await pushAcpModel();
-      await pushAcpMode();
-      await pushAcpEffort();
+      await Promise.all([pushAcpMode(), pushAcpEffort()]);
       if (stale()) return undefined;
     } catch (err) {
       // Do not retain a half-negotiated peer. A failed session/new or config
@@ -4105,6 +4197,10 @@ async function discoverAcpCatalog() {
   const bin = resolveDriverBinary();
   if (!bin) return;
   const negotiation = ensureAcp(bin).catch(() => undefined);
+  // When real models were already seeded from the daemon's shared cache, let
+  // session negotiation finish in the background instead of blocking the picker:
+  // live `models_changed` updates if anything changed, and any prompt awaits it.
+  if (catalogSeededFromCache && !acpSessionId) return;
   let timer;
   await Promise.race([
     negotiation,
@@ -4124,6 +4220,7 @@ async function discoverAcpCatalog() {
 async function discoverCatalog() {
   if (driver === "claude") {
     const probe = ensureClaudeCatalog();
+    if (catalogSeededFromCache) return;
     let timer;
     await Promise.race([
       probe,
@@ -4218,13 +4315,51 @@ async function handleCommand(cmd) {
       await discoverCatalog();
       if (driver === "acp") {
         const efforts = acpEffortLevels();
-        return { levels: efforts.length ? efforts : ["off"] };
+        if (efforts.length) return { levels: efforts };
+        if (Array.isArray(cachedThinkingLevels) && cachedThinkingLevels.length) return { levels: cachedThinkingLevels };
+        return { levels: ["off"] };
       }
       if (driver === "claude" && currentModel?.reasoning) {
         const efforts = Array.isArray(currentModel.effortLevels) && currentModel.effortLevels.length ? currentModel.effortLevels : ["low", "medium", "high"];
         return { levels: [...new Set(["off", ...efforts])] };
       }
       return { levels: currentModel?.reasoning ? ["off", "low", "medium", "high"] : ["off"] };
+    case "prewarm": {
+      const choice = cmd.initialChoice;
+      if (choice?.model && typeof choice.model.id === "string" && choice.model.id) {
+        pendingInitialModel = { provider: String(choice.model.provider || ""), id: String(choice.model.id) };
+        const matched = matchInitialModel(availableModels);
+        if (matched) {
+          currentModel = matched;
+          pendingInitialModel = undefined;
+        }
+      }
+      if (typeof choice?.thinkingLevel === "string" && choice.thinkingLevel) {
+        thinkingLevel = choice.thinkingLevel;
+        thinkingLevelSet = true;
+        acpThinkingWanted = choice.thinkingLevel;
+      }
+      if (driver === "claude") {
+        await ensureClaudeCatalog();
+        return { ready: true, modelsCount: availableModels.length };
+      }
+      if (driver === "acp") {
+        const bin = resolveDriverBinary();
+        if (!bin) return { ready: false, modelsCount: availableModels.length };
+        if (cmd.mode === "init") {
+          await ensureAcpInitialized(bin).catch(() => undefined);
+          return { ready: Boolean(acpChild), modelsCount: availableModels.length };
+        }
+        await ensureAcp(bin).catch(() => undefined);
+        // If session was already negotiated before `prewarm` carried updated choices, push them now.
+        if (acpSessionId && !acpReset) {
+          await pushAcpModel();
+          await Promise.all([pushAcpMode(), pushAcpEffort()]);
+        }
+        return { ready: Boolean(acpSessionId), modelsCount: availableModels.length };
+      }
+      return { ready: true, modelsCount: availableModels.length };
+    }
     case "get_messages": {
       // The in-flight turn's message so far: a reattached client rebuilds its
       // live rows from it instead of losing them to a history that holds a
@@ -4332,6 +4467,7 @@ async function handleCommand(cmd) {
       });
       return { cancelled: false };
     case "switch_session":
+      pendingInitialModel = undefined;
       await changeSession(() => loadExternalSession(String(cmd.sessionPath)));
       return { cancelled: false };
     case "clone":
@@ -4350,6 +4486,7 @@ async function handleCommand(cmd) {
       });
       return { cancelled: false };
     case "set_model": {
+      pendingInitialModel = undefined;
       const found = availableModels.find((m) => m.id === cmd.modelId && m.provider === cmd.provider) || availableModels.find((m) => m.id === cmd.modelId);
       if (!found) throw new Error(`Model not found: ${cmd.provider}/${cmd.modelId}`);
       currentModel = found;
@@ -4499,8 +4636,54 @@ process.stdin.on("data", (chunk) => {
     nl = stdinBuf.indexOf("\n");
   }
 });
-// Warm Claude's catalog now so the model picker is populated before its first
-// open; the picker reads it again through get_available_models either way.
+/**
+ * Seeds models, thinking levels, and commands from the daemon's shared disk
+ * cache before any RPC arrives, and applies `config.initialChoice` so fresh
+ * sessions open straight onto the user's last model and effort without waiting
+ * on a redundant probe process.
+ */
+function hydrateCatalogFromDisk() {
+  if (typeof config.initialChoice?.thinkingLevel === "string" && config.initialChoice.thinkingLevel) {
+    thinkingLevel = config.initialChoice.thinkingLevel;
+    thinkingLevelSet = true;
+    acpThinkingWanted = config.initialChoice.thinkingLevel;
+  }
+  if (!catalogCacheFile) return;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(catalogCacheFile, "utf8"));
+    const entry = parsed?.version === 1 ? parsed?.agents?.[agentId] : undefined;
+    if (!entry || typeof entry !== "object") return;
+    const cachedModels = Array.isArray(entry.models) ? entry.models.filter((m) => m && typeof m.id === "string" && m.id) : [];
+    if (cachedModels.length) {
+      availableModels.splice(0, availableModels.length, ...cachedModels);
+      const wanted = matchInitialModel(availableModels);
+      if (wanted) {
+        currentModel = wanted;
+        pendingInitialModel = undefined;
+      } else {
+        currentModel = availableModels[0];
+      }
+      catalogSeededFromCache = true;
+    }
+    if (Array.isArray(entry.thinkingLevels) && entry.thinkingLevels.length) {
+      cachedThinkingLevels = entry.thinkingLevels.filter((l) => typeof l === "string" && l);
+    }
+    if (Array.isArray(entry.modelConfigs) && entry.modelConfigs.length) {
+      acpModelConfigs = entry.modelConfigs;
+    }
+    if (Array.isArray(entry.commands) && entry.commands.length) {
+      agentCommands = entry.commands;
+    }
+    const updatedAt = Number(entry.updatedAt || 0);
+    if (driver === "claude" && catalogSeededFromCache && updatedAt > 0 && Date.now() - updatedAt < SHARED_CATALOG_TTL_MS) {
+      claudeCatalogCooldownUntil = updatedAt + SHARED_CATALOG_TTL_MS;
+    }
+  } catch {}
+}
+
+hydrateCatalogFromDisk();
+// Warm Claude's catalog now when no fresh shared cache was available so the
+// model picker is populated before its first open.
 if (driver === "claude") void ensureClaudeCatalog();
 
 function shutdownBridge() {

@@ -118,6 +118,7 @@ import {
   storedAgentOverrides,
   storedCustomAgents,
   storedSessionChoice,
+  storedSessionChoices,
   wallpaper,
   wallpaperAgentReactive,
   wallpaperEffect,
@@ -1520,6 +1521,17 @@ async function ensureDaemon(): Promise<DaemonClient | undefined> {
         const started = await connect({
           onSession: upsertDaemonSession,
           onSessionRemoved: removeDaemonSessionLocal,
+          onCatalog: (agentId, catalog) => {
+            if (catalog.models?.length) cacheAgentModels(agentId, catalog.models);
+            if (catalog.thinkingLevels?.length) cacheAgentThinkingLevels(agentId, catalog.thinkingLevels);
+            if (agentId === currentAgentId() && phase().name === "starting") {
+              batch(() => {
+                if (catalog.models?.length && models().length === 0) models.set(catalog.models);
+                if (catalog.thinkingLevels?.length && levels().length <= 1) levels.set(catalog.thinkingLevels);
+                if (catalog.commands?.length && commands().length === 0) commands.set(catalog.commands);
+              });
+            }
+          },
           onExit: () => {
             daemonClient = undefined;
           },
@@ -1572,6 +1584,29 @@ export function pushDaemonConfig() {
     maxRunning: sessionTreeMax(),
     worktreeDefault: worktreeIsolationDefault(),
     linger: runInBackground(),
+    sessionChoices: storedSessionChoices(),
+    autoRetry: autoRetryChoice(),
+  });
+}
+
+/** Asks the daemon to warm a standby for `(cwd, agentId)` now that the active launch settled. */
+function requestPrewarm(cwd: string, agentId: string) {
+  if (!cwd || !daemonClient) return;
+  const spec = agents().find((a) => a.id === agentId);
+  const effectiveId = spec ? spec.id : "pi";
+  const driver = spec?.driver ?? (effectiveId === "pi" ? "pi" : "acp");
+  const customCfg = storedCustomAgents().find((c) => c.id === effectiveId);
+  const override = storedAgentOverrides()[effectiveId];
+  daemonClient.prewarm({
+    cwd,
+    agentId: effectiveId,
+    agentName: spec?.name ?? effectiveId,
+    driver,
+    runtimeMode: preferredRuntimeMode(),
+    binaryPath: override?.binaryPath,
+    extraArgs: override?.extraArgs,
+    customAgent: customCfg,
+    initialChoice: storedSessionChoice(effectiveId),
   });
 }
 
@@ -1725,11 +1760,19 @@ async function launch(
   const effectiveAgentId = spec ? spec.id : "pi";
 
   const keepAheadRun = Boolean(ahead && running());
+  const switchingAgent = effectiveAgentId !== currentAgentId();
   batch(() => {
     phase.set({ name: "starting" });
     workspace.set(cwd);
-    // Another agent's commands are not this one's: its own arrive once it has started.
-    if (effectiveAgentId !== currentAgentId()) commands.set([]);
+    // Another agent's commands and pickers are not this one's: seed from daemon
+    // catalog cache when available so fresh pickers are populated immediately.
+    if (switchingAgent) {
+      commands.set([]);
+      const cachedModels = modelsByAgent.get(effectiveAgentId);
+      const cachedLevels = levelsByAgent.get(effectiveAgentId);
+      models.set(cachedModels?.length ? cachedModels : []);
+      levels.set(cachedLevels?.length ? cachedLevels : ["off"]);
+    }
     currentAgentId.set(effectiveAgentId);
     if (!reopen && !daemonId) currentRuntimeMode.set(preferredRuntimeMode());
     state.set(undefined);
@@ -1767,12 +1810,12 @@ async function launch(
     const agentLabel = spec?.name ?? "Pi";
     const started = await connect(cwd, effectiveAgentId, mine, reopen, daemonId);
     if (!started) return;
-    const first = await withStartupTimeout(started.request("get_state"), agentLabel);
-    if (mine !== generation) return;
-    rememberProject(projectCwdOf(cwd, currentDaemonSession()));
-    const retry = autoRetryChoice();
-    if (retry !== undefined) request("set_auto_retry", { enabled: retry }).catch(() => undefined);
     if ((reopen || daemonId) && !preserveRows) {
+      const first = await withStartupTimeout(started.request("get_state"), agentLabel);
+      if (mine !== generation) return;
+      rememberProject(projectCwdOf(cwd, currentDaemonSession()));
+      const retry = autoRetryChoice();
+      if (retry !== undefined) request("set_auto_retry", { enabled: retry }).catch(() => undefined);
       // The daemon already put the process on `reopen`'s session file before answering the attach.
       const [, history] = await Promise.all([
         refreshState(),
@@ -1822,6 +1865,16 @@ async function launch(
       void finishLaunch().catch(failLaunch);
       return;
     }
+    // Fresh launch: issue `get_state`, models, and thinking levels in parallel to eliminate the serial waterfall.
+    const [first] = await Promise.all([
+      withStartupTimeout(started.request("get_state"), agentLabel),
+      refreshModels(effectiveAgentId),
+      refreshLevels(effectiveAgentId),
+    ]);
+    if (mine !== generation) return;
+    rememberProject(projectCwdOf(cwd, currentDaemonSession()));
+    const retry = autoRetryChoice();
+    if (retry !== undefined) request("set_auto_retry", { enabled: retry }).catch(() => undefined);
     await finishFreshLaunch(started, first, agentLabel);
   } catch (error) {
     failLaunch(error);
@@ -1836,9 +1889,13 @@ async function launch(
   async function finishFreshLaunch(started: PiClient, first: SessionState, agentLabel: string) {
     const listCwd = projectCwdOf(cwd, currentDaemonSession());
     void Promise.all([refreshCommands(), refreshSessions(listCwd), refreshCredentials(), refreshGitWorkspace(cwd)]);
-    const supporting = Promise.all([refreshModels(effectiveAgentId), refreshLevels()]);
-    const history = preserveRows ? undefined : await withStartupTimeout(displayHistory(started, effectiveAgentId), agentLabel);
-    await supporting;
+    // A brand-new empty session (`messageCount === 0`) has no history to fetch; skip the round trip.
+    const history =
+      preserveRows
+        ? undefined
+        : (first.messageCount ?? 0) > 0
+          ? await withStartupTimeout(displayHistory(started, effectiveAgentId), agentLabel)
+          : { messages: [] };
     if (mine !== generation) return;
     const chosen = await applySessionChoices(first, false);
     if (mine !== generation) return;
@@ -1854,6 +1911,7 @@ async function launch(
     } else if (history) {
       landHistory(history.messages);
     }
+    requestPrewarm(cwd, effectiveAgentId);
     void refreshStats();
   }
 
@@ -1927,6 +1985,7 @@ async function connect(cwd: string, agentId: string, mine: number, reopen?: stri
     binaryPath: override?.binaryPath,
     extraArgs: override?.extraArgs,
     customAgent: customCfg,
+    initialChoice: !reopen && !targetId ? storedSessionChoice(agentId) : undefined,
   });
 
   if (mine !== generation) {
@@ -2393,6 +2452,8 @@ export async function removeAgentApiKey(agentId: string) {
   });
   if (!removed) return;
   modelsByAgent.delete(agentId);
+  levelsByAgent.delete(agentId);
+  daemonClient?.clearCatalog(agentId);
   await Promise.all([refreshCredentials(), refreshAgents()]);
   if (currentAgentId() === agentId && phase().name === "ready") {
     await restartPi();
@@ -2600,7 +2661,14 @@ async function applySessionChoices(initialState?: SessionState, commit = true): 
     if (found && (known?.model?.id !== found.id || known?.model?.provider !== found.provider)) {
       const chosen = await request("set_model", { provider: found.provider, modelId: found.id }).catch(() => undefined);
       if (chosen) {
-        known = await request("get_state").catch(() => (known ? { ...known, model: chosen } : undefined));
+        // ACP model changes can also alter advertised `modelConfigs` or clamped effort;
+        // other drivers return the full chosen model directly without needing another `get_state`.
+        known =
+          activeAgent().driver === "acp"
+            ? await request("get_state").catch(() => (known ? { ...known, model: chosen } : undefined))
+            : known
+              ? { ...known, model: chosen }
+              : undefined;
       }
     }
   }
@@ -3856,10 +3924,13 @@ async function settle() {
 async function changeSession(what: string, action: () => Promise<{ cancelled: boolean }>, target?: { file?: string }): Promise<boolean> {
   if (busy()) return false;
   if (target) return headFor({ cwd: workspace(), file: target.file }, () => changeSession(what, action));
+  const mine = generation;
   busy.set(true);
   try {
     await settle();
+    if (mine !== generation) return false;
     const { cancelled } = await action();
+    if (mine !== generation) return false;
     if (cancelled) {
       toast("info", tr("An extension cancelled the change.", "扩展已取消该操作。"));
       await stayPut();
@@ -3880,15 +3951,17 @@ async function changeSession(what: string, action: () => Promise<{ cancelled: bo
     });
     bashRequestId = undefined;
     await syncSession();
+    if (mine !== generation) return false;
     refreshSessions();
     focusComposer();
     return true;
   } catch (error) {
+    if (mine !== generation) return false;
     toast("error", `${what}: ${message(error)}`);
     await stayPut();
     return false;
   } finally {
-    busy.set(false);
+    if (mine === generation) busy.set(false);
   }
 }
 
@@ -4284,6 +4357,12 @@ export async function copyMessage(text: string): Promise<boolean> {
 // ── Model and behavior ──────────────────────────────────────────────────────
 
 export async function chooseModel(model: Model) {
+  // During an optimistic new session or switch, remember the pick immediately so the
+  // chip updates with zero wait and `finishFreshLaunch` applies it as soon as connected.
+  if (phase().name === "starting" || isSwitching() || !client) {
+    rememberSessionChoice(currentAgentId(), { model: { provider: model.provider, id: model.id } });
+    return;
+  }
   const chosen = await attempt(tr("Could not switch model", "无法切换模型"), () => request("set_model", { provider: model.provider, modelId: model.id }));
   if (!chosen) return;
   rememberSessionChoice(currentAgentId(), { model: { provider: chosen.provider, id: chosen.id } });
@@ -4292,6 +4371,10 @@ export async function chooseModel(model: Model) {
 }
 
 export async function chooseThinkingLevel(level: ThinkingLevel) {
+  if (phase().name === "starting" || isSwitching() || !client) {
+    rememberSessionChoice(currentAgentId(), { thinkingLevel: level });
+    return;
+  }
   const applied = await attempt(tr("Could not change thinking", "无法更改思考深度"), async () => {
     await request("set_thinking_level", { level });
     return true;
@@ -4342,6 +4425,9 @@ export async function saveProviderKey(provider: string, key: string) {
     return true;
   });
   if (!saved) return false;
+  modelsByAgent.delete("pi");
+  levelsByAgent.delete("pi");
+  daemonClient?.clearCatalog("pi");
   // Only a running Pi has a key to load: a session on another agent is left alone.
   if (activeAgent().driver !== "pi") {
     await refreshCredentials();
@@ -4367,6 +4453,8 @@ export async function removeProviderKey(provider: string) {
   if (!removed) return;
   if (activeAgent().driver === "pi") {
     modelsByAgent.delete("pi");
+    levelsByAgent.delete("pi");
+    daemonClient?.clearCatalog("pi");
     await restartPi();
   }
   else await refreshCredentials();

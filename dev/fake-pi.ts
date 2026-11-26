@@ -1568,6 +1568,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           return daemonInfo(s);
         },
         configure() {},
+        prewarm() {},
+        clearCatalog() {},
         setWorkspaces() {},
         async externalMcp() {
           return { url: "http://127.0.0.1:49999/mcp", token: "fake" };

@@ -300,3 +300,23 @@ test("opening an uncached agent's empty task session flushes the outgoing conver
   // And the named task keeps its own highlighted row in Recent rather than collapsing into an untitled draft.
   expect(app.count("id:sidebar-recents >> text:Gemini CLI · Fresh audit task")).toBe(1);
 });
+
+test("picking a model during a slow new-session switch updates immediately and lands on the chosen model", async () => {
+  const app = await launch("multi");
+  await app.waitFor("text:What are we building?");
+  await app.press("id:sidebar-recents >> text:Fix QuickJS GC mark phase");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+
+  // Start a slow new session in another project — while the agent process is still starting, pick GPT-5.1.
+  await app.hover("label:New session in pipi");
+  await app.press("label:New session in pipi");
+  await app.press("text:Claude Sonnet 4.5");
+  await app.press("text:GPT-5.1");
+
+  // Updates immediately on screen with no error toast, and holds once the new process finishes connecting.
+  expect(app.texts()).toContain("GPT-5.1");
+  expect(app.texts().some((t) => t.includes("Could not switch model"))).toBe(false);
+  await app.wait(DELAY * 2);
+  expect(app.texts()).toContain("GPT-5.1");
+  expect(app.texts().some((t) => t.includes("Could not switch model"))).toBe(false);
+});

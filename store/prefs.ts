@@ -502,6 +502,7 @@ export const sendMode = () => prefs().sendMode;
 export const storedAgentOverrides = () => prefs().agentOverrides;
 export const storedCustomAgents = () => prefs().customAgents;
 export const storedSessionChoice = (agentId: string): AgentSessionChoice | undefined => prefs().agentSessionChoices[agentId];
+export const storedSessionChoices = (): Record<string, AgentSessionChoice> => prefs().agentSessionChoices;
 // The stored wallpaper/effect may name a dynamic kind the feature gate hides;
 // readers must agree with the render gate (`EffectSurface.canRender`), so the
 // accessors report such a config/effect as absent rather than let the shell
@@ -555,6 +556,7 @@ export function setSidebarWidth(width: number) {
 
 export function rememberAutoRetry(enabled: boolean) {
   change({ autoRetry: enabled });
+  notifyDaemonPrefs();
 }
 
 export function setPreferredAgentId(agentId: string) {
@@ -637,6 +639,7 @@ export function rememberSessionChoice(agentId: string, patch: Partial<AgentSessi
   if (!agentId) return;
   const current = prefs().agentSessionChoices[agentId] ?? {};
   change({ agentSessionChoices: { ...prefs().agentSessionChoices, [agentId]: { ...current, ...patch } } });
+  notifyDaemonPrefs();
 }
 
 export function addCustomAgentPref(agent: CustomAgentConfig) {
