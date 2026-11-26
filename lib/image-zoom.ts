@@ -26,10 +26,10 @@ export function panRange(content: number, view: number): { min: number; max: num
   return { min: view - content, max: 0 };
 }
 
-/** Clamps a pan so the content never leaves a gap inside the viewport. */
-export function clampPan(state: ZoomState, box: ZoomBox): ZoomState {
-  const x = panRange(box.width * state.z, box.width);
-  const y = panRange(box.height * state.z, box.height);
+/** Clamps a pan so the content stays centered when smaller than `view` and never leaves a gap when larger. */
+export function clampPan(state: ZoomState, box: ZoomBox, view: ZoomBox = box): ZoomState {
+  const x = panRange(box.width * state.z, view.width);
+  const y = panRange(box.height * state.z, view.height);
   return {
     z: state.z,
     tx: Math.min(x.max, Math.max(x.min, state.tx)),
@@ -43,11 +43,18 @@ export function clampPan(state: ZoomState, box: ZoomBox): ZoomState {
  * for keys and buttons. Edges win over the anchor: the clamped result can
  * drift off it, never into a gap.
  */
-export function zoomAtPoint(state: ZoomState, z1: number, ax: number, ay: number, box: ZoomBox): ZoomState {
-  if (z1 === state.z) return clampPan(state, box);
+export function zoomAtPoint(
+  state: ZoomState,
+  z1: number,
+  ax: number,
+  ay: number,
+  box: ZoomBox,
+  view: ZoomBox = box,
+): ZoomState {
+  if (z1 === state.z) return clampPan(state, box, view);
   const cx = (ax - state.tx) / state.z;
   const cy = (ay - state.ty) / state.z;
-  return clampPan({ z: z1, tx: ax - cx * z1, ty: ay - cy * z1 }, box);
+  return clampPan({ z: z1, tx: ax - cx * z1, ty: ay - cy * z1 }, box, view);
 }
 
 /** Where a zoom lands, bounded: never past the fit (`1`), never past `maxZ`. */

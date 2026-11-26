@@ -1,23 +1,29 @@
-import { cleanup, createAnimatedValue, effect, Image, reduceMotion, signal, Text, untracked, View } from "nsh";
+import { cleanup, createAnimatedValue, effect, Image, platform, reduceMotion, Scroll, signal, Text, untracked, View, windowSize } from "nsh";
 import type { KeyEvent, PinchEvent, PressEvent, ViewRef, WheelEvent } from "nsh";
 import { Button as BaseButton } from "nsh/base";
 import { tr } from "../lib/i18n";
-import type { ImageDimensions } from "../lib/image-size";
+import { fitImageBox, type ImageDimensions } from "../lib/image-size";
 import { clampPan, clampZoom, maxZoom, sampleBezier, stepZoom, toggleZoom, wheelScale, zoomAtPoint, zoomPercent } from "../lib/image-zoom";
 import { IconButton } from "../ui/Button";
-import { POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
+import { Icon } from "../ui/Icon";
+import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { uiType } from "../ui/typography";
 
 /**
- * The zoom layer's image viewer: the picture in a fixed viewport it exactly
- * fits, magnified and panned inside it —
+ * The zoom layer's image viewer: either a fixed-box viewport (for standalone
+ * stages and tests) or a full-stage lightbox filling the window sheet —
  *
- * - the wheel or a pinch zooms at the pointer, continuously;
+ * - opens fitted cleanly to the live stage, resizing with the window;
+ * - the wheel or a pinch zooms at the pointer, continuously, expanding across
+ *   the full stage when magnified;
  * - a drag pans what no longer fits;
  * - a double press dives to the picture's own pixels and back to the fit;
- * - the pill at the foot steps out and in and says the scale — its middle
- *   resets to the fit — and `+` / `−` / `0` and the arrows play the keyboard.
+ * - when viewing a photo from a multi-image stream, `←` / `→` (at fit, or
+ *   with Cmd/Ctrl / `[` / `]`), side chevrons, and the bottom thumbnail
+ *   filmstrip switch smoothly between neighboring photos;
+ * - `+` / `−` / `0` and the bottom zoom pill step, read out, and reset scale
+ *   without ever covering image pixels in stage mode.
  *
  * The transform is the compositor's (`scale` + `translate` on animated values,
  * origin the top left corner: `screen = content × z + t`); gestures only set
@@ -26,6 +32,8 @@ import { uiType } from "../ui/typography";
  */
 
 const ZOOM_MS = 180;
+/** Subtle settle when switching between gallery photos. */
+const SWITCH_MS = 110;
 /** The curve zoom transitions play, sampled in `interrupt` with the same math. */
 const ZOOM_EASE: [number, number, number, number] = [0.22, 1, 0.36, 1];
 /** A press this soon after a drag ended is the drag's tail, not a click. */
@@ -36,34 +44,91 @@ const DOUBLE_PT = 8;
 /** A drag starts past this many points, so a clicking hand's tremor pans nothing. */
 const DRAG_PT = 3;
 
-export function ZoomImage(props: { src: string; title?: string; natural?: ImageDimensions; box: ImageDimensions }) {
-  const box = untracked(() => props.box);
+export interface ZoomGalleryEntry {
+  id: string;
+  src: string;
+  title?: string;
+}
+
+function estimateStageSize(hasGallery: boolean): ImageDimensions {
+  const win = untracked(windowSize);
+  const w = Math.max(320, (win.width || 1120) - 24);
+  const topPad = platform.os === "macos" ? 44 : 12;
+  const footerH = hasGallery ? 56 : 44;
+  const h = Math.max(240, (win.height || 820) - topPad - 12 - 44 - footerH);
+  return { width: w, height: h };
+}
+
+export function ZoomImage(props: {
+  src: string;
+  title?: string;
+  natural?: ImageDimensions;
+  /** Explicit fixed viewport box (standalone stage mode). Omit to fill the live lightbox stage. */
+  box?: ImageDimensions;
+  /** Optional ordered image strip for multi-image navigation in stage mode. */
+  gallery?: readonly ZoomGalleryEntry[];
+  activeIndex?: number;
+  canPrev?: boolean;
+  canNext?: boolean;
+  onPrev?: () => void;
+  onNext?: () => void;
+  onSelectIndex?: (index: number) => void;
+  onMeasureNatural?: (dims: ImageDimensions) => void;
+  onClose?: () => void;
+}) {
+  const isStage = () => props.box === undefined;
+  const hasGallery = () => (props.gallery?.length ?? 0) > 1;
+  const stageSize = signal<ImageDimensions>(estimateStageSize(untracked(hasGallery)));
   /** What the picture itself said on load, for when no metadata knew it. */
-  let measured: ImageDimensions | undefined;
-  const natural = () => untracked(() => props.natural) ?? measured;
+  const measured = signal<ImageDimensions | undefined>(undefined);
+
+  const natural = () => props.natural ?? measured();
+
+  const contentBox = (): ImageDimensions => {
+    if (props.box) return props.box;
+    const s = stageSize();
+    // Reserve clean side gutters for circular prev/next buttons so controls never cover the fitted photo.
+    const padX = hasGallery() ? 120 : 36;
+    const padY = 28;
+    const maxWidth = Math.max(160, Math.floor(s.width - padX));
+    const maxHeight = Math.max(120, Math.floor(s.height - padY));
+    return fitImageBox(natural(), {
+      maxWidth,
+      maxHeight,
+      fallback: { width: Math.min(maxWidth, 840), height: Math.min(maxHeight, 560) },
+      upscale: false,
+    });
+  };
+
+  const viewBox = (): ImageDimensions => props.box ?? stageSize();
+
   const naturalScale = () => {
     const n = natural();
-    return n && n.width > 0 && box.width > 0 ? n.width / box.width : 1;
+    const c = contentBox();
+    return n && n.width > 0 && c.width > 0 ? n.width / c.width : 1;
   };
   const fitScale = () => {
     const n = natural();
-    return n && n.width > 0 ? box.width / n.width : 1;
+    const c = contentBox();
+    return n && n.width > 0 ? c.width / n.width : 1;
   };
   const maxZ = () => maxZoom(naturalScale());
 
-  const zv = createAnimatedValue(1);
-  const txv = createAnimatedValue(0);
-  const tyv = createAnimatedValue(0);
+  const initialPose = clampPan({ z: 1, tx: 0, ty: 0 }, untracked(contentBox), untracked(viewBox));
+  const zv = createAnimatedValue(initialPose.z);
+  const txv = createAnimatedValue(initialPose.tx);
+  const tyv = createAnimatedValue(initialPose.ty);
+  const imageOpacity = createAnimatedValue(1);
   /** The zoom as it stands — the target while a transition is flying. */
-  let z = 1;
-  let tx = 0;
-  let ty = 0;
-  const percent = signal(zoomPercent(1, fitScale()));
+  let z = initialPose.z;
+  let tx = initialPose.tx;
+  let ty = initialPose.ty;
+  const percent = signal(zoomPercent(1, untracked(fitScale)));
   const zoomed = signal(false);
   const panning = signal(false);
 
   function readout() {
-    percent.set(zoomPercent(z, fitScale()));
+    percent.set(zoomPercent(z, untracked(fitScale)));
     zoomed.set(z > 1.001);
   }
 
@@ -117,26 +182,82 @@ export function ZoomImage(props: { src: string; title?: string; natural?: ImageD
   /** Zooms to `z1` keeping the content point under (`ax`, `ay`) there. */
   function applyZoom(z1raw: number, ax: number, ay: number, animated: boolean) {
     interrupt();
-    const z1 = clampZoom(z1raw, maxZ());
-    land(zoomAtPoint({ z, tx, ty }, z1, ax, ay, box), animated);
+    const z1 = clampZoom(z1raw, untracked(maxZ));
+    land(zoomAtPoint({ z, tx, ty }, z1, ax, ay, untracked(contentBox), untracked(viewBox)), animated);
   }
 
-  const center = () => ({ x: box.width / 2, y: box.height / 2 });
+  const center = () => {
+    const v = untracked(viewBox);
+    return { x: v.width / 2, y: v.height / 2 };
+  };
+
+  function focusViewport() {
+    viewportRef?.focus();
+    queueMicrotask(() => viewportRef?.focus());
+  }
 
   function stepBy(dir: 1 | -1) {
-    const z1 = stepZoom(z, dir, naturalScale(), maxZ());
+    const z1 = stepZoom(z, dir, untracked(naturalScale), untracked(maxZ));
     if (z1 === z) return;
     const c = center();
     applyZoom(z1, c.x, c.y, true);
-    viewportRef?.focus();
+    focusViewport();
   }
 
   function resetToFit() {
     if (z === 1) return;
     interrupt();
-    land(clampPan({ z: 1, tx: 0, ty: 0 }, box), true);
-    viewportRef?.focus();
+    land(clampPan({ z: 1, tx: 0, ty: 0 }, untracked(contentBox), untracked(viewBox)), true);
+    focusViewport();
   }
+
+  // Reset zoom cleanly when switching images, while keeping `viewportRef` mounted & focused.
+  let trackedSrc = untracked(() => props.src);
+  effect(() => {
+    const nextSrc = props.src;
+    if (nextSrc === trackedSrc) return;
+    trackedSrc = nextSrc;
+    untracked(() => {
+      interrupt();
+      drag = undefined;
+      panning.set(false);
+      measured.set(undefined);
+      const nextPose = clampPan({ z: 1, tx: 0, ty: 0 }, contentBox(), viewBox());
+      z = nextPose.z;
+      tx = nextPose.tx;
+      ty = nextPose.ty;
+      zv.set(z);
+      txv.set(tx);
+      tyv.set(ty);
+      readout();
+      if (!reduceMotion()) {
+        void imageOpacity.stop();
+        imageOpacity.set(0.72);
+        void imageOpacity.timing(1, { duration: SWITCH_MS, easing: ZOOM_EASE });
+      }
+    });
+  });
+
+  // Re-center / re-clamp seamlessly when stage size or natural dimensions update.
+  effect(() => {
+    const c = contentBox();
+    const v = viewBox();
+    // Subscribe to natural() so readout updates as soon as metadata or onLoad arrives.
+    natural();
+    untracked(() => {
+      if (anim) return;
+      const clamped = clampPan({ z: clampZoom(z, maxZ()), tx, ty }, c, v);
+      if (Math.abs(clamped.z - z) > 0.0005 || Math.abs(clamped.tx - tx) > 0.5 || Math.abs(clamped.ty - ty) > 0.5) {
+        z = clamped.z;
+        tx = clamped.tx;
+        ty = clamped.ty;
+        zv.set(z);
+        txv.set(tx);
+        tyv.set(ty);
+      }
+      readout();
+    });
+  });
 
   // ── Gestures ──────────────────────────────────────────────────────────────
 
@@ -158,7 +279,7 @@ export function ZoomImage(props: { src: string; title?: string; natural?: ImageD
   let lastPressY = 0;
 
   function panTo(tx1: number, ty1: number) {
-    const next = clampPan({ z, tx: tx1, ty: ty1 }, box);
+    const next = clampPan({ z, tx: tx1, ty: ty1 }, untracked(contentBox), untracked(viewBox));
     tx = next.tx;
     ty = next.ty;
     txv.set(tx);
@@ -196,7 +317,7 @@ export function ZoomImage(props: { src: string; title?: string; natural?: ImageD
     const near = Math.abs(e.position.x - lastPressX) < DOUBLE_PT && Math.abs(e.position.y - lastPressY) < DOUBLE_PT;
     if (lastPressAt && now - lastPressAt < DOUBLE_MS && near) {
       lastPressAt = 0;
-      const z1 = toggleZoom(z, naturalScale(), maxZ());
+      const z1 = toggleZoom(z, untracked(naturalScale), untracked(maxZ));
       applyZoom(z1, e.position.x, e.position.y, true);
       return;
     }
@@ -207,9 +328,30 @@ export function ZoomImage(props: { src: string; title?: string; natural?: ImageD
 
   function onKeyDown(e: KeyEvent) {
     const key = e.key;
+    if (key === "Escape") {
+      props.onClose?.();
+      return;
+    }
     if (key === "+" || key === "=") return stepBy(1);
     if (key === "-" || key === "_") return stepBy(-1);
     if (key === "0") return resetToFit();
+    const navChord = e.modifiers.platform || e.modifiers.control;
+    if (key === "[" || (key === "ArrowLeft" && (z <= 1.001 || navChord))) {
+      if (props.canPrev) props.onPrev?.();
+      return;
+    }
+    if (key === "]" || (key === "ArrowRight" && (z <= 1.001 || navChord))) {
+      if (props.canNext) props.onNext?.();
+      return;
+    }
+    if (key === "Home" && z <= 1.001 && hasGallery()) {
+      props.onSelectIndex?.(0);
+      return;
+    }
+    if (key === "End" && z <= 1.001 && hasGallery()) {
+      props.onSelectIndex?.((props.gallery?.length ?? 1) - 1);
+      return;
+    }
     const step = e.modifiers.shift ? 240 : 80;
     if (key === "ArrowLeft") return panBy(step, 0);
     if (key === "ArrowRight") return panBy(-step, 0);
@@ -231,85 +373,249 @@ export function ZoomImage(props: { src: string; title?: string; natural?: ImageD
     const timers = [0, 80, 200, 400].map((ms) =>
       setTimeout(() => {
         if (!focused) viewportRef?.focus();
-      }, ms)
+      }, ms),
     );
     cleanup(() => timers.forEach(clearTimeout));
   });
 
+  cleanup(() => {
+    void zv.stop();
+    void txv.stop();
+    void tyv.stop();
+    void imageOpacity.stop();
+  });
+
   const cursor = () => (panning() ? "grabbing" : zoomed() ? "grab" : "zoom-in");
-  const showPill = box.width >= 220 && box.height >= 140;
+  const atMaxZoom = () => percent() >= zoomPercent(maxZ(), fitScale());
+
+  const zoomPill = (surfaceClass: string) => (
+    <View class={`flex-row items-center gap-0.5 rounded-full px-1 py-0.5 ${surfaceClass}`} testID="zoom-controls">
+      <IconButton icon="minus" size="sm" label={tr("Zoom out", "缩小")} disabled={!zoomed()} onPress={() => stepBy(-1)} />
+      <BaseButton
+        onPress={resetToFit}
+        disabled={!zoomed()}
+        accessibilityLabel={tr("Reset zoom", "重置缩放")}
+        tooltip={tip(tr("Reset zoom", "重置缩放"), "0", isStage() ? "top" : "bottom")}
+        class={`rounded-md corner-squircle px-1.5 py-0.5 ${PRESS} ${PRESS_SCALE} hover:bg-accent/45 disabled:opacity-65`}
+      >
+        <Text class={`${uiType("xs")} tabular-nums text-muted-foreground`}>{`${percent()}%`}</Text>
+      </BaseButton>
+      <IconButton icon="plus" size="sm" label={tr("Zoom in", "放大")} disabled={atMaxZoom()} onPress={() => stepBy(1)} />
+    </View>
+  );
+
+  // ── Standalone Fixed-Box Mode (ZoomStage / unit stages) ───────────────────
+
+  if (!isStage()) {
+    const fixedBox = props.box!;
+    const showPill = fixedBox.width >= 220 && fixedBox.height >= 140;
+    return (
+      <View class="w-full items-center justify-center">
+        <View
+          ref={(r) => {
+            viewportRef = r;
+          }}
+          testID="zoom-image-viewport"
+          focusable
+          captureKeys={["Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"]}
+          accessibilityLabel={props.title ?? tr("Image preview", "图片预览")}
+          class="overflow-hidden rounded-lg corner-squircle bg-sunken"
+          style={{ width: fixedBox.width, height: fixedBox.height, cursor: cursor() }}
+          onWheel={onWheel}
+          onPinch={onPinch}
+          onPress={onPress}
+          onPressDown={(e) => {
+            interrupt();
+            drag = { x: e.position.x, y: e.position.y, tx, ty, moved: false };
+          }}
+          onMouseUp={endDrag}
+          onMouseMove={(e) => {
+            if (!drag) return;
+            if (e.pressedButton !== "left") return endDrag();
+            moveDrag(e.position.x, e.position.y);
+          }}
+          onKeyDown={onKeyDown}
+          onFocus={() => {
+            focused = true;
+          }}
+          onBlur={() => {
+            focused = false;
+          }}
+        >
+          <View
+            style={{
+              width: fixedBox.width,
+              height: fixedBox.height,
+              transformOrigin: "top left",
+              scale: zv,
+              translate: [txv, tyv],
+            }}
+          >
+            <Image
+              src={props.src}
+              style={{ width: fixedBox.width, height: fixedBox.height, objectFit: "contain" }}
+              accessibilityLabel={props.title}
+              onLoad={(e) => {
+                if (untracked(() => props.natural) || untracked(measured)) return;
+                if (e.size.width > 0 && e.size.height > 0) {
+                  measured.set({ width: e.size.width, height: e.size.height });
+                }
+              }}
+            />
+          </View>
+          <If when={showPill}>
+            <View class="pointer-events-none absolute inset-x-0 bottom-2 items-center">
+              <View class="pointer-events-auto">{zoomPill(POPUP)}</View>
+            </View>
+          </If>
+        </View>
+      </View>
+    );
+  }
+
+  // ── Full-Stage Lightbox Mode ──────────────────────────────────────────────
 
   return (
-    <View class="w-full items-center justify-center">
+    <View class="min-h-0 size-full">
       <View
-        ref={(r) => {
-          viewportRef = r;
-        }}
-        testID="zoom-image-viewport"
-        focusable
-        captureKeys={["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]}
-        accessibilityLabel={props.title ?? tr("Image preview", "图片预览")}
-        class="overflow-hidden rounded-lg corner-squircle bg-sunken"
-        style={{ width: box.width, height: box.height, cursor: cursor() }}
-        onWheel={onWheel}
-        onPinch={onPinch}
-        onPress={onPress}
-        onPressDown={(e) => {
-          interrupt();
-          drag = { x: e.position.x, y: e.position.y, tx, ty, moved: false };
-        }}
-        onMouseUp={endDrag}
-        onMouseMove={(e) => {
-          if (!drag) return;
-          if (e.pressedButton !== "left") return endDrag();
-          moveDrag(e.position.x, e.position.y);
-        }}
-        onKeyDown={onKeyDown}
-        onFocus={() => {
-          focused = true;
-        }}
-        onBlur={() => {
-          focused = false;
+        class="relative min-h-0 w-full flex-1 bg-sunken/55"
+        onLayout={(e) => {
+          const w = Math.round(e.bounds.size.width);
+          const h = Math.round(e.bounds.size.height);
+          if (w > 0 && h > 0) {
+            const cur = untracked(stageSize);
+            if (cur.width !== w || cur.height !== h) stageSize.set({ width: w, height: h });
+          }
         }}
       >
         <View
-          style={{
-            width: box.width,
-            height: box.height,
-            transformOrigin: "top left",
-            scale: zv,
-            translate: [txv, tyv],
+          ref={(r) => {
+            viewportRef = r;
+          }}
+          testID="zoom-image-viewport"
+          focusable
+          captureKeys={["Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"]}
+          accessibilityLabel={props.title ?? tr("Image preview", "图片预览")}
+          class="size-full overflow-hidden"
+          style={{ cursor: cursor() }}
+          onWheel={onWheel}
+          onPinch={onPinch}
+          onPress={onPress}
+          onPressDown={(e) => {
+            interrupt();
+            drag = { x: e.position.x, y: e.position.y, tx, ty, moved: false };
+          }}
+          onMouseUp={endDrag}
+          onMouseMove={(e) => {
+            if (!drag) return;
+            if (e.pressedButton !== "left") return endDrag();
+            moveDrag(e.position.x, e.position.y);
+          }}
+          onKeyDown={onKeyDown}
+          onFocus={() => {
+            focused = true;
+          }}
+          onBlur={() => {
+            focused = false;
           }}
         >
-          <Image
-            src={props.src}
-            style={{ width: box.width, height: box.height, objectFit: "contain" }}
-            accessibilityLabel={props.title}
-            onLoad={(e) => {
-              if (untracked(() => props.natural) || measured) return;
-              measured = { width: e.size.width, height: e.size.height };
-              readout();
+          <View
+            class="overflow-hidden rounded-lg corner-squircle border-[0.5px] border-hairline-hover bg-card/30 shadow-sm"
+            style={{
+              width: contentBox().width,
+              height: contentBox().height,
+              transformOrigin: "top left",
+              scale: zv,
+              translate: [txv, tyv],
+              opacity: imageOpacity,
             }}
-          />
+          >
+            <Image
+              src={props.src}
+              style={{ width: contentBox().width, height: contentBox().height, objectFit: "contain" }}
+              accessibilityLabel={props.title}
+              onLoad={(e) => {
+                if (e.size.width > 0 && e.size.height > 0) {
+                  const dims = { width: e.size.width, height: e.size.height };
+                  measured.set(dims);
+                  props.onMeasureNatural?.(dims);
+                }
+              }}
+            />
+          </View>
         </View>
-        <If when={showPill}>
-          <View class="pointer-events-none absolute inset-x-0 bottom-2 items-center">
-            <View class={`pointer-events-auto flex-row items-center gap-0.5 rounded-full px-1 py-0.5 ${POPUP}`} testID="zoom-controls">
-              <IconButton icon="minus" size="sm" label={tr("Zoom out", "缩小")} disabled={!zoomed()} onPress={() => stepBy(-1)} />
-              <BaseButton
-                onPress={resetToFit}
-                disabled={!zoomed()}
-                accessibilityLabel={tr("Reset zoom", "重置缩放")}
-                tooltip={tip(tr("Reset zoom", "重置缩放"))}
-                class={`rounded-md corner-squircle px-1.5 py-0.5 ${PRESS} ${PRESS_SCALE} hover:bg-accent/45 disabled:opacity-65`}
-              >
-                <Text class={`${uiType("xs")} tabular-nums text-muted-foreground`}>{`${percent()}%`}</Text>
-              </BaseButton>
-              <IconButton icon="plus" size="sm" label={tr("Zoom in", "放大")} disabled={percent() >= zoomPercent(maxZ(), fitScale())} onPress={() => stepBy(1)} />
-            </View>
+
+        <If when={hasGallery()}>
+          <View class="pointer-events-none absolute inset-y-0 left-3 justify-center">
+            <BaseButton
+              testID="zoom-prev"
+              disabled={!props.canPrev}
+              onPress={() => {
+                props.onPrev?.();
+                focusViewport();
+              }}
+              accessibilityLabel={tr("Previous image", "上一张图片")}
+              tooltip={props.canPrev ? tip(tr("Previous", "上一张"), "ArrowLeft", "right") : undefined}
+              class={`pointer-events-auto size-9 items-center justify-center rounded-full border-[0.5px] border-hairline-hover bg-popover/85 shadow-sm hover:bg-popover disabled:opacity-25 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING}`}
+              style={GLASS_REGULAR}
+            >
+              <Icon name="chevronLeft" size={16} tone="foreground" />
+            </BaseButton>
+          </View>
+          <View class="pointer-events-none absolute inset-y-0 right-3 justify-center">
+            <BaseButton
+              testID="zoom-next"
+              disabled={!props.canNext}
+              onPress={() => {
+                props.onNext?.();
+                focusViewport();
+              }}
+              accessibilityLabel={tr("Next image", "下一张图片")}
+              tooltip={props.canNext ? tip(tr("Next", "下一张"), "ArrowRight", "left") : undefined}
+              class={`pointer-events-auto size-9 items-center justify-center rounded-full border-[0.5px] border-hairline-hover bg-popover/85 shadow-sm hover:bg-popover disabled:opacity-25 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING}`}
+              style={GLASS_REGULAR}
+            >
+              <Icon name="chevronRight" size={16} tone="foreground" />
+            </BaseButton>
           </View>
         </If>
       </View>
+
+      <If
+        when={hasGallery()}
+        else={
+          <View class="h-11 shrink-0 flex-row items-center justify-center border-t-[0.5px] border-hairline px-3.5">
+            {zoomPill("border-[0.5px] border-hairline bg-secondary/70")}
+          </View>
+        }
+      >
+        <View class="h-14 shrink-0 flex-row items-center gap-3 border-t-[0.5px] border-hairline px-3.5">
+          <Scroll horizontal class="min-w-0 flex-1" contentClass="flex-row items-center gap-1.5 py-2">
+            <Each of={props.gallery ?? []} key={(item) => item.id}>
+              {(item, i) => {
+                const active = () => i() === props.activeIndex;
+                return (
+                  <BaseButton
+                    testID="zoom-thumb"
+                    onPress={() => {
+                      props.onSelectIndex?.(i());
+                      focusViewport();
+                    }}
+                    accessibilityLabel={item().title || tr(`Image ${i() + 1}`, `第 ${i() + 1} 张图片`)}
+                    tooltip={active() ? undefined : tip(item().title || tr(`Image ${i() + 1}`, `第 ${i() + 1} 张图片`), undefined, "top")}
+                    class={`relative h-9 w-12 shrink-0 overflow-hidden rounded-md corner-squircle bg-sunken ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} ${
+                      active() ? "opacity-100 ring-2 ring-brand" : "border-[0.5px] border-hairline opacity-55 hover:opacity-90"
+                    }`}
+                  >
+                    <Image src={item().src} class="size-full" style={{ objectFit: "cover" }} accessibilityElementsHidden />
+                  </BaseButton>
+                );
+              }}
+            </Each>
+          </Scroll>
+          <View class="shrink-0">{zoomPill("border-[0.5px] border-hairline bg-secondary/70")}</View>
+        </View>
+      </If>
     </View>
   );
 }

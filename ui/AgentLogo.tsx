@@ -1,4 +1,4 @@
-import { Canvas, Path2D, token, View } from "nsh";
+import { Canvas, computed, Path2D, token, View } from "nsh";
 import type { CanvasPaint, CanvasRenderingContext2D, Tokens } from "nsh";
 import { Icon, type Tone } from "./Icon";
 
@@ -168,6 +168,15 @@ function paint(cx: CanvasRenderingContext2D, ink: Ink | undefined, tone: Tone): 
   return wash;
 }
 
+type LogoKind = "pi" | "glyph" | "fallback";
+
+let logoMountObserver: ((kind: LogoKind) => void) | null = null;
+
+/** Test-only hook to observe branch mounts without touching production renders. */
+export function _setAgentLogoMountObserver(observer: ((kind: LogoKind) => void) | null) {
+  logoMountObserver = observer;
+}
+
 /**
  * A harness's brand mark, `size` points square. `pi` draws Pi's pixel mark;
  * the rest are brand glyphs, in colour while the agent is present and in
@@ -176,29 +185,40 @@ function paint(cx: CanvasRenderingContext2D, ink: Ink | undefined, tone: Tone): 
  * is always there, could never carry one.
  */
 export function AgentLogo(props: { id: string; size?: number; tone?: Tone; status?: "ready" | "off"; class?: string }) {
-  const size = () => props.size ?? 16;
-  const glyph = () => (props.id in GLYPHS ? (props.id as GlyphId) : undefined);
-  const ink = () => (props.status === "off" ? undefined : GLYPHS[glyph()!]?.ink);
+  const logoId = computed(() => props.id);
+  const size = computed(() => props.size ?? 16);
+  const glyph = computed(() => (logoId() in GLYPHS ? (logoId() as GlyphId) : undefined));
+  const kind = computed<LogoKind>(() => (logoId() === "pi" ? "pi" : glyph() ? "glyph" : "fallback"));
+  const ink = computed(() => {
+    const name = glyph();
+    return props.status === "off" || !name ? undefined : GLYPHS[name].ink;
+  });
+  const tone = computed<Tone>(() => props.tone ?? "muted-foreground");
   return (
     <View class={`relative items-center justify-center ${props.class ?? ""}`} style={{ width: size(), height: size() }}>
-      {props.id === "pi" ? (
-        <PiMark size={size()} />
-      ) : glyph() ? (
-        <Canvas
-          style={{ width: size(), height: size() }}
-          accessibilityElementsHidden
-          draw={(cx, { width }) => {
-            const name = glyph()!;
-            const spec = GLYPHS[name];
-            cx.scale(width / spec.viewBox, width / spec.viewBox);
-            cx.fillStyle = paint(cx, ink(), props.tone ?? "muted-foreground");
-            if (spec.evenodd) cx.fill(path(name), "evenodd");
-            else cx.fill(path(name));
-          }}
-        />
-      ) : (
-        <Icon name="command" size={size()} tone={props.tone ?? "muted-foreground"} />
-      )}
+      {(() => {
+        const k = kind();
+        if (logoMountObserver) logoMountObserver(k);
+        if (k === "pi") return <PiMark size={size()} />;
+        if (k === "glyph") {
+          return (
+            <Canvas
+              style={{ width: size(), height: size() }}
+              accessibilityElementsHidden
+              draw={(cx, { width }) => {
+                const name = glyph();
+                if (!name) return;
+                const spec = GLYPHS[name];
+                cx.scale(width / spec.viewBox, width / spec.viewBox);
+                cx.fillStyle = paint(cx, ink(), tone());
+                if (spec.evenodd) cx.fill(path(name), "evenodd");
+                else cx.fill(path(name));
+              }}
+            />
+          );
+        }
+        return <Icon name="command" size={size()} tone={tone()} />;
+      })()}
     </View>
   );
 }

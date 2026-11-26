@@ -1,18 +1,20 @@
 import { readFile } from "fs/promises";
 import { Canvas, cleanup, Clipboard, computed, createAnimatedValue, effect, Image, keymap, Overlay, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
-import type { InputRef, PasteEvent, ScrollRef, ViewRef } from "nsh";
+import type { InputRef, JSX, PasteEvent, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Input, Popover } from "nsh/base";
 import { money } from "../lib/format";
 import { matchDocMentions, readDocMention, removeDocMention, type DocMentionInput } from "../lib/doc-mention";
 import { commandSourceLabel, tr } from "../lib/i18n";
 import { extensionLabel, formatBytes, isRichPasteFile, type FileAttachment } from "../lib/media";
-import { matchCommands, matchOptions, readSlashInput } from "../lib/slash";
+import { matchCommands, matchOptions, readSlashInput, type ComposerCommand } from "../lib/slash";
+import type { ExtensionUiAnswer, ExtensionUiDialog, SessionStats } from "../pi/protocol";
 import { compactNumber } from "../pi/transcript";
 import {
   activeAgent,
   addAttachment,
   answerDialog,
   attachLocalPath,
+  type Attachment,
   composerAttachments,
   composerDocs,
   composerDraft,
@@ -27,9 +29,11 @@ import {
   hasModel,
   isBashRunning,
   isDraftAhead,
+  isPersonaSession,
   isRunning,
   openLocalFile,
   pendingDialog,
+  personaDisplayName,
   pickComposerFile,
   removeAttachment,
   removeFileAttachment,
@@ -47,6 +51,7 @@ import {
 } from "../store/app";
 import { docAt } from "../store/docs";
 import { readingSize, FONT_SIZES, SEND_MODES, sendMode, setSendMode, type SendMode } from "../store/prefs";
+import { focusedPane, focusPane, isSplitOpen } from "../store/split";
 import { attachDocToCurrentComposer, draftToDoc, mentionableDocs, openDocTab } from "../store/tabs";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
@@ -112,19 +117,115 @@ interface SlashRow {
  * (`slashCommands`), so the list changes with the agent and the shell's part
  * of it does not.
  */
-function useSlashMenu(onComplete: (row: SlashRow) => void) {
+/**
+ * State and actions that drive a `Composer` instance. Every chat surface —
+ * primary pane and split panes alike — mounts the exact same `Composer`
+ * component backed by its own `ComposerStore`.
+ */
+export interface ComposerStore {
+  isActive: () => boolean;
+  isFocused: () => boolean;
+  onFocusPane?: () => void;
+  draft: () => string;
+  setDraft: (value: string) => void;
+  attachments: () => Attachment[];
+  addAttachment: (att: Attachment) => void;
+  removeAttachment: (index: number) => void;
+  files: () => FileAttachment[];
+  attachLocalPath: (path: string) => Promise<boolean>;
+  removeFileAttachment: (path: string) => void;
+  pickFile: () => Promise<void>;
+  docs: () => DocRef[];
+  attachDocPath: (path: string) => Promise<void>;
+  detachDoc: (path: string) => void;
+  draftToDoc?: () => Promise<void>;
+  trackAttachmentRead?: (pending: Promise<void>) => void;
+  focusTick: () => number;
+  requestFocus: () => void;
+  ready: () => boolean;
+  canSend: () => boolean;
+  failed: () => boolean;
+  hasModel: () => boolean;
+  visionSupported: () => boolean;
+  running: () => boolean;
+  working: () => boolean;
+  agentName: () => string;
+  personaName?: () => string | undefined;
+  slashCommands: () => ComposerCommand[];
+  pendingDialog: () => ExtensionUiDialog | undefined;
+  answerDialog: (id: string, answer: ExtensionUiAnswer) => void;
+  extensionStatuses?: () => Record<string, string>;
+  extensionWidgets?: () => Record<string, { lines: string[]; below: boolean }>;
+  contextUsage?: () => { stats: SessionStats | undefined; hasRows: boolean };
+  send: (mode?: "steer" | "followUp") => Promise<unknown>;
+  stop: () => Promise<unknown>;
+  renderLeftPickers?: (dismissMenus: () => void) => JSX.Element;
+  renderPermissionPicker?: (dismissMenus: () => void) => JSX.Element;
+  renderExtensionPrompt?: () => JSX.Element;
+  inputTestID?: string;
+  inputLabel?: string;
+  sendTestID?: string;
+  stopTestID?: string;
+  autoFocus?: boolean;
+}
+
+const primaryComposerStore: ComposerStore = {
+  isActive: () => currentView().name === "chat",
+  isFocused: () => currentView().name === "chat" && (!isSplitOpen() || focusedPane() === "primary"),
+  onFocusPane: () => {
+    if (isSplitOpen()) focusPane("primary");
+  },
+  draft: composerDraft,
+  setDraft,
+  attachments: composerAttachments,
+  addAttachment,
+  removeAttachment,
+  files: composerFiles,
+  attachLocalPath,
+  removeFileAttachment,
+  pickFile: pickComposerFile,
+  docs: composerDocs,
+  attachDocPath: async (path) => {
+    await attachDocToCurrentComposer(path);
+  },
+  detachDoc,
+  draftToDoc,
+  trackAttachmentRead,
+  focusTick: composerFocusTick,
+  requestFocus: focusComposer,
+  ready: () => sidecarPhase().name === "ready",
+  canSend: () => sidecarPhase().name === "ready" || isDraftAhead(),
+  failed: () => sidecarPhase().name === "failed",
+  hasModel,
+  visionSupported: () => Boolean(sessionState()?.model?.input?.includes("image")),
+  running: isRunning,
+  working: () => isRunning() || isBashRunning() || waitingCount() > 0,
+  agentName: () => activeAgent().name,
+  personaName: () => (isPersonaSession() ? personaDisplayName() : undefined),
+  slashCommands,
+  pendingDialog,
+  answerDialog,
+  extensionStatuses,
+  extensionWidgets,
+  contextUsage: () => ({ stats: sessionStats(), hasRows: transcriptRows().length > 0 }),
+  send,
+  stop,
+  autoFocus: true,
+};
+
+function useSlashMenu(s: ComposerStore, onComplete: (row: SlashRow) => void) {
   const selected = signal(0);
   /** Ticks when an arrow key moves the mark: the list scrolls after the keys, not after the pointer. */
   const keyed = signal(0, { equals: false });
   /** The kind of input Escape closed the menu on; it stays closed while the draft is still that. */
   const dismissed = signal<"command" | "argument" | undefined>(undefined);
-  const input = computed(() => readSlashInput(composerDraft()));
+  const input = computed(() => (s.isFocused() ? readSlashInput(s.draft()) : undefined));
   const rows = computed<SlashRow[]>(() => {
     const asked = input();
     if (!asked || asked.kind === dismissed()) return [];
     if (asked.kind === "command") {
-      const agentName = activeAgent().name;
-      return matchCommands(slashCommands(), asked.query).map((command) => ({
+      const agentName = s.agentName();
+      return matchCommands(s.slashCommands(), asked.query).map((command) => ({
         key: command.name,
         title: `/${command.name}`,
         hint: command.argumentHint,
@@ -133,7 +234,7 @@ function useSlashMenu(onComplete: (row: SlashRow) => void) {
         completion: `/${command.name} `,
       }));
     }
-    const command = slashCommands().find((known) => known.name === asked.name);
+    const command = s.slashCommands().find((known) => known.name === asked.name);
     return matchOptions(command?.options ?? [], asked.query).map((option) => ({
       key: `${asked.name} ${option.value}`,
       title: option.value,
@@ -199,7 +300,13 @@ function useSlashMenu(onComplete: (row: SlashRow) => void) {
  * (the input, the tray, the chip row) is not an outside press: the draft is
  * still being written there.
  */
-function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (row: SlashRow) => void; anchor?: ViewRef; width: number }) {
+function SlashMenu(props: {
+  menu: ReturnType<typeof useSlashMenu>;
+  agentName: () => string;
+  onChoose: (row: SlashRow) => void;
+  anchor?: ViewRef;
+  width: number;
+}) {
   const mounted = signal(false);
   const opacity = createAnimatedValue(0);
   const translateY = createAnimatedValue(6);
@@ -296,7 +403,10 @@ function SlashMenu(props: { menu: ReturnType<typeof useSlashMenu>; onChoose: (ro
           <If when={shown()?.unmatched === true}>
             <View class={`${uiHeight(32)} flex-row items-center px-2`}>
               <Text class={`min-w-0 flex-1 truncate ${uiType("sm")} text-muted-foreground`}>
-                {tr(`No command by that name. Enter sends it to ${activeAgent().name} as written.`, `没有这个命令，回车将原样发给 ${activeAgent().name}。`)}
+                {tr(
+                  `No command by that name. Enter sends it to ${props.agentName()} as written.`,
+                  `没有这个命令，回车将原样发给 ${props.agentName()}。`,
+                )}
               </Text>
             </View>
           </If>
@@ -344,6 +454,7 @@ interface DocMentionRow {
  * decorators or scoped package names (`@scope/pkg`) never traps Enter or Tab.
  */
 function useDocMention(
+  s: ComposerStore,
   caretPos: () => number,
   slashOpen: () => boolean,
   onPick: (row: DocMentionRow, mention: DocMentionInput) => void,
@@ -351,7 +462,7 @@ function useDocMention(
   const selected = signal(0);
   const keyed = signal(0, { equals: false });
   const dismissedStart = signal<number | undefined>(undefined);
-  const input = computed(() => (currentView().name === "chat" && !slashOpen() ? readDocMention(composerDraft(), caretPos()) : undefined));
+  const input = computed(() => (s.isFocused() && !slashOpen() ? readDocMention(s.draft(), caretPos()) : undefined));
   const rows = computed<DocMentionRow[]>(() => {
     const asked = input();
     if (!asked || asked.start === dismissedStart()) return [];
@@ -524,7 +635,7 @@ function DocMentionMenu(props: {
  * goes or a passage. A press goes back to the document — the words are still
  * written there, not here.
  */
-function DocCard(props: { doc: DocRef }) {
+function DocCard(props: { doc: DocRef; onRemove: (path: string) => void }) {
   const title = () => docAt(props.doc.path)?.title() ?? props.doc.title;
   return (
     <View testID="composer-doc" class={`group relative ${uiHeight(56)} w-52 shrink-0`} style={enter("zoomIn")}>
@@ -543,7 +654,7 @@ function DocCard(props: { doc: DocRef }) {
         </View>
       </BaseButton>
       <BaseButton
-        onPress={() => detachDoc(props.doc.path)}
+        onPress={() => props.onRemove(props.doc.path)}
         accessibilityLabel={tr("Remove document", "移除文档")}
         tooltip={tip(tr("Remove document", "移除文档"))}
         class={`absolute right-1 top-1 size-5 items-center justify-center rounded-full border-[0.5px] border-hairline-hover bg-popover shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-secondary ${HOVER_REVEAL}`}
@@ -562,19 +673,46 @@ function fileCardIcon(kind: FileAttachment["kind"]): IconName {
   return "file";
 }
 
-function FileCard(props: { file: FileAttachment }) {
+function composerImageGallery(store: ComposerStore) {
+  const fromFiles = store
+    .files()
+    .filter((f) => f.kind === "image")
+    .map((f) => ({
+      id: `att:${f.path}`,
+      kind: "image" as const,
+      title: f.name,
+      path: f.path,
+      src: f.path,
+      mimeType: f.mimeType,
+      size: f.size,
+    }));
+  const fromPasted = store.attachments().map((img, idx) => ({
+    id: `paste:${idx}:${img.name}`,
+    kind: "image" as const,
+    title: img.name,
+    src: `data:${img.mimeType};base64,${img.data}`,
+    mimeType: img.mimeType,
+    data: img.data,
+  }));
+  return [...fromFiles, ...fromPasted];
+}
+
+function FileCard(props: { file: FileAttachment; onRemove: (path: string) => void; gallery: () => ReturnType<typeof composerImageGallery> }) {
   const meta = () => [extensionLabel(props.file.path, props.file.mimeType), formatBytes(props.file.size)].filter(Boolean).join(" · ");
   const preview = () => {
     if (props.file.kind === "image" || props.file.kind === "video") {
-      openMediaZoom({
-        id: `att:${props.file.path}`,
-        kind: props.file.kind,
-        title: props.file.name,
-        path: props.file.path,
-        src: props.file.path,
-        mimeType: props.file.mimeType,
-        size: props.file.size,
-      });
+      openMediaZoom(
+        {
+          id: `att:${props.file.path}`,
+          kind: props.file.kind,
+          title: props.file.name,
+          path: props.file.path,
+          src: props.file.path,
+          mimeType: props.file.mimeType,
+          size: props.file.size,
+        },
+        props.file.kind === "image" ? { gallery: props.gallery() } : undefined,
+      );
     } else {
       void openLocalFile(props.file.path);
     }
@@ -596,7 +734,7 @@ function FileCard(props: { file: FileAttachment }) {
         </View>
       </BaseButton>
       <BaseButton
-        onPress={() => removeFileAttachment(props.file.path)}
+        onPress={() => props.onRemove(props.file.path)}
         accessibilityLabel={tr("Remove file", "移除文件")}
         tooltip={tip(tr("Remove file", "移除文件"))}
         class={`absolute right-1 top-1 size-5 items-center justify-center rounded-full border-[0.5px] border-hairline-hover bg-popover shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-secondary ${HOVER_REVEAL}`}
@@ -614,12 +752,13 @@ function FileCard(props: { file: FileAttachment }) {
  * Documents come first, then attached files, then pasted images — each one's
  * remove button shows on hover or focus.
  */
-function AttachmentTray() {
-  const held = () => composerAttachments().length > 0 || composerDocs().length > 0 || composerFiles().length > 0;
-  const shown = keepLast(() => (held() ? { docs: composerDocs(), files: composerFiles(), images: composerAttachments() } : undefined), {
-    docs: composerDocs(),
-    files: composerFiles(),
-    images: composerAttachments(),
+function AttachmentTray(props: { store: ComposerStore }) {
+  const s = props.store;
+  const held = () => s.attachments().length > 0 || s.docs().length > 0 || s.files().length > 0;
+  const shown = keepLast(() => (held() ? { docs: s.docs(), files: s.files(), images: s.attachments() } : undefined), {
+    docs: s.docs(),
+    files: s.files(),
+    images: s.attachments(),
   });
   return (
     <Reveal open={held()} offset={6}>
@@ -629,10 +768,10 @@ function AttachmentTray() {
       >
         <Scroll horizontal contentClass="flex-row gap-2 p-2">
           <Each of={shown()?.docs ?? []} key={(doc) => doc.path}>
-            {(doc) => <DocCard doc={doc()} />}
+            {(doc) => <DocCard doc={doc()} onRemove={s.detachDoc} />}
           </Each>
           <Each of={shown()?.files ?? []} key={(file) => file.path}>
-            {(file) => <FileCard file={file()} />}
+            {(file) => <FileCard file={file()} onRemove={s.removeFileAttachment} gallery={() => composerImageGallery(s)} />}
           </Each>
           <Each of={shown()?.images ?? []} key="index">
             {(image, index) => (
@@ -646,7 +785,7 @@ function AttachmentTray() {
                 {/* The edge is drawn over the pixels, so a white screenshot still has one. */}
                 <View class="pointer-events-none absolute inset-0 rounded-lg corner-squircle border-[0.5px] border-hairline-hover" />
                 <BaseButton
-                  onPress={() => removeAttachment(index())}
+                  onPress={() => s.removeAttachment(index())}
                   accessibilityLabel={tr("Remove image", "移除图片")}
                   tooltip={tip(tr("Remove image", "移除图片"))}
                   class={`absolute right-1 top-1 size-5 items-center justify-center rounded-full border-[0.5px] border-hairline-hover bg-popover shadow-sm ${PRESS} ${FOCUS_RING} hover:bg-secondary ${HOVER_REVEAL}`}
@@ -663,9 +802,9 @@ function AttachmentTray() {
 }
 
 /** Lines an extension shows beside the editor (`setWidget`), and its statuses (`setStatus`). */
-function ExtensionLines(props: { below: boolean }) {
+function ExtensionLines(props: { store: ComposerStore; below: boolean }) {
   const lines = computed(() =>
-    Object.values(extensionWidgets())
+    Object.values(props.store.extensionWidgets?.() ?? {})
       .filter((widget) => widget.below === props.below)
       .flatMap((widget) => widget.lines),
   );
@@ -687,17 +826,18 @@ function ExtensionLines(props: { below: boolean }) {
 /** How full the model's context window is: a ring and a percentage. An engine
  * that reports no window still gets its used count in the tooltip, with the
  * ring left unfilled rather than a made-up share. */
-function ContextMeter() {
-  const usage = () => sessionStats()?.contextUsage;
+function ContextMeter(props: { store: ComposerStore }) {
+  const info = () => props.store.contextUsage?.() ?? { stats: undefined, hasRows: false };
+  const usage = () => info().stats?.contextUsage;
   const percent = () => usage()?.percent ?? null;
   const visible = () => {
     const context = usage();
-    if (!context || transcriptRows().length === 0) return false;
+    if (!context || !info().hasRows) return false;
     const share = percent();
     return share === null ? (context.tokens ?? 0) > 0 : share >= 50;
   };
   const detail = () => {
-    const stats = sessionStats();
+    const stats = info().stats;
     const context = usage();
     if (!stats || !context) return tr("Context", "上下文");
     const used = context.tokens === null ? "—" : compactNumber(context.tokens);
@@ -756,14 +896,15 @@ const sendModeText = (mode: SendMode): { icon: IconName; label: string; hint: st
   return { icon: "steer", label: tr("Interrupt & send", "打断发送"), hint: tr("Sent at the run's next step", "在本轮的下一步发送") };
 };
 
-/** Where the user writes to Pi: the message, the model that answers, and send or stop. */
-export function Composer() {
+/** Where the user writes to the active agent: shared across the primary chat and every split pane. */
+export function Composer(props?: { store?: ComposerStore }) {
+  const s = props?.store ?? primaryComposerStore;
   let input: InputRef | undefined;
   let selection = { start: 0, end: 0 };
   const caretPos = signal(0);
-  let trackedDraft = untracked(composerDraft);
+  let trackedDraft = untracked(s.draft);
   const height = signal(MIN_HEIGHT);
-  /** An input method's marked text shows in the field while `composerDraft` is still empty; the hint stays away for it. */
+  /** An input method's marked text shows in the field while `draft` is still empty; the hint stays away for it. */
   const composing = signal(false);
   /** Confirming a menu row fills it into the draft with the caret at the end so arguments or a second Enter can follow. */
   const completeSlash = (row: SlashRow) => {
@@ -772,22 +913,22 @@ export function Composer() {
     trackedDraft = next;
     selection = { start: next.length, end: next.length };
     caretPos.set(next.length);
-    setDraft(next);
+    s.setDraft(next);
     input?.setSelection(next.length, next.length);
-    focusComposer();
+    s.requestFocus();
   };
-  const slash = useSlashMenu(completeSlash);
+  const slash = useSlashMenu(s, completeSlash);
   const applyDocMention = (row: DocMentionRow, mention: DocMentionInput) => {
-    const next = removeDocMention(composerDraft(), mention);
+    const next = removeDocMention(s.draft(), mention);
     trackedDraft = next.text;
     selection = { start: next.caret, end: next.caret };
     caretPos.set(next.caret);
-    setDraft(next.text);
+    s.setDraft(next.text);
     input?.setSelection(next.caret, next.caret);
-    void attachDocToCurrentComposer(row.path);
-    focusComposer();
+    void s.attachDocPath(row.path);
+    s.requestFocus();
   };
-  const docMention = useDocMention(caretPos, slash.open, applyDocMention);
+  const docMention = useDocMention(s, caretPos, slash.open, applyDocMention);
   const dismissMenus = () => {
     slash.dismiss();
     docMention.dismiss();
@@ -795,12 +936,12 @@ export function Composer() {
   /** The composer's column, which the slash menu stands on and whose width it takes. */
   const column = signal<ViewRef | undefined>(undefined);
   const columnWidth = signal(0);
-  const ready = () => sidecarPhase().name === "ready";
-  const canSend = () => ready() || isDraftAhead();
-  const working = () => isRunning() || isBashRunning() || waitingCount() > 0;
-  const hasText = () => composerDraft().trim().length > 0 || composerAttachments().length > 0 || composerDocs().length > 0 || composerFiles().length > 0;
-  const showPlaceholder = computed(() => composerDraft().length === 0 && !composing());
-  const statusLine = () => Object.values(extensionStatuses()).join("  ·  ");
+  const ready = () => s.ready();
+  const canSend = () => s.canSend();
+  const working = () => s.working();
+  const hasText = () => s.draft().trim().length > 0 || s.attachments().length > 0 || s.docs().length > 0 || s.files().length > 0;
+  const showPlaceholder = computed(() => s.draft().length === 0 && !composing());
+  const statusLine = () => Object.values(s.extensionStatuses?.() ?? {}).join("  ·  ");
   const shownStatus = keepLast(() => statusLine() || undefined, "");
   const showStop = () => working() && !hasText();
   const actionScale = createAnimatedValue(1);
@@ -831,7 +972,7 @@ export function Composer() {
   });
 
   effect(() => {
-    const draft = composerDraft();
+    const draft = s.draft();
     if (draft !== trackedDraft) {
       trackedDraft = draft;
       selection = { start: draft.length, end: draft.length };
@@ -843,8 +984,8 @@ export function Composer() {
   /** When the user temporarily steps out of a question card to queue a chat message. */
   const composeDuringForm = signal<string | undefined>(undefined);
   const formDialog = () => {
-    const dialog = pendingDialog();
-    return dialog?.method === "form" && currentView().name === "chat" ? dialog : undefined;
+    const dialog = s.pendingDialog();
+    return dialog?.method === "form" && s.isActive() ? dialog : undefined;
   };
   const showFormTakeover = () => Boolean(formDialog()) && composeDuringForm() !== formDialog()?.id;
   const showFormResume = () => Boolean(formDialog()) && composeDuringForm() === formDialog()?.id;
@@ -855,30 +996,30 @@ export function Composer() {
   });
 
   effect(() => {
-    composerFocusTick();
-    // The keyboard is the composer's only while the chat is in front and no
-    // question card currently owns the surface.
-    if (currentView().name === "chat" && !showFormTakeover()) input?.focus();
-    else input?.blur();
+    s.focusTick();
+    // The keyboard is the composer's only while this surface is active & focused
+    // and no question card currently owns the surface.
+    if (s.isActive() && s.isFocused() && !showFormTakeover()) input?.focus();
+    else if (!s.isActive()) input?.blur();
   });
 
   // Escape while temporarily drafting a queued message returns to the waiting question card.
   effect(() => {
-    if (!showFormResume()) return;
+    if (!showFormResume() || !s.isFocused()) return;
     cleanup(keymap.bind("escape", () => composeDuringForm.set(undefined), { when: "always" }));
   });
 
   const sendMenuOpen = signal(false);
   /** When a press closed the menu as an outside press, so the button it landed on doesn't reopen it on release. */
   let sendMenuClosedAt = 0;
-  const questionOpen = () => pendingDialog()?.method === "form";
+  const questionOpen = () => s.pendingDialog()?.method === "form";
   const wireMode = () => (questionOpen() || sendMode() === "queue" ? ("followUp" as const) : ("steer" as const));
   /** A send press: an explicit mode wins; otherwise the menu's choice decides. */
-  const fireSend = (mode?: "steer" | "followUp") => void send(mode ?? wireMode());
+  const fireSend = (mode?: "steer" | "followUp") => void s.send(mode ?? wireMode());
   const chooseDocMention = (row: DocMentionRow) => {
     const mention = docMention.input();
     if (mention) applyDocMention(row, mention);
-    else void attachDocToCurrentComposer(row.path);
+    else void s.attachDocPath(row.path);
   };
   const submit = (mode?: "steer" | "followUp") => {
     if (untracked(composing)) return;
@@ -888,51 +1029,40 @@ export function Composer() {
     if (mentioned) return chooseDocMention(mentioned);
     fireSend(mode);
   };
-  keymap.bind(
-    "mod+enter",
-    () => {
-      if (currentView().name === "chat") submit("followUp");
-    },
-    { when: "always" },
+  cleanup(
+    keymap.bind(
+      "mod+enter",
+      () => {
+        if (s.isActive() && s.isFocused()) submit("followUp");
+      },
+      { when: "always" },
+    ),
   );
 
   /** A menu choice is the send button's new behavior — and fires it at once when a draft waits. */
   const pickSendMode = (mode: SendMode) => {
     sendMenuOpen.set(false);
     setSendMode(mode);
-    focusComposer();
+    s.requestFocus();
     if (canSend() && hasText()) submit();
   };
 
   const sendLabel = () =>
     wireMode() === "followUp"
       ? tr("Queue", "排队发送")
-      : isRunning()
+      : s.running()
         ? tr("Interrupt & send", "打断发送")
         : tr("Send", "发送");
   const sendTipText = () =>
     wireMode() === "followUp"
       ? tr("Queue — sends after the run finishes", "排队发送 — 本轮结束后发送")
-      : isRunning()
+      : s.running()
         ? tr("Interrupt & send — sent at the run's next step", "打断发送 — 在本轮的下一步发送")
         : tr("Send — ⌘↵ queues a follow-up", "发送 — ⌘↵ 排队追问");
 
-  /**
-   * A paste is attachments first, text second (`pasteBehavior="report"`):
-   * - `files` carry bytes (a screenshot, an image copied in an app) — they attach.
-   * - `uris` are local files copied in a file manager — images attach; anything
-   *   else goes in as its path, a reference the agent reads with its own tools.
-   * - An image the paste could not hand over as usable bytes — a TIFF only (QQ,
-   *   Preview), or a file in another app's sandbox container that macOS will
-   *   not let us read (QQ's `Library/Containers/com.tencent.qq/…/tmp`) — is
-   *   read once more off the clipboard as an image (`Clipboard.readImage`,
-   *   which the platform encodes as PNG) instead of falling back to its path.
-   * - `text` splices into the controlled draft at `selection` (`insertText` is
-   *   not implemented on the macOS host yet), minus any file-copy path echo.
-   */
   const paste = ({ text, files = [], uris = [] }: PasteEvent) => {
     const pending = (async () => {
-      const vision = !!sessionState()?.model?.input?.includes("image");
+      const vision = s.visionSupported();
       let rejected = false;
       let oversized = false;
       let attached = 0;
@@ -948,7 +1078,7 @@ export function Composer() {
           if (path) references.push(path);
           return;
         }
-        addAttachment({ type: "image", data: Buffer.from(bytes).toString("base64"), mimeType, name });
+        s.addAttachment({ type: "image", data: Buffer.from(bytes).toString("base64"), mimeType, name });
         attached++;
       };
       for (const file of files) {
@@ -962,7 +1092,7 @@ export function Composer() {
         const ext = name.split(".").pop()?.toLowerCase() ?? "";
         const declared = IMAGE_EXTENSIONS[ext] ?? "";
         if (!declared && isRichPasteFile(path)) {
-          const ok = await attachLocalPath(path);
+          const ok = await s.attachLocalPath(path);
           if (ok) {
             attached++;
             continue;
@@ -972,7 +1102,7 @@ export function Composer() {
           const bytes = await readFile(path);
           const mimeType = sniffImageType(bytes) ?? (IMAGE_TYPES.has(declared) ? (declared === "image/jpg" ? "image/jpeg" : declared) : undefined);
           if (mimeType && (!vision || bytes.length > MAX_IMAGE_BYTES)) {
-            if (await attachLocalPath(path)) {
+            if (await s.attachLocalPath(path)) {
               attached++;
               continue;
             }
@@ -981,7 +1111,7 @@ export function Composer() {
         } catch {
           // A folder, a file gone between copy and paste, or one we may not read.
           if (isRichPasteFile(path)) {
-            const ok = await attachLocalPath(path);
+            const ok = await s.attachLocalPath(path);
             if (ok) {
               attached++;
               continue;
@@ -1009,29 +1139,31 @@ export function Composer() {
       const isFileEcho = !!text.trim() && text.split(/\s+/).every((word) => echo.has(word));
       const insertion = [...references, ...(isFileEcho || !text.trim() ? [] : [text])].join(" ");
       if (insertion) {
-        const current = composerDraft();
+        const current = s.draft();
         const start = Math.max(0, Math.min(selection.start, current.length));
         const end = Math.max(start, Math.min(selection.end, current.length));
         const next = `${current.slice(0, start)}${insertion}${current.slice(end)}`;
         const caret = start + insertion.length;
         trackedDraft = next;
         selection = { start: caret, end: caret };
-        setDraft(next);
+        s.setDraft(next);
         input?.setSelection(caret, caret);
       }
     })();
-    trackAttachmentRead(pending);
+    s.trackAttachmentRead?.(pending);
   };
 
   const placeholder = () => {
-    const name = activeAgent().name;
+    const name = s.agentName();
     // While the agent starts (a session switch), the field keeps its usual words rather than passing through others.
-    if (sidecarPhase().name === "failed") return tr(`${name} is not running`, `${name} 未运行`);
-    if (ready() && !hasModel()) return tr("Connect a model provider to start", "连接模型服务商以开始使用");
+    if (s.failed()) return tr(`${name} is not running`, `${name} 未运行`);
+    if (ready() && !s.hasModel()) return tr("Connect a model provider to start", "连接模型服务商以开始使用");
     // A document rides on the message: words are what to do with it, and none sends it as it is.
-    if (composerDocs().length) return tr("Say what to do with it, or just send", "说说要怎么处理，或直接发送");
+    if (s.docs().length) return tr("Say what to do with it, or just send", "说说要怎么处理，或直接发送");
     if (questionOpen()) return tr("Queue a follow-up…", "排队发送后续消息…");
-    if (isRunning()) return tr(`Steer ${name}…`, `引导 ${name}…`);
+    const persona = s.personaName?.();
+    if (persona) return tr(`Message ${persona}…`, `给 ${persona} 发消息…`);
+    if (s.running()) return tr(`Steer ${name}…`, `引导 ${name}…`);
     return tr(`Ask ${name}…`, `问问 ${name}…`);
   };
 
@@ -1044,7 +1176,7 @@ export function Composer() {
         onLayout={(e) => columnWidth.set(e.bounds.size.width)}
         class="pointer-events-auto relative w-full max-w-180 self-center"
       >
-        <ExtensionPrompt />
+        {s.renderExtensionPrompt ? s.renderExtensionPrompt() : <ExtensionPrompt />}
         <Reveal open={showFormResume()} offset={6}>
           <If when={formDialog()}>
             {(dialog) => (
@@ -1068,23 +1200,25 @@ export function Composer() {
             )}
           </If>
         </Reveal>
-        <SlashMenu menu={slash} onChoose={completeSlash} anchor={column()} width={columnWidth()} />
+        <SlashMenu menu={slash} agentName={s.agentName} onChoose={completeSlash} anchor={column()} width={columnWidth()} />
         <DocMentionMenu menu={docMention} onChoose={chooseDocMention} anchor={column()} width={columnWidth()} />
         <If when={!showFormTakeover()}>
-          <AttachmentTray />
+          <AttachmentTray store={s} />
         </If>
         <View class={`relative rounded-[22px] corner-squircle ${COMPOSER_SURFACE}`} style={GLASS_REGULAR}>
           <If
             when={showFormTakeover() ? formDialog() : undefined}
             else={
               <View>
-                <ExtensionLines below={false} />
+                <ExtensionLines store={s} below={false} />
                 <Input
+                  testID={s.inputTestID}
                   ref={input}
                   multiline
-                  autoFocus
+                  autoFocus={s.autoFocus ?? true}
                   scrollbar={false}
-                  value={composerDraft()}
+                  value={s.draft()}
+                  onFocus={() => s.onFocusPane?.()}
                   onChange={({ value }) => {
                     const before = trackedDraft.length;
                     const start = Math.max(0, Math.min(selection.start, before));
@@ -1094,7 +1228,7 @@ export function Composer() {
                     trackedDraft = value;
                     selection = { start: caret, end: caret };
                     caretPos.set(caret);
-                    setDraft(value);
+                    s.setDraft(value);
                   }}
                   onSelectionChange={({ start, end }) => {
                     selection = { start, end };
@@ -1109,26 +1243,28 @@ export function Composer() {
                   submitBehavior="submit"
                   autoCapitalize="none"
                   autoCorrect={false}
-                  disabled={sidecarPhase().name === "failed"}
-                  accessibilityLabel={tr("Message", "消息")}
+                  disabled={s.failed()}
+                  accessibilityLabel={s.inputLabel ?? tr("Message", "消息")}
                   class={`ml-4 mr-9 mt-4 ${readingType()} text-foreground caret-brand`}
                   style={{ height: Math.max(height(), Math.ceil(MIN_HEIGHT * readingSize() / FONT_SIZES.reading.default)) }}
                 />
                 {/* A draft past its second line is offered room: it goes on as a document, where Return is
                     a new line and every word is kept. The field's right margin is the button's seat always,
                     so its arrival never re-wraps what is written. */}
-                <Presence show={height() >= Math.round(LONG_DRAFT_HEIGHT * readingSize() / FONT_SIZES.reading.default)} scaleFrom={0.85} class="absolute right-2 top-2.5">
-                  <IconButton
-                    testID="composer-to-doc"
-                    icon="expand"
-                    size="sm"
-                    tone="subtle"
-                    label={tr("Continue in a document", "在文档中继续写")}
-                    shortcut="mod+e"
-                    tipPlacement="top"
-                    onPress={() => void draftToDoc()}
-                  />
-                </Presence>
+                <If when={Boolean(s.draftToDoc)}>
+                  <Presence show={height() >= Math.round(LONG_DRAFT_HEIGHT * readingSize() / FONT_SIZES.reading.default)} scaleFrom={0.85} class="absolute right-2 top-2.5">
+                    <IconButton
+                      testID="composer-to-doc"
+                      icon="expand"
+                      size="sm"
+                      tone="subtle"
+                      label={tr("Continue in a document", "在文档中继续写")}
+                      shortcut="mod+e"
+                      tipPlacement="top"
+                      onPress={() => void s.draftToDoc?.()}
+                    />
+                  </Presence>
+                </If>
                 {/* The hint is app-drawn, not the host's placeholder: host text re-rasterizes at
                     integer offsets under the dock's transform and visibly steps a frame late. */}
                 <If when={showPlaceholder()}>
@@ -1136,18 +1272,24 @@ export function Composer() {
                     <Text class={`truncate ${readingType()} text-subtle`}>{placeholder()}</Text>
                   </View>
                 </If>
-                <ExtensionLines below />
+                <ExtensionLines store={s} below />
                 <View class="flex-row items-end justify-between gap-2 pb-2 pl-2.5 pr-2 pt-2">
-                  <View class="min-w-0 flex-1 flex-row flex-wrap items-center gap-1">
-                    <AgentPicker onOpen={dismissMenus} />
-                    <View class="mx-0.5 h-3 w-[0.5px] bg-hairline-hover" />
-                    <ModelPicker onOpen={dismissMenus} />
-                    <ModelConfigPickers onOpen={dismissMenus} />
-                    <ThinkingPicker onOpen={dismissMenus} />
+                  <View class="min-w-0 flex-1 flex-row items-center gap-1 overflow-hidden">
+                    {s.renderLeftPickers ? (
+                      s.renderLeftPickers(dismissMenus)
+                    ) : (
+                      <>
+                        <AgentPicker onOpen={dismissMenus} />
+                        <View class="mx-0.5 h-3 w-[0.5px] bg-hairline-hover" />
+                        <ModelPicker onOpen={dismissMenus} />
+                        <ModelConfigPickers onOpen={dismissMenus} />
+                        <ThinkingPicker onOpen={dismissMenus} />
+                      </>
+                    )}
                   </View>
                   <View class="shrink-0 flex-row items-center gap-1.5">
                     <If when={ready()}>
-                      <ContextMeter />
+                      <ContextMeter store={s} />
                     </If>
                     <IconButton
                       icon="paperclip"
@@ -1155,15 +1297,16 @@ export function Composer() {
                       tone="subtle"
                       label={tr("Attach file", "添加文件")}
                       tipPlacement="top"
-                      onPress={() => void pickComposerFile()}
+                      onPress={() => void s.pickFile()}
                     />
-                    <PermissionPicker onOpen={dismissMenus} />
+                    {s.renderPermissionPicker ? s.renderPermissionPicker(dismissMenus) : <PermissionPicker onOpen={dismissMenus} />}
                     <View style={{ opacity: actionOpacity, transform: [{ scale: actionScale }] }}>
                       <If
                         when={showStop()}
                         else={
                           <View class={`h-7 shrink-0 flex-row items-stretch rounded-full shadow-sm ${canSend() && hasText() ? "bg-primary" : "bg-muted shadow-none"}`}>
                             <BaseButton
+                              testID={s.sendTestID}
                               onPress={() => {
                                 sendMenuOpen.set(false);
                                 submit();
@@ -1197,7 +1340,8 @@ export function Composer() {
                         }
                       >
                         <BaseButton
-                          onPress={() => void stop()}
+                          testID={s.stopTestID}
+                          onPress={() => void s.stop()}
                           accessibilityLabel={tr("Stop", "停止")}
                           tooltip={tip(tr("Stop", "停止"), "escape", "top")}
                           class={`size-7 shrink-0 items-center justify-center rounded-full bg-foreground ${PRESS} ${FOCUS_RING} hover:bg-foreground/85 active:scale-92 motion-reduce:active:scale-100`}
@@ -1215,8 +1359,8 @@ export function Composer() {
               <View class="px-4 pb-3 pt-3.5">
                 <QuestionForm
                   request={dialog()}
-                  onAnswer={answerDialog}
-                  shortcuts
+                  onAnswer={s.answerDialog}
+                  shortcuts={s.isFocused()}
                   footerLeft={
                     <BaseButton
                       testID="question-to-draft"
@@ -1228,9 +1372,9 @@ export function Composer() {
                     >
                       <Icon name="queue" size={12} tone="subtle" />
                       <Text class={`${uiType("xs")}`}>
-                        {composerDraft().trim() ? tr("Draft", "草稿") : tr("Queue message", "排队消息")}
+                        {s.draft().trim() ? tr("Draft", "草稿") : tr("Queue message", "排队消息")}
                       </Text>
-                      <If when={composerDraft().trim()}>
+                      <If when={s.draft().trim()}>
                         <View class="size-1.5 rounded-full bg-brand" />
                       </If>
                     </BaseButton>

@@ -1,20 +1,36 @@
 import * as fs from "fs/promises";
-import { AudioPlayer, cleanup, effect, Image, openUrl, platform, signal, Text, untracked, Video, View, type VideoRef } from "nsh";
+import { AudioPlayer, cleanup, context, effect, Image, openUrl, platform, signal, Text, untracked, Video, View, windowSize, type VideoRef } from "nsh";
 import { Button as BaseButton } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { compactPath, tildePath } from "../lib/format";
 import { tr } from "../lib/i18n";
 import { fitImageBox, imageSizeFromBase64, type ImageDimensions } from "../lib/image-size";
-import { extensionLabel, formatBytes, formatMediaDuration, type MediaItem, type MediaKind } from "../lib/media";
-import { copyText, openLocalFile, revealLocalFile } from "../store/app";
+import {
+  collectTranscriptImages,
+  extensionLabel,
+  findMediaImageIndex,
+  formatBytes,
+  formatMediaDuration,
+  isPreviewableImage,
+  type MediaItem,
+  type MediaKind,
+} from "../lib/media";
+import { copyText, openLocalFile, revealLocalFile, transcriptRows, workspacePath } from "../store/app";
 import { backend } from "../store/backend";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { uiType } from "../ui/typography";
-import { isZoomOpen, openZoom } from "../ui/Zoom";
-import { ZoomImage } from "./ZoomImage";
+import { closeZoom, isZoomOpen, openZoom } from "../ui/Zoom";
+import { ZoomImage, type ZoomGalleryEntry } from "./ZoomImage";
+
+/**
+ * Supplies the enclosing conversation's ordered previewable image stream so
+ * opening any photo in the transcript lets `←` / `→` step across neighboring
+ * photos (scoped per pane, including split chat panes).
+ */
+export const MediaStreamContext = context<(() => readonly MediaItem[]) | undefined>(undefined);
 
 // ── File probe cache & single-playback coordination ───────────────────────────
 
@@ -28,6 +44,11 @@ interface FileProbe {
 const fileProbes = new Map<string, FileProbe>();
 const probingPaths = new Set<string>();
 const probeTick = signal(0);
+
+/** True once a local file path has been probed and confirmed absent on disk. */
+export function isKnownMissingPath(filePath: string): boolean {
+  return fileProbes.get(filePath)?.exists === false;
+}
 
 /** Active inline playback item id so starting one video/audio pauses any sibling player. */
 const activePlaybackId = signal<string | undefined>(undefined);
@@ -93,9 +114,9 @@ function openMediaItem(item: MediaItem) {
   else if (item.remoteUrl) void openUrl(item.remoteUrl);
 }
 
-function showMediaPopup(item: MediaItem, pos: { x: number; y: number }, canZoom = false) {
+function showMediaPopup(item: MediaItem, pos: { x: number; y: number }, canZoom = false, zoomOptions?: MediaZoomOptions) {
   const entries = [
-    ...(canZoom ? [{ label: tr("Preview", "预览"), onSelect: () => openMediaZoom(item) }] : []),
+    ...(canZoom ? [{ label: tr("Preview", "预览"), onSelect: () => openMediaZoom(item, zoomOptions) }] : []),
     ...(item.path ? [{ label: tr("Open", "打开"), onSelect: () => void openLocalFile(item.path!) }] : []),
     ...(item.path ? [{ label: revealLabel(), onSelect: () => void revealLocalFile(item.path!) }] : []),
     ...(item.remoteUrl ? [{ label: tr("Open Link", "打开链接"), onSelect: () => void openUrl(item.remoteUrl!) }] : []),
@@ -107,12 +128,17 @@ function showMediaPopup(item: MediaItem, pos: { x: number; y: number }, canZoom 
 
 // ── Zoom Layer Preview (Images & Video) ───────────────────────────────────────
 
-const ZOOM_BOUNDS = {
-  maxWidth: 880,
-  maxHeight: 520,
-  fallback: { width: 640, height: 420 },
-  upscale: false,
-};
+export interface MediaZoomOptions {
+  startAtSeconds?: number;
+  /** Primary ordered image gallery (typically the conversation's full photo stream). */
+  gallery?: readonly MediaItem[];
+  /** Local sibling gallery fallback when the clicked item isn't in `gallery`. */
+  fallbackGallery?: readonly MediaItem[];
+}
+
+function mediaImageSrc(item: MediaItem): string | undefined {
+  return item.src ?? (item.data ? `data:${item.mimeType ?? "image/png"};base64,${item.data}` : undefined);
+}
 
 function ZoomActions(props: { item: MediaItem }) {
   return (
@@ -142,21 +168,38 @@ function ZoomActions(props: { item: MediaItem }) {
 function ZoomVideoPlayer(props: { src: string; title: string; startAt?: number; natural?: ImageDimensions }) {
   const paused = signal(false);
   const dims = signal<ImageDimensions | undefined>(props.natural);
+  const win = untracked(windowSize);
+  const topPad = platform.os === "macos" ? 44 : 12;
+  const stage = signal<ImageDimensions>({
+    width: Math.max(360, (win.width || 1120) - 24),
+    height: Math.max(240, (win.height || 820) - topPad - 12 - 44),
+  });
   let videoRef: VideoRef | undefined;
   let sought = false;
-  const box = () =>
-    fitImageBox(dims(), {
-      maxWidth: 860,
-      maxHeight: 500,
-      minWidth: 360,
-      minHeight: 200,
-      fallback: { width: 720, height: 405 },
+  const box = () => {
+    const s = stage();
+    const maxWidth = Math.max(320, Math.floor(s.width - 36));
+    const maxHeight = Math.max(200, Math.floor(s.height - 28));
+    return fitImageBox(dims(), {
+      maxWidth,
+      maxHeight,
+      minWidth: Math.min(360, maxWidth),
+      minHeight: Math.min(200, maxHeight),
+      fallback: { width: Math.min(maxWidth, 960), height: Math.min(maxHeight, 540) },
       upscale: false,
     });
+  };
 
   return (
-    <View class="w-full items-center justify-center">
-      <View class="overflow-hidden rounded-xl corner-squircle border border-border bg-sunken" style={{ width: box().width, height: box().height }}>
+    <View
+      class="size-full items-center justify-center bg-sunken/55"
+      onLayout={(e) => {
+        const w = Math.round(e.bounds.size.width);
+        const h = Math.round(e.bounds.size.height);
+        if (w > 0 && h > 0) stage.set({ width: w, height: h });
+      }}
+    >
+      <View class="overflow-hidden rounded-xl corner-squircle border-[0.5px] border-hairline-hover bg-sunken shadow-sm" style={{ width: box().width, height: box().height }}>
         <Video
           ref={(r) => {
             videoRef = r;
@@ -181,42 +224,155 @@ function ZoomVideoPlayer(props: { src: string; title: string; startAt?: number; 
   );
 }
 
-export function openMediaZoom(item: MediaItem, startAtSeconds?: number) {
+function resolveGallery(item: MediaItem, options?: MediaZoomOptions): { items: MediaItem[]; index: number } {
+  const filterPreviewable = (list?: readonly MediaItem[]) =>
+    (list ?? []).filter((entry) => isPreviewableImage(entry, isKnownMissingPath) && Boolean(mediaImageSrc(entry)));
+
+  const candidates: readonly (readonly MediaItem[] | undefined)[] = [
+    options?.gallery,
+    options?.fallbackGallery,
+    options?.gallery === undefined && options?.fallbackGallery === undefined
+      ? collectTranscriptImages(untracked(transcriptRows), {
+          cwd: untracked(workspacePath),
+          home: backend().home(),
+          isMissingPath: isKnownMissingPath,
+        })
+      : undefined,
+  ];
+
+  for (const list of candidates) {
+    const valid = filterPreviewable(list);
+    if (!valid.length) continue;
+    const hit = findMediaImageIndex(valid, item);
+    if (hit >= 0) return { items: valid, index: hit };
+  }
+  return { items: [item], index: 0 };
+}
+
+function ZoomImageStage(props: {
+  items: readonly MediaItem[];
+  activeIndex: () => number;
+  setIndex: (index: number) => void;
+  natural: () => ImageDimensions | undefined;
+  onMeasureNatural: (dims: ImageDimensions) => void;
+}) {
+  const current = () => props.items[props.activeIndex()] ?? props.items[0];
+  // Probe on-disk size/dimensions for whichever stream photo is currently shown (even if scrolled off-screen earlier).
+  useFileProbe(
+    () => current().path,
+    () => Boolean(current().path),
+  );
+  const galleryEntries: ZoomGalleryEntry[] = props.items.map((entry, idx) => ({
+    id: `${idx}:${entry.id}`,
+    src: mediaImageSrc(entry) ?? "",
+    title: entry.title,
+  }));
+
+  const step = (delta: number) => {
+    const next = props.activeIndex() + delta;
+    if (next < 0 || next >= props.items.length) return;
+    props.setIndex(next);
+  };
+
+  return (
+    <ZoomImage
+      src={mediaImageSrc(current()) ?? ""}
+      title={current().title}
+      natural={props.natural()}
+      gallery={galleryEntries}
+      activeIndex={props.activeIndex()}
+      canPrev={props.activeIndex() > 0}
+      canNext={props.activeIndex() < props.items.length - 1}
+      onPrev={() => step(-1)}
+      onNext={() => step(1)}
+      onSelectIndex={(idx) => {
+        if (idx >= 0 && idx < props.items.length) props.setIndex(idx);
+      }}
+      onMeasureNatural={props.onMeasureNatural}
+      onClose={closeZoom}
+    />
+  );
+}
+
+export function openMediaZoom(item: MediaItem, startOrOptions?: number | MediaZoomOptions) {
+  const options: MediaZoomOptions | undefined =
+    typeof startOrOptions === "number" ? { startAtSeconds: startOrOptions } : startOrOptions;
   activePlaybackId.set(undefined);
   if (item.kind === "video" && item.src && !item.remoteUrl) {
     const sizeText = formatBytes(item.size ?? (item.path ? fileProbes.get(item.path)?.size : undefined));
     openZoom({
+      layout: "stage",
       title: item.title,
       subtitle: sizeText || undefined,
       actions: () => <ZoomActions item={item} />,
-      render: () => <ZoomVideoPlayer src={item.src!} title={item.title} startAt={startAtSeconds} natural={item.width && item.height ? { width: item.width, height: item.height } : undefined} />,
+      render: () => (
+        <ZoomVideoPlayer
+          src={item.src!}
+          title={item.title}
+          startAt={options?.startAtSeconds}
+          natural={item.width && item.height ? { width: item.width, height: item.height } : undefined}
+        />
+      ),
     });
     return;
   }
 
-  const src = item.src ?? (item.data ? `data:${item.mimeType ?? "image/png"};base64,${item.data}` : undefined);
+  const src = mediaImageSrc(item);
   if (!src) {
     openMediaItem(item);
     return;
   }
-  const probe = item.path ? fileProbes.get(item.path) : undefined;
-  const natural =
-    item.width && item.height
-      ? { width: item.width, height: item.height }
-      : probe?.width && probe?.height
-        ? { width: probe.width, height: probe.height }
-        : item.data
-          ? imageSizeFromBase64({ data: item.data, mimeType: item.mimeType ?? "image/png" })
-          : undefined;
-  const box = fitImageBox(natural, ZOOM_BOUNDS);
-  const sizeText = formatBytes(item.size ?? probe?.size);
-  const dimText = natural ? `${natural.width} × ${natural.height}` : "";
-  const subtitle = [dimText, sizeText].filter(Boolean).join(" · ") || undefined;
+
+  const { items, index: initialIndex } = resolveGallery(item, options);
+  const activeIndex = signal(initialIndex);
+  const measuredDims = signal<Record<string, ImageDimensions>>({});
+
+  const current = () => items[activeIndex()] ?? items[0];
+  const currentKey = () => `${activeIndex()}:${mediaImageSrc(current()) ?? current().id}`;
+  const currentProbe = () => {
+    probeTick();
+    const p = current().path;
+    return p ? fileProbes.get(p) : undefined;
+  };
+  const currentNatural = (): ImageDimensions | undefined => {
+    const it = current();
+    if (it.width && it.height) return { width: it.width, height: it.height };
+    const p = currentProbe();
+    if (p?.width && p?.height) return { width: p.width, height: p.height };
+    if (it.data) {
+      const parsed = imageSizeFromBase64({ data: it.data, mimeType: it.mimeType ?? "image/png" });
+      if (parsed) return parsed;
+    }
+    return measuredDims()[currentKey()];
+  };
+
   openZoom({
-    title: item.title,
-    subtitle,
-    actions: () => <ZoomActions item={item} />,
-    render: () => <ZoomImage src={src} title={item.title} natural={natural} box={box} />,
+    layout: "stage",
+    badge: () => (items.length > 1 ? `${activeIndex() + 1} / ${items.length}` : undefined),
+    title: () => current().title,
+    subtitle: () => {
+      const it = current();
+      const p = currentProbe();
+      const nat = currentNatural();
+      const sizeText = formatBytes(it.size ?? p?.size);
+      const dimText = nat ? `${nat.width} × ${nat.height}` : "";
+      return [dimText, sizeText].filter(Boolean).join(" · ") || undefined;
+    },
+    actions: () => <ZoomActions item={current()} />,
+    render: () => (
+      <ZoomImageStage
+        items={items}
+        activeIndex={activeIndex}
+        setIndex={(idx) => activeIndex.set(idx)}
+        natural={currentNatural}
+        onMeasureNatural={(dims) => {
+          const key = untracked(currentKey);
+          const prev = untracked(measuredDims)[key];
+          if (prev && prev.width === dims.width && prev.height === dims.height) return;
+          measuredDims.update((map) => ({ ...map, [key]: dims }));
+        }}
+      />
+    ),
   });
 }
 
@@ -290,7 +446,17 @@ export function InlineFileCard(props: { item: MediaItem; compact?: boolean; stat
 
 // ── Inline Image Card ─────────────────────────────────────────────────────────
 
-export function InlineImageCard(props: { item: MediaItem; gallery?: boolean; compact?: boolean }) {
+export function InlineImageCard(props: {
+  item: MediaItem;
+  gallery?: boolean;
+  compact?: boolean;
+  siblings?: readonly MediaItem[];
+}) {
+  const getStream = MediaStreamContext();
+  const zoomOptions = (): MediaZoomOptions => ({
+    gallery: getStream?.(),
+    fallbackGallery: props.siblings,
+  });
   const src = () => props.item.src ?? (props.item.data ? `data:${props.item.mimeType ?? "image/png"};base64,${props.item.data}` : undefined);
   const probe = useFileProbe(
     () => props.item.path,
@@ -339,10 +505,10 @@ export function InlineImageCard(props: { item: MediaItem; gallery?: boolean; com
         testID="media-image-card"
         class="group relative self-start overflow-hidden rounded-xl corner-squircle bg-sunken"
         style={{ width: box().width, height: box().height }}
-        onContextMenu={(e: { pagePosition: { x: number; y: number } }) => showMediaPopup(props.item, e.pagePosition, true)}
+        onContextMenu={(e: { pagePosition: { x: number; y: number } }) => showMediaPopup(props.item, e.pagePosition, true, zoomOptions())}
       >
         <BaseButton
-          onPress={() => openMediaZoom(props.item)}
+          onPress={() => openMediaZoom(props.item, zoomOptions())}
           accessibilityLabel={props.item.title || tr("Preview image", "预览图片")}
           tooltip={tip(props.item.caption || props.item.title || tr("Preview image", "预览图片"))}
           class={`size-full ${PRESS} ${FOCUS_RING}`}
@@ -365,7 +531,7 @@ export function InlineImageCard(props: { item: MediaItem; gallery?: boolean; com
             size="sm"
             label={tr("Expand", "放大")}
             class="border-[0.5px] border-hairline-hover bg-popover/90 shadow-sm"
-            onPress={() => openMediaZoom(props.item)}
+            onPress={() => openMediaZoom(props.item, zoomOptions())}
           />
           <If when={props.item.path}>
             {(p) => (
@@ -818,7 +984,7 @@ export function MediaGallery(props: {
       <If when={images().length > 0}>
         <View class={`max-w-full flex-row flex-wrap gap-2 ${rowJustify()}`}>
           <Each of={images()} key={(item) => item.id}>
-            {(item) => <InlineImageCard item={item()} gallery={images().length > 1} compact={props.compact} />}
+            {(item) => <InlineImageCard item={item()} gallery={images().length > 1} compact={props.compact} siblings={images()} />}
           </Each>
         </View>
       </If>

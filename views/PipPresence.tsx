@@ -1,6 +1,7 @@
-import { cleanup, computed, createAnimatedValue, effect, reduceMotion, signal, Text, untracked, View } from "nsh";
-import type { JSX, ViewRef } from "nsh";
+import { Animated, Canvas, cleanup, computed, createAnimatedValue, effect, Path2D, reduceMotion, signal, Text, token, untracked, View } from "nsh";
+import type { CanvasRenderingContext2D, CompositeAnimation, JSX, ViewRef } from "nsh";
 import { Button as BaseButton, Popover } from "nsh/base";
+import { Menu } from "nsh/desktop";
 import { activeLanguage, tr } from "../lib/i18n";
 import { derivePipLiveStatus, formatElapsedCompact, type PipChildStatus, type PipLiveStatus, type PipPhase } from "../lib/pip-status";
 import { Pip } from "../mascot/Pip";
@@ -13,6 +14,7 @@ import {
 } from "../pi/turns";
 import {
   activeAgent,
+  copyMessage,
   currentActivity,
   currentChildSessions,
   currentDaemonSession,
@@ -32,12 +34,48 @@ import {
   waitingCount,
 } from "../store/app";
 import { Icon } from "../ui/Icon";
-import { EASING, popupHiddenStyle, popupLeavingStyle, popupStyle, SPRING, useBreathingOpacity } from "../ui/motion";
-import { FOCUS_RING, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
+import {
+  EASING,
+  isRowSeen,
+  popupHiddenStyle,
+  popupLeavingStyle,
+  popupStyle,
+  useBreathingOpacity,
+  useSmsBubbleEntrance,
+} from "../ui/motion";
+import { FOCUS_RING, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { uiHeight, uiType } from "../ui/typography";
+import { PipBubbleBlocks, type PipBubbleRow } from "./Prose";
 
 const HOVER_OPEN_MS = 100;
 const HOVER_CLOSE_MS = 160;
+
+/** Crisp curved macOS iMessage tail drawn on a 11x15 Retina canvas. */
+const TAIL_PATH = new Path2D(
+  "M 11 0 L 5.5 0 C 5.5 6.8 3.6 11.4 0.4 13.8 C 0.1 14.05 0.25 14.5 0.7 14.5 C 4.4 14.5 7.6 13.3 10.2 11.2 L 11 11.2 Z",
+);
+
+export function BubbleTail(props: { side: "left" | "right"; tone: "sms-incoming" | "brand" }) {
+  const draw = (cx: CanvasRenderingContext2D) => {
+    cx.save();
+    if (props.side === "right") {
+      cx.translate(11, 0);
+      cx.scale(-1, 1);
+    }
+    cx.fillStyle = token(props.tone);
+    cx.fill(TAIL_PATH);
+    cx.restore();
+  };
+
+  return (
+    <View
+      class={`pointer-events-none absolute bottom-0 ${props.side === "left" ? "-left-[5.5px]" : "-right-[5.5px]"}`}
+      style={{ width: 11, height: 15 }}
+    >
+      <Canvas style={{ width: 11, height: 15 }} draw={draw} />
+    </View>
+  );
+}
 
 /** Live status snapshot for Pip, derived reactively from real store + transcript + daemon state. */
 export const pipLiveStatus = computed<PipLiveStatus>(() => {
@@ -94,7 +132,7 @@ function childStatusLabel(status: PipChildStatus["status"]): string {
   }
 }
 
-/** Floating Liquid Glass real-time status card shown when hovering any Pip avatar. */
+/** Floating Liquid Glass real-time status card shown when hovering any Pip avatar or typing bubble. */
 function PipStatusCard(props: {
   open: () => boolean;
   turnMeta?: () => PipTurnMeta | undefined;
@@ -277,8 +315,8 @@ function PipStatusCard(props: {
 }
 
 /**
- * Reusable hoverable Pip avatar with a Raft-style floating real-time status card.
- * Used identically on the bottom active working indicator and on every delivered Pip message.
+ * Reusable hoverable Pip avatar with a floating real-time status card.
+ * Anchors at the bottom-left of both the typing indicator and each delivered Pip bubble cluster.
  */
 export function PipAvatarBadge(props: {
   /** Active working indicator at the bottom (`true`) vs delivered message avatar (`false`). */
@@ -291,11 +329,18 @@ export function PipAvatarBadge(props: {
   processOpen?: () => boolean;
   /** Folds or unfolds this turn's process into the stream. */
   onToggleProcess?: () => void;
+  /** Optional external hover/toggle controller so hovering the adjacent typing bubble shares the same card. */
+  externalOpen?: () => boolean;
+  onExternalHover?: (hovering: boolean) => void;
+  onExternalToggle?: () => void;
   testID?: string;
 }) {
-  const open = signal(false);
+  const localOpen = signal(false);
   let openTimer: ReturnType<typeof setTimeout> | undefined;
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const isControlled = Boolean(props.externalOpen);
+  const open = () => (props.externalOpen ? props.externalOpen() : localOpen());
 
   const clearTimers = () => {
     clearTimeout(openTimer);
@@ -311,38 +356,55 @@ export function PipAvatarBadge(props: {
     if (nextId !== boundId) {
       boundId = nextId;
       clearTimers();
-      open.set(false);
+      localOpen.set(false);
     }
   });
 
   cleanup(clearTimers);
 
   const onEnter = () => {
+    if (props.onExternalHover) {
+      props.onExternalHover(true);
+      return;
+    }
     clearTimeout(closeTimer);
     closeTimer = undefined;
-    if (untracked(open)) return;
+    if (untracked(localOpen)) return;
     clearTimeout(openTimer);
     openTimer = setTimeout(() => {
       openTimer = undefined;
-      open.set(true);
+      localOpen.set(true);
     }, HOVER_OPEN_MS);
   };
 
   const onLeave = () => {
+    if (props.onExternalHover) {
+      props.onExternalHover(false);
+      return;
+    }
     clearTimeout(openTimer);
     openTimer = undefined;
     clearTimeout(closeTimer);
     closeTimer = setTimeout(() => {
       closeTimer = undefined;
-      open.set(false);
+      localOpen.set(false);
     }, HOVER_CLOSE_MS);
+  };
+
+  const onToggle = () => {
+    if (props.onExternalToggle) {
+      props.onExternalToggle();
+      return;
+    }
+    clearTimers();
+    localOpen.set(!untracked(localOpen));
   };
 
   const status = pipLiveStatus;
   const isBusy = () => Boolean(props.active) && status().active;
   const haloOpacity = useBreathingOpacity(isBusy);
-  const avatarSize = () => (props.active ? 20 : 18);
-  const boxClass = () => (props.active ? "size-8" : "size-7");
+  const avatarSize = () => (props.active ? 19 : 18);
+  const boxClass = () => "size-7";
   const cornerDotClass = () => {
     if (!props.active || !status().active) return "";
     if (status().phase === "waiting_user" || status().phase === "retrying") return "bg-warning";
@@ -354,7 +416,11 @@ export function PipAvatarBadge(props: {
       open={open()}
       onOpenChange={(e) => {
         clearTimers();
-        open.set(e.open);
+        if (isControlled) {
+          if (!e.open) props.onExternalHover?.(false);
+        } else {
+          localOpen.set(e.open);
+        }
       }}
       placement="top"
       align="start"
@@ -374,10 +440,7 @@ export function PipAvatarBadge(props: {
           accessibilityState={{ busy: isBusy(), expanded: open() }}
           onMouseEnter={onEnter}
           onMouseLeave={onLeave}
-          onPress={() => {
-            clearTimers();
-            open.set(!untracked(open));
-          }}
+          onPress={onToggle}
           class={`relative ${boxClass()} shrink-0 select-none items-center justify-center rounded-full border-[0.5px] border-hairline bg-card/90 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:border-hairline-hover hover:bg-card`}
         >
           {/* Soft breathing cobalt halo while Pip is actively working */}
@@ -401,7 +464,8 @@ export function PipAvatarBadge(props: {
         onPointerLeave={onLeave}
         onOpenSession={(id) => {
           clearTimers();
-          open.set(false);
+          if (isControlled) props.onExternalHover?.(false);
+          else localOpen.set(false);
           void openDaemonSession(id);
         }}
         processOpen={props.processOpen}
@@ -412,49 +476,221 @@ export function PipAvatarBadge(props: {
 }
 
 /**
- * Bottom active placeholder for Pip (personal agent) conversations: replaces
- * `ActivityLine`'s streaming status words with a quiet, breathing Pip avatar
- * medallion. Hovering the avatar reveals Pip's real-time status card.
+ * Three smoothly bouncing & pulsing dots inside the iMessage typing bubble.
+ * Driven entirely on the native UI compositor thread via staggered infinite keyframes.
+ */
+function TypingDots() {
+  const dots = [0, 1, 2].map(() => ({
+    opacity: createAnimatedValue(0.36),
+    scale: createAnimatedValue(0.88),
+    translateY: createAnimatedValue(0),
+  }));
+
+  effect(() => {
+    const reduced = reduceMotion();
+    const running: CompositeAnimation[] = [];
+    if (reduced) {
+      const staticAlphas = [0.45, 0.72, 0.96];
+      dots.forEach((dot, idx) => {
+        void dot.opacity.stop();
+        void dot.scale.stop();
+        void dot.translateY.stop();
+        dot.opacity.set(staticAlphas[idx]);
+        dot.scale.set(1);
+        dot.translateY.set(0);
+      });
+      return;
+    }
+
+    dots.forEach((dot, idx) => {
+      const delay = idx * 165;
+      const anim = Animated.parallel([
+        Animated.keyframes(dot.opacity, {
+          keyframes: [
+            { offset: 0, value: 0.34, easing: "easeInOut" },
+            { offset: 0.28, value: 0.96, easing: "easeInOut" },
+            { offset: 0.62, value: 0.34, easing: "easeInOut" },
+            { offset: 1, value: 0.34 },
+          ],
+          duration: 1180,
+          delay,
+          iterations: "infinite",
+        }),
+        Animated.keyframes(dot.scale, {
+          keyframes: [
+            { offset: 0, value: 0.86, easing: "easeInOut" },
+            { offset: 0.28, value: 1.15, easing: "easeInOut" },
+            { offset: 0.62, value: 0.86, easing: "easeInOut" },
+            { offset: 1, value: 0.86 },
+          ],
+          duration: 1180,
+          delay,
+          iterations: "infinite",
+        }),
+        Animated.keyframes(dot.translateY, {
+          keyframes: [
+            { offset: 0, value: 0, easing: "easeInOut" },
+            { offset: 0.28, value: -2.4, easing: "easeInOut" },
+            { offset: 0.62, value: 0, easing: "easeInOut" },
+            { offset: 1, value: 0 },
+          ],
+          duration: 1180,
+          delay,
+          iterations: "infinite",
+        }),
+      ]);
+      void anim.start();
+      running.push(anim);
+    });
+
+    cleanup(() => {
+      for (const anim of running) anim.stop();
+      for (const dot of dots) {
+        void dot.opacity.stop();
+        void dot.scale.stop();
+        void dot.translateY.stop();
+      }
+    });
+  });
+
+  return (
+    <View class="flex-row items-center gap-[5px]">
+      {dots.map((dot) => (
+        <View
+          class="size-[7px] rounded-full bg-muted-foreground"
+          style={{
+            opacity: dot.opacity,
+            transform: [{ translateY: dot.translateY }, { scale: dot.scale }],
+          }}
+        />
+      ))}
+    </View>
+  );
+}
+
+/**
+ * Bottom iMessage typing indicator row for Pip (personal agent) conversations:
+ * Pip's live avatar paired with an authentic macOS Messages typing bubble (three
+ * staggered pulsing dots + two trailing thought-dots) that pops in from bottom-left
+ * while Pip is working and vanishes cleanly the instant the reply bubbles land.
+ * Hovering either Pip's avatar or the typing bubble reveals the live status card.
  *
- * Reserves a constant 44pt (`h-11`) slot so starting and settling a run never
+ * Reserves a constant 48pt (`h-12`) slot so starting and settling a run never
  * shifts the scroll content height.
  */
 export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) => void }) {
   const isChatActive = () => isRunning() || waitingCount() > 0;
-  const alreadyWorking = untracked(() => (isChatActive() || pipMood() === "happy") && transcriptRows().length > 0);
+  const alreadyWorking = untracked(() => isChatActive() && transcriptRows().length > 0);
   const shown = signal(alreadyWorking);
+  const cardOpen = signal(false);
   const opacity = createAnimatedValue(alreadyWorking ? 1 : 0);
-  const translateY = createAnimatedValue(alreadyWorking ? 0 : 4);
+  const translateY = createAnimatedValue(alreadyWorking ? 0 : 7);
+  const scale = createAnimatedValue(alreadyWorking ? 1 : 0.48);
+  const breathe = createAnimatedValue(1);
   let exitTimer: ReturnType<typeof setTimeout> | undefined;
+  let openTimer: ReturnType<typeof setTimeout> | undefined;
+  let closeTimer: ReturnType<typeof setTimeout> | undefined;
+  let breatheAnim: CompositeAnimation | null = null;
+
+  const clearHoverTimers = () => {
+    clearTimeout(openTimer);
+    clearTimeout(closeTimer);
+    openTimer = undefined;
+    closeTimer = undefined;
+  };
+
+  const handleHover = (hovering: boolean) => {
+    clearTimeout(openTimer);
+    clearTimeout(closeTimer);
+    openTimer = undefined;
+    closeTimer = undefined;
+    if (hovering) {
+      if (untracked(cardOpen)) return;
+      openTimer = setTimeout(() => {
+        openTimer = undefined;
+        cardOpen.set(true);
+      }, HOVER_OPEN_MS);
+    } else {
+      closeTimer = setTimeout(() => {
+        closeTimer = undefined;
+        cardOpen.set(false);
+      }, HOVER_CLOSE_MS);
+    }
+  };
+
+  const handleToggle = () => {
+    clearHoverTimers();
+    cardOpen.set(!untracked(cardOpen));
+  };
 
   effect(() => {
     if (isLeavingSession()) return;
-    const active = isChatActive() || pipMood() === "happy";
+    const active = isChatActive();
     const reduced = reduceMotion();
     untracked(() => {
       clearTimeout(exitTimer);
+      breatheAnim?.stop();
+      breatheAnim = null;
       if (active) {
         const entering = !shown();
         shown.set(true);
         if (reduced) {
           opacity.set(1);
           translateY.set(0);
+          scale.set(1);
+          breathe.set(1);
         } else if (entering) {
           opacity.set(0);
-          void opacity.keyframes([0, 1], { duration: 160, delay: 45, easing: EASING.entrance });
-          void translateY.spring(0, SPRING.snappy);
+          translateY.set(7);
+          scale.set(0.48);
+          void opacity.keyframes([0, 1], { duration: 180, delay: 60, easing: EASING.entrance });
+          void translateY.keyframes(
+            [
+              { offset: 0, value: 7 },
+              { offset: 0.68, value: -1 },
+              { offset: 1, value: 0 },
+            ],
+            { duration: 240, delay: 60, easing: EASING.signature },
+          );
+          void scale.keyframes(
+            [
+              { offset: 0, value: 0.48 },
+              { offset: 0.66, value: 1.04 },
+              { offset: 1, value: 1 },
+            ],
+            { duration: 240, delay: 60, easing: EASING.signature },
+          );
         } else {
-          void opacity.timing(1, { duration: 160, easing: EASING.entrance });
-          void translateY.spring(0, SPRING.snappy);
+          void opacity.timing(1, { duration: 150, easing: EASING.entrance });
+          void translateY.timing(0, { duration: 180, easing: EASING.signature });
+          void scale.timing(1, { duration: 180, easing: EASING.signature });
+        }
+        if (!reduced) {
+          breatheAnim = Animated.keyframes(breathe, {
+            keyframes: [
+              { offset: 0, value: 1, easing: "easeInOut" },
+              { offset: 0.5, value: 1.022, easing: "easeInOut" },
+              { offset: 1, value: 1 },
+            ],
+            duration: 1800,
+            delay: entering ? 300 : 0,
+            iterations: "infinite",
+          });
+          void breatheAnim.start();
         }
       } else if (shown()) {
+        clearHoverTimers();
+        cardOpen.set(false);
+        breathe.set(1);
         if (reduced) {
           opacity.set(0);
+          scale.set(0.84);
           shown.set(false);
         } else {
-          void opacity.timing(0, { duration: 200, easing: EASING.exit });
-          void translateY.timing(3, { duration: 200, easing: EASING.exit });
-          exitTimer = setTimeout(() => shown.set(false), 210);
+          void opacity.timing(0, { duration: 130, easing: EASING.exit });
+          void translateY.timing(4, { duration: 130, easing: EASING.exit });
+          void scale.timing(0.82, { duration: 130, easing: EASING.exit });
+          exitTimer = setTimeout(() => shown.set(false), 140);
         }
       }
     });
@@ -462,17 +698,145 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
 
   cleanup(() => {
     clearTimeout(exitTimer);
+    clearHoverTimers();
+    breatheAnim?.stop();
     void opacity.stop();
     void translateY.stop();
+    void scale.stop();
+    void breathe.stop();
   });
 
+  const status = pipLiveStatus;
+  const isWaitingChildrenOnly = () => !isRunning() && waitingCount() > 0 && status().phase === "waiting_sessions";
+  const isWaitingUser = () => status().phase === "waiting_user";
+
   return (
-    <View ref={(node: ViewRef) => props.anchor?.(node)} class="h-11 w-full max-w-180 select-none justify-center self-center pt-1">
+    <View ref={(node: ViewRef) => props.anchor?.(node)} class="h-12 w-full max-w-180 select-none justify-end self-center pb-1">
       <If when={shown()}>
-        <View class="flex-row items-center" style={{ opacity, transform: [{ translateY }] }}>
-          <PipAvatarBadge active testID="pip-active-avatar" />
+        <View class="flex-row items-end gap-3.5">
+          <PipAvatarBadge
+            active
+            testID="pip-active-avatar"
+            externalOpen={cardOpen}
+            onExternalHover={handleHover}
+            onExternalToggle={handleToggle}
+          />
+          <View
+            testID="pip-typing-bubble"
+            role="button"
+            accessibilityLabel={`${status().name}: ${status().headline}`}
+            accessibilityState={{ busy: isChatActive() }}
+            onMouseEnter={() => handleHover(true)}
+            onMouseLeave={() => handleHover(false)}
+            onPress={handleToggle}
+            style={{
+              transformOrigin: "left bottom",
+              opacity,
+              transform: [{ translateY }, { scale: scale.mul(breathe) }],
+            }}
+            class="relative mb-0.5"
+          >
+            {/* Iconic iMessage typing thought-tail dots at bottom-left */}
+            <View class="pointer-events-none absolute -bottom-[1px] -left-[2px] size-[8.5px] rounded-full bg-sms-incoming" />
+            <View class="pointer-events-none absolute -bottom-[4px] -left-[6px] size-[4.5px] rounded-full bg-sms-incoming" />
+            <View class="h-[34px] flex-row items-center justify-center gap-2 rounded-[18px] corner-squircle bg-sms-incoming px-3.5">
+              <If
+                when={isWaitingUser()}
+                else={
+                  <If when={isWaitingChildrenOnly()} else={<TypingDots />}>
+                    <View class="size-2.5 shrink-0 rounded-full border-[1.5px] border-input border-t-brand motion-safe:animate-spin" />
+                    <Text class={`${uiType("xs")} text-muted-foreground`}>{status().headline}</Text>
+                  </If>
+                }
+              >
+                <View class="size-2 shrink-0 rounded-full bg-warning" />
+                <Text class={`${uiType("xs")} text-muted-foreground`}>{status().headline}</Text>
+              </If>
+            </View>
+          </View>
         </View>
       </If>
+    </View>
+  );
+}
+
+/**
+ * One iMessage-style incoming SMS bubble from Pip:
+ * - Soft neutral gray bubble (`bg-sms-incoming`) with cluster-aware corner radii
+ *   and a crisp curved bottom-left tail on the last bubble of the cluster.
+ * - Pip's hoverable avatar sits cleanly at the bottom-left beside the final bubble's tail.
+ * - New live bubbles pop out from `left bottom` with brisk multi-bubble stagger.
+ */
+export function PipBubbleView(props: {
+  row: PipBubbleRow;
+  processOpen?: () => boolean;
+  onToggleProcess?: () => void;
+}) {
+  const entrance = useSmsBubbleEntrance(
+    () => props.row.id,
+    () => "left",
+    {
+      skip: () => isRowSeen(props.row.rowId),
+      stagger: () => props.row.bubbleIndex,
+    },
+  );
+
+  const bubbleRadius = () => {
+    if (props.row.first && props.row.last) return "rounded-[18px] rounded-bl-[5px]";
+    if (props.row.first) return "rounded-[18px] rounded-bl-[6px]";
+    if (props.row.last) return "rounded-[18px] rounded-tl-[6px] rounded-bl-[5px]";
+    return "rounded-[18px] rounded-l-[6px]";
+  };
+
+  const contextMenu = (e: { pagePosition: { x: number; y: number } }) => {
+    const items = [
+      ...(props.row.copyText
+        ? [{ label: tr("Copy", "复制"), onSelect: () => void copyMessage(props.row.copyText) }]
+        : []),
+      ...(props.row.fullText && props.row.fullText !== props.row.copyText
+        ? [{ label: tr("Copy Full Reply", "复制完整回复"), onSelect: () => void copyMessage(props.row.fullText) }]
+        : []),
+    ];
+    if (items.length > 0) Menu.popup(items, e.pagePosition);
+  };
+
+  const bubblePad = () => (props.row.blocks.length > 1 || props.row.wide ? "px-4 py-3" : "px-3.5 py-2");
+
+  return (
+    <View class="flex-row items-end gap-3">
+      <View class="w-7 shrink-0 pb-0.5">
+        <If when={props.row.pip.tail}>
+          <PipAvatarBadge
+            rowId={() => props.row.id}
+            turnMeta={() => props.row.pip.meta}
+            processOpen={props.processOpen}
+            onToggleProcess={props.onToggleProcess}
+          />
+        </If>
+      </View>
+      <View class="min-w-0 flex-1 items-start">
+        <If
+          when={props.row.mediaOnly}
+          else={
+            <View
+              testID="pip-sms-bubble"
+              selectable
+              onContextMenu={contextMenu}
+              style={entrance}
+              class={`relative ${props.row.wide ? "max-w-[84%]" : "max-w-[74%]"} ${bubbleRadius()} corner-squircle bg-sms-incoming ${bubblePad()}`}
+            >
+              <If when={props.row.last}>
+                <BubbleTail side="left" tone="sms-incoming" />
+              </If>
+              <PipBubbleBlocks row={props.row} />
+            </View>
+          }
+        >
+          <View testID="pip-sms-bubble" style={entrance} class="max-w-[74%]">
+            <PipBubbleBlocks row={props.row} />
+          </View>
+        </If>
+      </View>
     </View>
   );
 }
@@ -480,7 +844,7 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
 /** Clean clickable cards for child sessions Pip dispatched (`session_start`), reading live daemon state. */
 export function PipSessionsView(props: { row: PipSessionsRow }) {
   return (
-    <View testID="pip-delegated-sessions" class="flex-row flex-wrap gap-1.5 py-0.5">
+    <View testID="pip-delegated-sessions" class="max-w-[76%] flex-row flex-wrap gap-1.5 py-0.5">
       <Each of={props.row.sessions} key={(s) => s.toolId}>
         {(ref) => <PipSessionChip session={ref()} />}
       </Each>
@@ -541,7 +905,7 @@ function PipSessionChip(props: { session: PipDelegatedSession }) {
       else={
         <View
           testID="pip-session-chip"
-          class={`${uiHeight(28)} select-none flex-row items-center gap-1.5 rounded-lg corner-squircle border-[0.5px] border-hairline bg-card/75 px-2.5`}
+          class={`${uiHeight(28)} select-none flex-row items-center gap-1.5 rounded-[14px] corner-squircle border-[0.5px] border-hairline bg-card/80 px-3`}
         >
           {chipBody()}
         </View>
@@ -553,7 +917,7 @@ function PipSessionChip(props: { session: PipDelegatedSession }) {
           if (props.session.sessionId) void openDaemonSession(props.session.sessionId);
         }}
         accessibilityLabel={tr(`Open session ${title()}`, `打开会话「${title()}」`)}
-        class={`${uiHeight(28)} select-none flex-row items-center gap-1.5 rounded-lg corner-squircle border-[0.5px] border-hairline bg-card/80 px-2.5 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:border-hairline-hover hover:bg-accent active:bg-accent`}
+        class={`${uiHeight(28)} select-none flex-row items-center gap-1.5 rounded-[14px] corner-squircle border-[0.5px] border-hairline bg-card/85 px-3 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:border-hairline-hover hover:bg-accent active:bg-accent`}
       >
         {chipBody()}
       </BaseButton>
@@ -561,14 +925,16 @@ function PipSessionChip(props: { session: PipDelegatedSession }) {
   );
 }
 
-/** Quiet IM message footer: the Copy action, nothing else. A turn's process is the avatar card's to show. */
+/** Quiet SMS message footer: hover-revealed Copy action, nothing else. A turn's process is the avatar card's to show. */
 export function PipFooterView(props: {
   row: PipFooterRow;
-  renderCopy: (id: string, text: string) => JSX.Element;
+  renderCopy: (id: string, text: string, cls?: string) => JSX.Element;
 }) {
   return (
-    <View class="h-6 select-none flex-row items-center gap-2">
-      <View class="-ml-1">{props.renderCopy(props.row.id, props.row.text)}</View>
+    <View class="group h-5 select-none flex-row items-center gap-2">
+      <View class="-ml-1">
+        {props.renderCopy(props.row.id, props.row.text, `transition-opacity duration-150 motion-reduce:transition-none ${HOVER_REVEAL}`)}
+      </View>
     </View>
   );
 }

@@ -105,3 +105,42 @@ test("a message Pi turns down is said once, in a toast, and comes back to the co
   expect(app.texts().filter((text) => text === toast)).toHaveLength(1);
   expect(app.value("label:Message")).toBe("refuse this");
 });
+
+test("a queued message comes back to the composer when the run dies before delivering it", async () => {
+  const app = await launch("slow");
+  await app.waitFor("text:What are we building?");
+  await app.type("label:Message", "an outage");
+  await app.submit("label:Message");
+  await app.waitFor("label:Stop", { timeout: 10000 });
+
+  // Queued while the failing run retries: the agent confirms it into its queue.
+  await app.type("label:Message", "also update the readme");
+  await app.submit("label:Message");
+  await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 1, { timeout: 10000 });
+
+  // The retries run out before the queue drains. The message never echoes — but its
+  // bubble must not just vanish: the words go back to the composer, in one piece,
+  // and nothing stays in the agent's queue to surface at some later run's end.
+  await app.waitUntil(() => app.value("label:Message") === "also update the readme", { timeout: 30000 });
+  expect(app.count("label:Conversation >> text:Queued")).toBe(0);
+  expect(app.count("label:Conversation >> text:also update the readme")).toBe(0);
+}, 60000);
+
+test("stopping a run hands a queued message back once — the settle does not repeat it", async () => {
+  const app = await launch("slow");
+  await app.waitFor("text:What are we building?");
+  await app.type("label:Message", "make a plan");
+  await app.submit("label:Message");
+  await app.waitFor("label:Stop", { timeout: 10000 });
+
+  await app.type("label:Message", "also update the readme");
+  await app.submit("label:Message");
+  await app.waitUntil(() => app.count("label:Conversation >> text:Queued") === 1, { timeout: 10000 });
+
+  await app.press("label:Stop");
+  await app.waitUntil(() => app.value("label:Message") === "also update the readme", { timeout: 10000 });
+  await app.waitFor("label:Send", { timeout: 10000 });
+  // The stop recalled the words itself; the settle over the same queue must not add them again.
+  expect(app.value("label:Message")).toBe("also update the readme");
+  expect(app.count("label:Conversation >> text:Queued")).toBe(0);
+}, 40000);

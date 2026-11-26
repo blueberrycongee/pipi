@@ -55,6 +55,8 @@
       "success": "oklch(0.54 0.14 155)",
       "warning": "oklch(0.62 0.14 70)",
       "scrim": "oklch(0.2 0.02 262 / 28%)",
+      "sms-incoming": "oklch(0.938 0.004 262)",
+      "sms-incoming-code": "oklch(0.99 0.002 262 / 78%)",
       "agent-qwen": "#6950EF",
       "pip-line": "#16161D"
     },
@@ -95,6 +97,8 @@
       "success": "oklch(0.76 0.15 155)",
       "warning": "oklch(0.8 0.13 80)",
       "scrim": "oklch(0 0 0 / 50%)",
+      "sms-incoming": "oklch(0.278 0.008 262)",
+      "sms-incoming-code": "oklch(0.184 0.007 262 / 78%)",
       "agent-qwen": "#8B7BFF",
       "pip-line": "#F1F2F6"
     }

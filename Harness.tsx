@@ -34,6 +34,7 @@ import { fakeBackend, sampleHistory } from "./dev/fake-pi";
 import { boot, newSession, openSession, send, setDraft, showSettings, type SettingsSection } from "./store/app";
 import { useBackend } from "./store/backend";
 import { closeTab, openTabs, selectTab, tabId } from "./store/tabs";
+import { startSplitDrag, workspaceBounds } from "./store/split";
 import { Shell } from "./views/Shell";
 
 const now = Date.now();
@@ -149,6 +150,19 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       else if (target.startsWith("send:")) {
         if (target.length > 5) setDraft(target.slice(5).replace(/\\n/g, "\n"));
         void send();
+      } else if (target.startsWith("splitdrag:")) {
+        const side = target.slice(10) === "left" ? "left" : "right";
+        const rect = workspaceBounds() ?? { left: 264, top: 7, width: 949, height: 766 };
+        const x = side === "left" ? rect.left + rect.width * 0.25 : rect.left + rect.width * 0.78;
+        const y = rect.top + rect.height * 0.45;
+        startSplitDrag({
+          source: "sidebar",
+          target: { kind: "chat", ref: "/sessions/four.jsonl", file: "/sessions/four.jsonl", title: "Release notes for 0.1", agentId: "dsh" },
+          title: "Release notes for 0.1",
+          agentId: "dsh",
+          x,
+          y,
+        });
       } else {
         const [file, cwd] = target.split("@");
         void openSession(file, cwd);

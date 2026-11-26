@@ -72,7 +72,11 @@ multi-agent orchestration, and settings.
   dropping them onto the line (`controlsOffset` in nsh.json, re-aimed per
   wallpaper by `Shell`'s effect) inflates that report to twice their
   center — a number nothing may follow: the strips and `topBarHeight` are
-  the fixed `TITLE_BAR_HEIGHT`, never `titleBarArea().height`.
+  the fixed `TITLE_BAR_HEIGHT`, never `titleBarArea().height`. The sidebar's
+  strip alone reaches `SHEET_INSET` lower when no wallpaper floats the
+  sheet, its bottom meeting the sheet strip's own — the sidebar's rows
+  start on the pane's first line, and the lights keep their air over
+  新会话.
 - A chat needs no project. 闲聊 lives as a special built-in workspace inside
   工作区 (and in the welcome folder picker) — never crowding 新会话 at the
   sidebar's top — starting a session in `<dataDir>/chat/` (`chatFolder` in
@@ -260,10 +264,12 @@ multi-agent orchestration, and settings.
 - `nsh test Media.test.tsx --target macos` — inline media in the message stream
   (`views/Media.tsx`, `lib/media.ts`): local images/galleries, video/audio
   players, PDF/deliverable cards, safe remote-URL cards, user `<attachment>`
-  files (paperclip/drop/paste), and `present_files` + tool `ImageContent`
-  surfacing outside collapsed turn folds (`--target macos` shoots
-  `.nsh/shots/media-*.png`; `nsh test lib/media.test.ts` unit-tests parsing
-  and resolution; `node --test sidecar/external-media.test.mjs` covers Claude,
+  files (paperclip/drop/paste), `present_files` + tool `ImageContent`
+  surfacing outside collapsed turn folds, and the full-stage image lightbox
+  with `←` / `→` stream switching, side chevrons, and bottom filmstrip + zoom
+  dock (`--target macos` shoots `.nsh/shots/media-*.png`; `nsh test
+  lib/media.test.ts` unit-tests parsing, resolution, and transcript image
+  collection; `node --test sidecar/external-media.test.mjs` covers Claude,
   Codex, and ACP media/structuredContent forwarding)
 - `nsh test WallpaperLook.test.tsx --target macos` — the app under a wallpaper,
   every surface it reaches, in `.nsh/shots/wallpaper-*.png` (`harness.wallpaper`

@@ -124,9 +124,9 @@ export function lazyMotion(options?: MotionOptions) {
   };
 }
 
-/** Lean two-channel motion (`opacity` + `translateY` / `translateX`) for recycled
- * `List` cells so each row costs 2 native `AnimatedValue` nodes instead of 11. */
-const REST = { opacity: 1, translateX: 0, translateY: 0 } as const;
+/** Lean multi-channel motion (`opacity`, `translateX`, `translateY`, `scale`) for recycled
+ * `List` cells so each row allocates only the native `AnimatedValue` nodes it needs. */
+const REST = { opacity: 1, translateX: 0, translateY: 0, scale: 1 } as const;
 type LeanChannel = keyof typeof REST;
 
 interface LeanSpec<C extends LeanChannel> {
@@ -222,6 +222,62 @@ const USER_ENTRANCE_SPEC: LeanSpec<"opacity" | "translateY"> = {
   easing: EASING.signature,
 };
 
+/** iMessage-style outgoing SMS bubble pop-in from the bottom-right corner. */
+const SMS_OUTGOING_SPEC: LeanSpec<"opacity" | "translateX" | "translateY" | "scale"> = {
+  tracks: {
+    opacity: [
+      { offset: 0, value: 0 },
+      { offset: 0.42, value: 0.94 },
+      { offset: 1, value: 1 },
+    ],
+    translateX: [
+      { offset: 0, value: 6 },
+      { offset: 0.68, value: -0.6 },
+      { offset: 1, value: 0 },
+    ],
+    translateY: [
+      { offset: 0, value: 14 },
+      { offset: 0.68, value: -1.2 },
+      { offset: 1, value: 0 },
+    ],
+    scale: [
+      { offset: 0, value: 0.86 },
+      { offset: 0.66, value: 1.018 },
+      { offset: 1, value: 1 },
+    ],
+  },
+  duration: 240,
+  easing: EASING.signature,
+};
+
+/** iMessage-style incoming SMS bubble pop-in blooming from the bottom-left corner. */
+const SMS_INCOMING_SPEC: LeanSpec<"opacity" | "translateX" | "translateY" | "scale"> = {
+  tracks: {
+    opacity: [
+      { offset: 0, value: 0 },
+      { offset: 0.38, value: 0.94 },
+      { offset: 1, value: 1 },
+    ],
+    translateX: [
+      { offset: 0, value: -7 },
+      { offset: 0.66, value: 0.8 },
+      { offset: 1, value: 0 },
+    ],
+    translateY: [
+      { offset: 0, value: 11 },
+      { offset: 0.66, value: -1.5 },
+      { offset: 1, value: 0 },
+    ],
+    scale: [
+      { offset: 0, value: 0.78 },
+      { offset: 0.64, value: 1.024 },
+      { offset: 1, value: 1 },
+    ],
+  },
+  duration: 260,
+  easing: EASING.signature,
+};
+
 /** Tracks which transcript row IDs have already animated in during the current
  * session so recycled `List` cells and history loads stay still while newly
  * streamed/appended rows glide into place once. */
@@ -285,6 +341,59 @@ export function useRowEntrance(id: () => string, streaming?: () => boolean, skip
   return {
     opacity: item.values.opacity,
     transform: [{ translateY: item.values.translateY }],
+  };
+}
+
+/** iMessage-style bubble pop-in anchored directly to the bubble's own corner
+ * (`left bottom` for Pip's incoming bubbles, `right bottom` for the user's outgoing bubbles).
+ * Plays once for newly arrived live bubbles; loaded history and recycled cells stay steady. */
+export function useSmsBubbleEntrance(
+  id: () => string,
+  side: () => "left" | "right",
+  options?: { enabled?: () => boolean; skip?: () => boolean; stagger?: () => number },
+): ViewStyle {
+  const item = leanMotion(["opacity", "translateX", "translateY", "scale"] as const);
+  let lastId = "";
+  effect(() => {
+    const currentId = id();
+    const enabled = options?.enabled ? options.enabled() : true;
+    untracked(() => {
+      if (currentId === lastId && enabled) return;
+      lastId = currentId;
+      if (!enabled || !currentId || options?.skip?.()) {
+        if (currentId) seenRowIds.add(currentId);
+        item.reset();
+        return;
+      }
+      if (!liveEntranceEnabled || seenRowIds.has(currentId)) {
+        seenRowIds.add(currentId);
+        item.reset();
+        return;
+      }
+      seenRowIds.add(currentId);
+      const isLeft = side() === "left";
+      const spec = isLeft ? SMS_INCOMING_SPEC : SMS_OUTGOING_SPEC;
+      const delay = isLeft ? Math.min(Math.max(0, options?.stagger?.() ?? 0), 4) * 85 : 0;
+      if (reduceMotion()) {
+        item.reset();
+        return;
+      }
+      item.values.opacity.set(0);
+      item.values.translateX.set(isLeft ? -7 : 6);
+      item.values.translateY.set(isLeft ? 11 : 14);
+      item.values.scale.set(isLeft ? 0.78 : 0.86);
+      item.play(spec, delay);
+    });
+  });
+  cleanup(() => item.stop());
+  return {
+    transformOrigin: side() === "left" ? "left bottom" : "right bottom",
+    opacity: item.values.opacity,
+    transform: [
+      { translateX: item.values.translateX },
+      { translateY: item.values.translateY },
+      { scale: item.values.scale },
+    ],
   };
 }
 

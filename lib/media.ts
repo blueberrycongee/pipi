@@ -1,6 +1,6 @@
 import type { TextViewBlock, TextViewInline } from "nsh/base";
 import type { AudioContent, ImageContent, MediaResourceContent, ProtocolMediaBlock } from "../pi/protocol";
-import type { ToolRow } from "../pi/transcript";
+import type { Row, ToolRow } from "../pi/transcript";
 import { basename } from "./format";
 import { PENDING_LINK_URL } from "./mend";
 
@@ -860,4 +860,216 @@ export function extractToolResultMedia(
     if (item) items.push(item);
   });
   return items;
+}
+
+// ── Stream-wide image collection (for lightbox prev/next navigation) ──────────
+
+/** True for local/base64 image items that can render inside the native image viewer. */
+export function isPreviewableImage(item: MediaItem, isMissingPath?: (path: string) => boolean): boolean {
+  if (item.kind !== "image") return false;
+  if (item.remoteUrl || item.missing) return false;
+  if (!item.src && !item.data) return false;
+  if (item.path && isMissingPath?.(item.path)) return false;
+  return true;
+}
+
+/** Strips fenced code blocks and inline code spans so example Markdown inside code never enters the photo stream. */
+function stripMarkdownCode(markdown: string): string {
+  return markdown
+    .replace(/(^|\n)[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:\n[ \t]*\2[ \t]*(?=\n|$)|$)/g, "\n")
+    .replace(/`[^`\n]+`/g, "");
+}
+
+/**
+ * Extracts previewable local/data images referenced in Markdown prose (both
+ * `![alt](target "title")` embeds and `[label](local-image.png)` links) in
+ * document order.
+ */
+export function extractMarkdownImages(markdown: string, cwd?: string, home?: string, idPrefix = "md"): MediaItem[] {
+  if (!markdown) return [];
+  const cleaned = stripMarkdownCode(markdown);
+  const out: MediaItem[] = [];
+  const re = /(!?)\[([^\]\n]*)\]\(\s*(?:<([^>\n]+)>|([^)\s]+))(?:\s+"([^"\n]*)")?\s*\)/g;
+  let idx = 0;
+  for (const hit of cleaned.matchAll(re)) {
+    const isEmbed = hit[1] === "!";
+    const label = (hit[2] ?? "").trim();
+    const rawTarget = (hit[3] ?? hit[4] ?? "").trim();
+    const titleAttr = (hit[5] ?? "").trim();
+    if (!rawTarget) continue;
+    if (!isEmbed && !isLocalTarget(rawTarget)) continue;
+    const resolved = resolveMediaTarget(rawTarget, cwd, home);
+    if (!resolved || resolved.kind !== "image" || resolved.remoteUrl) continue;
+    if (!resolved.src && !resolved.data) continue;
+    out.push(
+      mediaItemFromResolved(
+        `${idPrefix}:img:${idx++}`,
+        resolved,
+        titleAttr || label || resolved.title,
+        titleAttr && label ? label : undefined,
+      ),
+    );
+  }
+  return out;
+}
+
+function streamImageDedupKey(item: MediaItem): string {
+  if (item.path) return `path:${item.path}`;
+  if (item.src) return `src:${item.src}`;
+  if (item.data) return `data:${item.mimeType ?? ""}:${item.data.slice(0, 64)}:${item.data.length}`;
+  return `id:${item.id}`;
+}
+
+/** Stable identity key for matching a clicked `MediaItem` against its entry in the stream gallery. */
+export function findMediaImageIndex(list: readonly MediaItem[], target: MediaItem): number {
+  const byId = list.findIndex((item) => item.id === target.id);
+  if (byId >= 0) return byId;
+  if (target.path) {
+    const byPath = list.findIndex((item) => item.path === target.path);
+    if (byPath >= 0) return byPath;
+  }
+  if (target.src) {
+    const bySrc = list.findIndex((item) => item.src === target.src);
+    if (bySrc >= 0) return bySrc;
+  }
+  if (target.data) {
+    const byData = list.findIndex((item) => item.data === target.data && item.mimeType === target.mimeType);
+    if (byData >= 0) return byData;
+  }
+  return -1;
+}
+
+const READ_TOOL_NAMES = new Set(["read", "read_file", "read_files", "view_file", "cat", "open_file"]);
+const isTurnRowKind = (row: Row): row is Extract<Row, { kind: "text" | "thinking" | "tool" | "media" }> =>
+  row.kind === "text" || row.kind === "thinking" || row.kind === "tool" || row.kind === "media";
+
+/**
+ * Collects every previewable image across a conversation's transcript in
+ * on-screen chronological order (user pasted images & image attachments,
+ * assistant Markdown images, surfaced `present_files` / tool images, and
+ * delivered replies), deduplicating tool echoes against the turn's answer and
+ * `present_files` rows the same way `buildDisplayRows` does.
+ */
+export function collectTranscriptImages(
+  rows: readonly Row[],
+  context?: { cwd?: string; home?: string; isMissingPath?: (path: string) => boolean },
+): MediaItem[] {
+  const cwd = context?.cwd;
+  const home = context?.home;
+  const isMissingPath = context?.isMissingPath;
+  const out: MediaItem[] = [];
+
+  for (let i = 0; i < rows.length; ) {
+    const row = rows[i];
+
+    if (row.kind === "user") {
+      (row.imageBlocks ?? []).forEach((img, idx) => {
+        if (!img.data) return;
+        const mimeType = img.mimeType || "image/png";
+        const count = row.imageBlocks?.length ?? 1;
+        out.push({
+          id: `${row.id}:img:${idx}`,
+          kind: "image",
+          title: count > 1 ? `Image ${idx + 1}` : "Image",
+          src: `data:${mimeType};base64,${img.data}`,
+          mimeType,
+          data: img.data,
+        });
+      });
+      const { files } = splitFileMessage(row.text);
+      files.forEach((file, idx) => {
+        if (file.kind !== "image") return;
+        const resolved = resolveMediaTarget(file.path, cwd, home);
+        const item: MediaItem = {
+          id: `${row.id}:att:${idx}`,
+          kind: "image",
+          title: file.name,
+          path: resolved?.path ?? file.path,
+          ...(resolved?.src ? { src: resolved.src } : {}),
+          ...(file.mimeType ? { mimeType: file.mimeType } : resolved?.mimeType ? { mimeType: resolved.mimeType } : {}),
+          ...(typeof file.size === "number" ? { size: file.size } : {}),
+        };
+        if (isPreviewableImage(item, isMissingPath)) out.push(item);
+      });
+      i++;
+      continue;
+    }
+
+    if (row.kind === "delivery") {
+      for (const img of extractMarkdownImages(row.text, cwd, home, row.id)) {
+        if (isPreviewableImage(img, isMissingPath)) out.push(img);
+      }
+      i++;
+      continue;
+    }
+
+    if (!isTurnRowKind(row)) {
+      i++;
+      continue;
+    }
+
+    // Group one assistant turn the same way `buildDisplayRows` lays it out:
+    // commentary/answer Markdown images first, then deduplicated surfaced media.
+    const directMedia: MediaItem[] = [];
+    const toolPresented: MediaItem[] = [];
+    const autoMedia: MediaItem[] = [];
+    const commentaryImages: MediaItem[] = [];
+    const answerImages: MediaItem[] = [];
+    const answerPaths = new Set<string>();
+    const first = row;
+
+    for (; i < rows.length; i++) {
+      const cur = rows[i];
+      if (!isTurnRowKind(cur)) break;
+      if (cur !== first && cur.turnStart && answerImages.length > 0) break;
+
+      if (cur.kind === "media") {
+        for (const item of cur.items) {
+          if (isPreviewableImage(item, isMissingPath)) directMedia.push(item);
+        }
+        continue;
+      }
+      if (cur.kind === "tool") {
+        if (cur.status !== "done") continue;
+        const presented = extractPresentedMedia(cur, cwd, home);
+        if (presented && presented.items.length > 0) {
+          for (const item of presented.items) {
+            if (isPreviewableImage(item, isMissingPath)) toolPresented.push(item);
+          }
+        } else if (!READ_TOOL_NAMES.has(normalizeMcpToolName(cur.name)) && (cur.imageBlocks?.length || cur.resources?.length)) {
+          for (const item of extractToolResultMedia(cur, cwd, home)) {
+            if (isPreviewableImage(item, isMissingPath)) autoMedia.push(item);
+          }
+        }
+        continue;
+      }
+      if (cur.kind === "text" && cur.text.trim()) {
+        const imgs = extractMarkdownImages(cur.text, cwd, home, cur.id).filter((img) => isPreviewableImage(img, isMissingPath));
+        if (cur.final) {
+          answerImages.push(...imgs);
+          for (const p of extractMarkdownMediaPaths(cur.text, cwd, home)) answerPaths.add(p);
+        } else {
+          commentaryImages.push(...imgs);
+        }
+      }
+    }
+
+    const turnSeen = new Set<string>();
+    const pushUnique = (item: MediaItem) => {
+      const key = streamImageDedupKey(item);
+      if (turnSeen.has(key)) return;
+      turnSeen.add(key);
+      out.push(item);
+    };
+    for (const img of commentaryImages) pushUnique(img);
+    for (const img of answerImages) pushUnique(img);
+    for (const img of directMedia) pushUnique(img);
+    for (const img of toolPresented) pushUnique(img);
+    for (const img of autoMedia) {
+      if (img.path && answerPaths.has(img.path)) continue;
+      pushUnique(img);
+    }
+  }
+
+  return out;
 }

@@ -1381,7 +1381,9 @@ test("a queued staged bubble reconciles with the agent's queue: delivered echoes
   const second = t.stageUser("follow up on this", 0);
   t.markStagedQueued(first);
   t.markStagedQueued(second);
-  expect(t.hasPendingUser()).toBe(true);
+  // Confirmed into the agent's queue, neither expects a run or an echo of its own any
+  // time soon: a settle arriving over them is the run's real end, not a stale one.
+  expect(t.hasPendingUser()).toBe(false);
 
   // Both queued: the queue covers them, nothing is marked for withdrawal.
   t.reconcileQueue(["steer this"], ["follow up on this"]);
@@ -1429,9 +1431,43 @@ test("a queued staged bubble reconciles with the agent's queue: delivered echoes
   expect(t.rows().some((r) => r.kind === "user" && "text" in r && r.text === "lost message")).toBe(false);
 });
 
+test("two identical queued messages: dequeuing the first must not doom the still-queued second", () => {
+  // The queue delivers oldest-first, so when one of two identical copies leaves
+  // the wire the remaining slot covers the newest bubble — the oldest is the one
+  // in flight. Consuming cover oldest-first would arm the still-queued copy for
+  // withdrawal instead, and the sweep would vanish it before its turn came.
+  const t = new Transcript();
+  const first = t.stageUser("继续", 0);
+  const second = t.stageUser("继续", 0);
+  t.markStagedQueued(first);
+  t.markStagedQueued(second);
 
+  t.reconcileQueue([], ["继续", "继续"]);
+  expect(t.dropDeadline()).toBeUndefined();
 
+  // The first is dequeued for delivery: one copy remains in the queue.
+  // The first (being delivered) arms its echo grace; the second keeps covered.
+  t.reconcileQueue([], ["继续"]);
 
+  // The echo of the first arrives and is adopted.
+  t.apply({ type: "message_start", message: { role: "user", content: "继续", timestamp: 10 } } as never);
+
+  // Past the grace: nothing is swept — the second bubble is still legitimately queued.
+  const realNow = Date.now;
+  Date.now = () => realNow() + 3100;
+  try {
+    expect(t.sweepDrops()).toBe(false);
+  } finally {
+    Date.now = realNow;
+  }
+  expect(t.rows().filter((r) => r.kind === "user" && (r as { text?: string }).text === "继续").length).toBe(2);
+
+  // The second one dequeues in its turn: its bubble is marked, then the echo adopts it.
+  t.reconcileQueue([], []);
+  expect(t.dropDeadline()).toBeGreaterThan(Date.now());
+  t.apply({ type: "message_start", message: { role: "user", content: "继续", timestamp: 11 } } as never);
+  expect(t.rows().filter((r) => r.kind === "user" && (r as { text?: string }).text === "继续").length).toBe(2);
+});
 
 test("a pending assistant message in get_messages rebuilds the live stream so deltas keep their rows", () => {
   // What the bridge carries mid-turn: the turn's settled messages — tool

@@ -154,12 +154,13 @@ function activeBranch(entries: PiTreeEntry[], leafId?: string | null): PiTreeEnt
     }
   }
 
-  // Reconstruct the active branch from the current leaf (last appended entry) to its root (`docs/pi/session-format.md`).
+  // Reconstruct the active branch from the current leaf (active `leafId` when recorded, else last tree entry) to its root (`docs/pi/session-format.md`).
   let pathEntries: PiTreeEntry[];
   if (hasTreeIds && entries.length > 0) {
     const reversed: PiTreeEntry[] = [];
     const seen = new Set<string>();
-    let cur: PiTreeEntry | undefined = leafId === undefined ? entries.at(-1) : byId.get(leafId);
+    const fallbackLeaf = [...entries].reverse().find((entry) => typeof entry.id === "string" && entry.id);
+    let cur: PiTreeEntry | undefined = leafId === undefined ? fallbackLeaf : (byId.get(leafId) ?? fallbackLeaf);
     while (cur) {
       if (typeof cur.id === "string") {
         if (seen.has(cur.id)) break;
@@ -180,7 +181,15 @@ function activeBranch(entries: PiTreeEntry[], leafId?: string | null): PiTreeEnt
 function parsePiSnapshot(lines: Record<string, unknown>[]): SessionSnapshot {
   const header = lines[0];
   const entries = lines.slice(1) as PiTreeEntry[];
-  const pathEntries = activeBranch(entries);
+  let activeLeaf: string | null | undefined;
+  if (typeof header.leafId === "string" && header.leafId) activeLeaf = header.leafId;
+  else if (header.leafId === null) activeLeaf = null;
+  for (const entry of entries) {
+    const rawLeaf = (entry as { leafId?: unknown }).leafId;
+    if (typeof rawLeaf === "string" && rawLeaf) activeLeaf = rawLeaf;
+    else if (rawLeaf === null) activeLeaf = null;
+  }
+  const pathEntries = activeBranch(entries, activeLeaf);
   let name: string | undefined;
   for (const entry of entries) {
     if (entry.type === "session_info" && typeof entry.name === "string" && entry.name) name = entry.name;

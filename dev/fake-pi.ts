@@ -314,11 +314,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         recordMessage(queuedReply);
         emit({ type: "agent_end", willRetry: false });
       }
-      if (aborted && (queued.steering.length > 0 || queued.followUp.length > 0)) {
-        queued.steering.length = 0;
-        queued.followUp.length = 0;
-        emit({ type: "queue_update", steering: [], followUp: [] });
-      }
+      // An abort strands whatever is still queued, as Pi's does: the messages stay
+      // in memory unannounced until a later run's end or a `clear_queue` takes them.
     }
 
     /** A longer run, as agents work: prose between steps, several tool calls at a time, then the answer. */
@@ -971,12 +968,10 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
           return { disposition: "started" };
         }
         case "abort":
+          // As Pi does: an abort strands the queue in place — no `queue_update`,
+          // no drain; the messages wait in memory for the next run's end, unless
+          // someone takes them back out (`clear_queue`).
           aborted = isStreaming;
-          if (queued.steering.length > 0 || queued.followUp.length > 0) {
-            queued.steering.length = 0;
-            queued.followUp.length = 0;
-            emit({ type: "queue_update", steering: [], followUp: [] });
-          }
           return undefined;
         case "abort_retry":
           cancelRetry?.();

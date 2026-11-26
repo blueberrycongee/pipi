@@ -1,5 +1,26 @@
+import { effect } from "nsh";
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
+import { fakeBackend } from "./dev/fake-pi";
+import { advanceElemVeil, beginVeilPass, clearVeils, finishVeilPass, reseedVeils, rowVeil } from "./lib/veil";
+import { parseSessionSnapshot } from "./pi/session-file";
+import { sameVisualRows, Transcript } from "./pi/transcript";
+import {
+  boot,
+  conversationKey,
+  currentView,
+  isLeavingSession,
+  isRunning,
+  isSnapshotPending,
+  openSession,
+  refreshSessions,
+  savedSessions,
+  transcriptRows,
+  workspaceSessions,
+} from "./store/app";
+import { useBackend } from "./store/backend";
+import { proseRows } from "./views/Prose";
+import { enterConversation } from "./views/Rows";
 
 // A session change answers the click, not the agent. On a manual clock with
 // agents as slow as real CLIs (`harness.startDelay`), each test reads the chat
@@ -320,3 +341,242 @@ test("picking a model during a slow new-session switch updates immediately and l
   expect(app.texts()).toContain("GPT-5.1");
   expect(app.texts().some((t) => t.includes("Could not switch model"))).toBe(false);
 });
+
+test("cold switch with fast disk snapshot lands at steady opacity without leaving dip or Welcome Waking flash", async () => {
+  // 1) Welcome -> cold saved session via `harness.then` (captures Frame 0 on the click):
+  //    never flashes "Waking Pi" while the fast disk snapshot resolves.
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: {
+      "harness.scenario": "welcome",
+      "harness.startDelay": String(DELAY),
+      "harness.distinct": "1",
+      "harness.then": "2000:/sessions/two.jsonl",
+    },
+  });
+  await app.waitFor("text:What are we building?");
+  await app.wait(1950);
+  const welcomeFrames = await frames(app, () => ({
+    welcome: app.texts().includes("What are we building?"),
+    next: shows(app, REFACTOR),
+    waking: app.texts().some((t) => t.includes("Waking Pi")),
+  }));
+  expect(welcomeFrames.some((f) => f.waking)).toBe(false);
+  expect(welcomeFrames.some((f) => f.next)).toBe(true);
+  expect(welcomeFrames.at(-1)?.next).toBe(true);
+
+  // 2) Direct store check: Session A -> unvisited Session B with fast snapshot never sets `isLeavingSession()` true.
+  const now = Date.now();
+  const list = [
+    { path: "/sessions/a.jsonl", id: "a", name: "Session A", firstMessage: "", messageCount: 2, created: now - 60_000, modified: now - 60_000 },
+    { path: "/sessions/b.jsonl", id: "b", name: "Session B", firstMessage: "", messageCount: 2, created: now - 30_000, modified: now - 30_000 },
+  ];
+  useBackend(fakeBackend({ sessions: list, distinctHistories: true, startDelay: 80 }));
+  await boot();
+  await openSession("/sessions/a.jsonl");
+  expect(transcriptRows().length).toBeGreaterThan(0);
+
+  let everLeft = false;
+  let everSnapPending = false;
+  let watching = true;
+  effect(() => {
+    const l = isLeavingSession();
+    const s = isSnapshotPending();
+    if (!watching) return;
+    if (l) everLeft = true;
+    if (s) everSnapPending = true;
+  });
+  try {
+    await openSession("/sessions/b.jsonl");
+    expect(everSnapPending).toBe(true);
+    expect(everLeft).toBe(false);
+    expect(isLeavingSession()).toBe(false);
+    expect(isSnapshotPending()).toBe(false);
+  } finally {
+    watching = false;
+  }
+});
+
+test("cached switch avoids double prose rebuild, preserves session list refs, and guards chat view notifications", async () => {
+  const now = Date.now();
+  const list = [
+    { path: "/sessions/a.jsonl", id: "a", name: "Alpha task", firstMessage: "", messageCount: 4, created: now - 60_000, modified: now - 60_000 },
+    { path: "/sessions/b.jsonl", id: "b", name: "Beta task", firstMessage: "", messageCount: 4, created: now - 30_000, modified: now - 30_000 },
+  ];
+  useBackend(fakeBackend({ sessions: list, distinctHistories: true, startDelay: 20 }));
+  await boot();
+  await refreshSessions();
+  await openSession("/sessions/a.jsonl");
+  await openSession("/sessions/b.jsonl");
+
+  const savedBefore = savedSessions();
+  const wsBefore = workspaceSessions();
+  let watching = true;
+  let viewNotifications = 0;
+  effect(() => {
+    currentView();
+    if (watching) viewNotifications++;
+  });
+  let keyChanges = 0;
+  effect(() => {
+    conversationKey();
+    if (watching) keyChanges++;
+  });
+  viewNotifications = 0;
+  keyChanges = 0;
+
+  try {
+    // Refreshing unchanged session lists preserves exact array & map references.
+    await refreshSessions();
+    expect(savedSessions()).toBe(savedBefore);
+    expect(workspaceSessions()).toBe(wsBefore);
+
+    // Switching back to cached Session A fires zero redundant `currentView` updates and one `conversationKey` swap.
+    await openSession("/sessions/a.jsonl");
+    expect(viewNotifications).toBe(0);
+    expect(keyChanges).toBe(1);
+
+    // Synchronous `enterConversation(key)` before `proseRows()` keeps exact `ProseRow` refs across subsequent reads.
+    const key = conversationKey();
+    enterConversation(key);
+    const textRow = transcriptRows().find((r): r is Extract<typeof r, { kind: "text" }> => r.kind === "text");
+    expect(textRow).toBeDefined();
+    const first = proseRows(textRow!);
+    const second = proseRows(textRow!);
+    expect(second).toBe(first);
+  } finally {
+    watching = false;
+  }
+});
+
+test("background-completed session invalidates stale visited cache and lands settled without streaming+idle mismatch", async () => {
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: {
+      "harness.scenario": "stream",
+      "harness.startDelay": "300",
+      "harness.distinct": "1",
+    },
+  });
+  await app.waitFor("text:What are we building?");
+
+  // Open Session A and start a multi-step streamed run.
+  await app.press(row(REFACTOR));
+  await app.waitUntil(() => shows(app, REFACTOR));
+  await app.wait(400);
+  await app.type("label:Message", "please do this in steps");
+  await app.submit("label:Message");
+  await app.wait(300);
+
+  // Switch away to Session B while Session A is still streaming (stashing Session A mid-run).
+  await app.press(row(NOTES));
+  await app.waitUntil(() => shows(app, NOTES));
+
+  // Wait long enough on the manual clock for Session A's ~13s streamed background run to complete on the daemon.
+  await app.wait(16000);
+
+  // Switch back to Session A: must land on the completed answer cleanly without showing a running stop button.
+  await app.press(row(REFACTOR));
+  const seen = await frames(app, () => ({
+    hasRefactor: shows(app, REFACTOR),
+    hasFinal: app.texts().some((t) => t.includes("Everything else is as it was")),
+    stopping: app.shows("label:Stop"),
+  }));
+  expect(seen.some((f) => f.stopping)).toBe(false);
+  expect(seen.every((f) => f.hasRefactor && f.hasFinal)).toBe(true);
+}, 120000);
+
+test("live streaming re-attach recovers #live mid-message, settles catch-up veils, and aligns snapshot leaf/turnMs", async () => {
+  // 1) Transcript `#update` mid-stream `#live` recovery (when Pi `get_entries` omits in-flight assistant message).
+  const t = new Transcript();
+  t.load([{ role: "user", content: "explain it", timestamp: 1 } as never], true);
+  t.apply({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Part one " } });
+  t.apply({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "and two." } });
+  const streamingRow = t.rows().at(-1);
+  expect(streamingRow).toMatchObject({ kind: "text", text: "Part one and two.", streaming: true });
+  const liveId = streamingRow!.id;
+  t.apply({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "Part one and two." }],
+      stopReason: "stop",
+      timestamp: 2,
+    } as never,
+  });
+  expect(t.rows().filter((r) => r.kind === "text")).toHaveLength(1);
+  expect(t.rows().at(-1)?.id).toBe(liveId);
+
+  // 2) `reseedVeils` settles catch-up text on already-initialized streaming rows without 0->1 fade,
+  //    while subsequent live deltas still fade smoothly.
+  clearVeils();
+  const v = rowVeil("live-catchup");
+  beginVeilPass(v, 5, true);
+  advanceElemVeil(v, "p:0", "Hello", 100);
+  finishVeilPass(v);
+  expect(v.initialized).toBe(true);
+  reseedVeils(["live-catchup"]);
+  const v2 = rowVeil("live-catchup");
+  expect(v2.seeding).toBe(true);
+  expect(advanceElemVeil(v2, "p:0", "Hello plus a full catch-up paragraph from landHistory", 300)).toEqual([]);
+  finishVeilPass(v2);
+  const nextDelta = advanceElemVeil(v2, "p:0", "Hello plus a full catch-up paragraph from landHistory and new words", 360);
+  expect(nextDelta).toHaveLength(1);
+  expect(nextDelta[0].start).toBe("Hello plus a full catch-up paragraph from landHistory".length);
+  clearVeils();
+
+  // 3) `parseSessionSnapshot` follows recorded `leafId` and `sameVisualRows` tolerates optional `turnMs` skew.
+  const branched = [
+    JSON.stringify({ type: "session", version: 3, id: "s_br", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/w", leafId: "a1" }),
+    JSON.stringify({ type: "message", id: "u1", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "q1", timestamp: 1 } }),
+    JSON.stringify({ type: "message", id: "a1", parentId: "u1", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "text", text: "chosen branch" }], stopReason: "stop", timestamp: 2 } }),
+    JSON.stringify({ type: "message", id: "a2", parentId: "u1", timestamp: "2026-01-01T00:00:03.000Z", message: { role: "assistant", content: [{ type: "text", text: "abandoned branch" }], stopReason: "stop", timestamp: 3 } }),
+  ].join("\n");
+  const snap = parseSessionSnapshot(branched)!;
+  expect(snap.messages).toHaveLength(2);
+  expect((snap.messages[1] as { content: { text: string }[] }).content[0].text).toBe("chosen branch");
+
+  const withTurnMs = [{ kind: "text", id: "t1", text: "done", streaming: false, final: true, turnStart: true, turnMs: 1200 }] as const;
+  const withoutTurnMs = [{ kind: "text", id: "t2", text: "done", streaming: false, final: true, turnStart: true }] as const;
+  expect(sameVisualRows(withTurnMs, withoutTurnMs)).toBe(true);
+
+  // 4) Headless live re-attach: leave a streaming session and return while it is still streaming;
+  //    verify it continues smoothly to completion without clearing.
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: {
+      "harness.scenario": "stream",
+      "harness.startDelay": "200",
+      "harness.distinct": "1",
+    },
+  });
+  await app.waitFor("text:What are we building?");
+  await app.press(row(REFACTOR));
+  await app.waitUntil(() => shows(app, REFACTOR));
+  await app.wait(300);
+  await app.type("label:Message", "please do this in steps");
+  await app.submit("label:Message");
+  await app.wait(250);
+
+  await app.press(row(NOTES));
+  await app.waitUntil(() => shows(app, NOTES));
+  await app.wait(250);
+
+  // Return mid-stream and confirm it stays on Session A and streams to completion.
+  await app.press(row(REFACTOR));
+  expect(shows(app, REFACTOR)).toBe(true);
+  await app.waitUntil(() => app.texts().some((t) => t.includes("Everything else is as it was")), { timeout: 15000 });
+  expect(shows(app, REFACTOR)).toBe(true);
+}, 120000);

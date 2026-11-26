@@ -685,3 +685,108 @@ test("Pip's pinned row opens the one personal agent, whose folder of notes never
   expect(app.count("id:sidebar-workspaces >> text:persona")).toBe(0);
   expect(app.count(PIP)).toBe(1);
 });
+
+test("cross-workspace session switch preserves row hover reveal and leaves Documents and Archived untouched", async () => {
+  const dir = `/tmp/pipi-sidebar-isolation-${Date.now()}`;
+  const notePath = `${dir}/docs/checklist.md`;
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: {
+      "harness.scenario": "multi",
+      "harness.startDelay": String(DELAY),
+      "harness.dataDir": dir,
+      "harness.files": JSON.stringify({ [notePath]: "# Release checklist\n\nVerify sidebar isolation.\n" }),
+    },
+  });
+  await app.waitFor("text:What are we building?");
+  await app.waitFor("id:sidebar-docs >> text:Release checklist");
+
+  // Archive one session in pipi so the Archived section is populated and visible.
+  await app.hover("id:sidebar-workspaces >> text:Release notes for 0.1");
+  await app.press("id:sidebar-workspaces >> label:Archive >> nth=3");
+  await app.waitFor("text:Archived");
+
+  // Open a saved session in pipi first and let its startup settle completely.
+  await app.press("id:sidebar-workspaces >> text:Refactor the transcript reducer");
+  await app.waitUntil(() => app.texts().includes("Here is the plan."));
+  await app.waitUntil(() => weight(app, "id:sidebar-workspaces >> text:Refactor the transcript reducer") > 400);
+  await app.wait(DELAY * 2);
+
+  // Hovering a row in nsh clears pointerResting; pressing it switches cross-workspace (pipi -> nsh).
+  const nshRow = "id:sidebar-workspaces >> text:Fix QuickJS GC mark phase";
+  const nshArchive = "id:sidebar-workspaces >> label:Archive >> nth=3";
+  await app.hover(nshRow);
+  await app.press(nshRow);
+  const seen = await frames(app, () => ({
+    docCount: app.count("id:sidebar-docs >> text:Release checklist"),
+    docWeight: weight(app, "id:sidebar-docs >> text:Release checklist"),
+    archivedHeading: app.count("text:Archived"),
+    nshWeight: weight(app, nshRow),
+    pipiWeight: weight(app, "id:sidebar-workspaces >> text:Refactor the transcript reducer"),
+  }));
+
+  expect(seen.every((f) => f.docCount === 1 && f.docWeight <= 400)).toBe(true);
+  expect(seen.every((f) => f.archivedHeading === 1)).toBe(true);
+  expect(seen.filter((f) => !(f.nshWeight > 400 && f.pipiWeight <= 400))).toEqual([]);
+
+  // Without re-hovering, the hover-only Archive action on the clicked nsh row remains interactive
+  // (pointerResting stayed false because rowSignature did not change across the cross-workspace switch).
+  await app.press(nshArchive);
+  await app.waitUntil(() => app.count(nshRow) === 0);
+  expect(app.count("id:sidebar-docs >> text:Release checklist")).toBe(1);
+});
+
+test("collapsed workspace running dot stays steady across every 16ms frame during a saved-session switch", async () => {
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: {
+      "harness.scenario": "multi-slow",
+      "harness.startDelay": String(DELAY),
+      "harness.distinct": "1",
+    },
+  });
+  await app.waitFor("text:What are we building?");
+
+  // Tab 0: open a saved pipi session that will go cold once we switch away.
+  await app.press("id:sidebar-workspaces >> text:Look around and tell me what this project is");
+  await app.waitUntil(() => weight(app, "id:sidebar-workspaces >> text:Look around and tell me what this project is") > 400);
+
+  // Tab 1: open another pipi session in a new tab and start a long background run.
+  await app.rightClick("id:sidebar-workspaces >> text:Refactor the transcript reducer");
+  await app.chooseMenuItem("Open in New Tab");
+  await app.waitFor("id:tab-1");
+  await app.waitUntil(() => weight(app, "id:sidebar-workspaces >> text:Refactor the transcript reducer") > 400);
+  await app.type("label:Message", "long work in pipi");
+  await app.submit("label:Message");
+  await app.waitUntil(() => app.count("id:sidebar-recents >> id:sidebar-session-running") === 1);
+
+  // Tab 2: open an nsh session in a new tab so pipi's run is parked in the background.
+  await app.rightClick("id:sidebar-workspaces >> text:Fix QuickJS GC mark phase");
+  await app.chooseMenuItem("Open in New Tab");
+  await app.waitFor("id:tab-2");
+  await app.waitUntil(() => weight(app, "id:sidebar-workspaces >> text:Fix QuickJS GC mark phase") > 400);
+
+  // Collapse both pipi and Recent so the collapsed pipi folder row carries the running dot.
+  await app.press("label:Collapse pipi");
+  await app.press("label:Collapse Recent");
+  await app.waitUntil(() => app.count("id:sidebar-project-running") === 1);
+
+  // Switch back to Tab 0 (cold saved session in pipi): startingHere must not hide the collapsed running dot.
+  await app.press("id:tab-0");
+  const seen = await frames(app, () => ({
+    runningDot: app.count("id:sidebar-project-running"),
+    pipiCollapsed: app.count("label:Expand pipi"),
+    recentsCollapsed: app.count("label:Expand Recent"),
+  }));
+
+  expect(seen.every((f) => f.runningDot === 1)).toBe(true);
+  expect(seen.every((f) => f.pipiCollapsed === 1 && f.recentsCollapsed === 1)).toBe(true);
+});

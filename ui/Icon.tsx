@@ -65,6 +65,16 @@ const ICONS = {
   info: { stroke: "M8 13.5a5.5 5.5 0 1 0 0-11 5.5 5.5 0 0 0 0 11zM8 7.5v3.25M8 5.2v.1" },
   refresh: { stroke: "M13 8a5 5 0 1 1-1.6-3.65M13 2.75v2.5h-2.5" },
   sidebar: { stroke: "M2.5 3.5h11v9h-11zM6.25 3.5v9" },
+  split: { stroke: "M2.5 3.5h11v9h-11zM8 3.5v9" },
+  splitLeft: {
+    stroke: "M2.5 3.5h11v9h-11zM8 3.5v9",
+    fill: "M2.5 3.5H8v9H2.5z",
+  },
+  splitRight: {
+    stroke: "M2.5 3.5h11v9h-11zM8 3.5v9",
+    fill: "M8 3.5h5.5v9H8z",
+  },
+  swap: { stroke: "M3 5.5h10M10.5 3L13 5.5L10.5 8M13 10.5H3M5.5 8L3 10.5L5.5 13" },
   sparkle: { stroke: "M7 3l1.2 3.3L11.5 7.5 8.2 8.7 7 12 5.8 8.7 2.5 7.5l3.3-1.2zM12.25 2.5v2.5M11 3.75h2.5M12.5 11v2M11.5 12h2" },
   bolt: { stroke: "M8.75 2L4 9h3.5L7 14l4.75-7H8.25z" },
   chip: { stroke: "M5 5h6v6H5zM7 2.5V5M9 2.5V5M7 11v2.5M9 11v2.5M2.5 7H5M2.5 9H5M11 7h2.5M11 9h2.5" },

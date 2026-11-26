@@ -105,13 +105,28 @@ export interface PipTurnMeta {
 }
 
 export interface PipRowSlot {
-  /** First visible row of a settled Pip IM turn: carries Pip's avatar on the left. */
+  /** First visible row of a settled Pip SMS turn (starts a new turn's top spacing). */
   lead?: boolean;
-  /** Aligned to Pip's IM content column (past the avatar gutter). */
+  /** Final bubble/media row of a settled Pip SMS turn: carries Pip's bottom-left avatar + tail. */
+  tail?: boolean;
+  /** Aligned to Pip's SMS bubble column (past the avatar gutter). */
   indent?: boolean;
+  /** Full text of the turn's reply, for "Copy full reply" from any bubble in the cluster. */
+  fullText?: string;
   /** Concise metadata for this turn, shown when hovering the message's Pip avatar at rest. */
   meta?: PipTurnMeta;
 }
+
+export interface UserSmsSlot {
+  /** First user bubble in a consecutive user cluster. */
+  first: boolean;
+  /** Last user bubble in a consecutive user cluster (carries the outgoing curved tail). */
+  last: boolean;
+  /** Quiet iMessage-style delivery/read receipt under the trailing user message before Pip replies. */
+  receipt?: "delivered" | "read";
+}
+
+export type DisplayUserRow = Extract<Row, { kind: "user" }> & { sms?: UserSmsSlot };
 
 export interface PipDelegatedSession {
   toolId: string;
@@ -146,7 +161,8 @@ export interface MediaDisplayRow {
 export type DisplayTextRow = Extract<Row, { kind: "text" }> & { pip?: PipRowSlot };
 
 export type DisplayRow =
-  | Exclude<Row, ToolRow | { kind: "media" | "text" }>
+  | Exclude<Row, ToolRow | { kind: "media" | "text" | "user" }>
+  | DisplayUserRow
   | DisplayTextRow
   | ActivityRow
   | TurnHeaderRow
@@ -1153,11 +1169,13 @@ export function buildDisplayRows(
       };
       // The process stays out of the stream unless the reader unfolds it from the avatar's status card.
       const open = folds.chosen?.(id) ?? false;
+      const copyText = messages.map((m) => m.text).join("\n\n");
+      const contentStart = out.length;
       let leadPlaced = false;
       const claimSlot = (): PipRowSlot => {
         const lead = !leadPlaced;
         leadPlaced = true;
-        return { lead, indent: true, meta: turnMeta };
+        return { lead, tail: false, indent: true, ...(copyText ? { fullText: copyText } : {}), meta: turnMeta };
       };
 
       for (const msg of messages) {
@@ -1166,22 +1184,38 @@ export function buildDisplayRows(
       for (const media of surfacedMedia) {
         out.push({ ...media, pip: claimSlot() });
       }
+      // Anchor Pip's bottom-left avatar + bubble tail on the last text/media bubble of this turn
+      // (or on the delegated sessions card / footer if the turn has no text/media bubbles).
+      let tailPlaced = false;
+      for (let k = out.length - 1; k >= contentStart; k--) {
+        const item = out[k];
+        if (item.kind === "text" || item.kind === "media") {
+          item.pip = { ...item.pip, tail: true };
+          tailPlaced = true;
+          break;
+        }
+      }
+
       if (delegated.length > 0) {
+        const slot = claimSlot();
+        if (!tailPlaced) {
+          slot.tail = true;
+          tailPlaced = true;
+        }
         out.push({
           kind: "pip-sessions",
           id: `pipsess:${first.id}`,
           sessions: delegated,
-          pip: claimSlot(),
+          pip: slot,
         });
       }
 
-      const copyText = messages.map((m) => m.text).join("\n\n");
       if (copyText) {
         out.push({
           kind: "pip-footer",
           id: `pipfoot:${first.id}`,
           text: copyText,
-          pip: { lead: false, indent: true, meta: turnMeta },
+          pip: { lead: false, tail: !tailPlaced, indent: true, fullText: copyText, meta: turnMeta },
         });
       }
 
@@ -1226,6 +1260,35 @@ export function buildDisplayRows(
     }
     out.push(...answer, ...surfacedMedia);
   }
+  // In Pip SMS mode, tag consecutive user bubbles with cluster boundaries and
+  // show a quiet delivery/read receipt under the trailing user message before Pip replies.
+  if (persona) {
+    let lastNonQueuedUserIdx = -1;
+    for (let k = out.length - 1; k >= 0; k--) {
+      const r = out[k];
+      if (r.kind === "user") {
+        if (!r.queued && lastNonQueuedUserIdx < 0) lastNonQueuedUserIdx = k;
+        continue;
+      }
+      break;
+    }
+    for (let k = 0; k < out.length; k++) {
+      const r = out[k];
+      if (r.kind !== "user") continue;
+      const prevIsUser = k > 0 && out[k - 1].kind === "user";
+      const nextIsUser = k + 1 < out.length && out[k + 1].kind === "user";
+      const receipt: UserSmsSlot["receipt"] =
+        k === lastNonQueuedUserIdx ? (sessionRunning ? "read" : "delivered") : undefined;
+      out[k] = {
+        ...r,
+        sms: {
+          first: !prevIsUser,
+          last: !nextIsUser,
+          ...(receipt ? { receipt } : {}),
+        },
+      };
+    }
+  }
   // One looping status cue at a time: the newest row still working breathes,
   // every one still working behind it stands still.
   for (let i = out.length - 1; i >= 0; i--) {
@@ -1264,12 +1327,20 @@ function samePipSlot(a?: PipRowSlot, b?: PipRowSlot): boolean {
   if (!a || !b) return false;
   return (
     a.lead === b.lead &&
+    a.tail === b.tail &&
     a.indent === b.indent &&
+    a.fullText === b.fullText &&
     a.meta?.turnId === b.meta?.turnId &&
     a.meta?.durationMs === b.meta?.durationMs &&
     a.meta?.hasDetails === b.meta?.hasDetails &&
     a.meta?.summary === b.meta?.summary
   );
+}
+
+function sameUserSmsSlot(a?: UserSmsSlot, b?: UserSmsSlot): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.first === b.first && a.last === b.last && a.receipt === b.receipt;
 }
 
 function sameDelegatedSession(a: PipDelegatedSession, b: PipDelegatedSession): boolean {
@@ -1278,6 +1349,15 @@ function sameDelegatedSession(a: PipDelegatedSession, b: PipDelegatedSession): b
 
 function sameRow(a: DisplayRow, b: DisplayRow): boolean {
   if (a === b) return true;
+  if (a.kind === "user" && b.kind === "user") {
+    return (
+      a.text === b.text &&
+      a.images === b.images &&
+      a.queued === b.queued &&
+      a.imageBlocks === b.imageBlocks &&
+      sameUserSmsSlot(a.sms, b.sms)
+    );
+  }
   if (a.kind === "text" && b.kind === "text") {
     return a.text === b.text && a.streaming === b.streaming && a.final === b.final && samePipSlot(a.pip, b.pip);
   }

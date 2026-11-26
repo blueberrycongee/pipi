@@ -93,6 +93,7 @@ import {
   pickDocTab,
   saveDocAs,
 } from "../store/tabs";
+import { endSplitDrag, isPointInWorkspace, moveSplitDrag, openSplit, splitDrag, startSplitDrag, type SplitTarget } from "../store/split";
 import {
   docRankOverrides,
   isGroupCollapsed,
@@ -146,11 +147,38 @@ const leftControls = () => platform.os === "macos" || titleBarArea().left > 0;
 /** True when the platform's primary modifier (⌘ on macOS, Ctrl elsewhere) was held on a press. */
 const isModPress = (e?: { modifiers?: { platform?: boolean; control?: boolean } }) =>
   Boolean(platform.os === "macos" ? e?.modifiers?.platform : e?.modifiers?.control);
+function sameItems<T>(a: readonly T[], b: readonly T[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a === b) return true;
+  if (a.size !== b.size) return false;
+  for (const item of a) if (!b.has(item)) return false;
+  return true;
+}
+
+const sameEngine = (
+  a: { id: string; name: string; available: boolean },
+  b: { id: string; name: string; available: boolean },
+) => a.id === b.id && a.name === b.name && a.available === b.available;
+
+const sameLabel = (a: { name: string; parent?: string }, b: { name: string; parent?: string }) =>
+  a.name === b.name && a.parent === b.parent;
+
 /** The open project folder; Pip's folder of notes is no project, so with Pip open none is. */
-const activeProjectPath = () => {
+const activeProjectPath = computed(() => {
   const cwd = openFolderPath();
   return isPersonaFolder(cwd) ? "" : cwd;
-};
+});
+const activeViewName = computed(() => currentView().name);
+const activeDocId = computed(() => {
+  const v = currentView();
+  return v.name === "doc" ? v.docId : undefined;
+});
 const ROW_PRESS = `${PRESS} ${FOCUS_RING} hover:bg-sidebar-accent group-hover:bg-sidebar-accent active:bg-sidebar-accent`;
 /**
  * The pointer rests while rows slide under it — a draft row opening or closing
@@ -173,37 +201,43 @@ const draftGroup = signal<GroupId>("workspaces");
 let explicitDraftGroup: GroupId | undefined;
 
 /** The open project folders: the active one first, then the recents it also leads. */
-const projects = computed(() => {
-  const active = activeProjectPath();
-  const list = recentWorkspaces();
-  if (!active || isChatFolder(active)) return list;
-  return list.includes(active) ? list : [active, ...list];
-});
+const projects = computed(
+  () => {
+    const active = activeProjectPath();
+    const list = recentWorkspaces();
+    if (!active || isChatFolder(active)) return list;
+    return list.includes(active) ? list : [active, ...list];
+  },
+  { equals: sameItems },
+);
 
 const WORKSPACE_LIMIT = 6;
 const workspacesExpanded = signal(false);
-const shownProjects = computed(() => {
-  const all = projects();
-  if (workspacesExpanded() || all.length <= WORKSPACE_LIMIT) return all;
-  const head = all.slice(0, WORKSPACE_LIMIT);
-  const active = activeProjectPath();
-  if (active && !isChatFolder(active) && all.includes(active) && !head.includes(active)) {
-    return [active, ...head.slice(0, WORKSPACE_LIMIT - 1)];
-  }
-  return head;
-});
+const shownProjects = computed(
+  () => {
+    const all = projects();
+    if (workspacesExpanded() || all.length <= WORKSPACE_LIMIT) return all;
+    const head = all.slice(0, WORKSPACE_LIMIT);
+    const active = activeProjectPath();
+    if (active && !isChatFolder(active) && all.includes(active) && !head.includes(active)) {
+      return [active, ...head.slice(0, WORKSPACE_LIMIT - 1)];
+    }
+    return head;
+  },
+  { equals: sameItems },
+);
 
 /** The folders 最近 gathers sessions from: every open project, and the chat folder. */
-const recentFolders = computed(() => [...projects(), chatFolder()]);
+const recentFolders = computed(() => [...projects(), chatFolder()], { equals: sameItems });
 
 const titleOf = (session: SessionSummary) => sessionTitle(session, tr("New session", "新会话"));
 
 /** The daemon session open on screen (or where a session change is heading). */
-const openDaemon = () => {
+const openDaemon = computed(() => {
   const pending = pendingSession();
   if (pending) return pending.daemonId ? daemonSessionOfId(pending.daemonId) : daemonSessionByFile(pending.file);
   return currentDaemonSession();
-};
+});
 
 /**
  * The open session has no row of its own yet: it is not in the saved list. Pi
@@ -212,9 +246,9 @@ const openDaemon = () => {
  * stays until the saved row takes its place, never leaving a gap between them.
  * While a session change is under way, its destination decides instead.
  */
-const openDaemonId = () => pendingSession()?.daemonId ?? currentDaemonId();
+const openDaemonId = computed(() => pendingSession()?.daemonId ?? currentDaemonId());
 
-const isDraftSession = () => {
+const isDraftSession = computed(() => {
   const ds = openDaemon();
   if (isDaemonTaskSession(ds)) return false;
   const pending = pendingSession();
@@ -222,16 +256,16 @@ const isDraftSession = () => {
   const current = sessionState();
   if (!current) return false;
   return !current.sessionFile || !savedSessions().some((s) => s.path === current.sessionFile);
-};
+});
 
 /** The session file the sidebar marks as open: where a change is heading, else the one on screen. */
-const openFile = () => {
+const openFile = computed(() => {
   const pending = pendingSession();
   return pending ? pending.file : sessionState()?.sessionFile;
-};
+});
 
 /** The active folder's list can be trusted: its agent is ready, or a session change knows where it lands. */
-const listSteady = () => sidecarPhase().name === "ready" || pendingSession() !== undefined;
+const listSteady = computed(() => sidecarPhase().name === "ready" || pendingSession() !== undefined);
 
 /** True on a fresh single-folder install with nothing saved, archived, or written yet. */
 const singleEmpty = computed(
@@ -243,7 +277,7 @@ const singleEmpty = computed(
     notes().length === 0 &&
     archivedSessionItems().length === 0 &&
     !daemonSessions().some(
-      (ds) => !(ds.id === openDaemonId() && isDraftSession()) && (Boolean(ds.parentId) || daemonRootEarnsRow(ds)),
+      (ds) => !(isDraftSession() && ds.id === openDaemonId()) && (Boolean(ds.parentId) || daemonRootEarnsRow(ds)),
     ) &&
     sessionsReady() &&
     listSteady(),
@@ -258,11 +292,11 @@ const hasRecentDraft = computed(() => Boolean(activeProjectPath()) && listSteady
  * takes its exact place in the same commit, so collapsing the draft slot would
  * briefly show the session twice.
  */
-const draftGraduated = () => {
+const draftGraduated = computed(() => {
   if (isDraftSession() || pendingSession()?.file) return false;
   const file = sessionState()?.sessionFile;
   return Boolean(file && savedSessions().some((s) => s.path === file));
-};
+});
 
 /** Animates explicit sidebar list edits without ever touching layout animation during a run (`AGENTS.md`). */
 function animateSidebarList() {
@@ -293,8 +327,10 @@ function animateSidebarList() {
 // sideways-first by the row's pan recognizer (`panActivation`), so a plain
 // vertical swipe stays the scroll view's.
 
+/** Payload carried when dragging a sidebar row horizontally into the workspace to split. */
+type SplitDragInfo = { target: SplitTarget; title: string; agentId?: string };
 /** Which list a draggable row belongs to and the id its order is kept under. */
-type DragSpec = { list: string; id: string };
+type DragSpec = { list: string; id: string; split?: SplitDragInfo };
 
 /** Points of travel before a held row becomes a drag. */
 const DRAG_ARM_DISTANCE = 6;
@@ -339,7 +375,7 @@ let dragTargetBefore: string | null = null;
 let settleGeneration = 0;
 
 /** A left-button press on a draggable row, not yet moved far enough (or held long enough) to lift it. */
-let mouseArm: { spec: DragSpec; y: number } | null = null;
+let mouseArm: { spec: DragSpec; x: number; y: number } | null = null;
 let holdTimer: ReturnType<typeof setTimeout> | undefined;
 /** The drag's input path: the pointer that lifted it, or the row's pan after a touch claimed it. */
 let dragVia: "pointer" | "pan" = "pointer";
@@ -443,14 +479,16 @@ function registerDropList(list: string, ref: ViewRef | null) {
 }
 
 /** A press went down on a draggable row; a still press lifts it after `DRAG_HOLD_MS`. */
-function armMouseDrag(spec: DragSpec, y = Number.NaN) {
+function armMouseDrag(spec: DragSpec, y = Number.NaN, x = Number.NaN) {
   if (Number.isFinite(y)) lastPointerY = y;
   if (mouseArm && mouseArm.spec.list === spec.list && mouseArm.spec.id === spec.id) {
     if (!Number.isFinite(mouseArm.y) && Number.isFinite(y)) mouseArm.y = y;
+    if (!Number.isFinite(mouseArm.x) && Number.isFinite(x)) mouseArm.x = x;
     return;
   }
   disarmMouseDrag();
-  mouseArm = { spec, y };
+  mouseArm = { spec, x, y };
+  if (spec.list === "__split__") return;
   holdTimer = setTimeout(() => {
     holdTimer = undefined;
     const arm = mouseArm;
@@ -463,6 +501,53 @@ function disarmMouseDrag() {
   if (holdTimer !== undefined) clearTimeout(holdTimer);
   holdTimer = undefined;
   mouseArm = null;
+}
+
+/** Hands an active or armed sidebar row drag off to the workspace's split drop overlay. */
+function handoffSidebarToSplit(split: SplitDragInfo, x: number, y: number) {
+  disarmMouseDrag();
+  if (rowDrag()) finishDrag(false);
+  startSplitDrag(
+    {
+      source: "sidebar",
+      target: split.target,
+      title: split.title,
+      agentId: split.agentId,
+      x,
+      y,
+    },
+    () => pointerResting.set(false),
+  );
+}
+
+/** Called from `Shell`'s window-level mouse move so dragging a sidebar row into the workspace hands off cleanly. */
+export function notifySidebarPointerMove(x: number, y: number, pressed: boolean) {
+  if (splitDrag()) return;
+  if (!pressed) {
+    if (rowDrag() && dragVia === "pointer") finishDrag(true);
+    else if (!rowDrag()) disarmMouseDrag();
+    return;
+  }
+  const active = rowDrag();
+  if (active && dragVia === "pointer") {
+    if (active.split && isPointInWorkspace(x, y)) {
+      handoffSidebarToSplit(active.split, x, y);
+    }
+    return;
+  }
+  const arm = mouseArm;
+  if (arm?.spec.split && isPointInWorkspace(x, y)) {
+    handoffSidebarToSplit(arm.spec.split, x, y);
+  }
+}
+
+/** Called from `Shell`'s window-level mouse up so a sidebar drag released outside the sidebar never lingers. */
+export function notifySidebarPointerUp() {
+  if (splitDrag()) {
+    disarmMouseDrag();
+    return;
+  }
+  endMouseDrag();
 }
 
 /** Measures the list once and lifts the row; a release before the measure lands is dropped. */
@@ -735,13 +820,24 @@ function endMouseDrag() {
 /** A mouse move over the sidebar tree: arms a held row past the threshold, then tracks the drop. */
 function sidebarDragMove(e: MouseEvent) {
   lastPointerY = e.pagePosition.y;
+  if (splitDrag()) return;
   if (e.pressedButton === "left") {
     const arm = mouseArm;
     if (!rowDrag() && arm) {
-      if (!Number.isFinite(arm.y)) arm.y = e.pagePosition.y;
-      else if (Math.abs(e.pagePosition.y - arm.y) > DRAG_ARM_DISTANCE) void beginDrag(arm.spec, "pointer");
+      if (arm.spec.split && isPointInWorkspace(e.pagePosition.x, e.pagePosition.y)) {
+        handoffSidebarToSplit(arm.spec.split, e.pagePosition.x, e.pagePosition.y);
+        return;
+      }
+      if (arm.spec.list !== "__split__") {
+        if (!Number.isFinite(arm.y)) arm.y = e.pagePosition.y;
+        else if (Math.abs(e.pagePosition.y - arm.y) > DRAG_ARM_DISTANCE) void beginDrag(arm.spec, "pointer");
+      }
     }
     if (rowDrag() && dragVia === "pointer") {
+      if (rowDrag()?.split && isPointInWorkspace(e.pagePosition.x, e.pagePosition.y)) {
+        handoffSidebarToSplit(rowDrag()!.split!, e.pagePosition.x, e.pagePosition.y);
+        return;
+      }
       if (
         dragViewport &&
         (lastPointerY < dragViewport.top - DRAG_ESCAPE_MARGIN || lastPointerY > dragViewport.bottom + DRAG_ESCAPE_MARGIN)
@@ -887,10 +983,11 @@ function edgeTick() {
 function DropRow(props: {
   list: string;
   id: string;
+  split?: () => SplitDragInfo;
   onContextMenu?: (e: ContextMenuEvent) => void;
   children?: JSX.Element;
 }) {
-  const spec = () => ({ list: props.list, id: props.id });
+  const spec = (): DragSpec => ({ list: props.list, id: props.id, ...(props.split ? { split: props.split() } : {}) });
   const dragging = () => rowDrag()?.list === props.list && rowDrag()?.id === props.id;
   const lineAbove = () => dropTarget()?.list === props.list && dropTarget()?.before === props.id;
   const lineBelow = () => {
@@ -969,12 +1066,13 @@ function DropRow(props: {
       class={hoverGroup()}
       style={liveStyle()}
       onContextMenu={props.onContextMenu}
-      onPressDown={(e) => armMouseDrag(spec(), e.pagePosition.y)}
+      onPressDown={(e) => armMouseDrag(spec(), e.pagePosition.y, e.pagePosition.x)}
       onPressUp={endMouseDrag}
       pan={{ x: panX, y: panY }}
       panActivation={{ activeOffsetX: DRAG_CLAIM_X, failOffsetY: DRAG_CLAIM_X }}
       onPanStart={() => {
         panActive = true;
+        if (splitDrag()) return;
         if (rowDrag()?.list === props.list && rowDrag()?.id === props.id) dragVia = "pan";
         else void beginDrag(spec(), "pan");
         startEdgeScroll();
@@ -983,6 +1081,10 @@ function DropRow(props: {
         panActive = false;
         panX.set(0);
         panY.set(0);
+        if (splitDrag()) {
+          endSplitDrag(!e.cancelled);
+          return;
+        }
         if (rowDrag()?.list === props.list && rowDrag()?.id === props.id) finishDrag(!e.cancelled);
       }}
       onTouchStart={(e: GestureResponderEvent) => {
@@ -991,6 +1093,15 @@ function DropRow(props: {
       }}
       onTouchMove={(e: GestureResponderEvent) => {
         lastPointerY = e.pageY;
+        if (splitDrag()) {
+          moveSplitDrag(e.pageX, e.pageY);
+          return;
+        }
+        const splitInfo = props.split?.();
+        if (splitInfo && isPointInWorkspace(e.pageX, e.pageY)) {
+          handoffSidebarToSplit(splitInfo, e.pageX, e.pageY);
+          return;
+        }
         const d = rowDrag();
         if (!d || d.list !== props.list || d.id !== props.id) return;
         if (panActive) dragVia = "pan";
@@ -1000,11 +1111,19 @@ function DropRow(props: {
       }}
       onTouchEnd={() => {
         touchHeld = false;
+        if (splitDrag()) {
+          endSplitDrag(true);
+          return;
+        }
         if (!panActive && rowDrag()?.list === props.list && rowDrag()?.id === props.id) finishDrag(true);
         else if (!rowDrag()) disarmMouseDrag();
       }}
       onTouchCancel={() => {
         touchHeld = false;
+        if (splitDrag()) {
+          endSplitDrag(false);
+          return;
+        }
         if (!panActive && rowDrag()?.list === props.list && rowDrag()?.id === props.id) finishDrag(false);
         else if (!rowDrag()) disarmMouseDrag();
       }}
@@ -1052,13 +1171,25 @@ const daemonStandingOf = (session: DaemonSession) => {
   return session.lastActive;
 };
 /** The sessions a project folder lists, active folder or parked one. */
-const sessionsOf = (cwd: string) => (cwd === activeProjectPath() ? savedSessions() : (workspaceSessions()[cwd] ?? []));
+const EMPTY_SESSIONS: SessionSummary[] = [];
+const sessionsOf = (cwd: string) => {
+  const byCwd = workspaceSessions();
+  if (cwd in byCwd) return byCwd[cwd];
+  return cwd === activeProjectPath() ? savedSessions() : EMPTY_SESSIONS;
+};
 /** What a root row of 最近 is ranked and dragged by: a session's file, or a daemon tree's id. */
 const recentKey = (item: RecentItem) => item.session?.path ?? `daemon:${item.child!.id}`;
 const standOf = (item: RecentItem) =>
   recentRankOverrides()[recentKey(item)] ??
   (item.session ? standingOf(item.session) : daemonStandingOf(item.child!));
 const createdOf = (item: RecentItem) => item.session?.created ?? item.child?.createdAt ?? 0;
+
+let prevRecentsById = new Map<string, RecentItem>();
+function reuseRecentItem(id: string, session?: SessionSummary, child?: DaemonSession, cwd?: string): RecentItem {
+  const prev = prevRecentsById.get(id);
+  if (prev && prev.session === session && prev.child === child && prev.cwd === cwd) return prev;
+  return { id, ...(session ? { session } : {}), ...(child ? { child } : {}), ...(cwd !== undefined ? { cwd } : {}) };
+}
 
 /**
  * What was worked on lately — sessions across every open folder in one list:
@@ -1069,65 +1200,74 @@ const createdOf = (item: RecentItem) => item.session?.created ?? item.child?.cre
  * detached runs, starts still without a file); a child whose own tree hides keeps
  * a flat row rather than going missing.
  */
-const allRecents = computed<RecentItem[]>(() => {
-  const active = activeProjectPath();
-  const open = new Set(recentFolders());
-  const seen = new Set<string>();
-  const summaries: { session: SessionSummary; cwd: string }[] = [];
-  for (const cwd of recentFolders()) {
-    const list = sessionsOf(cwd);
-    for (const session of list) {
-      if (seen.has(session.path)) continue;
-      seen.add(session.path);
-      summaries.push({ session, cwd });
+const allRecents = computed<RecentItem[]>(
+  () => {
+    const folders = recentFolders();
+    const open = new Set(folders);
+    const seen = new Set<string>();
+    const summaries: { session: SessionSummary; cwd: string }[] = [];
+    for (const cwd of folders) {
+      const list = sessionsOf(cwd);
+      for (const session of list) {
+        if (seen.has(session.path)) continue;
+        seen.add(session.path);
+        summaries.push({ session, cwd });
+      }
     }
-  }
-  const listed = new Set(summaries.map((entry) => entry.session.path));
+    const listed = new Set(summaries.map((entry) => entry.session.path));
 
-  // Daemon trees no saved row claims: each is led by its unclaimed top, and earns
-  // the row when it or anything under it has something to say — or holds a file
-  // the list would otherwise drop. The open draft leads no row: the draft's does.
-  const tops = new Map<string, DaemonSession>();
-  for (const ds of daemonSessions()) {
-    if (ds.file && listed.has(ds.file)) continue;
-    // Archived from its tree: it is in 已归档, and leads no row here.
-    if (isSessionArchived(ds.file)) continue;
-    const { claimed, top } = daemonTreePlace(ds, listed);
-    if (claimed || top.id !== ds.id) continue;
-    if (ds.id === openDaemonId() && isDraftSession()) continue;
-    if (!open.has(projectCwdOf(ds.cwd, ds))) continue;
-    const earns =
-      daemonRootEarnsRow(ds) ||
-      childSessionsOfDaemon(ds.id).some((d) => daemonRootEarnsRow(d) || (d.file !== undefined && listed.has(d.file)));
-    if (earns) tops.set(ds.id, ds);
-  }
-
-  const roots: RecentItem[] = [];
-  const draftChildren = hasRecentDraft() ? new Set(childSessionsOfOpen().map((c) => c.id)) : new Set<string>();
-  for (const { session, cwd } of summaries) {
-    const ds = daemonSessionByFile(session.path);
-    if (ds?.parentId) {
+    // Daemon trees no saved row claims: each is led by its unclaimed top, and earns
+    // the row when it or anything under it has something to say — or holds a file
+    // the list would otherwise drop. The open draft leads no row: the draft's does.
+    const tops = new Map<string, DaemonSession>();
+    for (const ds of daemonSessions()) {
+      if (ds.file && listed.has(ds.file)) continue;
+      // Archived from its tree: it is in 已归档, and leads no row here.
+      if (isSessionArchived(ds.file)) continue;
       const { claimed, top } = daemonTreePlace(ds, listed);
-      // A daemon child belongs under its tree's row, not in the flat list — unless nothing above it takes a row here.
-      if (claimed || tops.has(top.id) || draftChildren.has(ds.id)) continue;
+      if (claimed || top.id !== ds.id) continue;
+      if (!open.has(projectCwdOf(ds.cwd, ds))) continue;
+      const earns =
+        daemonRootEarnsRow(ds) ||
+        childSessionsOfDaemon(ds.id).some((d) => daemonRootEarnsRow(d) || (d.file !== undefined && listed.has(d.file)));
+      if (!earns) continue;
+      if (isDraftSession() && ds.id === openDaemonId()) continue;
+      tops.set(ds.id, ds);
     }
-    roots.push({ id: `recent:${session.path}`, session, cwd });
-  }
-  for (const ds of tops.values()) roots.push({ id: `recent-daemon:${ds.id}`, child: ds });
-  roots.sort((a, b) => standOf(b) - standOf(a) || createdOf(b) - createdOf(a) || a.id.localeCompare(b.id));
 
-  const out: RecentItem[] = [];
-  for (const root of roots) {
-    out.push(root);
-    const children = root.session ? childSessionsOf(root.session.path) : childSessionsOfDaemon(root.child!.id);
-    for (const child of children) out.push({ id: `recent-child:${child.id}`, child });
-  }
-  return out;
-});
+    const roots: RecentItem[] = [];
+    const draftChildren = hasRecentDraft() ? new Set(childSessionsOfOpen().map((c) => c.id)) : new Set<string>();
+    for (const { session, cwd } of summaries) {
+      const ds = daemonSessionByFile(session.path);
+      if (ds?.parentId) {
+        const { claimed, top } = daemonTreePlace(ds, listed);
+        // A daemon child belongs under its tree's row, not in the flat list — unless nothing above it takes a row here.
+        if (claimed || tops.has(top.id) || draftChildren.has(ds.id)) continue;
+      }
+      roots.push(reuseRecentItem(`recent:${session.path}`, session, undefined, cwd));
+    }
+    for (const ds of tops.values()) roots.push(reuseRecentItem(`recent-daemon:${ds.id}`, undefined, ds, undefined));
+    roots.sort((a, b) => standOf(b) - standOf(a) || createdOf(b) - createdOf(a) || a.id.localeCompare(b.id));
+
+    const out: RecentItem[] = [];
+    for (const root of roots) {
+      out.push(root);
+      const children = root.session ? childSessionsOf(root.session.path) : childSessionsOfDaemon(root.child!.id);
+      for (const child of children) out.push(reuseRecentItem(`recent-child:${child.id}`, undefined, child, undefined));
+    }
+    const nextById = new Map<string, RecentItem>();
+    for (const item of out) nextById.set(item.id, item);
+    prevRecentsById = nextById;
+    return out;
+  },
+  { equals: sameItems },
+);
 
 /** What 最近 shows: its newest slice until the footer expands it, then everything. */
 const recentsExpanded = signal(false);
-const recents = computed<RecentItem[]>(() => (recentsExpanded() ? allRecents() : allRecents().slice(0, RECENT_LIMIT)));
+const recents = computed<RecentItem[]>(() => (recentsExpanded() ? allRecents() : allRecents().slice(0, RECENT_LIMIT)), {
+  equals: sameItems,
+});
 
 /**
  * Where each document stands in 文档: its last write as of the first time the
@@ -1146,33 +1286,44 @@ const docStandOf = (note: NoteSummary) => {
   docStanding.set(note.path, note.modified);
   return note.modified;
 };
-const allDocs = computed<NoteSummary[]>(() => {
-  const listed = notes();
-  // A path gone from the list stands anew when a note takes it again (`newDocPath` reuses a deleted note's name).
-  const paths = new Set(listed.map((note) => note.path));
-  for (const path of docStanding.keys()) if (!paths.has(path)) docStanding.delete(path);
-  return [...listed].sort((a, b) => docStandOf(b) - docStandOf(a) || a.path.localeCompare(b.path));
-});
+const allDocs = computed<NoteSummary[]>(
+  () => {
+    const listed = notes();
+    // A path gone from the list stands anew when a note takes it again (`newDocPath` reuses a deleted note's name).
+    const paths = new Set(listed.map((note) => note.path));
+    for (const path of docStanding.keys()) if (!paths.has(path)) docStanding.delete(path);
+    return [...listed].sort((a, b) => docStandOf(b) - docStandOf(a) || a.path.localeCompare(b.path));
+  },
+  { equals: sameItems },
+);
 /** What 文档 shows: its first slice until the footer expands it, then everything. */
 const docsExpanded = signal(false);
-const shownDocs = computed<NoteSummary[]>(() => (docsExpanded() ? allDocs() : allDocs().slice(0, DOCS_LIMIT)));
+const shownDocs = computed<NoteSummary[]>(() => (docsExpanded() ? allDocs() : allDocs().slice(0, DOCS_LIMIT)), {
+  equals: sameItems,
+});
 
 /** Daemon sessions with a row in 最近 right now: nested under its roots, or under the draft's row. */
-const recentDaemonRows = computed(() => {
-  const ids = new Set<string>();
-  for (const item of recents()) if (item.child) ids.add(item.child.id);
-  if (hasRecentDraft()) for (const child of childSessionsOfOpen()) ids.add(child.id);
-  return ids;
-});
+const recentDaemonRows = computed(
+  () => {
+    const ids = new Set<string>();
+    for (const item of recents()) if (item.child) ids.add(item.child.id);
+    if (hasRecentDraft()) for (const child of childSessionsOfOpen()) ids.add(child.id);
+    return ids;
+  },
+  { equals: sameStringSet },
+);
 
-const recentSessionPaths = computed(() => {
-  const paths = new Set<string>();
-  for (const item of recents()) {
-    if (item.session?.path) paths.add(item.session.path);
-    if (item.child?.file) paths.add(item.child.file);
-  }
-  return paths;
-});
+const recentSessionPaths = computed(
+  () => {
+    const paths = new Set<string>();
+    for (const item of recents()) {
+      if (item.session?.path) paths.add(item.session.path);
+      if (item.child?.file) paths.add(item.child.file);
+    }
+    return paths;
+  },
+  { equals: sameStringSet },
+);
 
 /** Whether a daemon session's mark is already on show in 最近 (a folded folder needn't repeat it). */
 const daemonShownInRecents = (ds: DaemonSession) => !isGroupCollapsed("recents") && recentDaemonRows().has(ds.id);
@@ -1293,11 +1444,38 @@ function projectLabel(cwd: string, all: readonly string[]): { name: string; pare
 }
 
 /** What every session row shows on a right click, in a workspace, 最近, or 已归档. */
+function sessionSplitTarget(session: SessionSummary, cwd: string): SplitTarget {
+  return {
+    kind: "chat",
+    ref: session.path,
+    file: session.path,
+    cwd,
+    agentId: session.agentId,
+    title: titleOf(session),
+  };
+}
+
+function daemonSplitTarget(session: DaemonSession): SplitTarget {
+  return {
+    kind: "chat",
+    ref: session.file ?? `daemon:${session.id}`,
+    file: session.file,
+    daemonId: session.id,
+    cwd: session.cwd,
+    agentId: session.agentId,
+    title: daemonSessionTitle(session),
+  };
+}
+
 function sessionMenuItems(session: SessionSummary, cwd: string): MenuItem[] {
+  const splitTarget = sessionSplitTarget(session, cwd);
   if (isSessionArchived(session.path)) {
     return [
       { label: tr("Open", "打开"), onSelect: () => void openSessionTab(session.path, cwd) },
       { label: tr("Open in New Tab", "在新标签页中打开"), onSelect: () => void openSessionTab(session.path, cwd, { newTab: true }) },
+      { label: tr("Split Right", "向右分屏"), onSelect: () => openSplit(splitTarget, "right") },
+      { label: tr("Split Left", "向左分屏"), onSelect: () => openSplit(splitTarget, "left") },
+      { type: "separator" },
       {
         label: tr("Unarchive", "取消归档"),
         onSelect: () => {
@@ -1312,6 +1490,9 @@ function sessionMenuItems(session: SessionSummary, cwd: string): MenuItem[] {
   return [
     { label: tr("Open", "打开"), onSelect: () => void openSessionTab(session.path, cwd) },
     { label: tr("Open in New Tab", "在新标签页中打开"), onSelect: () => void openSessionTab(session.path, cwd, { newTab: true }) },
+    { label: tr("Split Right", "向右分屏"), onSelect: () => openSplit(splitTarget, "right") },
+    { label: tr("Split Left", "向左分屏"), onSelect: () => openSplit(splitTarget, "left") },
+    { type: "separator" },
     { label: tr("Rename…", "重命名…"), onSelect: () => void renameFrom(session, cwd) },
     {
       label: tr("Archive", "归档"),
@@ -1375,7 +1556,7 @@ function GroupHeading(props: {
   alwaysShowAction?: boolean;
   onContextMenu?: (e: ContextMenuEvent) => void;
 }) {
-  const collapsed = () => isGroupCollapsed(props.id);
+  const collapsed = computed(() => isGroupCollapsed(props.id));
   const actionReveal = () =>
     props.alwaysShowAction
       ? "opacity-55 hover:opacity-100 group-hover:opacity-100 focus-within:opacity-100"
@@ -1441,7 +1622,7 @@ function FunctionalGroup(props: {
   first?: boolean;
   children?: JSX.Element;
 }) {
-  const collapsed = () => isGroupCollapsed(props.id);
+  const collapsed = computed(() => isGroupCollapsed(props.id));
   return (
     <View class={props.first ? "pt-1" : "pt-6"}>
       <Collapsible open={!collapsed() && props.count > 0} reveal content={<View class="pt-1.5">{props.children}</View>}>
@@ -1460,10 +1641,10 @@ function FunctionalGroup(props: {
 
 function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly string[] }) {
   const home = backend().home();
-  const active = () => props.cwd === activeProjectPath();
-  const collapsed = () => isWorkspaceCollapsed(props.cwd);
-  const label = () => projectLabel(props.cwd, props.allProjects);
-  const sessions = () => sessionsOf(props.cwd);
+  const active = computed(() => props.cwd === activeProjectPath());
+  const collapsed = computed(() => isWorkspaceCollapsed(props.cwd));
+  const label = computed(() => projectLabel(props.cwd, props.allProjects), { equals: sameLabel });
+  const sessions = computed(() => sessionsOf(props.cwd));
   const shownInRecents = (path: string | undefined) => !isGroupCollapsed("recents") && Boolean(path && recentSessionPaths().has(path));
   const activeShownInRecents = () =>
     !isGroupCollapsed("recents") && (isDraftSession() ? hasRecentDraft() : shownInRecents(openFile()));
@@ -1476,15 +1657,29 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
         (ds.status === "working" || ds.status === "blocked") &&
         !daemonShownInRecents(ds),
     );
-  const collapsedRunning = () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents()));
+  const collapsedRunning = computed(
+    () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents())),
+  );
   /** A folded folder surfaces an answer that finished out of sight the same way. */
-  const collapsedUnread = () =>
-    collapsed() &&
-    !collapsedRunning() &&
-    (sessions().some((s) => isSessionUnread(s.path) && !shownInRecents(s.path)) ||
-      daemonSessions().some((ds) => projectCwdOf(ds.cwd, ds) === props.cwd && ds.unread && !daemonShownInRecents(ds)));
-  const startingHere = () => active() && sidecarPhase().name === "starting" && !isDraftAhead();
-  const canRemove = () => props.allProjects.length > 1;
+  const collapsedUnread = computed(
+    () =>
+      collapsed() &&
+      !collapsedRunning() &&
+      (sessions().some((s) => isSessionUnread(s.path) && !shownInRecents(s.path)) ||
+        daemonSessions().some((ds) => projectCwdOf(ds.cwd, ds) === props.cwd && ds.unread && !daemonShownInRecents(ds))),
+  );
+  const startingHere = computed(
+    () =>
+      active() &&
+      sidecarPhase().name === "starting" &&
+      !isDraftAhead() &&
+      !pendingSession()?.file &&
+      !pendingSession()?.daemonId &&
+      !collapsedRunning() &&
+      !collapsedUnread(),
+  );
+  const canRemove = computed(() => props.allProjects.length > 1);
+  const tooltipText = computed(() => tildePath(props.cwd, home));
 
   return (
     <View
@@ -1520,7 +1715,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
           onPressUp={endMouseDrag}
           accessibilityLabel={collapsed() ? tr(`Expand ${label().name}`, `展开 ${label().name}`) : tr(`Collapse ${label().name}`, `收起 ${label().name}`)}
           hitSlop={props.first ? undefined : { top: 4 }}
-          tooltip={tip(tildePath(props.cwd, home), undefined, "right")}
+          tooltip={tip(tooltipText(), undefined, "right")}
           class={`${uiHeight(28)} w-full min-w-0 flex-row items-center gap-1.5 rounded-md corner-squircle pl-2.5 pr-8 ${calm(ROW_PRESS)}`}
         >
           <View class={ICON_SLOT}>
@@ -1553,7 +1748,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
             </View>
           </If>
           <Presence
-            show={!startingHere() && collapsedRunning()}
+            show={collapsedRunning()}
             testID="sidebar-project-running"
             accessibilityLabel={tr("Running in the background", "后台运行中")}
             class="absolute inset-0 items-center justify-center"
@@ -1561,7 +1756,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
             <Pip size={16} mood="work" />
           </Presence>
           <Presence
-            show={!startingHere() && collapsedUnread()}
+            show={collapsedUnread()}
             testID="sidebar-project-unread"
             accessibilityLabel={tr("Finished in the background", "后台已完成")}
             class="absolute inset-0 items-center justify-center"
@@ -1591,19 +1786,20 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
  * opens a chat straight away). Never persisted into the user's project list.
  */
 function ChatWorkspaceRow(props: { first: boolean }) {
-  const cwd = () => chatFolder();
-  const active = () => cwd() === activeProjectPath();
-  const collapsed = () => isWorkspaceCollapsed(cwd());
-  const sessions = () => sessionsOf(cwd());
-  const hasDaemonInside = () =>
+  const cwd = computed(() => chatFolder());
+  const active = computed(() => cwd() === activeProjectPath());
+  const collapsed = computed(() => isWorkspaceCollapsed(cwd()));
+  const sessions = computed(() => sessionsOf(cwd()));
+  const hasDaemonInside = computed(() =>
     daemonSessions().some(
       (ds) =>
         projectCwdOf(ds.cwd, ds) === cwd() &&
         !isSessionArchived(ds.file) &&
-        !(ds.id === openDaemonId() && isDraftSession()) &&
-        daemonRootEarnsRow(ds),
-    );
-  const hasChildren = () => sessions().length > 0 || (active() && isDraftSession()) || hasDaemonInside();
+        daemonRootEarnsRow(ds) &&
+        !(isDraftSession() && ds.id === openDaemonId()),
+    ),
+  );
+  const hasChildren = computed(() => sessions().length > 0 || (active() && isDraftSession()) || hasDaemonInside());
   const shownInRecents = (path: string | undefined) => !isGroupCollapsed("recents") && Boolean(path && recentSessionPaths().has(path));
   const activeShownInRecents = () =>
     !isGroupCollapsed("recents") && (isDraftSession() ? hasRecentDraft() : shownInRecents(openFile()));
@@ -1615,13 +1811,26 @@ function ChatWorkspaceRow(props: { first: boolean }) {
         (ds.status === "working" || ds.status === "blocked") &&
         !daemonShownInRecents(ds),
     );
-  const collapsedRunning = () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents()));
-  const collapsedUnread = () =>
-    collapsed() &&
-    !collapsedRunning() &&
-    (sessions().some((s) => isSessionUnread(s.path) && !shownInRecents(s.path)) ||
-      daemonSessions().some((ds) => projectCwdOf(ds.cwd, ds) === cwd() && ds.unread && !daemonShownInRecents(ds)));
-  const startingHere = () => active() && sidecarPhase().name === "starting" && !isDraftAhead();
+  const collapsedRunning = computed(
+    () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents())),
+  );
+  const collapsedUnread = computed(
+    () =>
+      collapsed() &&
+      !collapsedRunning() &&
+      (sessions().some((s) => isSessionUnread(s.path) && !shownInRecents(s.path)) ||
+        daemonSessions().some((ds) => projectCwdOf(ds.cwd, ds) === cwd() && ds.unread && !daemonShownInRecents(ds))),
+  );
+  const startingHere = computed(
+    () =>
+      active() &&
+      sidecarPhase().name === "starting" &&
+      !isDraftAhead() &&
+      !pendingSession()?.file &&
+      !pendingSession()?.daemonId &&
+      !collapsedRunning() &&
+      !collapsedUnread(),
+  );
 
   const openChat = (newTab = false) => {
     if (collapsed()) setWorkspaceCollapsed(cwd(), false);
@@ -1703,7 +1912,7 @@ function ChatWorkspaceRow(props: { first: boolean }) {
             </View>
           </If>
           <Presence
-            show={!startingHere() && collapsedRunning()}
+            show={collapsedRunning()}
             testID="sidebar-project-running"
             accessibilityLabel={tr("Running in the background", "后台运行中")}
             class="absolute inset-0 items-center justify-center"
@@ -1711,7 +1920,7 @@ function ChatWorkspaceRow(props: { first: boolean }) {
             <Pip size={16} mood="work" />
           </Presence>
           <Presence
-            show={!startingHere() && collapsedUnread()}
+            show={collapsedUnread()}
             testID="sidebar-project-unread"
             accessibilityLabel={tr("Finished in the background", "后台已完成")}
             class="absolute inset-0 items-center justify-center"
@@ -1790,12 +1999,11 @@ function EngineMark(props: { id: string; available: boolean; selected?: boolean 
 }
 
 function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean }) {
-  const home = backend().home();
-  const resolvedCwd = () => props.cwd || activeProjectPath();
-  const active = () => Boolean(resolvedCwd()) && resolvedCwd() === activeProjectPath() && isDraftSession();
-  const primary = () => active() && ownsDraftSession(props.group, resolvedCwd());
-  const running = () => active() && (isRunning() || openDaemon()?.status === "working" || openDaemon()?.status === "blocked");
-  const selected = () => primary() && currentView().name === "chat";
+  const resolvedCwd = computed(() => props.cwd || activeProjectPath());
+  const active = computed(() => Boolean(resolvedCwd()) && resolvedCwd() === activeProjectPath() && isDraftSession());
+  const primary = computed(() => active() && ownsDraftSession(props.group, resolvedCwd()));
+  const running = computed(() => active() && (isRunning() || openDaemon()?.status === "working" || openDaemon()?.status === "blocked"));
+  const selected = computed(() => primary() && activeViewName() === "chat");
   const shownTitle = signal(untracked(() => (isDraftSession() ? currentTitle() : tr("New session", "新会话"))));
   const shownAgentId = signal(untracked(activeAgentId));
   const shownCwd = signal(untracked(resolvedCwd));
@@ -1805,7 +2013,10 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
     shownAgentId.set(activeAgentId());
     shownCwd.set(resolvedCwd());
   });
-  const engine = () => engineOf(shownAgentId());
+  const engine = computed(() => engineOf(shownAgentId()), { equals: sameEngine });
+  const tooltipText = computed(() =>
+    props.group === "recents" ? `${engine().name} · ${placeLabel(shownCwd())}` : engine().name,
+  );
   return (
     <View class={hoverGroup()}>
       <View
@@ -1827,11 +2038,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
           draftGroup.set(props.group);
           void openNewSessionTab({ newTab: true, cwd: target && target !== activeProjectPath() ? target : undefined });
         }}
-        tooltip={tip(
-          props.group === "recents" ? `${engine().name} · ${placeLabel(shownCwd())}` : engine().name,
-          undefined,
-          "right",
-        )}
+        tooltip={tip(tooltipText(), undefined, "right")}
         class={calm(sessionRowClass(Boolean(props.indent), running(), false))}
       >
         <EngineMark id={engine().id} available={engine().available} selected={selected()} />
@@ -1847,38 +2054,44 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
 }
 
 function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupId; indent?: boolean }) {
-  const home = backend().home();
+  const path = computed(() => props.session.path);
   /** The daemon session behind this file — its status is the row's truth (a parent's children keep its mark too). */
-  const daemon = () => daemonSessionByFile(props.session.path);
-  const active = () =>
-    !isDraftSession() && projectCwdOf(props.cwd, daemon()) === activeProjectPath() && props.session.path === openFile();
-  const owns = () => ownsActiveSession(props.group, props.session.path, props.cwd);
-  const primary = () => active() && owns();
-  const waitingHere = () => childSessionsOf(props.session.path).some((c) => c.status === "working" || c.status === "blocked");
-  const daemonRunning = () => isSessionRunning(props.session.path) || waitingHere();
+  const daemon = computed(() => daemonSessionByFile(path()));
+  const active = computed(
+    () => !isDraftSession() && path() === openFile() && projectCwdOf(props.cwd, daemon()) === activeProjectPath(),
+  );
+  const owns = computed(() => ownsActiveSession(props.group, path(), props.cwd));
+  const primary = computed(() => active() && owns());
+  const waitingHere = computed(() => childSessionsOf(path()).some((c) => c.status === "working" || c.status === "blocked"));
+  const daemonRunning = computed(() => isSessionRunning(path()) || waitingHere());
   /** A run kept going off screen marks every row the session has — whichever group the reader is looking at. */
-  const backgroundRunning = () => !active() && daemonRunning();
+  const backgroundRunning = computed(() => !active() && daemonRunning());
   /** The on-screen run marks all of the session's rows too; `owns` picks where the highlight sits, not the mark. */
-  const running = () => (active() && isRunning()) || daemonRunning();
+  const running = computed(() => (active() && isRunning()) || daemonRunning());
   /** A session waiting on a person (an approval) shows the waiting mark, not the working one. */
-  const blocked = () => !active() && (daemon()?.status === "blocked" || childSessionsOf(props.session.path).some((c) => c.status === "blocked"));
+  const blocked = computed(
+    () => !active() && (daemon()?.status === "blocked" || childSessionsOf(path()).some((c) => c.status === "blocked")),
+  );
   /** A run that died off screen keeps its mark until the session is opened again. */
-  const failed = () => !active() && !running() && daemon()?.status === "failed";
+  const failed = computed(() => !active() && !running() && daemon()?.status === "failed");
   /** A run that finished off screen leaves a dot until the session is opened again. */
-  const unread = () => !active() && !backgroundRunning() && !failed() && isSessionUnread(props.session.path);
-  const archived = () => isSessionArchived(props.session.path);
-  const engine = () => engineOf(props.session.agentId);
-  const selected = () => primary() && currentView().name === "chat";
-  const keepCue = () => running() || blocked();
+  const unread = computed(() => !active() && !backgroundRunning() && !failed() && isSessionUnread(path()));
+  const archived = computed(() => isSessionArchived(path()));
+  const engine = computed(() => engineOf(props.session.agentId), { equals: sameEngine });
+  const selected = computed(() => primary() && activeViewName() === "chat");
+  const keepCue = computed(() => running() || blocked());
+  const reserveTrailing = computed(() => running() || unread() || blocked() || failed());
+  const title = computed(() => titleOf(props.session));
+  const tooltipText = computed(() => `${engine().name} · ${placeLabel(props.cwd)}`);
   /** The list a drag of this row belongs to; 已归档's rows do not move. */
   const dropList = () =>
     props.group === "workspaces" ? `ws:${props.cwd}` : props.group === "recents" ? "recents" : undefined;
   const openRow = (newTab: boolean) => {
     touchHeld = false;
     disarmMouseDrag();
-    const path = props.session.path;
-    if (chosenGroups()[path] !== props.group) chosenGroups.update((all) => ({ ...all, [path]: props.group }));
-    void openSessionTab(props.session.path, props.cwd, { newTab });
+    const p = path();
+    if (chosenGroups()[p] !== props.group) chosenGroups.update((all) => ({ ...all, [p]: props.group }));
+    void openSessionTab(p, props.cwd, { newTab });
   };
   const content = (
     <>
@@ -1887,17 +2100,31 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
         accessibilityState={{ selected: selected() }}
         onPress={(e: PressEvent) => openRow(isModPress(e))}
         onPressDown={(e: PressEvent) => {
-          if (!isModPress(e) && dropList()) armMouseDrag({ list: dropList()!, id: props.session.path }, e.pagePosition.y);
+          if (!isModPress(e)) {
+            armMouseDrag(
+              {
+                list: dropList() ?? "__split__",
+                id: path(),
+                split: {
+                  target: sessionSplitTarget(props.session, props.cwd),
+                  title: title(),
+                  agentId: props.session.agentId,
+                },
+              },
+              e.pagePosition.y,
+              e.pagePosition.x,
+            );
+          }
         }}
         onPressUp={endMouseDrag}
         onMouseUp={(e: MouseEvent) => {
           if (e.button === "middle") openRow(true);
         }}
-        tooltip={tip(`${engine().name} · ${placeLabel(props.cwd)}`, undefined, "right")}
-        class={calm(sessionRowClass(Boolean(props.indent), running() || unread() || blocked() || failed(), true, 0, keepCue()))}
+        tooltip={tip(tooltipText(), undefined, "right")}
+        class={calm(sessionRowClass(Boolean(props.indent), reserveTrailing(), true, 0, keepCue()))}
       >
         <EngineMark id={engine().id} available={engine().available} selected={selected()} />
-        <Text class={sessionTitleClass(selected())}>{titleOf(props.session)}</Text>
+        <Text class={sessionTitleClass(selected())}>{title()}</Text>
       </View>
       <View class={keepCue() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`} style={{ top: rowTrailingTop() }}>
         <Presence
@@ -1941,8 +2168,8 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
         hitSlop={{ top: 2, bottom: 2 }}
         onPress={() => {
           animateSidebarList();
-          if (archived()) unarchiveSession(props.session.path);
-          else void archiveSession(props.session.path, props.cwd);
+          if (archived()) unarchiveSession(path());
+          else void archiveSession(path(), props.cwd);
         }}
         class={`absolute ${keepCue() ? "right-7" : "right-1"} transition-opacity ${inert(HOVER_REVEAL)}`}
         style={{ top: rowTrailingTop() }}
@@ -1960,7 +2187,12 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
   return (
     <DropRow
       list={list}
-      id={props.session.path}
+      id={path()}
+      split={() => ({
+        target: sessionSplitTarget(props.session, props.cwd),
+        title: title(),
+        agentId: props.session.agentId,
+      })}
       onContextMenu={(e) => Menu.popup(sessionMenuItems(props.session, props.cwd), e.pagePosition)}
     >
       {content}
@@ -1970,28 +2202,36 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
 
 /** A session the daemon started under another one (or externally without a file yet) — nested in the sidebar. */
 function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; nested?: boolean }) {
-  const home = backend().home();
   const session = () => props.session;
-  const file = () => session().file;
-  const active = () =>
-    session().id === openDaemonId() || (file() !== undefined && file() === openFile() && !isDraftSession());
-  const engine = () => engineOf(session().agentId);
-  const working = () => (active() && isRunning()) || session().status === "working" || session().status === "blocked";
-  const blocked = () => !active() && session().status === "blocked";
-  const failed = () => !active() && (session().status === "failed" || session().status === "interrupted");
-  const unread = () => session().unread && !active() && !failed() && !working();
+  const file = computed(() => session().file);
+  const active = computed(
+    () => session().id === openDaemonId() || (file() !== undefined && file() === openFile() && !isDraftSession()),
+  );
+  const engine = computed(() => engineOf(session().agentId), { equals: sameEngine });
+  const working = computed(() => (active() && isRunning()) || session().status === "working" || session().status === "blocked");
+  const blocked = computed(() => !active() && session().status === "blocked");
+  const failed = computed(() => !active() && (session().status === "failed" || session().status === "interrupted"));
+  const unread = computed(() => session().unread && !active() && !failed() && !working());
   /** A row the open session has in both groups takes the highlight in one only (`ownsDaemonRow`). */
-  const primary = () => active() && ownsDaemonRow(props.group, session());
-  const selected = () => primary() && currentView().name === "chat";
+  const primary = computed(() => active() && ownsDaemonRow(props.group, session()));
+  const selected = computed(() => primary() && activeViewName() === "chat");
   /** Whether the row hangs under its parent's — a tree top whose own tree hides takes a flat row of its own. */
-  const nested = () => props.nested ?? Boolean(session().parentId);
+  const nested = computed(() => props.nested ?? Boolean(session().parentId));
   /** A child steps one notch in from its parent's row: 最近's roots sit at the folder's level, 工作区's a rung deeper. */
-  const rowDepth = () => {
+  const rowDepth = computed(() => {
     if (!nested()) return 0;
     return props.group === "recents" ? Math.max(0, session().depth - 1) : Math.max(1, session().depth);
-  };
+  });
   /** Any settled/failed/interrupted daemon row (or one with a transcript file) can be archived out of the list. */
-  const archivable = () => file() !== undefined || !working();
+  const archivable = computed(() => file() !== undefined || !working());
+  const reserveTrailing = computed(() => working() || unread() || failed());
+  const title = computed(() => daemonSessionTitle(session()));
+  const tooltipText = computed(
+    () =>
+      `${engine().name} · ${placeLabel(session().cwd)}${session().worktree?.branch ? ` · ${session().worktree!.branch}` : ""}${
+        file() ? "" : ` · ${statusLabel(session().status)}`
+      }`,
+  );
   /** Only 最近's root rows drag: a nested row's place is its tree's, a 工作区 row's is the daemon's order. */
   const dropList = () => (props.group === "recents" && !nested() ? "recents" : undefined);
   const openDaemonRow = (newTab: boolean) => {
@@ -2013,23 +2253,32 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
         accessibilityState={{ selected: selected() }}
         onPress={(e: PressEvent) => openDaemonRow(isModPress(e))}
         onPressDown={(e: PressEvent) => {
-          if (!isModPress(e) && dropList()) armMouseDrag({ list: dropList()!, id: `daemon:${session().id}` }, e.pagePosition.y);
+          if (!isModPress(e)) {
+            const s = session();
+            armMouseDrag(
+              {
+                list: dropList() ?? "__split__",
+                id: `daemon:${s.id}`,
+                split: {
+                  target: daemonSplitTarget(s),
+                  title: daemonSessionTitle(s),
+                  agentId: s.agentId,
+                },
+              },
+              e.pagePosition.y,
+              e.pagePosition.x,
+            );
+          }
         }}
         onPressUp={endMouseDrag}
         onMouseUp={(e: MouseEvent) => {
           if (e.button === "middle") openDaemonRow(true);
         }}
-        tooltip={tip(
-          `${engine().name} · ${placeLabel(session().cwd)}${session().worktree?.branch ? ` · ${session().worktree!.branch}` : ""}${
-            file() ? "" : ` · ${statusLabel(session().status)}`
-          }`,
-          undefined,
-          "right",
-        )}
+        tooltip={tip(tooltipText(), undefined, "right")}
         class={calm(
           sessionRowClass(
             props.group === "workspaces" || nested(),
-            working() || unread() || failed(),
+            reserveTrailing(),
             archivable(),
             rowDepth(),
             working(),
@@ -2037,7 +2286,7 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
         )}
       >
         <EngineMark id={engine().id} available={engine().available} selected={selected()} />
-        <Text class={sessionTitleClass(selected())}>{daemonSessionTitle(session())}</Text>
+        <Text class={sessionTitleClass(selected())}>{title()}</Text>
       </View>
       <View class={working() || !archivable() ? TRAILING_SLOT : `${TRAILING_SLOT} transition-opacity group-hover:opacity-0`} style={{ top: rowTrailingTop() }}>
         <Presence
@@ -2102,6 +2351,14 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
     <DropRow
       list={list}
       id={`daemon:${session().id}`}
+      split={() => {
+        const s = session();
+        return {
+          target: daemonSplitTarget(s),
+          title: daemonSessionTitle(s),
+          agentId: s.agentId,
+        };
+      }}
       onContextMenu={(e) => Menu.popup(childMenuItems(session()), e.pagePosition)}
     >
       {content}
@@ -2128,9 +2385,13 @@ function statusLabel(status: DaemonSession["status"]) {
 /** A daemon session's right-click: open it, stop it outright, archive it, or delete it. */
 function childMenuItems(session: DaemonSession): MenuItem[] {
   const working = session.status === "working" || session.status === "blocked";
+  const splitTarget = daemonSplitTarget(session);
   return [
     { label: tr("Open", "打开"), onSelect: () => openDaemonSessionTab(session.id) },
     { label: tr("Open in New Tab", "在新标签页中打开"), onSelect: () => openDaemonSessionTab(session.id, { newTab: true }) },
+    { label: tr("Split Right", "向右分屏"), onSelect: () => openSplit(splitTarget, "right") },
+    { label: tr("Split Left", "向左分屏"), onSelect: () => openSplit(splitTarget, "left") },
+    { type: "separator" },
     {
       label: tr("Stop session", "停止会话"),
       disabled: !working,
@@ -2154,37 +2415,51 @@ function childMenuItems(session: DaemonSession): MenuItem[] {
 }
 
 function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; collapsed: () => boolean }) {
-  const isCurrent = () => props.cwd === activeProjectPath();
-  const folderSessions = () => sessionsOf(props.cwd);
-  const hasDraft = () =>
-    isCurrent() &&
-    listSteady() &&
-    isDraftSession() &&
-    (isChatFolder(props.cwd) || folderSessions().length > 0 || props.allProjects.length > 1 || childSessionsOfOpen().length > 0);
+  const isCurrent = computed(() => props.cwd === activeProjectPath());
+  const folderSessions = computed(() => sessionsOf(props.cwd));
+  const hasDraft = computed(
+    () =>
+      isCurrent() &&
+      listSteady() &&
+      isDraftSession() &&
+      (isChatFolder(props.cwd) || folderSessions().length > 0 || props.allProjects.length > 1 || childSessionsOfOpen().length > 0),
+  );
 
+  let prevById = new Map<string, FolderItem>();
   let lastItems: FolderItem[] = [];
-  const items = computed<FolderItem[]>(() => {
-    if (props.collapsed()) return lastItems;
-    const rows: FolderItem[] = [];
-    const listed = new Set(folderSessions().map((s) => s.path));
-    for (const ds of daemonSessions()) {
-      if (ds.parentId || (ds.file && listed.has(ds.file))) continue;
-      if (isSessionArchived(ds.file)) continue;
-      if (projectCwdOf(ds.cwd, ds) !== props.cwd) continue;
-      if (!daemonRootEarnsRow(ds)) continue;
-      if (ds.id === openDaemonId() && isDraftSession()) continue;
-      rows.push({ id: `child:${ds.id}`, child: ds });
-      for (const child of childSessionsOfDaemon(ds.id)) rows.push({ id: `child:${child.id}`, child });
-    }
-    for (const session of sortedFolderSessions(props.cwd)) {
-      rows.push({ id: `session:${session.path}`, session });
-      for (const child of childSessionsOf(session.path)) rows.push({ id: `child:${child.id}`, child });
-    }
-    lastItems = rows;
-    return rows;
-  });
+  const reuseFolderItem = (id: string, session?: SessionSummary, child?: DaemonSession): FolderItem => {
+    const prev = prevById.get(id);
+    if (prev && prev.session === session && prev.child === child) return prev;
+    return { id, ...(session ? { session } : {}), ...(child ? { child } : {}) };
+  };
+  const items = computed<FolderItem[]>(
+    () => {
+      if (props.collapsed()) return lastItems;
+      const rows: FolderItem[] = [];
+      const listed = new Set(folderSessions().map((s) => s.path));
+      for (const ds of daemonSessions()) {
+        if (ds.parentId || (ds.file && listed.has(ds.file))) continue;
+        if (isSessionArchived(ds.file)) continue;
+        if (projectCwdOf(ds.cwd, ds) !== props.cwd) continue;
+        if (!daemonRootEarnsRow(ds)) continue;
+        if (isDraftSession() && ds.id === openDaemonId()) continue;
+        rows.push(reuseFolderItem(`child:${ds.id}`, undefined, ds));
+        for (const child of childSessionsOfDaemon(ds.id)) rows.push(reuseFolderItem(`child:${child.id}`, undefined, child));
+      }
+      for (const session of sortedFolderSessions(props.cwd)) {
+        rows.push(reuseFolderItem(`session:${session.path}`, session, undefined));
+        for (const child of childSessionsOf(session.path)) rows.push(reuseFolderItem(`child:${child.id}`, undefined, child));
+      }
+      const nextById = new Map<string, FolderItem>();
+      for (const item of rows) nextById.set(item.id, item);
+      prevById = nextById;
+      lastItems = rows;
+      return rows;
+    },
+    { equals: sameItems },
+  );
 
-  const draftChildren = () => childSessionsOfOpen();
+  const draftChildren = computed(() => (hasDraft() ? childSessionsOfOpen() : []), { equals: sameItems });
   return (
     <View ref={(ref) => registerDropList(`ws:${props.cwd}`, ref)}>
       <Reveal open={hasDraft()} instant={props.collapsed() || draftGraduated()}>
@@ -2209,7 +2484,7 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; c
 }
 
 function ProjectSection(props: { cwd: string; first: boolean; allProjects: readonly string[]; chat?: boolean }) {
-  const collapsed = () => isWorkspaceCollapsed(props.cwd);
+  const collapsed = computed(() => isWorkspaceCollapsed(props.cwd));
   const mounted = signal(!untracked(collapsed));
   let unmountTimer: ReturnType<typeof setTimeout> | undefined;
   effect(() => {
@@ -2272,10 +2547,9 @@ async function confirmDeleteNote(note: NoteSummary) {
  */
 function NoteRow(props: { note: NoteSummary }) {
   const home = backend().home();
-  const selected = () => {
-    const v = currentView();
-    return v.name === "doc" && v.docId === props.note.path;
-  };
+  const selected = computed(() => activeDocId() === props.note.path);
+  const title = computed(() => docTabTitle(props.note.path));
+  const tooltipText = computed(() => tildePath(props.note.path, home));
   const revealLabel = () => (platform.os === "macos" ? tr("Show in Finder", "在访达中显示") : tr("Show in File Manager", "在文件管理器中显示"));
   const menu = (e: ContextMenuEvent) => {
     const targets = docChatTargets();
@@ -2287,6 +2561,9 @@ function NoteRow(props: { note: NoteSummary }) {
       [
         { label: tr("Open", "打开"), onSelect: () => openDocTab(props.note.path) },
         { label: tr("Open in New Tab", "在新标签页中打开"), onSelect: () => openDocTab(props.note.path, { newTab: true }) },
+        { label: tr("Split Right", "向右分屏"), onSelect: () => openSplit({ kind: "doc", path: props.note.path }, "right") },
+        { label: tr("Split Left", "向左分屏"), onSelect: () => openSplit({ kind: "doc", path: props.note.path }, "left") },
+        { type: "separator" },
         {
           label: targets.hasActiveDraft ? tr("Add to Current Draft", "添加到当前草稿") : tr("New Session with Document", "用新会话讨论"),
           onSelect: () =>
@@ -2311,25 +2588,46 @@ function NoteRow(props: { note: NoteSummary }) {
     openDocTab(props.note.path, { newTab });
   };
   return (
-    <DropRow list="docs" id={props.note.path} onContextMenu={menu}>
+    <DropRow
+      list="docs"
+      id={props.note.path}
+      split={() => ({
+        target: { kind: "doc", path: props.note.path },
+        title: docTabTitle(props.note.path),
+      })}
+      onContextMenu={menu}
+    >
       <View
         role="button"
         accessibilityState={{ selected: selected() }}
         onPress={(e: PressEvent) => openRow(isModPress(e))}
         onPressDown={(e: PressEvent) => {
-          if (!isModPress(e)) armMouseDrag({ list: "docs", id: props.note.path }, e.pagePosition.y);
+          if (!isModPress(e)) {
+            armMouseDrag(
+              {
+                list: "docs",
+                id: props.note.path,
+                split: {
+                  target: { kind: "doc", path: props.note.path },
+                  title: docTabTitle(props.note.path),
+                },
+              },
+              e.pagePosition.y,
+              e.pagePosition.x,
+            );
+          }
         }}
         onPressUp={endMouseDrag}
         onMouseUp={(e: MouseEvent) => {
           if (e.button === "middle") openRow(true);
         }}
-        tooltip={tip(tildePath(props.note.path, home), undefined, "right")}
+        tooltip={tip(tooltipText(), undefined, "right")}
         class={calm(sessionRowClass(false, false, false))}
       >
         <View class={ICON_SLOT}>
           <Icon name="file" size={uiIconSize(14)} tone={selected() ? "foreground" : "muted-foreground"} />
         </View>
-        <Text class={sessionTitleClass(selected())}>{docTabTitle(props.note.path)}</Text>
+        <Text class={sessionTitleClass(selected())}>{title()}</Text>
       </View>
     </DropRow>
   );
@@ -2337,8 +2635,9 @@ function NoteRow(props: { note: NoteSummary }) {
 
 /** The scrollable tree: 工作区's project folders, 最近's sessions, 文档's Markdown notes, and 已归档's tucked-away sessions. */
 function SidebarTree() {
-  const recentCount = () => allRecents().length + (hasRecentDraft() ? 1 + childSessionsOfOpen().length : 0);
-  const showRecents = () => recentCount() > 0;
+  const recentCount = computed(() => allRecents().length + (hasRecentDraft() ? 1 + childSessionsOfOpen().length : 0));
+  const showRecents = computed(() => recentCount() > 0);
+  const recentDraftChildren = computed(() => (hasRecentDraft() ? childSessionsOfOpen() : []), { equals: sameItems });
   const docsGroupMenu = (e: ContextMenuEvent) =>
     Menu.popup(
       [
@@ -2356,7 +2655,8 @@ function SidebarTree() {
 
   // The rows under the pointer are about to move: any relist is a move under a
   // resting pointer — a draft row opening, a daemon push, a rescan, an
-  // auto-archive. The guard keys on the row set itself, so every path arms it.
+  // auto-archive. The guard keys on the rendered row set itself, so switching
+  // between already-listed workspaces leaves hover state undisturbed.
   const rowSignature = computed(() =>
     [
       projects().join(";"),
@@ -2366,14 +2666,11 @@ function SidebarTree() {
       notes()
         .map((n) => n.path)
         .join(";"),
-      savedSessions()
-        .map((s) => s.path)
-        .join(";"),
-      ...Object.entries(workspaceSessions()).map(([cwd, list]) => `${cwd}=${list.map((s) => s.path).join(",")}`),
+      ...recentFolders().map((cwd) => `${cwd}=${sessionsOf(cwd).map((s) => s.path).join(",")}`),
       archivedSessionItems()
         .map((item) => item.id)
         .join(";"),
-      childSessionsOfOpen()
+      recentDraftChildren()
         .map((c) => c.id)
         .join(";"),
       hasRecentDraft() ? "draft" : "",
@@ -2472,7 +2769,7 @@ function SidebarTree() {
               <Reveal open={hasRecentDraft()} instant={draftGraduated()}>
                 <View>
                   <DraftSessionRow cwd={activeProjectPath()} group="recents" />
-                  <Each of={childSessionsOfOpen()} key={(c) => `child:${c.id}`}>
+                  <Each of={recentDraftChildren()} key={(c) => `child:${c.id}`}>
                     {(child) => <DaemonSessionRow session={child()} group="recents" />}
                   </Each>
                 </View>
@@ -2568,7 +2865,7 @@ function SidebarTree() {
 
 /** The left column: 新会话, the open project workspaces, 最近, and the way to settings. */
 export function Sidebar() {
-  const settingsOpen = () => currentView().name === "settings";
+  const settingsOpen = computed(() => activeViewName() === "settings");
   let prevDraft = untracked(isDraftSession);
   let lastSavedOwner: GroupId = "workspaces";
   let lastDraftOwner: GroupId | undefined = prevDraft ? untracked(draftGroup) : undefined;
@@ -2578,7 +2875,7 @@ export function Sidebar() {
     const file = openFile();
     if (!draft) {
       if (prevDraft) {
-        if (lastDraftOwner && file && !pendingSession()?.file && chosenGroups()[file] === undefined) {
+        if (lastDraftOwner && file && !pendingSession()?.file && untracked(chosenGroups)[file] === undefined) {
           const inherited = lastDraftOwner;
           chosenGroups.update((all) => ({ ...all, [file]: inherited }));
         }
@@ -2598,7 +2895,7 @@ export function Sidebar() {
     }
     const owner: GroupId = cwd && ownsDraftSession("recents", cwd) ? "recents" : "workspaces";
     lastDraftOwner = owner;
-    if (file && chosenGroups()[file] !== owner) {
+    if (file && untracked(chosenGroups)[file] !== owner) {
       chosenGroups.update((all) => ({ ...all, [file]: owner }));
     }
     prevDraft = true;
@@ -2607,17 +2904,19 @@ export function Sidebar() {
     <View class={`size-full ${WALLPAPER_FROST ? "" : "bg-sidebar"}`}>
       {/* A title bar's height where window controls stand at the strip's left
          end — it carries the hide button; elsewhere a slim drag margin, and
-         the hide button rides on 新会话's row instead. The padding centers the
-         button on the sheet strip's line rather than this strip's own: without
-         a wallpaper the sheet floats SHEET_INSET below the window's top, and
-         twice that padding re-centers the remaining room on its line. */}
+         the hide button rides on 新会话's row instead. Without a wallpaper the
+         sheet floats SHEET_INSET below the window's top, so the strip reaches
+         that much farther down: its bottom meets the sheet strip's own, the
+         rows below start on the pane's first line, and the traffic lights keep
+         their air over 新会话. The padding centers the hide button on the
+         strip's line rather than the lengthened strip's own. */}
       <View
         desktop={{ windowDrag: true }}
         class="shrink-0 flex-row items-center justify-end pr-2.5"
         style={{
-          height: leftControls() ? TITLE_BAR_HEIGHT : 12,
+          height: leftControls() ? TITLE_BAR_HEIGHT + (wallpaper() ? 0 : SHEET_INSET) : 12,
           paddingLeft: (titleBarArea().left || 0) + 14,
-          paddingTop: leftControls() && !wallpaper() ? SHEET_INSET * 2 : 0,
+          paddingTop: leftControls() && !wallpaper() ? SHEET_INSET : 0,
         }}
       >
         <If when={leftControls()}>

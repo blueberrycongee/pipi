@@ -113,7 +113,6 @@ export function sameVisualRow(a: Row, b: Row): boolean {
   if (a.kind !== b.kind) return false;
   if (isTurnRow(a) && isTurnRow(b)) {
     if (Boolean(a.turnStart) !== Boolean(b.turnStart)) return false;
-    if ((a.turnMs !== undefined) !== (b.turnMs !== undefined)) return false;
   }
   switch (a.kind) {
     case "user": {
@@ -826,7 +825,7 @@ export class Transcript {
         }
         break;
       case "message_update":
-        this.#update(event.assistantMessageEvent);
+        this.#update(event.assistantMessageEvent, (event as { message?: AssistantMessage }).message);
         break;
       case "message_end":
         if (event.message.role === "assistant") this.#finish(event.message);
@@ -1043,7 +1042,10 @@ export class Transcript {
     const now = Date.now();
     let changed = false;
     const unmatched: StagedUserEntry[] = [];
-    for (const item of this.#staged) {
+    // The queue delivers oldest-first, so when identical texts thin out the cover
+    // goes to the newest bubbles: the oldest copy is the one being delivered, and
+    // marking the still-waiting newest for withdrawal would vanish it from the line.
+    for (const item of [...this.#staged].reverse()) {
       if (!item.queued) continue;
       const left = cover.get(item.row.text) ?? 0;
       if (left > 0) {
@@ -1142,10 +1144,13 @@ export class Transcript {
 
   /**
    * Whether a staged message still expects a run or an echo: one the queue took
-   * back (`dropAt`) no longer does — its bubble only waits out the grace.
+   * back (`dropAt`) no longer does — its bubble only waits out the grace. One
+   * the agent confirmed into its queue does not count either: it is not about to
+   * start anything, so a settle arriving over it is the run's real end (which only
+   * error or abort can bring while the queue still holds it), not a stale one.
    */
   hasPendingUser(): boolean {
-    return this.#staged.some((item) => item.dropAt === undefined);
+    return this.#staged.some((item) => item.dropAt === undefined && !(item.queued && item.queueAcked));
   }
 
   /** The soonest a staged bubble may withdraw, for the store to wake a flush at. */
@@ -1409,9 +1414,29 @@ export class Transcript {
   }
 
   /** One content block's progress in the live assistant message. */
-  #update(event: AssistantMessageEvent) {
-    const live = this.#live;
-    if (!live || !("contentIndex" in event)) return;
+  #update(event: AssistantMessageEvent, snapshot?: AssistantMessage) {
+    let live = this.#live;
+    if (!("contentIndex" in event)) return;
+    if (!live) {
+      // Mid-stream re-attach (e.g. Pi `get_entries` omits the in-flight assistant message,
+      // so the first live event after attach is a `message_update` with no prior `message_start`).
+      // Recover `#live` from an attached cumulative snapshot when present, or synthesize `#live`
+      // on demand so subsequent deltas stream smoothly instead of being dropped until `message_end`.
+      if (snapshot?.role === "assistant" && Array.isArray(snapshot.content)) {
+        this.#pendingMessage(snapshot);
+        return;
+      }
+      live = { key: `m${++seq}`, rowIds: new Map(), toolIds: new Map(), toolJson: new Map(), thinkingSince: new Map(), argsAt: new Map() };
+      this.#live = live;
+      const last = this.#rows.at(-1);
+      if (
+        last &&
+        (((event.type === "text_delta" || event.type === "text_end") && last.kind === "text" && last.streaming) ||
+          ((event.type === "thinking_delta" || event.type === "thinking_end") && last.kind === "thinking" && last.streaming))
+      ) {
+        live.rowIds.set(event.contentIndex, last.id);
+      }
+    }
     const id = live.rowIds.get(event.contentIndex) ?? `${live.key}.${event.contentIndex}`;
     switch (event.type) {
       case "text_start":
@@ -1419,11 +1444,13 @@ export class Transcript {
         this.#set({ kind: "text", id, text: "", streaming: true });
         break;
       case "text_delta": {
+        if (!live.rowIds.has(event.contentIndex)) live.rowIds.set(event.contentIndex, id);
         const row = this.#openRow(id, "text");
         this.#set({ kind: "text", id, text: (row?.kind === "text" ? row.text : "") + event.delta, streaming: true });
         break;
       }
       case "text_end":
+        if (!live.rowIds.has(event.contentIndex)) live.rowIds.set(event.contentIndex, id);
         this.#set({ kind: "text", id, text: event.content, streaming: false });
         break;
       case "thinking_start":
@@ -1432,11 +1459,13 @@ export class Transcript {
         this.#set({ kind: "thinking", id, text: "", streaming: true, redacted: false });
         break;
       case "thinking_delta": {
+        if (!live.rowIds.has(event.contentIndex)) live.rowIds.set(event.contentIndex, id);
         const row = this.#openRow(id, "thinking");
         this.#set({ kind: "thinking", id, text: (row?.kind === "thinking" ? row.text : "") + event.delta, streaming: true, redacted: false });
         break;
       }
       case "thinking_end": {
+        if (!live.rowIds.has(event.contentIndex)) live.rowIds.set(event.contentIndex, id);
         const since = live.thinkingSince.get(event.contentIndex);
         this.#set({ kind: "thinking", id, text: event.content, streaming: false, redacted: false, durationMs: since ? Date.now() - since : undefined });
         break;

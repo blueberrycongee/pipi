@@ -23,6 +23,7 @@ import type { TextViewBlock, TextViewDocument, TextViewImage, TextViewInline, Te
 import { tr } from "../lib/i18n";
 import { extractBlockMedia, resolveMediaTarget, type MediaItem } from "../lib/media";
 import { mendStreamingMarkdown, PENDING_LINK_URL } from "../lib/mend";
+import { groupPipMessageBlocks } from "../lib/pip-bubbles";
 import { clearPacers, pacedStreamText } from "../lib/stream-pacer";
 import {
   advanceElemVeil,
@@ -48,7 +49,7 @@ import { tip } from "../ui/Tip";
 import { readingType, codeType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
 import { openZoom } from "../ui/Zoom";
-import { MediaGallery, openMediaZoom } from "./Media";
+import { MediaGallery, MediaStreamContext, openMediaZoom } from "./Media";
 
 /** Shared typography classes for `TextView` fallback blocks (alerts, math, settled code). */
 export const proseClasses = computed(() => ({
@@ -69,6 +70,17 @@ export const proseClasses = computed(() => ({
   tableHeaderCell: `${readingType("xs")} font-semibold text-muted-foreground`,
   rule: "border-hairline",
   listMarker: "text-subtle",
+}));
+
+/** Typography classes for Markdown rendered inside Pip's incoming SMS bubble. */
+const bubbleProseClasses = computed(() => ({
+  ...proseClasses(),
+  root: `gap-2 ${readingType()} text-foreground`,
+  code: `rounded-[4px] bg-sms-incoming-code px-1 ${readingType("sm")} text-foreground`,
+  codeBlock: "rounded-xl corner-squircle border-[0.5px] border-hairline bg-background/85",
+  codeBlockCode: `p-3 ${codeType()} leading-relaxed`,
+  table: "rounded-lg corner-squircle border-[0.5px] border-hairline bg-background/70",
+  tableHead: "bg-background/90",
 }));
 
 /** Gentle opacity entrance for newly created structural blocks (tables, rules, code cards). */
@@ -98,7 +110,7 @@ function zoomTable(block: Extract<TextViewBlock, { type: "table" }>) {
 }
 
 /** Opens an image in the same zoom layer (`TextView`'s `onImagePress`). */
-function zoomImage(image: TextViewImage) {
+function zoomImage(image: TextViewImage, gallery?: readonly MediaItem[]) {
   const resolved = resolveMediaTarget(image.src, workspacePath(), backend().home());
   const item: MediaItem = resolved
     ? {
@@ -117,7 +129,7 @@ function zoomImage(image: TextViewImage) {
         title: image.title || image.alt || "image",
         src: image.src,
       };
-  openMediaZoom(item);
+  openMediaZoom(item, gallery ? { gallery } : undefined);
 }
 
 /** A block's hover-revealed expand button: a floating chip at its top-right corner that opens it in the zoom layer. */
@@ -198,7 +210,7 @@ function flatInlineText(content: readonly TextViewInline[]): string {
 }
 
 type ToneRole = "fg" | "muted" | "brand";
-type BgRole = "muted" | "brand-soft";
+type BgRole = "muted" | "brand-soft" | "sms-code";
 
 interface InlineMarks {
   cls: string;
@@ -214,7 +226,7 @@ interface InlineRun extends InlineMarks {
   text: string;
 }
 
-function collectRuns(content: readonly TextViewInline[], marks: InlineMarks, out: InlineRun[]) {
+function collectRuns(content: readonly TextViewInline[], marks: InlineMarks, out: InlineRun[], inBubble = false) {
   for (const n of content) {
     switch (n.type) {
       case "text":
@@ -225,24 +237,25 @@ function collectRuns(content: readonly TextViewInline[], marks: InlineMarks, out
           n.content,
           { ...marks, cls: `${marks.cls} font-semibold`, tone: marks.tone === "muted" ? "fg" : marks.tone },
           out,
+          inBubble,
         );
         break;
       case "emphasis":
-        collectRuns(n.content, { ...marks, cls: `${marks.cls} italic` }, out);
+        collectRuns(n.content, { ...marks, cls: `${marks.cls} italic` }, out, inBubble);
         break;
       case "strikethrough":
-        collectRuns(n.content, { ...marks, strikethrough: true }, out);
+        collectRuns(n.content, { ...marks, strikethrough: true }, out, inBubble);
         break;
       case "underline":
-        collectRuns(n.content, { ...marks, underline: true }, out);
+        collectRuns(n.content, { ...marks, underline: true }, out, inBubble);
         break;
       case "highlight":
-        collectRuns(n.content, { ...marks, cls: `${marks.cls} rounded-xs corner-squircle`, bg: "brand-soft" }, out);
+        collectRuns(n.content, { ...marks, cls: `${marks.cls} rounded-xs corner-squircle`, bg: "brand-soft" }, out, inBubble);
         break;
       case "small":
       case "subscript":
       case "superscript":
-        collectRuns(n.content, { ...marks, cls: `${marks.cls} ${readingType("xs")}` }, out);
+        collectRuns(n.content, { ...marks, cls: `${marks.cls} ${readingType("xs")}` }, out, inBubble);
         break;
       case "code":
         if (n.code) {
@@ -252,7 +265,7 @@ function collectRuns(content: readonly TextViewInline[], marks: InlineMarks, out
             cls: `${marks.cls} font-mono rounded-sm corner-squircle px-1`,
             em: 0.9,
             tone: marks.tone === "brand" ? "brand" : "fg",
-            bg: "muted",
+            bg: inBubble ? "sms-code" : "muted",
           });
         }
         break;
@@ -262,12 +275,12 @@ function collectRuns(content: readonly TextViewInline[], marks: InlineMarks, out
             ...marks,
             text: n.text,
             cls: `${marks.cls} font-mono ${readingType("xs")} rounded-sm corner-squircle px-1`,
-            bg: "muted",
+            bg: inBubble ? "sms-code" : "muted",
           });
         }
         break;
       case "link":
-        collectRuns(n.content, { ...marks, tone: "brand", underline: true, url: n.url }, out);
+        collectRuns(n.content, { ...marks, tone: "brand", underline: true, url: n.url }, out, inBubble);
         break;
       case "break":
         out.push({ ...marks, text: "\n", bg: undefined });
@@ -287,7 +300,9 @@ function resolvedToneHex(role: ToneRole): string {
 }
 
 function resolvedBgHex(role: BgRole): string {
-  return role === "brand-soft" ? token("brand-soft") : token("muted");
+  if (role === "brand-soft") return token("brand-soft");
+  if (role === "sms-code") return token("sms-incoming-code");
+  return token("muted");
 }
 
 /** A resolved theme color (`#rgb`, `#rrggbb`, `#rrggbbaa`) at `alpha` (0..1) of its own. */
@@ -388,10 +403,10 @@ function veilCuts(local: readonly { start: number; end: number; chunk: VeilChunk
 }
 
 /** Renders an array of `TextViewInline` nodes with per-chunk opacity veil spans (zero width shift). */
-export function renderVeiledInlines(content: readonly TextViewInline[], chunks: VeilChunk[], baseTone: ToneRole): JSX.Element[] {
+export function renderVeiledInlines(content: readonly TextViewInline[], chunks: VeilChunk[], baseTone: ToneRole, inBubble = false): JSX.Element[] {
   pruneSettledChunks(chunks, Date.now());
   const runs: InlineRun[] = [];
-  collectRuns(content, { cls: "", tone: baseTone }, runs);
+  collectRuns(content, { cls: "", tone: baseTone }, runs, inBubble);
   const out: JSX.Element[] = [];
   let offset = 0;
 
@@ -578,6 +593,7 @@ function VeiledListView(props: {
   depth: number;
   baseTone: ToneRole;
   chunks: () => ReadonlyMap<string, VeilChunk[]>;
+  inBubble?: boolean;
 }) {
   const bullets = ["•", "◦", "▪"];
   // The marker column is one width for the whole list, sized for its widest
@@ -629,7 +645,7 @@ function VeiledListView(props: {
                         <If when={child().type === "paragraph" ? (child() as Extract<TextViewBlock, { type: "paragraph" }>) : undefined}>
                           {(para) => (
                             <Text class={`${readingType()} leading-relaxed`}>
-                              {renderVeiledInlines(para().content, props.chunks().get(key()) ?? [], props.baseTone)}
+                              {renderVeiledInlines(para().content, props.chunks().get(key()) ?? [], props.baseTone, props.inBubble)}
                             </Text>
                           )}
                         </If>
@@ -641,6 +657,7 @@ function VeiledListView(props: {
                               depth={props.depth + 1}
                               baseTone={props.baseTone}
                               chunks={props.chunks}
+                              inBubble={props.inBubble}
                             />
                           )}
                         </If>
@@ -662,6 +679,7 @@ function VeiledTableView(props: {
   blockIdx: () => number;
   settled: boolean;
   chunks: () => ReadonlyMap<string, VeilChunk[]>;
+  inBubble?: boolean;
 }) {
   const alignClass = (col: number) => {
     const a = props.block.align?.[col];
@@ -672,15 +690,20 @@ function VeiledTableView(props: {
 
   return (
     <View class="group relative">
-      <View selectable class="overflow-hidden rounded-lg corner-squircle border border-border">
+      <View
+        selectable
+        class={`overflow-hidden rounded-lg corner-squircle border ${
+          props.inBubble ? "border-hairline bg-background/70" : "border-border"
+        }`}
+      >
         <Scroll horizontal class="w-full">
           <View class="min-w-full">
-            <View class="flex-row border-b border-border bg-muted">
+            <View class={`flex-row border-b ${props.inBubble ? "border-hairline bg-background/90" : "border-border bg-muted"}`}>
               <Each of={props.block.head} key="index">
                 {(cell, c) => (
                   <View class="min-w-24 flex-1 px-3 py-1.5">
                     <Text class={`${readingType("xs")} font-semibold ${alignClass(c())}`}>
-                      {renderVeiledInlines(cell().content, props.chunks().get(`th:${props.blockIdx()}:${c()}`) ?? [], "muted")}
+                      {renderVeiledInlines(cell().content, props.chunks().get(`th:${props.blockIdx()}:${c()}`) ?? [], "muted", props.inBubble)}
                     </Text>
                   </View>
                 )}
@@ -693,7 +716,7 @@ function VeiledTableView(props: {
                     {(cell, c) => (
                       <View class="min-w-24 flex-1 px-3 py-1.5">
                         <Text class={`${readingType("sm")} leading-relaxed ${alignClass(c())}`}>
-                          {renderVeiledInlines(cell().content, props.chunks().get(`td:${props.blockIdx()}:${r()}:${c()}`) ?? [], "fg")}
+                          {renderVeiledInlines(cell().content, props.chunks().get(`td:${props.blockIdx()}:${r()}:${c()}`) ?? [], "fg", props.inBubble)}
                         </Text>
                       </View>
                     )}
@@ -711,18 +734,19 @@ function VeiledTableView(props: {
   );
 }
 
-function FallbackTextViewBlock(props: { block: TextViewBlock; settled: boolean }) {
+function FallbackTextViewBlock(props: { block: TextViewBlock; settled: boolean; inBubble?: boolean }) {
+  const getStream = MediaStreamContext();
   return (
     <TextView
       document={{ blocks: [props.block] }}
-      classes={proseClasses()}
+      classes={props.inBubble ? bubbleProseClasses() : proseClasses()}
       selectable
       links="report"
       onLinkPress={({ url }) => openProseLink(url)}
       codeBlockScrollbar={false}
       tableScrollbar={false}
       codeBlockActions={props.settled ? [{ id: "copy", label: tr("Copy code", "复制代码") }] : undefined}
-      onImagePress={({ image }) => zoomImage(image)}
+      onImagePress={({ image }) => zoomImage(image, getStream?.())}
     />
   );
 }
@@ -769,11 +793,48 @@ interface ProseEntry {
   hasRefDefs: boolean;
 }
 
+/** One iMessage-style incoming SMS bubble projected from a settled Pip reply. */
+export interface PipBubbleRow {
+  kind: "pip-bubble";
+  id: string;
+  /** The underlying transcript text row id (used to skip pop-in animation on loaded history). */
+  rowId: string;
+  /** Position inside this message's bubble cluster (0-based, drives staggered pop-in). */
+  bubbleIndex: number;
+  /** First bubble of the message cluster (tight top corners on subsequent bubbles). */
+  first: boolean;
+  /** Last bubble of the message cluster (carries curved tail + bottom-left Pip avatar when `pip.tail`). */
+  last: boolean;
+  /** Parsed Markdown blocks rendered inside this bubble. */
+  blocks: TextViewBlock[];
+  /** Footnotes attached to the last bubble when present. */
+  footnotes?: TextViewDocument["footnotes"];
+  /** Plain text for copying this single bubble. */
+  copyText: string;
+  /** Full reply text across all bubbles in this turn (for "Copy full reply"). */
+  fullText: string;
+  /** True when the bubble contains wide structured content (code block / table). */
+  wide: boolean;
+  /** True when the bubble is purely media (renders borderless rounded media like an iMessage photo). */
+  mediaOnly?: boolean;
+  /** Pip turn slot metadata (`lead` on first bubble, `tail` on final bubble). */
+  pip: PipRowSlot;
+}
+
+interface PipBubbleEntry {
+  text: string;
+  pipKey: string;
+  rows: PipBubbleRow[];
+}
+
+const pipBubbleEntries = new Map<string, PipBubbleEntry>();
+
 const proseEntries = new Map<string, ProseEntry>();
 
 /** Clears cached blocks, pacers and veils when switching sessions. */
 export function clearProseState() {
   proseEntries.clear();
+  pipBubbleEntries.clear();
   clearPacers();
   clearVeils();
   veilUntil = 0;
@@ -924,7 +985,63 @@ function advanceDocVeil(
  */
 function pipSlotKey(pip?: PipRowSlot): string {
   if (!pip) return "";
-  return `${pip.lead ? 1 : 0}:${pip.indent ? 1 : 0}:${pip.meta?.turnId ?? ""}:${pip.meta?.durationMs ?? ""}:${pip.meta?.hasDetails ? 1 : 0}:${pip.meta?.summary ?? ""}`;
+  return `${pip.lead ? 1 : 0}:${pip.tail ? 1 : 0}:${pip.indent ? 1 : 0}:${pip.meta?.turnId ?? ""}:${pip.meta?.durationMs ?? ""}:${pip.meta?.hasDetails ? 1 : 0}:${pip.meta?.summary ?? ""}`;
+}
+
+const EMPTY_CHUNKS: ReadonlyMap<string, VeilChunk[]> = new Map();
+
+/**
+ * Projects a settled Pip reply into 1..N iMessage-style SMS bubble rows,
+ * cached per transcript row id so unchanged bubbles keep exact object identity.
+ */
+export function pipBubbleRows(row: { id: string; text: string; pip?: PipRowSlot }): PipBubbleRow[] {
+  const pipKey = pipSlotKey(row.pip);
+  const before = pipBubbleEntries.get(row.id);
+  if (before && before.text === row.text && before.pipKey === pipKey) {
+    return before.rows;
+  }
+
+  const doc = TextView.parse(row.text, { streaming: false });
+  const groups = groupPipMessageBlocks(doc.blocks, row.text.trim());
+  const basePip: PipRowSlot = row.pip ?? { lead: true, tail: true, indent: true };
+  const fullText = basePip.fullText || row.text;
+  const cwd = workspacePath();
+  const home = backend().home();
+
+  const rows: PipBubbleRow[] = groups.map((group, idx) => {
+    const isFirst = idx === 0;
+    const isLast = idx === groups.length - 1;
+    let mediaOnly = false;
+    if (group.blocks.length === 1 && group.blocks[0].type === "paragraph") {
+      const res = extractBlockMedia(group.blocks[0], cwd, home, `pip-m:${row.id}:${idx}`);
+      if (res.mode === "pure") mediaOnly = true;
+    }
+    const slot: PipRowSlot = {
+      ...basePip,
+      lead: Boolean(basePip.lead && isFirst),
+      tail: Boolean(basePip.tail && isLast),
+      indent: true,
+      fullText,
+    };
+    return {
+      kind: "pip-bubble",
+      id: `${row.id}#b${idx}`,
+      rowId: row.id,
+      bubbleIndex: idx,
+      first: isFirst,
+      last: isLast,
+      blocks: group.blocks,
+      ...(isLast && doc.footnotes?.length ? { footnotes: doc.footnotes } : {}),
+      copyText: group.copyText,
+      fullText,
+      wide: group.wide,
+      ...(mediaOnly ? { mediaOnly: true } : {}),
+      pip: slot,
+    };
+  });
+
+  pipBubbleEntries.set(row.id, { text: row.text, pipKey, rows });
+  return rows;
 }
 
 export function proseRows(row: { id: string; text: string; streaming: boolean; pip?: PipRowSlot }): ProseRow[] {
@@ -1060,7 +1177,7 @@ export function proseRows(row: { id: string; text: string; streaming: boolean; p
 }
 
 /** A block of a reply: veiled text for what streams, `TextView` for the rest. */
-export function ProseBlock(props: { row: ProseRow }) {
+export function ProseBlock(props: { row: ProseRow; inBubble?: boolean }) {
   const item = (): TextViewBlock => props.row.block ?? { type: "paragraph", content: [] };
   const index = () => props.row.index;
   const chunksOf = (key: string): VeilChunk[] => (props.row.chunks.get(key) as VeilChunk[] | undefined) ?? [];
@@ -1133,7 +1250,7 @@ export function ProseBlock(props: { row: ProseRow }) {
       else={
         <TextView
           document={{ blocks: [], footnotes: props.row.footnotes ?? [] }}
-          classes={proseClasses()}
+          classes={props.inBubble ? bubbleProseClasses() : proseClasses()}
           selectable
           links="report"
           onLinkPress={({ url }) => openProseLink(url)}
@@ -1168,7 +1285,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                                       when={asStreamingCode()}
                                       else={
                                         <View class="gap-2">
-                                          <FallbackTextViewBlock block={paraMedia()?.strippedBlock ?? item()} settled={!props.row.tail} />
+                                          <FallbackTextViewBlock block={paraMedia()?.strippedBlock ?? item()} settled={!props.row.tail} inBubble={props.inBubble} />
                                           <If when={paraMedia()?.mode === "mixed"}>
                                             <MediaGallery items={paraMedia()!.items} />
                                           </If>
@@ -1181,7 +1298,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                                 >
                                   {(tableBlock) => (
                                     <View class="group relative">
-                                      <FallbackTextViewBlock block={tableBlock()} settled={!props.row.tail} />
+                                      <FallbackTextViewBlock block={tableBlock()} settled={!props.row.tail} inBubble={props.inBubble} />
                                       <If when={!props.row.tail}>
                                         <ExpandButton onPress={() => zoomTable(tableBlock())} />
                                       </If>
@@ -1190,7 +1307,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                                 </If>
                               }
                             >
-                              {(tableBlock) => <VeiledTableView block={tableBlock()} blockIdx={index} settled={!props.row.tail} chunks={chunksMap} />}
+                              {(tableBlock) => <VeiledTableView block={tableBlock()} blockIdx={index} settled={!props.row.tail} chunks={chunksMap} inBubble={props.inBubble} />}
                             </If>
                           }
                         >
@@ -1202,7 +1319,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                                     <If when={qChild().type === "paragraph" ? (qChild() as Extract<TextViewBlock, { type: "paragraph" }>) : undefined}>
                                       {(qp) => (
                                         <Text class={`${readingType()} leading-relaxed italic`}>
-                                          {renderVeiledInlines(qp().content, chunksOf(`bq:${index()}:${k()}`), "muted")}
+                                          {renderVeiledInlines(qp().content, chunksOf(`bq:${index()}:${k()}`), "muted", props.inBubble)}
                                         </Text>
                                       )}
                                     </If>
@@ -1214,6 +1331,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                                           depth={0}
                                           baseTone="muted"
                                           chunks={chunksMap}
+                                          inBubble={props.inBubble}
                                         />
                                       )}
                                     </If>
@@ -1232,6 +1350,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                           depth={0}
                           baseTone="fg"
                           chunks={chunksMap}
+                          inBubble={props.inBubble}
                         />
                       )}
                     </If>
@@ -1242,7 +1361,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                     return (
                       <View selectable>
                         <Text role="header" accessibilityLevel={heading().level} class={headingClasses()[heading().level]}>
-                          {renderVeiledInlines(heading().content, chunksOf(key()), "fg")}
+                          {renderVeiledInlines(heading().content, chunksOf(key()), "fg", props.inBubble)}
                         </Text>
                       </View>
                     );
@@ -1255,7 +1374,7 @@ export function ProseBlock(props: { row: ProseRow }) {
                 return (
                   <View class="gap-2">
                     <View selectable>
-                      <Text class={`${readingType()} leading-relaxed`}>{renderVeiledInlines(para().block.content, chunksOf(key()), "fg")}</Text>
+                      <Text class={`${readingType()} leading-relaxed`}>{renderVeiledInlines(para().block.content, chunksOf(key()), "fg", props.inBubble)}</Text>
                     </View>
                     <If when={para().media.length > 0}>
                       <MediaGallery items={para().media} />
@@ -1266,9 +1385,47 @@ export function ProseBlock(props: { row: ProseRow }) {
             </If>
           }
         >
-          {(items) => <MediaGallery items={items()} class="py-1.5" />}
+          {(items) => <MediaGallery items={items()} class={props.inBubble ? "" : "py-1.5"} />}
         </If>
       </View>
     </If>
+  );
+}
+
+/** Renders the Markdown blocks of a single settled Pip SMS bubble using bubble-tuned styling. */
+export function PipBubbleBlocks(props: { row: PipBubbleRow }) {
+  return (
+    <View class="gap-2">
+      <Each of={props.row.blocks} key="index">
+        {(block, i) => (
+          <ProseBlock
+            inBubble
+            row={{
+              kind: "prose",
+              id: `${props.row.id}:${i()}`,
+              rowId: props.row.rowId,
+              index: i(),
+              block: block(),
+              tail: false,
+              chunks: EMPTY_CHUNKS,
+            }}
+          />
+        )}
+      </Each>
+      <If when={props.row.footnotes?.length}>
+        <ProseBlock
+          inBubble
+          row={{
+            kind: "prose",
+            id: `${props.row.id}:notes`,
+            rowId: props.row.rowId,
+            index: props.row.blocks.length,
+            footnotes: props.row.footnotes,
+            tail: false,
+            chunks: EMPTY_CHUNKS,
+          }}
+        />
+      </If>
+    </View>
   );
 }

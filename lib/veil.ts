@@ -108,6 +108,25 @@ export function markVeilsSeeded(ids: Iterable<string>): void {
   for (const id of ids) seededVeilIds.add(id);
 }
 
+/**
+ * Marks row ids so their next veil pass adopts all current text and structural
+ * blocks as settled — even if the row already had an initialized veil from a
+ * cached/snapshot view before `landHistory` caught it up. Subsequent live
+ * deltas after that pass continue fading normally.
+ */
+export function reseedVeils(ids: Iterable<string>): void {
+  for (const id of ids) {
+    seededVeilIds.add(id);
+    const v = rowVeils.get(id);
+    if (v) {
+      v.seeding = true;
+      for (const el of v.elems.values()) {
+        el.chunks.length = 0;
+      }
+    }
+  }
+}
+
 function createElemVeil(seed = ""): ElemVeil {
   return {
     prev: seed,
@@ -129,7 +148,7 @@ export function rowVeil(id: string): RowVeil {
       blockNodes: new Map(),
     };
     rowVeils.set(id, v);
-  } else if (!v.initialized && seededVeilIds.delete(id)) {
+  } else if (seededVeilIds.delete(id)) {
     v.seeding = true;
   }
   return v;
@@ -193,8 +212,14 @@ export function waveDelay(chunk: VeilChunk, offset: number): number {
 /** Advances a single element (`elemKey`) inside `v` to `text` at `now` (ms).
  * Idempotent when `text` is unchanged; returns active fading chunks for this element. */
 export function advanceElemVeil(v: RowVeil, elemKey: string, text: string, now: number): VeilChunk[] {
-  if (v.seeding && !v.elems.has(elemKey)) {
-    v.elems.set(elemKey, createElemVeil(text));
+  if (v.seeding) {
+    const existing = v.elems.get(elemKey);
+    if (existing) {
+      existing.prev = text;
+      existing.chunks.length = 0;
+    } else {
+      v.elems.set(elemKey, createElemVeil(text));
+    }
     return [];
   }
   let el = v.elems.get(elemKey);

@@ -5,6 +5,7 @@ import { edgeStep, edgeTarget } from "../lib/edge-scroll";
 import { topBarHeight } from "../lib/layout";
 import { basename, tildePath } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
+import { collectTranscriptImages } from "../lib/media";
 import { markPacersSeeded } from "../lib/stream-pacer";
 import { markVeilsSeeded } from "../lib/veil";
 import type { Mood } from "../mascot/geometry";
@@ -27,6 +28,7 @@ import {
   isLeavingSession,
   isPersonaSession,
   isRunning,
+  isSnapshotPending,
   isSwitching,
   newSession,
   newSessionInWorkspace,
@@ -59,8 +61,9 @@ import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styl
 import { uiHeight, uiMinHeight, uiType } from "../ui/typography";
 import { Composer } from "./Composer";
 import { hasFormTakeover, hasInlinePrompt } from "./ExtensionDialog";
+import { isKnownMissingPath, MediaStreamContext } from "./Media";
 import { PipWorkingFooter } from "./PipPresence";
-import { proseRows } from "./Prose";
+import { pipBubbleRows, proseRows } from "./Prose";
 import {
   type ChatRow,
   enterConversation,
@@ -825,8 +828,9 @@ export function Chat() {
   const screen = computed<Screen>(() => {
     const phase = sidecarPhase().name;
     if (phase === "failed") return (held = "failed");
-    // What is being left stays, dimmed, until its successor lands: no state in between passes through.
-    if (isLeavingSession()) return held;
+    // What is being left stays (steady during the fast disk-snapshot grace, or dimmed if slow)
+    // until its successor lands: no state in between passes through.
+    if (isLeavingSession() || isSnapshotPending()) return held;
     if (isDraftAhead()) return (held = "welcome");
     if (phase === "starting" || isSwitching() || !sessionState()) return (held = transcriptRows().length ? "transcript" : "starting");
     if (transcriptRows().length || isRunning()) return (held = "transcript");
@@ -835,9 +839,22 @@ export function Chat() {
   const stable = stableDisplayRows();
   let shown: ChatRow[] = [];
   let shownKey = -1;
+  let enteredKey = -1;
+  const ensureEntered = (key: number) => {
+    if (enteredKey === key) return;
+    enteredKey = key;
+    untracked(() => {
+      enterConversation(key);
+      const seenIds = displayRowIds(transcriptRows());
+      markRowsSeen(seenIds);
+      markPacersSeeded(seenIds);
+      markVeilsSeeded(seenIds);
+    });
+  };
   const displayRows = computed<ChatRow[]>(() => {
-    if (isLeavingSession() && shown.length > 0) return shown;
+    if ((isLeavingSession() || isSnapshotPending()) && shown.length > 0) return shown;
     const key = conversationKey();
+    ensureEntered(key);
     trackFoldState();
     trackRecallingUsers();
     const processOf = new Map<string, string>();
@@ -884,7 +901,11 @@ export function Chat() {
         rows.push(row);
         continue;
       }
-      if (row.pip || isPersonaSession()) {
+      if (row.pip) {
+        rows.push(...pipBubbleRows(row));
+        continue;
+      }
+      if (isPersonaSession()) {
         rows.push(...proseRows(row));
         continue;
       }
@@ -906,7 +927,7 @@ export function Chat() {
     // The rows a turn's fold shows, in order (commentary is a row per block, each the turn's its reply is).
     const folded = new Map<string, string>();
     for (const row of rows) {
-      const turn = processOf.get(row.id) ?? (row.kind === "prose" || row.kind === "actions" ? processOf.get(row.rowId) : undefined);
+      const turn = processOf.get(row.id) ?? (row.kind === "prose" || row.kind === "pip-bubble" || row.kind === "actions" ? processOf.get(row.rowId) : undefined);
       if (turn) folded.set(row.id, turn);
     }
     setProcessTurns(folded);
@@ -1377,7 +1398,7 @@ export function Chat() {
           return;
         }
       }
-      targetList.scrollTo({ y: 1e7, animated: false });
+      targetList.scrollToEnd({ animated: false });
     });
   };
 
@@ -1587,11 +1608,7 @@ export function Chat() {
       topRow.set(-1);
       bottomRow.set(-1);
       viewSpan = -1;
-      enterConversation(key);
-      const seenIds = displayRowIds(transcriptRows());
-      markRowsSeen(seenIds);
-      markPacersSeeded(seenIds);
-      markVeilsSeeded(seenIds);
+      ensureEntered(key);
       pokeRepaint();
     });
   });
@@ -1624,6 +1641,15 @@ export function Chat() {
       <PaneVeil docked={!hero()} reading={screen() === "transcript"} />
       <View class={`relative flex-1 ${isLeavingSession() ? "pointer-events-none" : ""}`} style={{ opacity: pane }}>
         <If when={screen() === "transcript"}>
+          <MediaStreamContext.Provider
+            value={() =>
+              collectTranscriptImages(untracked(transcriptRows), {
+                cwd: untracked(workspacePath),
+                home: backend().home(),
+                isMissingPath: isKnownMissingPath,
+              })
+            }
+          >
           <View
             selectable
             onSelectionChange={onSelection}
@@ -1707,6 +1733,7 @@ export function Chat() {
               }}
             </Each>
           </View>
+          </MediaStreamContext.Provider>
           <ScrollToBottomPill
             visible={!bottomFollowing() && distanceFromEnd() > FOLLOW_THRESHOLD}
             bottom={foot().end}

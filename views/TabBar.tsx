@@ -47,6 +47,18 @@ import {
   tabId,
   type OpenTab,
 } from "../store/tabs";
+import {
+  endSplitDrag,
+  isPointInWorkspace,
+  isSplitOpen,
+  isTabInSplit,
+  moveSplitDrag,
+  openSplit,
+  splitDrag,
+  splitTargetFromTab,
+  startSplitDrag,
+  toggleSplitView,
+} from "../store/split";
 import { AgentLogo } from "../ui/AgentLogo";
 import { Chip, IconButton } from "../ui/Button";
 import { Icon } from "../ui/Icon";
@@ -157,12 +169,29 @@ function tabTitle(tab: OpenTab): string {
   return chatTabTitle(tab);
 }
 
+let activeTabBarBridge:
+  | {
+      onMove: (x: number, y: number, pressed: boolean) => void;
+      onUp: () => void;
+    }
+  | undefined;
+
+/** Called from `Shell`'s window-level pointer move so a tab dragged downward out of the strip hands off into split view. */
+export function notifyTabBarPointerMove(x: number, y: number, pressed: boolean) {
+  activeTabBarBridge?.onMove(x, y, pressed);
+}
+
+/** Called from `Shell`'s window-level pointer up so a pending tab arm or drag never lingers after release outside the strip. */
+export function notifyTabBarPointerUp() {
+  activeTabBarBridge?.onUp();
+}
+
 export function TabBar() {
   const pillRefs = new Map<string, ViewRef>();
   /** Each pill's animated channels, keyed by tab id. */
   const pillAnims = new Map<string, PillAnim>();
   /** A press that has not travelled far enough to lift a drag yet. */
-  let mouseArm: { id: string; x: number } | null = null;
+  let mouseArm: { id: string; x: number; y: number; tab: OpenTab } | null = null;
   let holdTimer: ReturnType<typeof setTimeout> | undefined;
   /** The tab a press lifted into a drag: its release is a drop, not a click — reordering must not also select it. */
   let draggedId: string | null = null;
@@ -378,9 +407,9 @@ export function TabBar() {
   });
 
   /** A press went down on a pill; a still press lifts it after `DRAG_HOLD_MS`. */
-  function armPress(id: string, x: number) {
+  function armPress(id: string, x: number, y: number, tab: OpenTab) {
     disarmPress();
-    mouseArm = { id, x };
+    mouseArm = { id, x, y, tab };
     holdTimer = setTimeout(() => {
       holdTimer = undefined;
       const arm = mouseArm;
@@ -393,6 +422,21 @@ export function TabBar() {
     if (holdTimer !== undefined) clearTimeout(holdTimer);
     holdTimer = undefined;
     mouseArm = null;
+  }
+
+  /** Hands an active or armed tab drag off to the workspace split-drop overlay when pulled downward into the pane. */
+  function handoffToSplit(tab: OpenTab, id: string, pageX: number, pageY: number) {
+    draggedId = id;
+    disarmPress();
+    if (drag()) finishDrag(false);
+    startSplitDrag({
+      source: "tab",
+      target: splitTargetFromTab(tab),
+      title: tabTitle(tab),
+      agentId: chatTabSession(tab)?.agentId,
+      x: pageX,
+      y: pageY,
+    });
   }
 
   /** Measures the strip once and lifts the pill; a release before the measure lands is dropped. */
@@ -709,6 +753,45 @@ export function TabBar() {
     cleanup(keymap.bind("escape", () => finishDrag(false), { when: "always" }));
   });
 
+  // Register window-level pointer bridge so pulling a tab pill downward past the
+  // 44pt strip seamlessly hands off into the workspace's split drop zones.
+  const bridge = {
+    onMove(x: number, y: number, pressed: boolean) {
+      if (splitDrag()) return;
+      if (!pressed) {
+        if (drag() && dragVia === "pointer") finishDrag(true);
+        else if (!drag()) disarmPress();
+        return;
+      }
+      const d = drag();
+      if (d && dragVia === "pointer") {
+        if (dragBottom > 0 && y > dragBottom + 16 && isPointInWorkspace(x, y)) {
+          const tab = openTabs().find((t) => tabId(t) === d.id);
+          if (tab) {
+            handoffToSplit(tab, d.id, x, y);
+            return;
+          }
+        }
+        return;
+      }
+      const arm = mouseArm;
+      if (arm && y - arm.y > 20 && isPointInWorkspace(x, y)) {
+        handoffToSplit(arm.tab, arm.id, x, y);
+      }
+    },
+    onUp() {
+      if (splitDrag()) {
+        disarmPress();
+        return;
+      }
+      endPointerDrag();
+    },
+  };
+  activeTabBarBridge = bridge;
+  cleanup(() => {
+    if (activeTabBarBridge === bridge) activeTabBarBridge = undefined;
+  });
+
   function menuItems(tab: OpenTab): MenuItem[] {
     const id = tabId(tab);
     const items: MenuItem[] = [];
@@ -719,6 +802,9 @@ export function TabBar() {
         onSelect: () => startRenaming(),
       });
     }
+    items.push({ label: tr("Split Right", "向右分屏"), onSelect: () => openSplit(splitTargetFromTab(tab), "right") });
+    items.push({ label: tr("Split Left", "向左分屏"), onSelect: () => openSplit(splitTargetFromTab(tab), "left") });
+    items.push({ type: "separator" });
     items.push({ label: tr("Close Tab", "关闭标签页"), onSelect: () => closeTab(id) });
     if (openTabs().length > 1) {
       items.push({
@@ -793,8 +879,9 @@ export function TabBar() {
 
   function TabPill(props: { tab: () => OpenTab }) {
     const id = () => tabId(props.tab());
-    /** The page-x the current touch went down on (the lift's travel check). */
+    /** The page position the current touch went down on (the lift's travel check). */
     let touchX0 = 0;
+    let touchY0 = 0;
     const active = () => activeTabId() === id();
     const session = () => chatTabSession(props.tab());
     const renaming = () => isRenaming() && active() && props.tab().kind === "chat";
@@ -882,7 +969,7 @@ export function TabBar() {
             return;
           }
           lastPageX = e.pagePosition.x;
-          armPress(id(), e.pagePosition.x);
+          armPress(id(), e.pagePosition.x, e.pagePosition.y, props.tab());
         }}
         onPress={() => {
           // A double press closes the pill during press-down. The native press
@@ -903,16 +990,29 @@ export function TabBar() {
         panActivation={{ activeOffsetX: DRAG_CLAIM_X, failOffsetY: DRAG_CLAIM_X }}
         onTouchStart={(e: GestureResponderEvent) => {
           touchX0 = e.pageX;
+          touchY0 = e.pageY;
           lastPageX = e.pageX;
         }}
         onTouchMove={(e: GestureResponderEvent) => {
           lastPageX = e.pageX;
+          if (splitDrag()) {
+            moveSplitDrag(e.pageX, e.pageY);
+            return;
+          }
           const d = drag();
           if (!d) {
+            if (e.pageY - touchY0 > 20 && isPointInWorkspace(e.pageX, e.pageY)) {
+              handoffToSplit(props.tab(), id(), e.pageX, e.pageY);
+              return;
+            }
             if (Math.abs(e.pageX - touchX0) > DRAG_ARM_X) void beginDrag(id(), "touch");
             return;
           }
           if (d.id !== id()) return;
+          if (dragBottom > 0 && e.pageY > dragBottom + 16 && isPointInWorkspace(e.pageX, e.pageY)) {
+            handoffToSplit(props.tab(), id(), e.pageX, e.pageY);
+            return;
+          }
           if (escaped(e.pageY)) {
             finishDrag(false);
             return;
@@ -922,10 +1022,18 @@ export function TabBar() {
           startEdgeScroll();
         }}
         onTouchEnd={() => {
+          if (splitDrag()) {
+            endSplitDrag(true);
+            return;
+          }
           if (drag()?.id === id()) finishDrag(true);
           else if (!drag()) disarmPress();
         }}
         onTouchCancel={() => {
+          if (splitDrag()) {
+            endSplitDrag(false);
+            return;
+          }
           if (drag()?.id === id()) finishDrag(false);
           else if (!drag()) disarmPress();
         }}
@@ -969,7 +1077,10 @@ export function TabBar() {
         >
           <RenameField />
         </If>
-        {/* Dedicated non-overlapping status dot, followed by the close control. */}
+        {/* Dedicated non-overlapping status dot, split indicator, followed by the close control. */}
+        <If when={isTabInSplit(props.tab())}>
+          <Icon name="split" size={11} tone="brand-text" class="mr-0.5 shrink-0" />
+        </If>
         {props.tab().kind === "chat" ? <StatusMark session={session} /> : null}
         <View class={`relative ${uiSize() >= 15 ? "size-5" : "size-4"} shrink-0 items-center justify-center`}>
           <BaseButton
@@ -1014,8 +1125,22 @@ export function TabBar() {
         lastPageX = e.pagePosition.x;
         if (e.pressedButton === "left") {
           const arm = mouseArm;
-          if (!drag() && arm && Math.abs(e.pagePosition.x - arm.x) > DRAG_ARM_X) void beginDrag(arm.id, "pointer");
+          if (!drag() && arm) {
+            if (e.pagePosition.y - arm.y > 20 && isPointInWorkspace(e.pagePosition.x, e.pagePosition.y)) {
+              handoffToSplit(arm.tab, arm.id, e.pagePosition.x, e.pagePosition.y);
+              return;
+            }
+            if (Math.abs(e.pagePosition.x - arm.x) > DRAG_ARM_X) void beginDrag(arm.id, "pointer");
+          }
           if (drag() && dragVia === "pointer") {
+            if (dragBottom > 0 && e.pagePosition.y > dragBottom + 16 && isPointInWorkspace(e.pagePosition.x, e.pagePosition.y)) {
+              const cur = drag();
+              const tab = cur ? openTabs().find((t) => tabId(t) === cur.id) : undefined;
+              if (cur && tab) {
+                handoffToSplit(tab, cur.id, e.pagePosition.x, e.pagePosition.y);
+                return;
+              }
+            }
             if (escaped(e.pagePosition.y)) {
               finishDrag(false);
               return;
@@ -1132,6 +1257,15 @@ export function TabBar() {
           </Presence>
         </View>
       </If>
+      <IconButton
+        testID="tabbar-split-toggle"
+        icon="split"
+        size="sm"
+        label={isSplitOpen() ? tr("Close split view", "关闭分屏") : tr("Split view", "分屏对话")}
+        shortcut={"mod+\\"}
+        onPress={() => toggleSplitView("right")}
+        class={`shrink-0 ${isSplitOpen() ? "bg-accent" : ""}`}
+      />
     </View>
   );
 }

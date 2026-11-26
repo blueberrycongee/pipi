@@ -18,7 +18,7 @@ import { classifyMediaKind, composeFileMessage, isMarkdownPath, mimeTypeForPath,
 import { formAnswerText } from "../lib/form-answers";
 import { answersTo, type ComposerCommand, parseSlashLine } from "../lib/slash";
 import { markPacersSeeded } from "../lib/stream-pacer";
-import { markVeilsSeeded } from "../lib/veil";
+import { markVeilsSeeded, reseedVeils } from "../lib/veil";
 import {
   chooseRandomWallpaperCandidate,
   DEFAULT_WALLPAPER_ADJUSTMENT,
@@ -212,6 +212,9 @@ const widgets = signal<Record<string, { lines: string[]; below: boolean }>>({});
 const toasts = signal<Toast[]>([]);
 const credentials = signal<Record<string, CredentialKind>>({});
 const view = signal<View>({ name: "chat" });
+function setViewChat() {
+  if (view().name !== "chat") view.set({ name: "chat" });
+}
 const draft = signal("");
 const attachments = signal<Attachment[]>([]);
 const fileAttachments = signal<FileAttachment[]>([]);
@@ -235,6 +238,16 @@ const heading = signal<Heading | undefined>(undefined);
  * (there is nothing to leave), nor when the destination is already on screen.
  */
 const leaving = signal(false);
+/** A fast disk-snapshot read is in flight inside its brief grace window before dimming. */
+const snapPending = signal(false);
+const LEAVING_GRACE_MS = 70;
+let leavingGraceTimer: ReturnType<typeof setTimeout> | undefined;
+function clearLeavingGrace() {
+  if (leavingGraceTimer !== undefined) {
+    clearTimeout(leavingGraceTimer);
+    leavingGraceTimer = undefined;
+  }
+}
 /** Ticks when a session change puts its destination on screen: with the click when it can, else as it lands. */
 const arrived = signal(0);
 /** Session files whose background run settled (or a new answer landed) since the user last opened them. */
@@ -296,13 +309,66 @@ export interface ArchivedSessionItem {
   archivedAt: number;
 }
 
-export const savedSessions = computed<SessionSummary[]>(() => sessions().filter((s) => !isSessionArchived(s.path)));
+function sameArrayRefs<T>(a: readonly T[], b: readonly T[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function sameSessionSummary(a: SessionSummary, b: SessionSummary): boolean {
+  return (
+    a.path === b.path &&
+    a.id === b.id &&
+    a.name === b.name &&
+    a.firstMessage === b.firstMessage &&
+    a.messageCount === b.messageCount &&
+    a.created === b.created &&
+    a.modified === b.modified &&
+    a.agentId === b.agentId
+  );
+}
+
+/** Reuses unchanged `SessionSummary` object refs and returns `prev` itself when the whole list is structurally identical. */
+function reconcileSessionList(prev: SessionSummary[] | undefined, next: SessionSummary[]): SessionSummary[] {
+  if (!prev) return next;
+  const byPath = new Map<string, SessionSummary>();
+  for (const item of prev) byPath.set(item.path, item);
+  let same = prev.length === next.length;
+  const merged = next.map((item, idx) => {
+    const existing = byPath.get(item.path);
+    if (existing && sameSessionSummary(existing, item)) {
+      if (same && prev[idx] !== existing) same = false;
+      return existing;
+    }
+    same = false;
+    return item;
+  });
+  return same ? prev : merged;
+}
+
+const activeSessionFile = computed(() => state()?.sessionFile);
+
+export const savedSessions = computed<SessionSummary[]>(() => sessions().filter((s) => !isSessionArchived(s.path)), {
+  equals: sameArrayRefs,
+});
+let prevWorkspaceSessions: Record<string, SessionSummary[]> = {};
 export const workspaceSessions = computed<Record<string, SessionSummary[]>>(() => {
   const raw = sessionsByWorkspace();
   const out: Record<string, SessionSummary[]> = {};
+  let changed = Object.keys(raw).length !== Object.keys(prevWorkspaceSessions).length;
   for (const [cwd, list] of Object.entries(raw)) {
-    out[cwd] = list.filter((s) => !isSessionArchived(s.path));
+    const filtered = list.filter((s) => !isSessionArchived(s.path));
+    const prevList = prevWorkspaceSessions[cwd];
+    if (prevList && sameArrayRefs(prevList, filtered)) {
+      out[cwd] = prevList;
+    } else {
+      out[cwd] = filtered;
+      changed = true;
+    }
   }
+  if (!changed) return prevWorkspaceSessions;
+  prevWorkspaceSessions = out;
   return out;
 });
 export const archivedSessionItems = computed<ArchivedSessionItem[]>(() => {
@@ -399,6 +465,8 @@ export const sessionLandedTick = () => landed();
 export const pendingSession = () => heading();
 /** The open conversation is on its way out and its successor has not landed: the chat dims it and waits. */
 export const isLeavingSession = () => leaving();
+/** A cold session switch is inside its brief grace window waiting on a local disk snapshot before dimming. */
+export const isSnapshotPending = () => snapPending();
 /** Ticks each time a session change shows its destination, so the chat settles it in once. */
 export const sessionArrivedTick = () => arrived();
 /** The change under way is heading for a fresh session, whose empty chat is already on screen. */
@@ -460,17 +528,30 @@ function agentHasModel(agentId: string): boolean {
   return Boolean(spec && spec.available && spec.models.length > 0);
 }
 
+function hasLiveRow(list: readonly Row[]): boolean {
+  return list.some(
+    (row) =>
+      ((row.kind === "text" || row.kind === "thinking") && row.streaming) ||
+      (row.kind === "tool" && (row.status === "call" || row.status === "queued" || row.status === "running")) ||
+      (row.kind === "bash" && row.running),
+  );
+}
+
 /**
  * Marks a session change as heading for `target` until `work` ends.
  *
  * A change answers the click, not the agent: a conversation seen before goes
  * on screen at once from `visited` (the agent's own history confirms or
- * replaces it as it lands), and so does a fresh session's empty chat. Only a
- * destination with nothing to show yet leaves the screen waiting (`leaving`).
+ * replaces it as it lands), and so does a fresh session's empty chat. A saved
+ * file read gets a brief grace window before dimming so fast local snapshots
+ * land directly at steady opacity 1 without a blink/fade-in; only a genuinely
+ * slow switch (or one with no file to read) dims and waits (`leaving`).
  */
 async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
   let target = goal;
   let shown = false;
+  let run!: Promise<T>;
+  clearLeavingGrace();
   if (!goal.keepTitle) {
     // The app is usable already: ready, a welcome shown ahead, or content a
     // switch in flight already put on screen. Only a cold boot is not warm —
@@ -487,7 +568,15 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
       seenDaemon.status !== "blocked";
     const welcome = !goal.file && (!goal.daemonId || emptyDaemon) && warm && agentHasModel(goal.agentId ?? currentAgentId());
     stashTranscript();
-    const seen = (seenFile ? visited.get(seenFile) : undefined) ?? (seenDaemonId ? visitedByDaemon.get(seenDaemonId) : undefined);
+    const seenWorking = Boolean(seenDaemon && (seenDaemon.status === "working" || seenDaemon.status === "blocked"));
+    let seen = (seenFile ? visited.get(seenFile) : undefined) ?? (seenDaemonId ? visitedByDaemon.get(seenDaemonId) : undefined);
+    // Invalidate stale cached transcripts: a session that became unread/finished in background
+    // or still carries streaming/running rows while the daemon says idle must read fresh from disk.
+    if (seen && ((seenFile && isSessionUnread(seenFile)) || seenDaemon?.unread || (!seenWorking && hasLiveRow(seen.rows())))) {
+      if (seenFile) visited.delete(seenFile);
+      if (seenDaemonId) visitedByDaemon.delete(seenDaemonId);
+      seen = undefined;
+    }
     if (seen) {
       if (seenFile) visited.delete(seenFile);
       if (seenDaemonId) visitedByDaemon.delete(seenDaemonId);
@@ -504,20 +593,22 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
       shownVersion = -1;
       markTranscriptSeen();
     }
-    const seenWorking = Boolean(seen && seenDaemon && (seenDaemon.status === "working" || seenDaemon.status === "blocked"));
     // Only dim out the old content when there is actual content to leave behind.
-    // A welcome/empty screen has nothing to fade — the new session's loading state
-    // shows immediately instead, preventing a confusing blank white flash that
-    // looks like a new session was created.
+    // A welcome/empty screen has nothing to fade — and a cold saved-file switch
+    // holds steady during a brief grace window so fast local reads land at opacity 1.
     const hadContent = rows().length > 0;
+    const shouldDim = !shown && hadContent && (leaving() || warm);
+    const snapFile = !shown ? (goal.file ?? (goal.daemonId ? daemonSessionOfId(goal.daemonId)?.file : undefined)) : undefined;
+    const deferDim = Boolean(snapFile) && !leaving();
     batch(() => {
       heading.set(target);
-      leaving.set(!shown && hadContent && (leaving() || warm));
+      snapPending.set(deferDim);
+      leaving.set(deferDim ? false : shouldDim);
       if (shown) {
         if (seenWorking && !running()) runStartedAt.set(Date.now());
         running.set(seenWorking);
         bashRunning.set(false);
-        activity.set(seenWorking ? (activity().kind === "idle" ? { kind: "thinking" } : activity()) : { kind: "idle" });
+        activity.set(seenWorking ? { kind: "thinking" } : { kind: "idle" });
         queue.set({ steering: [], followUp: [] });
         dialogs.set([]);
         statuses.set({});
@@ -527,29 +618,53 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
         scrollToEnd.set(0);
         arrived.update((n) => n + 1);
       }
+      run = work();
     });
     // Nothing cached or fresh to show — the saved file still can be: it reads
     // in milliseconds while the agent attaches and confirms with its own.
-    if (!shown) {
-      const snapFile = goal.file ?? (goal.daemonId ? daemonSessionOfId(goal.daemonId)?.file : undefined);
-      if (snapFile) {
-        const snapHeld = (goal.daemonId ? daemonSessionOfId(goal.daemonId) : undefined) ?? daemonSessionByFile(snapFile);
-        const epoch = ++snapshotEpoch;
-        void backend()
-          .readSessionSnapshot(snapFile, { keepBackgroundTools: Boolean(snapHeld?.loaded) })
-          .then((snap) => {
-            if (!snap?.messages.length) return;
-            // A newer change took over, the change reverted (`stayPut`), or a destination already landed — nothing to paint.
-            if (snapshotEpoch !== epoch || heading() !== target || ahead || (!leaving() && transcript.rows().length)) return;
-            landSnapshot(snapFile, goal.daemonId, snap);
-          })
-          .catch(() => undefined);
+    if (snapFile) {
+      const snapHeld = (goal.daemonId ? daemonSessionOfId(goal.daemonId) : undefined) ?? daemonSessionByFile(snapFile);
+      const epoch = ++snapshotEpoch;
+      if (deferDim) {
+        leavingGraceTimer = setTimeout(() => {
+          leavingGraceTimer = undefined;
+          if (snapshotEpoch !== epoch || heading() !== target || ahead) return;
+          batch(() => {
+            snapPending.set(false);
+            if (shouldDim) leaving.set(true);
+          });
+        }, LEAVING_GRACE_MS);
       }
+      void backend()
+        .readSessionSnapshot(snapFile, { keepBackgroundTools: Boolean(snapHeld?.loaded) })
+        .then((snap) => {
+          if (snapshotEpoch !== epoch || heading() !== target || ahead) return;
+          if (!snap?.messages.length) {
+            clearLeavingGrace();
+            batch(() => {
+              snapPending.set(false);
+              if (shouldDim) leaving.set(true);
+            });
+            return;
+          }
+          landSnapshot(snapFile, goal.daemonId, snap);
+        })
+        .catch(() => {
+          if (snapshotEpoch !== epoch || heading() !== target || ahead) return;
+          clearLeavingGrace();
+          batch(() => {
+            snapPending.set(false);
+            if (shouldDim) leaving.set(true);
+          });
+        });
     }
   } else {
-    heading.set(target);
+    batch(() => {
+      heading.set(target);
+      snapPending.set(false);
+      run = work();
+    });
   }
-  const run = work();
   arrival = run.then(
     () => undefined,
     () => undefined,
@@ -559,8 +674,10 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
   } finally {
     if (heading() === target) {
       early = false;
+      clearLeavingGrace();
       batch(() => {
         heading.set(undefined);
+        snapPending.set(false);
         if (leaving()) {
           leaving.set(false);
           arrived.update((n) => n + 1);
@@ -574,7 +691,7 @@ async function headFor<T>(goal: Heading, work: () => Promise<T>): Promise<T> {
 export function isSessionRunning(path: string) {
   const known = daemonSessionByFile(path);
   const daemonBusy = known?.status === "working" || known?.status === "blocked";
-  if (path === state()?.sessionFile) return hasActiveOrQueuedWork() || daemonBusy;
+  if (path === activeSessionFile()) return hasActiveOrQueuedWork() || daemonBusy;
   return daemonBusy;
 }
 
@@ -584,11 +701,15 @@ export function isSessionUnread(path: string) {
 }
 
 function markSessionUnread(path: string) {
+  visited.delete(path);
   if (!unreadSessions().includes(path)) unreadSessions.set([...unreadSessions(), path]);
 }
 
 function markSessionRead(path: string | undefined) {
-  if (path && unreadSessions().includes(path)) unreadSessions.set(unreadSessions().filter((p) => p !== path));
+  if (!path) return;
+  const wasUnread = unreadSessions().includes(path) || daemonSessionByFile(path)?.unread === true;
+  if (wasUnread) visited.delete(path);
+  if (unreadSessions().includes(path)) unreadSessions.set(unreadSessions().filter((p) => p !== path));
 }
 
 // ── Session daemon accessors ────────────────────────────────────────────────
@@ -1186,7 +1307,60 @@ function stashTranscript() {
  * holds. Keep the stash when history is a visual prefix — the re-attached event
  * stream will fill in what happens next without a visible gap.
  */
+/** Live events received from a newly attached client before its authoritative `landHistory` commits. */
+let pendingAttachClient: PiClient | undefined;
+let pendingAttachEvents: SessionEvent[] = [];
+
+function clearPendingAttach() {
+  pendingAttachClient = undefined;
+  pendingAttachEvents = [];
+}
+
+/**
+ * Replays live events buffered during attach without duplicating messages that
+ * `displayHistory` already returned.
+ */
+function replayPendingAttachEvents(messages: readonly AgentMessage[]) {
+  const buffered = pendingAttachEvents;
+  const active = client;
+  const source = pendingAttachClient;
+  clearPendingAttach();
+  if (!buffered.length || !active || active !== source) return;
+  const hadPendingAssistant = messages.some((m) => m.role === "assistant" && m.stopReason === "pending");
+  if (hadPendingAssistant) {
+    // External bridges include the in-flight pending turn in `get_messages`; only replay
+    // session/lifecycle events that may have raced with `get_state`.
+    for (const event of buffered) {
+      if (
+        event.type === "agent_settled" ||
+        event.type === "queue_update" ||
+        event.type === "session_info_changed" ||
+        event.type === "thinking_level_changed"
+      ) {
+        onEvent(event);
+      }
+    }
+    return;
+  }
+  // Native Pi `get_entries` persists on `message_end`, omitting any in-flight assistant deltas:
+  // skip events up through the last `message_end` (already in `messages`), and replay everything after.
+  let startAt = 0;
+  for (let i = buffered.length - 1; i >= 0; i--) {
+    if (buffered[i].type === "message_end") {
+      startAt = i + 1;
+      break;
+    }
+  }
+  for (let i = startAt; i < buffered.length; i++) {
+    const event = buffered[i];
+    if (event.type === "message_start" && event.message.role === "user") continue;
+    onEvent(event);
+  }
+}
+
 function landHistory(messages: AgentMessage[]) {
+  snapshotEpoch++;
+  clearLeavingGrace();
   const known = state();
   const heldSession = currentDaemonSession();
   const file = known?.sessionFile ?? heldSession?.file;
@@ -1213,6 +1387,7 @@ function landHistory(messages: AgentMessage[]) {
     rows().length === 0 &&
     shownVersion === transcript.version &&
     !leaving() &&
+    !snapPending() &&
     !before &&
     !queue().steering.length &&
     !queue().followUp.length
@@ -1233,7 +1408,10 @@ function landHistory(messages: AgentMessage[]) {
     if (before.hasStagedUser() && countUsers(fresh.rows()) >= countUsers(before.rows())) {
       before.commitStagedUsers();
     }
-    if (shown) return;
+    if (shown) {
+      if (snapPending()) snapPending.set(false);
+      return;
+    }
     transcript = before;
   } else {
     if (before) {
@@ -1246,9 +1424,10 @@ function landHistory(messages: AgentMessage[]) {
   const waiting = queue();
   if (waiting.steering.length || waiting.followUp.length) transcript.reconcileQueue(waiting.steering, waiting.followUp);
   shownVersion = -1;
-  markTranscriptSeen();
+  markTranscriptSeen(true);
   batch(() => {
     flush();
+    if (snapPending()) snapPending.set(false);
     if (leaving()) {
       leaving.set(false);
       arrived.update((n) => n + 1);
@@ -1259,11 +1438,12 @@ function landHistory(messages: AgentMessage[]) {
 }
 
 /** Marks every row the transcript can put on screen as already seen: a landing never replays row entrances, pacers, or streaming veils. */
-function markTranscriptSeen() {
+function markTranscriptSeen(reseed = false) {
   const ids = displayRowIds(transcript.rows());
   markRowsSeen(ids);
   markPacersSeeded(ids);
-  markVeilsSeeded(ids);
+  if (reseed) reseedVeils(ids);
+  else markVeilsSeeded(ids);
 }
 
 /**
@@ -1274,6 +1454,8 @@ function markTranscriptSeen() {
  * going on there: the file may lag it, so its turn stays open.
  */
 function landSnapshot(file: string | undefined, daemonId: string | undefined, snap: SessionSnapshot) {
+  snapshotEpoch++;
+  clearLeavingGrace();
   const fresh = new Transcript(() => activeLanguage());
   const held = (file ? daemonSessionByFile(file) : undefined) ?? (daemonId ? daemonSessionOfId(daemonId) : undefined);
   const working = held?.status === "working" || held?.status === "blocked";
@@ -1287,7 +1469,7 @@ function landSnapshot(file: string | undefined, daemonId: string | undefined, sn
     if (working && !running()) runStartedAt.set(Date.now());
     running.set(working);
     bashRunning.set(false);
-    activity.set(working ? (activity().kind === "idle" ? { kind: "thinking" } : activity()) : { kind: "idle" });
+    activity.set(working ? { kind: "thinking" } : { kind: "idle" });
     queue.set({ steering: [], followUp: [] });
     dialogs.set([]);
     statuses.set({});
@@ -1295,7 +1477,8 @@ function landSnapshot(file: string | undefined, daemonId: string | undefined, sn
     flush();
     landed.update((n) => n + 1);
     scrollToEnd.set(0);
-    // The destination is on screen: the leaving dim was for the wait, and it is over.
+    // The destination is on screen: the grace wait or leaving dim is over.
+    if (snapPending()) snapPending.set(false);
     if (leaving()) leaving.set(false);
     arrived.update((n) => n + 1);
   });
@@ -1403,6 +1586,16 @@ function upsertDaemonSession(session: DaemonSession) {
   // The open session's rows refresh through its own stream (a settle re-lists, as before); every
   // other session reports only here — a status, title or file change re-reads its workspace list.
   const open = client !== undefined && session.id === clientDaemonId.get(client);
+  // A background session that changed status, finished unread, or progressed since stashed
+  // must not replay its stale mid-run `visited` cache on return.
+  if (
+    !open &&
+    prev &&
+    (session.status !== prev.status || session.unread || session.lastActive !== prev.lastActive)
+  ) {
+    if (session.file) visited.delete(session.file);
+    visitedByDaemon.delete(session.id);
+  }
   if (
     prev
       ? !open && (session.status !== prev.status || session.title !== prev.title || session.file !== prev.file)
@@ -1454,6 +1647,7 @@ export function setInlineDaemonRuntimeMode(id: string, mode: RuntimeMode) {
  */
 export async function attachInlineSession(options: {
   id?: string;
+  file?: string;
   cwd?: string;
   agentId?: string;
   title?: string;
@@ -1478,6 +1672,7 @@ export async function attachInlineSession(options: {
   const cwd = options.cwd || activeProjectPath() || workspace();
   const { transport, session } = await daemon.attach({
     id: options.id,
+    file: options.file,
     title: options.title,
     cwd,
     agentId: effectiveId,
@@ -1645,6 +1840,9 @@ function teardownStore() {
   unlistenWorkspaces = undefined;
   if (flushFrame !== undefined) cancelAnimationFrame(flushFrame);
   flushFrame = undefined;
+  clearLeavingGrace();
+  clearPendingAttach();
+  prevWorkspaceSessions = {};
   const active = client;
   client = undefined;
   for (const listener of [...teardownListeners]) {
@@ -1787,7 +1985,9 @@ async function launch(
     if (!preserveRows) {
       const rootCwd = projectCwdOf(cwd, daemonId ? daemonSessionOfId(daemonId) : daemonSessionByFile(reopen));
       const cached = sessionsByWorkspace()[rootCwd] ?? sessionsByWorkspace()[cwd];
-      sessions.set(cached ?? []);
+      const nextSessions = cached ?? [];
+      const reconciled = reconcileSessionList(sessions(), nextSessions);
+      if (reconciled !== sessions()) sessions.set(reconciled);
       // A folder listed before (even as empty) stays listed while its agent starts again.
       sessionsLoaded.set(cached !== undefined);
     }
@@ -1799,7 +1999,7 @@ async function launch(
     transcript.summary(preserveRows.handoffTitle, preserveRows.handoffDetail);
     flush();
     markTranscriptSeen();
-  } else if (!ahead && !leaving() && !isDraftAhead()) {
+  } else if (!ahead && !leaving() && !snapPending() && !isDraftAhead()) {
     // Nothing of the destination to show and nothing on its way out (a cold start, a restart).
     transcript.load([]);
     flush();
@@ -1811,8 +2011,20 @@ async function launch(
     const started = await connect(cwd, effectiveAgentId, mine, reopen, daemonId);
     if (!started) return;
     if ((reopen || daemonId) && !preserveRows) {
-      const first = await withStartupTimeout(started.request("get_state"), agentLabel);
+      let first = await withStartupTimeout(started.request("get_state"), agentLabel);
       if (mine !== generation) return;
+      if (reopen && first.sessionFile !== reopen && !first.isStreaming) {
+        // Re-attaching to a warm daemon process whose previous `switch_session` had not
+        // yet taken effect (or that was still on another/empty session) must align the
+        // engine onto `reopen` before reading history, or `displayHistory` returns `[]`
+        // and flashes Welcome over the destination.
+        const switched = await withStartupTimeout(started.request("switch_session", { sessionPath: reopen }), agentLabel);
+        if (mine !== generation) return;
+        if (!switched.cancelled) {
+          first = await withStartupTimeout(started.request("get_state"), agentLabel);
+          if (mine !== generation) return;
+        }
+      }
       rememberProject(projectCwdOf(cwd, currentDaemonSession()));
       const retry = autoRetryChoice();
       if (retry !== undefined) request("set_auto_retry", { enabled: retry }).catch(() => undefined);
@@ -1842,6 +2054,7 @@ async function launch(
           phase.set({ name: "ready" });
           landHistory(history.messages);
         });
+        replayPendingAttachEvents(history.messages);
         if ((resolved ?? base)?.sessionFile) reportSessionFile();
         const listCwd = projectCwdOf(cwd, currentDaemonSession());
         void Promise.all([refreshCommands(), refreshSessions(listCwd), refreshCredentials(), refreshGitWorkspace(cwd), refreshStats()]).catch(failLaunch);
@@ -1858,9 +2071,10 @@ async function launch(
           activity.set({ kind: "idle" });
         }
         phase.set({ name: "ready" });
+        landHistory(history.messages);
       });
+      replayPendingAttachEvents(history.messages);
       if ((state() ?? first).sessionFile) reportSessionFile();
-      landHistory(history.messages);
       // The conversation is on screen: the session change is over, its pickers fill in behind it.
       void finishLaunch().catch(failLaunch);
       return;
@@ -1904,13 +2118,15 @@ async function launch(
     batch(() => {
       state.set(resolved);
       phase.set({ name: "ready" });
+      if (preserveRows) {
+        scrollToEnd.set(0);
+      } else if (history) {
+        landHistory(history.messages);
+      }
     });
+    if (history) replayPendingAttachEvents(history.messages);
+    else clearPendingAttach();
     reportSessionFile();
-    if (preserveRows) {
-      scrollToEnd.set(0);
-    } else if (history) {
-      landHistory(history.messages);
-    }
     requestPrewarm(cwd, effectiveAgentId);
     void refreshStats();
   }
@@ -2004,6 +2220,8 @@ async function connect(cwd: string, agentId: string, mine: number, reopen?: stri
     onExit: (exit, stderr) => routeExit(started, exit, stderr, agentLabel),
   });
   client = started;
+  pendingAttachClient = started;
+  pendingAttachEvents = [];
   clientDaemonId.set(started, settledSession.id);
   batch(() => {
     if (settledSession !== session) upsertDaemonSession(settledSession);
@@ -2085,12 +2303,13 @@ function revive(agentLabel: string, cutShort: boolean, lost: Extract<Phase, { na
           }
           transcript = fresh;
           shownVersion = -1;
-          markTranscriptSeen();
+          markTranscriptSeen(true);
           flush();
           landed.update((n) => n + 1);
           scrollToEnd.set(0);
         }
       }
+      replayPendingAttachEvents(history.messages);
       open();
       if (cutShort) {
         toast(
@@ -2251,13 +2470,13 @@ export async function openWorkspace(path: string, sessionPath?: string, sessionA
     if (sessionPath) {
       await openSession(sessionPath, undefined, sessionAgentId);
     } else {
-      view.set({ name: "chat" });
+      setViewChat();
       focusComposer();
     }
     return;
   }
   pendingHandoff.set(undefined);
-  view.set({ name: "chat" });
+  setViewChat();
   const resolvedAgentId = sessionAgentId ?? held?.agentId ?? findKnownSessionSummary(sessionPath)?.agentId ?? currentAgentId();
   if (mustDetachOnSwitch()) return switchInto(path, sessionPath, resolvedAgentId, held?.id);
   await start(path, sessionPath, resolvedAgentId, undefined, held?.id);
@@ -2272,7 +2491,7 @@ export async function newSessionInWorkspace(cwd: string) {
     return newSession();
   }
   pendingHandoff.set(undefined);
-  view.set({ name: "chat" });
+  setViewChat();
   if (mustDetachOnSwitch()) return switchInto(cwd, undefined, currentAgentId());
   await start(cwd, undefined, currentAgentId());
   focusComposer();
@@ -2566,9 +2785,26 @@ export async function refreshSessions(cwd = activeProjectPath()) {
   if (!cwd) return;
   try {
     const found = await backend().listSessions(cwd);
-    sessionsByWorkspace.update((all) => ({ ...all, [cwd]: found }));
-    if (cwd === workspace() || cwd === activeProjectPath()) sessions.set(found);
-    applyAutoArchive();
+    const prev = sessionsByWorkspace()[cwd];
+    const reconciled = reconcileSessionList(prev, found);
+    if (prev && reconciled !== prev) {
+      const openPath = activeSessionFile();
+      const prevByPath = new Map(prev.map((s) => [s.path, s]));
+      for (const item of reconciled) {
+        const old = prevByPath.get(item.path);
+        if (item.path !== openPath && old && (old.modified !== item.modified || old.messageCount !== item.messageCount)) {
+          visited.delete(item.path);
+        }
+      }
+    }
+    if (reconciled !== prev) {
+      sessionsByWorkspace.update((all) => ({ ...all, [cwd]: reconciled }));
+    }
+    if (cwd === workspace() || cwd === activeProjectPath()) {
+      const activeReconciled = reconcileSessionList(sessions(), reconciled);
+      if (activeReconciled !== sessions()) sessions.set(activeReconciled);
+    }
+    if (reconciled !== prev || !prev) applyAutoArchive();
   } catch (error) {
     if (phase().name !== "failed") {
       toast("warning", `${tr("Could not list saved sessions", "无法读取历史会话列表")}: ${message(error)}`);
@@ -2589,13 +2825,38 @@ export async function refreshAllWorkspaceSessions() {
     const b = backend();
     if (b.listWorkspaceSessions) {
       const batchMap = await b.listWorkspaceSessions(cwds);
-      sessionsByWorkspace.update((all) => ({ ...all, ...batchMap }));
+      const prevMap = sessionsByWorkspace();
+      const openPath = activeSessionFile();
+      let mapChanged = false;
+      const updates: Record<string, SessionSummary[]> = {};
+      for (const [cwd, found] of Object.entries(batchMap)) {
+        const prev = prevMap[cwd];
+        const reconciled = reconcileSessionList(prev, found);
+        if (prev && reconciled !== prev) {
+          const prevByPath = new Map(prev.map((s) => [s.path, s]));
+          for (const item of reconciled) {
+            const old = prevByPath.get(item.path);
+            if (item.path !== openPath && old && (old.modified !== item.modified || old.messageCount !== item.messageCount)) {
+              visited.delete(item.path);
+            }
+          }
+        }
+        if (reconciled !== prev) {
+          updates[cwd] = reconciled;
+          mapChanged = true;
+        }
+      }
+      if (mapChanged) {
+        sessionsByWorkspace.update((all) => ({ ...all, ...updates }));
+      }
       const active = workspace();
       if (active && batchMap[active]) {
-        sessions.set(batchMap[active]);
+        const activeNext = updates[active] ?? prevMap[active] ?? batchMap[active];
+        const activeReconciled = reconcileSessionList(sessions(), activeNext);
+        if (activeReconciled !== sessions()) sessions.set(activeReconciled);
         sessionsLoaded.set(true);
       }
-      applyAutoArchive();
+      if (mapChanged) applyAutoArchive();
       return;
     }
     await Promise.all(cwds.map((cwd) => refreshSessions(cwd)));
@@ -2691,7 +2952,7 @@ async function applyThinkingChoice(known: SessionState | undefined, commit = tru
 
 // ── Events from Active Agent ────────────────────────────────────────────────
 
-function onEvent(event: SessionEvent) {
+function onEvent(event: SessionEvent, source?: PiClient) {
   if (event.type === "commands_changed") {
     // The bridge learned the agent's own commands (ACP `available_commands_update`, Claude's `initialize`).
     void refreshCommands();
@@ -2707,9 +2968,14 @@ function onEvent(event: SessionEvent) {
     })();
     return;
   }
-  // While a destination is shown ahead, records still arriving belong to the
-  // session being left: applying them would write one conversation's state into
-  // another's. The landing's `get_messages`/`get_state` is authoritative for it.
+  // While a destination is still attaching (`pendingAttachClient`), buffer its live
+  // events so `landHistory` can commit first and replay any post-history deltas
+  // without dropping words; events from an outgoing same-process session while `ahead`
+  // is set are still discarded so they never leak into the destination.
+  if (client && client === pendingAttachClient) {
+    pendingAttachEvents.push(event);
+    return;
+  }
   if (ahead) return;
 
   if (event.type === "agent_settled") {
@@ -2721,16 +2987,35 @@ function onEvent(event: SessionEvent) {
       return;
     }
     const wasRunning = running();
+    // A settle with the queue still holding messages means the run ended by error or
+    // abort before delivering them: the agent keeps them stranded — Pi never drains
+    // its queue on a dead run, and they would surface at the end of some later,
+    // unrelated run. Hand the words back to the composer instead of vanishing the
+    // bubbles, and pull the messages out of the agent so they cannot echo later.
+    // A stop the person asked for already did this on its way out (`stop` recalls
+    // the queue itself) — the queue signal still lists the messages here, but their
+    // words are the composer's already.
+    const strandedWire = stopAsked ? [] : [...queue().steering, ...queue().followUp];
     batch(() => {
       transcript.commitStagedUsers();
       transcript.apply(event);
-      flush();
       running.set(false);
       activity.set({ kind: "idle" });
       queue.set({ steering: [], followUp: [] });
       // A settle empties the queue too: whatever it still held never echoes.
       transcript.reconcileQueue([], []);
+      if (strandedWire.length) {
+        transcript.dropQueuedMatching(strandedWire);
+        const said = (wire: string) => withoutPreamble(withoutImageNotes(wire));
+        const waiting = strandedWire.map(said).filter(Boolean).join("\n\n");
+        if (waiting) draft.set(draft() ? `${draft()}\n\n${waiting}` : waiting);
+      }
+      flush();
     });
+    if (strandedWire.length) {
+      if (source && !source.closed) void source.request("clear_queue").catch(() => undefined);
+      toast("warning", tr("The run ended before the queued messages were sent; they are back in the composer.", "运行结束前排队消息未能发出，已放回输入框。"));
+    }
     if (wasRunning && !event.aborted && !stopAsked) celebrate();
     stopAsked = false;
     refreshState().catch(() => undefined);
@@ -2900,7 +3185,7 @@ function onUiRequest(ui: ExtensionUiRequest) {
 /** Routes a record to the open session's client; a detached client's stream no longer arrives. */
 function routeEvent(source: PiClient | undefined, event: SessionEvent) {
   if (!source) return;
-  if (source === client) return onEvent(event);
+  if (source === client) return onEvent(event, source);
 }
 
 function routeUiRequest(source: PiClient | undefined, ui: ExtensionUiRequest) {
@@ -3708,9 +3993,13 @@ export function openDaemonSession(sessionId: string) {
   const session = daemonSessionOfId(sessionId);
   if (!session) return;
   if (session.id === openDaemonId() && phase().name === "ready" && !isSwitching()) {
-    view.set({ name: "chat" });
+    setViewChat();
     focusComposer();
     return;
+  }
+  if (session.unread) {
+    if (session.file) visited.delete(session.file);
+    visitedByDaemon.delete(session.id);
   }
   daemonClient?.markRead(session.id);
   if (session.file) {
@@ -3845,6 +4134,7 @@ function closeActive() {
   const leavingSession = currentDaemonSession();
   const leavingCwd = projectCwdOf(workspace(), leavingSession);
   client = undefined;
+  clearPendingAttach();
   let heldSend = false;
   if (current) {
     const holds = clientSendHolds.get(current);
@@ -3886,13 +4176,15 @@ async function switchInto(cwd: string, sessionPath: string | undefined, agentId 
   busy.set(true);
   try {
     closeActive();
+    let started!: Promise<void>;
     batch(() => {
-      view.set({ name: "chat" });
+      setViewChat();
       pendingHandoff.set(undefined);
       renaming.set(false);
       attachments.set([]);
+      started = start(cwd, sessionPath, agentId, undefined, daemonId);
     });
-    await start(cwd, sessionPath, agentId, undefined, daemonId);
+    await started;
     focusComposer();
     return true;
   } finally {
@@ -3904,6 +4196,9 @@ async function switchInto(cwd: string, sessionPath: string | undefined, agentId 
 async function stayPut() {
   // Nothing the destination's saved file read still in flight may show lands after a reverted change.
   snapshotEpoch++;
+  clearLeavingGrace();
+  clearPendingAttach();
+  if (snapPending()) snapPending.set(false);
   if (!early) return;
   early = false;
   // The destination shown ahead goes back where it was kept; the session that stays comes back from there too (`landHistory`).
@@ -3937,7 +4232,7 @@ async function changeSession(what: string, action: () => Promise<{ cancelled: bo
       return false;
     }
     batch(() => {
-      view.set({ name: "chat" });
+      setViewChat();
       pendingHandoff.set(undefined);
       renaming.set(false);
       attachments.set([]);
@@ -3986,22 +4281,22 @@ export function newSession() {
   pendingHandoff.set(undefined);
   const rootCwd = workCwd();
   if (isDraftAhead() && heading()?.cwd === rootCwd && (!heading()?.agentId || heading()?.agentId === currentAgentId())) {
-    view.set({ name: "chat" });
+    setViewChat();
     return focusComposer();
   }
   if (phase().name !== "ready") {
     busy.set(false);
-    view.set({ name: "chat" });
+    setViewChat();
     return start(rootCwd, undefined, currentAgentId());
   }
   if (isSwitching()) {
     if (!heading()?.file && !heading()?.daemonId && !busy()) return focusComposer();
     busy.set(false);
-    view.set({ name: "chat" });
+    setViewChat();
     return start(rootCwd, undefined, currentAgentId());
   }
   if (!rows().length && !(state()?.messageCount) && !mustDetachOnSwitch()) {
-    if (view().name !== "chat") view.set({ name: "chat" });
+    setViewChat();
     return focusComposer();
   }
   if (mustDetachOnSwitch() || rootCwd !== workspace()) {
@@ -4030,10 +4325,16 @@ async function openSessionFile(path: string, ownerAgentId?: string) {
     if (phase().name === "ready" && !isSwitching()) {
       return switchInto(targetCwd, path, neededAgent, held?.id);
     }
-    busy.set(false);
-    view.set({ name: "chat" });
-    pendingHandoff.set(undefined);
-    await start(targetCwd, path, neededAgent, undefined, held?.id);
+    let started!: Promise<void>;
+    batch(() => {
+      busy.set(false);
+      setViewChat();
+      pendingHandoff.set(undefined);
+      renaming.set(false);
+      attachments.set([]);
+      started = start(targetCwd, path, neededAgent, undefined, held?.id);
+    });
+    await started;
     return true;
   }
   return changeSession(tr("Could not open the session", "无法打开会话"), () => request("switch_session", { sessionPath: path }), { file: path });
@@ -4048,7 +4349,7 @@ export function openSession(path: string, cwd?: string, ownerAgentId?: string) {
     return openWorkspace(held?.cwd ?? effectiveCwd, path, ownerAgentId ?? held?.agentId ?? summary?.agentId);
   }
   if (path === state()?.sessionFile && phase().name === "ready" && !isSwitching()) {
-    view.set({ name: "chat" });
+    setViewChat();
     focusComposer();
     return;
   }
@@ -4083,7 +4384,7 @@ export async function forkFrom(index: number) {
 }
 
 export function startRenaming() {
-  view.set({ name: "chat" });
+  setViewChat();
   renaming.set(true);
 }
 
@@ -4463,7 +4764,7 @@ export async function removeProviderKey(provider: string) {
 // ── Navigation ──────────────────────────────────────────────────────────────
 
 export function showChat() {
-  if (view().name !== "chat") view.set({ name: "chat" });
+  setViewChat();
   focusComposer();
 }
 
@@ -4509,7 +4810,7 @@ export function setPaletteOpen(open: boolean) {
 
 /** Opens the composer's model list, as a press on its chip does. */
 export function openModelPicker() {
-  view.set({ name: "chat" });
+  setViewChat();
   modelPickerAsk.set(0);
 }
 

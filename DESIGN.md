@@ -546,19 +546,26 @@ need it.
   workspace/branch; a row whose engine is gone greys the mark.
 - **tip()**: the tooltip.
 - **Zoom layer** (`ui/Zoom.tsx`): the window's one preview surface — what wants
-  more room than its place in the transcript gives it (a wide table, a
-  picture) — given whole in the glass sheet every floating surface shares, a
-  caption and its actions in the strip above. An image there is a viewer, not
-  a picture (`views/ZoomImage.tsx`): it opens exactly fitted, the wheel or a
-  pinch zooms at the pointer continuously, a drag pans what no longer fits, a
-  double press dives to the picture's own pixels and back at the point
-  pressed, and the pill at the foot steps out and in, says the scale and
-  resets — `+` / `−` / `0` and the arrows playing the same on the keyboard.
-  100% is the picture's own pixels, never the fit; steps snap onto it and the
-  fit as they cross, and no zoom or pan ever opens a gap inside the frame —
-  edges win over the anchor a gesture asked for. Transitions are a bounded
-  180ms, interruptible where they visibly are; gestures write compositor
-  values, so a stream of wheel ticks re-renders nothing but the readout.
+  more room than its place in the transcript gives it. Tables keep the roomy
+  scrollable glass sheet (`sheet` layout); media (`stage` layout) expands to a
+  full-window Liquid Glass stage (`pt-11 px-3 pb-3` on macOS to clear the
+  traffic lights, `p-3` elsewhere, over `SCRIM` with no max-width/height cap)
+  so screenshots and photos use the window cleanly. An image there is a viewer,
+  not a picture (`views/ZoomImage.tsx`): it opens fitted to the live stage and
+  adapts as the window resizes, the wheel or a pinch zooms at the pointer
+  continuously (expanding across the full stage when magnified), a drag pans
+  what no longer fits, and a double press dives to the picture's own pixels and
+  back at the point pressed. The bottom dock sits below the stage (never
+  covering image pixels) with the zoom pill (`+` / `−` / `0` on the keyboard)
+  and, when the conversation stream holds more than one previewable photo, a
+  scrollable thumbnail filmstrip (active item ringed in `brand`) alongside
+  edge-anchored circular chevrons and `←` / `→` keyboard switching at fit zoom
+  (or `⌘←` / `⌘→` / `[` / `]` while zoomed in). 100% is the picture's own
+  pixels, never the fit; steps snap onto it and the fit as they cross, and no
+  zoom or pan ever opens a gap inside the frame — edges win over the anchor a
+  gesture asked for. Transitions are a bounded 180ms, interruptible where they
+  visibly are; gestures write compositor values, so a stream of wheel ticks
+  re-renders nothing but the readout.
 - **Reveal / Presence / FloatingLayer / ViewDeck** (`ui/Reveal.tsx`, re-exported from
   `ui/motion.ts`): the standardized enter + exit primitives for flow
   rows/sections and inline marks, plus `FloatingLayer` (in-window glass sheet
@@ -613,7 +620,8 @@ indent, the spacing and the fold, never a drawn line; what a step unfolds is
 contained by what it is (a sunken output, quiet prose on a hairline, a list of
 calls), not by a rail around it. Expanded activity details grow to fit, up to
 half the readable pane or 320pt, whichever is smaller. The steps and their
-outputs scroll together below the summary so its fold stays within reach.
+outputs scroll together below the summary so its fold stays within reach; an
+edge fades only while more lies past it.
 A press on the header is the reader's say on
 the fold and holds from then on: through the run going on, the next message,
 and a change of session and back.

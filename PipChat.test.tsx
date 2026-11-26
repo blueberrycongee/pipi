@@ -39,11 +39,14 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
   await app.submit("label:Message");
   await app.waitFor("text:make a plan in steps");
 
-  // While Pip is working: wait until the active Pip avatar is visible, then sample frames through the run.
+  // While Pip is working: wait until the active Pip avatar + iMessage typing bubble are visible, then sample frames through the run.
   await app.waitFor("id:pip-active-avatar");
+  await app.waitFor("id:pip-typing-bubble");
   let hoveredDuringRun = false;
   let sawLiveCard = false;
   let sawLivePhase = false;
+  let sawTypingBubbleDuringRun = false;
+  let sawReadReceiptDuringRun = false;
   let sawToolWallDuringRun = false;
   let sawCommentaryDuringRun = false;
   let sawWorkingHeaderDuringRun = false;
@@ -51,6 +54,8 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
   for (let elapsed = 0; elapsed < 60_000; elapsed += 16) {
     const stillRunning = !app.shows("label:Send");
     if (stillRunning) {
+      if (app.shows("id:pip-typing-bubble")) sawTypingBubbleDuringRun = true;
+      if (app.shows("id:sms-receipt")) sawReadReceiptDuringRun = true;
       if (showsInChat(app, "Working")) sawWorkingHeaderDuringRun = true;
       if (showsInChat(app, "Reading package.json")) sawToolWallDuringRun = true;
       if (showsInChat(app, "The list follows by hand. Let me check the tests before changing it.")) {
@@ -76,7 +81,9 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
     await app.wait(16);
   }
 
-  // Main chat stream stayed completely clean during Pip's run.
+  // Main chat stream stayed completely clean during Pip's run while showing the SMS typing bubble & read receipt.
+  expect(sawTypingBubbleDuringRun).toBe(true);
+  expect(sawReadReceiptDuringRun).toBe(true);
   expect(sawWorkingHeaderDuringRun).toBe(false);
   expect(sawToolWallDuringRun).toBe(false);
   expect(sawCommentaryDuringRun).toBe(false);
@@ -89,9 +96,11 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
   await app.hover("id:sidebar-pip");
   await app.wait(300);
 
-  // Once settled, the complete IM message lands whole alongside Pip's message avatar.
-  // The stream itself carries no process pill: it stays clean, the steps stay hidden.
+  // Once settled, the typing bubble disappears and the reply lands as iMessage SMS bubbles alongside Pip's avatar.
+  // The stream itself carries no process pill: it stays clean, the steps stay hidden until opened from the avatar's card.
   await app.waitUntil(() => showsInChat(app, "Everything else is as it was, and the tests pass."), { timeout: 10_000 });
+  expect(app.shows("id:pip-typing-bubble")).toBe(false);
+  expect(app.count("id:pip-sms-bubble")).toBeGreaterThanOrEqual(1);
   expect(app.count("id:pip-message-avatar")).toBeGreaterThanOrEqual(1);
   expect(app.count("id:pip-process-toggle")).toBe(0);
   expect(showsInChat(app, "The list follows by hand. Let me check the tests before changing it.")).toBe(false);

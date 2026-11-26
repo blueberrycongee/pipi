@@ -12,6 +12,7 @@ import {
   signal,
   untracked,
   View,
+  type ViewRef,
 } from "nsh";
 import { AlertDialog } from "nsh/base";
 import { Application, currentWindow, isAvailable, Menu, Window, type WindowRef } from "nsh/desktop";
@@ -60,6 +61,19 @@ import {
   sidebarWidth,
 } from "../store/prefs";
 import { flushDocs, refreshNotes, revealDoc, syncDocs } from "../store/docs";
+import {
+  cancelSplitDrag,
+  endSplitDrag,
+  focusPane,
+  isSplitOpen,
+  moveSplitDrag,
+  refreshWorkspaceBounds,
+  registerWorkspaceMeasurer,
+  setWorkspaceBounds,
+  splitDrag,
+  splitSide,
+  toggleSplitView,
+} from "../store/split";
 import { activeTabId, closeTab, cycleTab, draftToDoc, newDocTab, openNewSessionTab, openTabs, pickDocTab, saveDocAs } from "../store/tabs";
 import { EASING } from "../ui/motion";
 import { SIDEBAR_GLASS, WALLPAPER_FROST } from "../ui/styles";
@@ -70,8 +84,16 @@ import { DocDeck, notifyDocPointerUp } from "./DocEditor";
 import { ExtensionDialog, hasInlinePrompt } from "./ExtensionDialog";
 import { Palette } from "./Palette";
 import { Settings } from "./Settings";
-import { Sidebar } from "./Sidebar";
-import { TabBar } from "./TabBar";
+import { notifySidebarPointerMove, notifySidebarPointerUp, Sidebar } from "./Sidebar";
+import {
+  isSplitSashDragging,
+  notifySplitSashMove,
+  notifySplitSashUp,
+  SplitDropOverlay,
+  SplitPane,
+  SplitResizeSash,
+} from "./SplitPane";
+import { notifyTabBarPointerMove, notifyTabBarPointerUp, TabBar } from "./TabBar";
 import { Toasts } from "./Toasts";
 import { UpdateCard } from "./UpdateCard";
 import {
@@ -114,6 +136,7 @@ const toggleSettings = () => (currentView().name === "settings" ? leaveSettings(
 
 /** Escape leaves what is on top: a dialog or inline prompt closes itself; then settings or sub-agent inspection; then the run stops. */
 function escape() {
+  if (splitDrag()) return cancelSplitDrag();
   if (isPaletteOpen() || isCompareOpen() || isZoomOpen() || isWallpaperAdjustOpen()) return;
   if (pendingDialog()) {
     if (hasInlinePrompt()) cancelPendingDialog();
@@ -340,6 +363,11 @@ function applicationMenu() {
           },
         },
         { label: sidebarOpen() ? tr("Hide Sidebar", "隐藏侧边栏") : tr("Show Sidebar", "显示侧边栏"), shortcut: "mod+b", onSelect: toggleSidebar },
+        {
+          label: isSplitOpen() ? tr("Close Split View", "关闭分屏") : tr("Split View", "分屏对话"),
+          shortcut: "mod+\\",
+          onSelect: () => toggleSplitView("right"),
+        },
         { label: tr("Random Wallpaper", "随机壁纸"), shortcut: "mod+u", onSelect: () => void randomWallpaper() },
         { type: "separator" },
         { label: tr("Next Tab", "下一个标签页"), shortcut: "mod+shift+]", disabled: openTabs().length < 2, onSelect: () => cycleTab(1) },
@@ -608,7 +636,30 @@ function SidebarSplit(props: { children: JSX.Element }) {
           sidebar tray; over a wallpaper the surface runs continuously edge-to-edge. */}
       <View class={`relative min-w-0 flex-1 ${wallpaper() ? "" : sidebarOpen() ? "py-[7px] pr-[7px]" : "p-[7px]"}`}>
         <View
-          class={`relative min-w-0 flex-1 ${
+          ref={(ref: ViewRef | null) => {
+            if (!ref) {
+              registerWorkspaceMeasurer(undefined);
+              return;
+            }
+            const measure = async () => {
+              const m = await ref.measure().catch(() => null);
+              if (!m) return null;
+              return {
+                left: m.pagePosition.x,
+                top: m.pagePosition.y,
+                width: m.bounds.size.width,
+                height: m.bounds.size.height,
+              };
+            };
+            registerWorkspaceMeasurer(measure);
+            void measure().then((rect) => {
+              if (rect && rect.width > 0 && rect.height > 0) setWorkspaceBounds(rect);
+            });
+          }}
+          onLayout={() => {
+            setTimeout(() => void refreshWorkspaceBounds(), 0);
+          }}
+          class={`relative min-w-0 flex-1 flex-row ${
             wallpaper()
               ? ""
               : "overflow-hidden rounded-[14px] corner-squircle border-[0.5px] border-hairline bg-background shadow-sheet dark:shadow-sheet-dark"
@@ -777,23 +828,38 @@ export function Shell() {
       "mod+k": () => setPaletteOpen(!isPaletteOpen()),
       "mod+shift+o": () => setCompareOpen(!isCompareOpen()),
       "mod+b": toggleSidebar,
+      "mod+\\": () => toggleSplitView("right"),
       "mod+u": () => void randomWallpaper(),
       "mod+l": () => (showChat(), focusComposer()),
     });
   }
   keymap.bind("escape", escape);
+  effect(() => {
+    if (!splitDrag()) return;
+    cleanup(keymap.bind("escape", () => cancelSplitDrag(), { when: "always" }));
+  });
 
   return (
     <View
       class="flex-1 flex-row bg-background"
-      onMouseMove={
-        DYNAMIC_WALLPAPER_ENABLED
-          ? (e) => {
-              if (e.pressedButton !== null && currentView().name === "doc") return;
-              notifyWallpaperPointerMove(e.pagePosition.x, e.pagePosition.y);
-            }
-          : undefined
-      }
+      onMouseMove={(e) => {
+        const pressed = e.pressedButton === "left";
+        if (isSplitSashDragging()) {
+          notifySplitSashMove(e.pagePosition.x, pressed);
+          return;
+        }
+        if (splitDrag()) {
+          if (e.pressedButton === null) endSplitDrag(true);
+          else moveSplitDrag(e.pagePosition.x, e.pagePosition.y);
+          return;
+        }
+        notifySidebarPointerMove(e.pagePosition.x, e.pagePosition.y, pressed);
+        notifyTabBarPointerMove(e.pagePosition.x, e.pagePosition.y, pressed);
+        if (DYNAMIC_WALLPAPER_ENABLED) {
+          if (e.pressedButton !== null && currentView().name === "doc") return;
+          notifyWallpaperPointerMove(e.pagePosition.x, e.pagePosition.y);
+        }
+      }}
       onMouseLeave={
         DYNAMIC_WALLPAPER_ENABLED
           ? () => {
@@ -803,6 +869,16 @@ export function Shell() {
       }
       onMouseUp={(e) => {
         notifyDocPointerUp();
+        if (isSplitSashDragging()) {
+          notifySplitSashUp(e.pagePosition.x);
+          return;
+        }
+        if (splitDrag()) {
+          endSplitDrag(true);
+          return;
+        }
+        notifySidebarPointerUp();
+        notifyTabBarPointerUp();
         if (
           DYNAMIC_WALLPAPER_ENABLED &&
           currentView().name === "chat" &&
@@ -816,9 +892,25 @@ export function Shell() {
       }}
     >
       <SidebarSplit>
-        <Chat />
-        <DocDeck />
+        <If when={isSplitOpen() && splitSide() === "left"}>
+          <SplitPane />
+          <SplitResizeSash />
+        </If>
+        <View
+          class="relative min-w-0 flex-1"
+          onPressDown={() => {
+            if (isSplitOpen()) focusPane("primary");
+          }}
+        >
+          <Chat />
+          <DocDeck />
+        </View>
+        <If when={isSplitOpen() && splitSide() === "right"}>
+          <SplitResizeSash />
+          <SplitPane />
+        </If>
         <TabBar />
+        <SplitDropOverlay />
       </SidebarSplit>
       <Palette />
       <CompareDialog />

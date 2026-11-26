@@ -447,29 +447,42 @@ function applyWallpaperTheme() {
   setTheme(null);
 }
 
-export const recentWorkspaces = () => prefs().workspaces;
-export const lastActiveWorkspace = () => prefs().activeWorkspace;
-export const collapsedWorkspaces = () => prefs().collapsedWorkspaces;
-export const recentRankOverrides = () => prefs().recentRanks;
+export const recentWorkspaces = computed(() => prefs().workspaces);
+export const lastActiveWorkspace = computed(() => prefs().activeWorkspace);
+export const collapsedWorkspaces = computed(() => prefs().collapsedWorkspaces);
+const collapsedGroups = computed(() => prefs().collapsedGroups);
+export const recentRankOverrides = computed(() => prefs().recentRanks);
+const sessionRanksMap = computed(() => prefs().sessionRanks);
 const NO_RANKS: Record<string, number> = {};
-export const sessionRankOverrides = (cwd: string) => prefs().sessionRanks[cwd] ?? NO_RANKS;
-export const docRankOverrides = () => prefs().docRanks;
-export const isWorkspaceCollapsed = (path: string) => prefs().collapsedWorkspaces.includes(path);
-export const isGroupCollapsed = (id: string) => prefs().collapsedGroups.includes(id);
-export const archivedSessions = () => prefs().archivedSessions;
+export const sessionRankOverrides = (cwd: string) => sessionRanksMap()[cwd] ?? NO_RANKS;
+export const docRankOverrides = computed(() => prefs().docRanks);
+export const isWorkspaceCollapsed = (path: string) => collapsedWorkspaces().includes(path);
+export const isGroupCollapsed = (id: string) => collapsedGroups().includes(id);
+export const archivedSessions = computed(() => prefs().archivedSessions);
 export const isSessionArchived = (path: string | undefined) =>
-  !!path && Object.prototype.hasOwnProperty.call(prefs().archivedSessions, path);
-export const autoArchiveDays = () => prefs().autoArchiveDays;
-export const storedOpenTabs = () => prefs().openTabs;
-export const docsFolder = () => prefs().docsFolder;
+  !!path && Object.prototype.hasOwnProperty.call(archivedSessions(), path);
+export const autoArchiveDays = computed(() => prefs().autoArchiveDays);
+export const storedOpenTabs = computed(() => prefs().openTabs);
+export const docsFolder = computed(() => prefs().docsFolder);
 
 export function setDocsFolderPref(folder: string | undefined) {
   const trimmed = folder?.trim().replace(/\/+$/, "") || undefined;
+  if (prefs().docsFolder === trimmed) return;
   change({ docsFolder: trimmed });
+}
+
+function sameOpenTabs(a: readonly StoredOpenTab[], b: readonly StoredOpenTab[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].kind !== b[i].kind || a[i].ref !== b[i].ref || a[i].file !== b[i].file) return false;
+  }
+  return true;
 }
 
 /** Remembers the tab strip's surfaces between launches; the order is the strip's. */
 export function setOpenTabs(tabs: StoredOpenTab[]) {
+  if (sameOpenTabs(prefs().openTabs, tabs)) return;
   change({ openTabs: tabs });
 }
 
@@ -484,42 +497,43 @@ export function resetFontSizes() {
   change({ fontSizes: DEFAULTS.fontSizes });
 }
 
-export const appearance = () => prefs().appearance;
-export const pipCoat = (): CoatId => (isCoat(prefs().pipCoat) ? prefs().pipCoat : "ghost");
-export const language = () => prefs().language;
-export const sidebarOpen = () => prefs().sidebarOpen;
-export const sidebarWidth = () => prefs().sidebarWidth;
-export const autoRetryChoice = () => prefs().autoRetry;
-export const preferredAgentId = () => prefs().defaultAgentId;
-export const preferredRuntimeMode = () => prefs().runtimeMode;
-export const worktreeIsolationDefault = () => prefs().worktreeIsolationDefault;
-export const agentSessionTools = () => prefs().agentSessionTools;
-export const agentSendScope = () => prefs().agentSendScope;
-export const sessionTreeDepth = () => prefs().sessionTreeDepth;
-export const sessionTreeMax = () => prefs().sessionTreeMax;
-export const runInBackground = () => prefs().runInBackground;
-export const sendMode = () => prefs().sendMode;
-export const storedAgentOverrides = () => prefs().agentOverrides;
-export const storedCustomAgents = () => prefs().customAgents;
-export const storedSessionChoice = (agentId: string): AgentSessionChoice | undefined => prefs().agentSessionChoices[agentId];
-export const storedSessionChoices = (): Record<string, AgentSessionChoice> => prefs().agentSessionChoices;
+export const appearance = computed(() => prefs().appearance);
+export const pipCoat = computed<CoatId>(() => (isCoat(prefs().pipCoat) ? prefs().pipCoat : "ghost"));
+export const language = computed(() => prefs().language);
+export const sidebarOpen = computed(() => prefs().sidebarOpen);
+export const sidebarWidth = computed(() => prefs().sidebarWidth);
+export const autoRetryChoice = computed(() => prefs().autoRetry);
+export const preferredAgentId = computed(() => prefs().defaultAgentId);
+export const preferredRuntimeMode = computed(() => prefs().runtimeMode);
+export const worktreeIsolationDefault = computed(() => prefs().worktreeIsolationDefault);
+export const agentSessionTools = computed(() => prefs().agentSessionTools);
+export const agentSendScope = computed(() => prefs().agentSendScope);
+export const sessionTreeDepth = computed(() => prefs().sessionTreeDepth);
+export const sessionTreeMax = computed(() => prefs().sessionTreeMax);
+export const runInBackground = computed(() => prefs().runInBackground);
+export const sendMode = computed(() => prefs().sendMode);
+export const storedAgentOverrides = computed(() => prefs().agentOverrides);
+export const storedCustomAgents = computed(() => prefs().customAgents);
+const storedSessionChoicesMap = computed(() => prefs().agentSessionChoices);
+export const storedSessionChoice = (agentId: string): AgentSessionChoice | undefined => storedSessionChoicesMap()[agentId];
+export const storedSessionChoices = (): Record<string, AgentSessionChoice> => storedSessionChoicesMap();
 // The stored wallpaper/effect may name a dynamic kind the feature gate hides;
 // readers must agree with the render gate (`EffectSurface.canRender`), so the
 // accessors report such a config/effect as absent rather than let the shell
 // dress an empty underlay in glass.
-export const wallpaper = (): WallpaperConfig | null => {
+export const wallpaper = computed<WallpaperConfig | null>(() => {
   const w = prefs().wallpaper;
   return DYNAMIC_WALLPAPER_ENABLED || !isDynamicWallpaperConfig(w) ? w : null;
-};
+});
 // An effect is a shader pass over a still image: while a video or a live
 // shader holds the slot it would only lay a second animation over the first,
 // so the stored choice is masked — kept, for when an image takes the slot
 // again — rather than applied where it cannot belong.
-export const wallpaperEffect = (): WallpaperEffect => {
+export const wallpaperEffect = computed<WallpaperEffect>(() => {
   const eff = prefs().wallpaperEffect;
   const w = wallpaper();
   return w && !isDynamicWallpaperConfig(w) && isAvailableWallpaperEffect(eff) ? eff : "none";
-};
+});
 export const wallpaperFolder = () => prefs().wallpaperFolder;
 export const wallpaperSource = () => prefs().wallpaperSource;
 export const wallpaperHistory = () => prefs().wallpaperHistory;
@@ -657,7 +671,9 @@ export function removeCustomAgentPref(agentId: string) {
 export function rememberWorkspace(path: string) {
   if (!path) return;
   const current = prefs().workspaces;
-  const workspaces = current.includes(path) ? current : [...current, path].slice(-MAX_WORKSPACES);
+  const alreadyListed = current.includes(path);
+  if (alreadyListed && prefs().activeWorkspace === path) return;
+  const workspaces = alreadyListed ? current : [...current, path].slice(-MAX_WORKSPACES);
   change({ workspaces, activeWorkspace: path });
 }
 
@@ -758,6 +774,7 @@ export function forgetWorkspace(path: string) {
 }
 
 export function setWorkspaceCollapsed(path: string, collapsed: boolean) {
+  if (prefs().collapsedWorkspaces.includes(path) === collapsed) return;
   const list = prefs().collapsedWorkspaces.filter((p) => p !== path);
   change({ collapsedWorkspaces: collapsed ? [...list, path] : list });
 }

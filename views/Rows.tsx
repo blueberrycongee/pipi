@@ -1,11 +1,11 @@
 import { cleanup, createAnimatedValue, effect, Image, openUrl, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
-import type { JSX, ViewRef } from "nsh";
+import type { JSX, ScrollEvent, ViewRef } from "nsh";
 import { Collapsible, TextView } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { clip } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
 import { type DocPart, splitDocMessage } from "../lib/doc-wire";
-import { fitImageBox, imageSizeFromBase64 } from "../lib/image-size";
+import { edgeFadeMask } from "../lib/scroll-mask";
 import {
   extractMarkdownMediaPaths,
   extractPresentedMedia,
@@ -29,6 +29,7 @@ import {
   classifyTool,
   type DiffStats,
   type DisplayRow,
+  type DisplayUserRow,
   type PipRowSlot,
   thinkingLabel,
   type TurnHeaderRow,
@@ -54,16 +55,15 @@ import { docTabTitle, titleLine } from "../store/docs";
 import { openDocIfThere } from "../store/tabs";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
-import { EASING, isRowSeen, keepLast, Presence, useBreathingOpacity, useRowEntrance } from "../ui/motion";
+import { EASING, isRowSeen, keepLast, Presence, useBreathingOpacity, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { openZoom } from "../ui/Zoom";
 import { readingType, codeType, uiHeight, uiType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
-import { MediaGallery, openMediaZoom } from "./Media";
-import { PipAvatarBadge, PipFooterView, PipSessionsView } from "./PipPresence";
-import { clearProseState, proseClasses, ProseBlock, proseVeilUntil, type ProseRow } from "./Prose";
+import { MediaGallery, MediaStreamContext, openMediaZoom } from "./Media";
+import { BubbleTail, PipAvatarBadge, PipBubbleView, PipFooterView, PipSessionsView } from "./PipPresence";
+import { clearProseState, proseClasses, ProseBlock, proseVeilUntil, type PipBubbleRow, type ProseRow } from "./Prose";
 
 /**
  * The rows of the chat. `List` recycles its cells, so every row reads its
@@ -449,11 +449,11 @@ export function enterConversation(key: number) {
   for (const id of [...foldTimers.keys()]) clearTurnTimers(id);
   for (const timer of recallTimers.values()) clearTimeout(timer);
   recallTimers.clear();
-  recallingUsers.set({});
+  if (Object.keys(untracked(recallingUsers)).length > 0) recallingUsers.set({});
   currentHorizon = undefined;
   pendingAutoClose.clear();
-  closingTurns.set({});
-  openingTurns.set({});
+  if (Object.keys(untracked(closingTurns)).length > 0) closingTurns.set({});
+  if (Object.keys(untracked(openingTurns)).length > 0) openingTurns.set({});
   // What was watched in the conversation left is not watched any more (one with no turn to show, an empty
   // chat, asks `turnDefault` nothing and would leave it standing): coming back finds no fold left to play.
   if (watched.key !== key) watched = { key: -1, seen: new Set() };
@@ -474,44 +474,41 @@ export function enterConversation(key: number) {
 }
 
 /**
- * The laid-out height of each user bubble's text, by row id. The text's own
- * layout reports it while it runs free; a folded pass reports at most the
- * clamp, so only a count under it (the real count again) is taken then — a
- * wrong first guess corrects itself.
+ * The laid-out height of each user bubble's text, keyed by stable text content
+ * signature + reading size so cold switches (which mint fresh row ids) hit the
+ * measured line count on Frame 1 without folding/unfolding on Frame 2.
  */
+const USER_LINE_COUNTS_LIMIT = 500;
 const userLineCounts = signal<Record<string, number>>({});
 
-const ZOOM_IMAGE_BOUNDS = {
-  maxWidth: 880,
-  maxHeight: 520,
-  fallback: { width: 640, height: 420 },
-  upscale: false,
-};
-
-function zoomUserImage(image: ImageContent, title?: string) {
-  const src = `data:${image.mimeType};base64,${image.data}`;
-  const box = fitImageBox(imageSizeFromBase64(image), ZOOM_IMAGE_BOUNDS);
-  openZoom({
-    title,
-    render: () => (
-      <View class="w-full items-center justify-center">
-        <Image
-          src={src}
-          style={{ width: box.width, height: box.height, objectFit: "contain" }}
-          class="rounded-lg corner-squircle"
-          accessibilityLabel={title ?? tr("Image preview", "图片预览")}
-        />
-      </View>
-    ),
-  });
+function userTextSig(text: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `${text.length}:${(h >>> 0).toString(36)}`;
 }
-
 function UserImages(props: {
+  rowId: string;
   images: readonly ImageContent[];
   missing: number;
   onContextMenu: (e: { pagePosition: { x: number; y: number } }) => void;
 }) {
+  const getStream = MediaStreamContext();
   const totalCount = () => props.images.length + props.missing;
+  const mediaItems = (): MediaItem[] =>
+    props.images.map((img, idx) => ({
+      id: `${props.rowId}:img:${idx}`,
+      kind: "image",
+      title:
+        totalCount() > 1
+          ? tr(`Image ${idx + 1} of ${totalCount()}`, `图片 ${idx + 1} / ${totalCount()}`)
+          : tr("Image", "图片"),
+      src: `data:${img.mimeType};base64,${img.data}`,
+      mimeType: img.mimeType,
+      data: img.data,
+    }));
 
   return (
     <If
@@ -535,14 +532,11 @@ function UserImages(props: {
             <View
               testID="message-image"
               role="button"
-              onPress={() =>
-                zoomUserImage(
-                  image(),
-                  totalCount() > 1
-                    ? tr(`Image ${index() + 1} of ${totalCount()}`, `图片 ${index() + 1} / ${totalCount()}`)
-                    : undefined,
-                )
-              }
+              onPress={() => {
+                const local = mediaItems();
+                const picked = local[index()];
+                if (picked) openMediaZoom(picked, { gallery: getStream?.(), fallbackGallery: local });
+              }}
               onContextMenu={props.onContextMenu}
               accessibilityLabel={
                 totalCount() > 1
@@ -595,12 +589,14 @@ function fileAttachmentToMedia(file: FileAttachment, id: string): MediaItem {
   };
 }
 
-function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
+function UserRow(props: { row: DisplayUserRow }) {
   // The fork command names a message by its place among the user's messages on screen.
   const ordinal = () =>
     transcriptRows()
       .filter((row) => row.kind === "user")
       .findIndex((row) => row.id === props.row.id);
+  const sms = () => props.row.sms;
+  const isSms = () => Boolean(sms());
   const open = () => isOpen(props.row.id, false);
   /** The message as its words, attached documents, and attached files (`lib/doc-wire.ts`, `lib/media.ts`); read again only when the text is another. */
   let readText: string | undefined;
@@ -617,7 +613,7 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   };
   const said = () => parts().said;
   const fileMedia = () => parts().files.map((file, idx) => fileAttachmentToMedia(file, `${props.row.id}:att:${idx}`));
-  const measureKey = () => `${props.row.id}:${readingSize()}`;
+  const measureKey = () => `${userTextSig(said())}:${readingSize()}`;
   const foldable = () => {
     const measured = userLineCounts()[measureKey()];
     if (measured !== undefined) return measured > USER_FOLD_LINES;
@@ -660,6 +656,12 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   });
   cleanup(() => void bubbleOpacity.stop());
 
+  const smsEntrance = useSmsBubbleEntrance(
+    () => props.row.id,
+    () => "right",
+    { enabled: isSms },
+  );
+
   const hostNode = signal<ViewRef | undefined>(undefined);
   effect(() => {
     const rowId = props.row.id;
@@ -675,6 +677,15 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
   const missingImages = () => Math.max(0, props.row.images - imageBlocks().length);
   const hasImages = () => imageBlocks().length > 0 || missingImages() > 0;
   const hasBubble = () => Boolean(said()) || parts().docs.length > 0;
+
+  const smsBubbleRadius = () => {
+    const slot = sms();
+    if (!slot) return "rounded-2xl rounded-br-md";
+    if (slot.first && slot.last) return "rounded-[18px] rounded-br-[5px]";
+    if (slot.first) return "rounded-[18px] rounded-br-[6px]";
+    if (slot.last) return "rounded-[18px] rounded-tr-[6px] rounded-br-[5px]";
+    return "rounded-[18px] rounded-r-[6px]";
+  };
 
   const contextMenu = (e: { pagePosition: { x: number; y: number } }) =>
     Menu.popup(
@@ -693,117 +704,187 @@ function UserRow(props: { row: Extract<Row, { kind: "user" }> }) {
 
   return (
     <View ref={(node: ViewRef) => hostNode.set(node)} class="group items-end">
-      <View class="max-w-[70%] items-end gap-1.5" style={{ opacity: bubbleOpacity }}>
-        <If when={hasImages()}>
-          <UserImages images={imageBlocks()} missing={missingImages()} onContextMenu={contextMenu} />
-        </If>
-        <If when={fileMedia().length > 0}>
-          <MediaGallery items={fileMedia()} compact align="end" />
-        </If>
-        <If when={hasBubble()}>
-          <View
-            testID="message-bubble"
-            class="max-w-full gap-1.5 rounded-2xl rounded-br-md corner-squircle border-[0.5px] border-hairline bg-secondary px-4 py-2.5"
-            selectable
-            onContextMenu={contextMenu}
-          >
-            <If when={said()}>
-              {/* While folded the whole message takes the press; while open it is plain selectable text again. */}
-              <View
-                role={folded() ? "button" : undefined}
-                onPress={folded() ? fold : undefined}
-                accessibilityState={folded() ? { expanded: false } : undefined}
-              >
-                <Text
-                  class={`${readingType()} text-secondary-foreground ${folded() ? "line-clamp-6" : ""}`}
-                  style={folded() ? { maskImage: "linear-gradient(to bottom, black 64%, transparent 94%)" } : undefined}
-                  onTextLayout={(e) => {
-                    const n = e.lines.length;
-                    // Fewer lines than the text's own breaks (or a zero-height headless stub box) is not a real layout pass.
-                    if (n < hardBreakLines(said()) || (n === 1 && (e.lines[0]?.bounds.size.height ?? 0) === 0)) return;
-                    if (folded() && n >= USER_FOLD_LINES) return;
-                    const key = measureKey();
-                    if (n !== userLineCounts()[key]) userLineCounts.update((all) => ({ ...all, [key]: n }));
-                  }}
-                >
-                  {said()}
-                </Text>
-              </View>
-            </If>
-            {/* A document that rode on the message is named, not printed: its words are in the document, a press away. */}
-            <Each of={parts().docs} key="index">
-              {(doc) => (
+      <View
+        class={`${isSms() ? "max-w-[72%]" : "max-w-[70%]"} items-end`}
+        style={isSms() ? smsEntrance : undefined}
+      >
+        <View class="max-w-full items-end gap-1.5" style={{ opacity: bubbleOpacity }}>
+          <If when={hasImages()}>
+            <UserImages rowId={props.row.id} images={imageBlocks()} missing={missingImages()} onContextMenu={contextMenu} />
+          </If>
+          <If when={fileMedia().length > 0}>
+            <MediaGallery items={fileMedia()} compact align="end" />
+          </If>
+          <If when={hasBubble()}>
+            <View
+              testID="message-bubble"
+              class={
+                isSms()
+                  ? `relative max-w-full gap-1.5 ${smsBubbleRadius()} corner-squircle bg-brand px-3.5 py-2`
+                  : "max-w-full gap-1.5 rounded-2xl rounded-br-md corner-squircle border-[0.5px] border-hairline bg-secondary px-4 py-2.5"
+              }
+              selectable
+              onContextMenu={contextMenu}
+            >
+              <If when={sms()?.last}>
+                <BubbleTail side="right" tone="brand" />
+              </If>
+              <If when={said()}>
+                {/* While folded the whole message takes the press; while open it is plain selectable text again. */}
                 <View
-                  testID="message-doc"
-                  role="button"
-                  onPress={() => void openDocIfThere(doc().path)}
-                  tooltip={tip(tr("Open the document", "打开文档"))}
-                  class={`group -mx-1 select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle px-1 py-0.5 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-accent`}
+                  role={folded() ? "button" : undefined}
+                  onPress={folded() ? fold : undefined}
+                  accessibilityState={folded() ? { expanded: false } : undefined}
                 >
-                  <Icon name="file" size={14} tone="muted-foreground" />
-                  <Text class={`shrink truncate ${uiType("xs")} text-muted-foreground transition-colors duration-100 group-hover:text-foreground`}>
-                    {(doc().excerpt ? "" : titleLine(doc().text, true)) || docTabTitle(doc().path)}
-                    {doc().excerpt ? tr(" · selection", " · 选中的内容") : ""}
+                  <Text
+                    class={`${readingType()} ${isSms() ? "text-brand-foreground" : "text-secondary-foreground"} ${folded() ? "line-clamp-6" : ""}`}
+                    style={folded() ? { maskImage: "linear-gradient(to bottom, black 64%, transparent 94%)" } : undefined}
+                    onTextLayout={(e) => {
+                      const n = e.lines.length;
+                      // Fewer lines than the text's own breaks (or a zero-height headless stub box) is not a real layout pass.
+                      if (n < hardBreakLines(said()) || (n === 1 && (e.lines[0]?.bounds.size.height ?? 0) === 0)) return;
+                      if (folded() && n >= USER_FOLD_LINES) return;
+                      const key = measureKey();
+                      if (n !== userLineCounts()[key]) {
+                        userLineCounts.update((all) => {
+                          const keys = Object.keys(all);
+                          if (keys.length >= USER_LINE_COUNTS_LIMIT) {
+                            const trimmed: Record<string, number> = {};
+                            for (let i = keys.length - Math.floor(USER_LINE_COUNTS_LIMIT / 2); i < keys.length; i++) {
+                              trimmed[keys[i]] = all[keys[i]];
+                            }
+                            trimmed[key] = n;
+                            return trimmed;
+                          }
+                          return { ...all, [key]: n };
+                        });
+                      }
+                    }}
+                  >
+                    {said()}
                   </Text>
                 </View>
-              )}
-            </Each>
-            <If when={foldable()}>
-              <View
-                role="button"
-                onPress={fold}
-                accessibilityState={{ expanded: open() }}
-                accessibilityLabel={open() ? tr("Collapse message", "收起消息") : tr("Expand message", "展开消息")}
-                class={`-mx-1 -mb-1 h-5 select-none items-center justify-center rounded-md corner-squircle ${PRESS} ${FOCUS_RING}`}
-              >
+              </If>
+              {/* A document that rode on the message is named, not printed: its words are in the document, a press away. */}
+              <Each of={parts().docs} key="index">
+                {(doc) => (
+                  <View
+                    testID="message-doc"
+                    role="button"
+                    onPress={() => void openDocIfThere(doc().path)}
+                    tooltip={tip(tr("Open the document", "打开文档"))}
+                    class={`group -mx-1 select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle px-1 py-0.5 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} ${
+                      isSms() ? "hover:bg-brand-foreground/15" : "hover:bg-accent"
+                    }`}
+                  >
+                    <Icon name="file" size={14} tone={isSms() ? "brand-foreground" : "muted-foreground"} />
+                    <Text
+                      class={`shrink truncate ${uiType("xs")} transition-colors duration-100 ${
+                        isSms() ? "text-brand-foreground/85 group-hover:text-brand-foreground" : "text-muted-foreground group-hover:text-foreground"
+                      }`}
+                    >
+                      {(doc().excerpt ? "" : titleLine(doc().text, true)) || docTabTitle(doc().path)}
+                      {doc().excerpt ? tr(" · selection", " · 选中的内容") : ""}
+                    </Text>
+                  </View>
+                )}
+              </Each>
+              <If when={foldable()}>
                 <View
-                  class={`transition-transform duration-200 ease-out-quint motion-reduce:transition-none ${open() ? "rotate-180" : ""}`}
+                  role="button"
+                  onPress={fold}
+                  accessibilityState={{ expanded: open() }}
+                  accessibilityLabel={open() ? tr("Collapse message", "收起消息") : tr("Expand message", "展开消息")}
+                  class={`-mx-1 -mb-1 h-5 select-none items-center justify-center rounded-md corner-squircle ${PRESS} ${FOCUS_RING}`}
                 >
-                  <Icon name="chevronDown" size={12} tone="muted-foreground" />
+                  <View
+                    class={`transition-transform duration-200 ease-out-quint motion-reduce:transition-none ${open() ? "rotate-180" : ""}`}
+                  >
+                    <Icon name="chevronDown" size={12} tone={isSms() ? "brand-foreground" : "muted-foreground"} />
+                  </View>
                 </View>
+              </If>
+            </View>
+          </If>
+        </View>
+      </View>
+      <If
+        when={isSms()}
+        else={
+          /* Shown while the pointer is on the message (or just after a copy), so the bubbles stay quiet. */
+          <View class="h-6 select-none flex-row items-center gap-1.5 pt-0.5">
+            {/* A waiting message is still the reader's: each one is taken back from its own bubble, to write again or to drop. */}
+            <If when={queued()}>
+              <View
+                class="flex-row items-center gap-1 pr-1"
+                accessibilityLabel={followsUp() ? tr("Follow-up", "追问") : tr("Steering", "引导")}
+                tooltip={tip(followsUp() ? tr("Follow-up: sent when the run is done", "追问：本轮结束后发送") : tr("Steering: sent at the run's next step", "引导：在本轮的下一步发送"))}
+              >
+                <Icon name={followsUp() ? "queue" : "steer"} size={12} tone="subtle" />
+                <Text class={`${uiType("xs")} text-subtle`}>{tr("Queued", "排队中")}</Text>
               </View>
+              <IconButton
+                icon="pencil"
+                tone="subtle"
+                size="sm"
+                tipPlacement="bottom"
+                label={tr("Edit queued message", "编辑排队消息")}
+                onPress={() => recallQueuedRow(props.row, true)}
+              />
+              <IconButton
+                icon="x"
+                tone="subtle"
+                size="sm"
+                tipPlacement="bottom"
+                label={tr("Remove from queue", "从队列中移除")}
+                onPress={() => recallQueuedRow(props.row, false)}
+              />
+            </If>
+            <If when={props.row.text}>
+              <CopyButton
+                id={props.row.id}
+                text={props.row.text}
+                label={tr("Copy message", "复制消息")}
+                class={`-mr-1 transition-opacity duration-150 motion-reduce:transition-none ${HOVER_REVEAL}`}
+              />
             </If>
           </View>
-        </If>
-      </View>
-      {/* Shown while the pointer is on the message (or just after a copy), so the bubbles stay quiet. */}
-      <View class="h-6 select-none flex-row items-center gap-1.5 pt-0.5">
-        {/* A waiting message is still the reader's: each one is taken back from its own bubble, to write again or to drop. */}
+        }
+      >
         <If when={queued()}>
-          <View
-            class="flex-row items-center gap-1 pr-1"
-            accessibilityLabel={followsUp() ? tr("Follow-up", "追问") : tr("Steering", "引导")}
-            tooltip={tip(followsUp() ? tr("Follow-up: sent when the run is done", "追问：本轮结束后发送") : tr("Steering: sent at the run's next step", "引导：在本轮的下一步发送"))}
-          >
-            <Icon name={followsUp() ? "queue" : "steer"} size={12} tone="subtle" />
-            <Text class={`${uiType("xs")} text-subtle`}>{tr("Queued", "排队中")}</Text>
+          <View class="h-6 select-none flex-row items-center gap-1.5 pt-0.5">
+            <View
+              class="flex-row items-center gap-1 pr-1"
+              accessibilityLabel={followsUp() ? tr("Follow-up", "追问") : tr("Steering", "引导")}
+              tooltip={tip(followsUp() ? tr("Follow-up: sent when the run is done", "追问：本轮结束后发送") : tr("Steering: sent at the run's next step", "引导：在本轮的下一步发送"))}
+            >
+              <Icon name={followsUp() ? "queue" : "steer"} size={12} tone="subtle" />
+              <Text class={`${uiType("2xs")} text-subtle`}>{tr("Queued", "排队中")}</Text>
+            </View>
+            <IconButton
+              icon="pencil"
+              tone="subtle"
+              size="sm"
+              tipPlacement="bottom"
+              label={tr("Edit queued message", "编辑排队消息")}
+              onPress={() => recallQueuedRow(props.row, true)}
+            />
+            <IconButton
+              icon="x"
+              tone="subtle"
+              size="sm"
+              tipPlacement="bottom"
+              label={tr("Remove from queue", "从队列中移除")}
+              onPress={() => recallQueuedRow(props.row, false)}
+            />
           </View>
-          <IconButton
-            icon="pencil"
-            tone="subtle"
-            size="sm"
-            tipPlacement="bottom"
-            label={tr("Edit queued message", "编辑排队消息")}
-            onPress={() => recallQueuedRow(props.row, true)}
-          />
-          <IconButton
-            icon="x"
-            tone="subtle"
-            size="sm"
-            tipPlacement="bottom"
-            label={tr("Remove from queue", "从队列中移除")}
-            onPress={() => recallQueuedRow(props.row, false)}
-          />
         </If>
-        <If when={props.row.text}>
-          <CopyButton
-            id={props.row.id}
-            text={props.row.text}
-            label={tr("Copy message", "复制消息")}
-            class={`-mr-1 transition-opacity duration-150 motion-reduce:transition-none ${HOVER_REVEAL}`}
-          />
+        <If when={!queued() && sms()?.receipt}>
+          <Text testID="sms-receipt" class={`select-none pr-1 pt-0.5 ${uiType("2xs")} font-medium text-subtle`}>
+            {sms()?.receipt === "read" ? tr("Read", "已读") : tr("Delivered", "已送达")}
+          </Text>
         </If>
-      </View>
+      </If>
     </View>
   );
 }
@@ -1240,35 +1321,67 @@ function ActivityView(props: { row: ActivityRow; maxHeight: number }) {
     return added > 0 || removed > 0 ? { added, removed } : undefined;
   };
 
+  const detailsMask = signal<string | undefined>(undefined);
+  let detailsY = 0;
+  let detailsViewHeight = 0;
+  let detailsContentHeight = 0;
+  const syncDetailsMask = () => {
+    const next = edgeFadeMask(detailsViewHeight, detailsY, detailsContentHeight - detailsViewHeight - detailsY);
+    if (next !== untracked(detailsMask)) detailsMask.set(next);
+  };
+  const detailsScrolled = (e: ScrollEvent) => {
+    detailsY = e.offset.y;
+    detailsViewHeight = e.size.height;
+    detailsContentHeight = e.contentSize.height;
+    syncDetailsMask();
+  };
+
   return (
     <Collapsible
       open={open() && hasBody()}
       reveal
       content={
-        <Scroll testID="activity-details" style={{ maxHeight: props.maxHeight }}>
-          <If
-            when={only()}
-            else={
-              <View class="mb-1 gap-0.5 py-0.5">
-                <Each of={props.row.steps} key={(step) => step.id}>
-                  {(step) => (
-                    <If
-                      when={step().kind === "thinking" ? (step() as Extract<Row, { kind: "thinking" }>) : undefined}
-                      else={<ToolCallRow row={step() as ToolRow} compact />}
-                    >
-                      {(thinking) => <ThinkingRow row={thinking()} compact defaultOpen={props.row.tools.length === 0} />}
-                    </If>
-                  )}
-                </Each>
-              </View>
-            }
+        <Scroll
+          testID="activity-details"
+          style={{ maxHeight: props.maxHeight, maskImage: detailsMask() }}
+          scrollEventThrottle={16}
+          onLayout={(e) => {
+            detailsViewHeight = e.bounds.size.height;
+            syncDetailsMask();
+          }}
+          onScroll={detailsScrolled}
+        >
+          <View
+            class="w-full"
+            onLayout={(e) => {
+              detailsContentHeight = e.bounds.size.height;
+              syncDetailsMask();
+            }}
           >
-            {(step) => (
-              <If when={step().kind === "thinking" ? (step() as Extract<Row, { kind: "thinking" }>) : undefined} else={<ToolDetail row={step() as ToolRow} insetClass="ml-0" />}>
-                {(thinking) => <ReasoningBody text={thinking().text} />}
-              </If>
-            )}
-          </If>
+            <If
+              when={only()}
+              else={
+                <View class="mb-1 gap-0.5 py-0.5">
+                  <Each of={props.row.steps} key={(step) => step.id}>
+                    {(step) => (
+                      <If
+                        when={step().kind === "thinking" ? (step() as Extract<Row, { kind: "thinking" }>) : undefined}
+                        else={<ToolCallRow row={step() as ToolRow} compact />}
+                      >
+                        {(thinking) => <ThinkingRow row={thinking()} compact defaultOpen={props.row.tools.length === 0} />}
+                      </If>
+                    )}
+                  </Each>
+                </View>
+              }
+            >
+              {(step) => (
+                <If when={step().kind === "thinking" ? (step() as Extract<Row, { kind: "thinking" }>) : undefined} else={<ToolDetail row={step() as ToolRow} insetClass="ml-0" />}>
+                  {(thinking) => <ReasoningBody text={thinking().text} />}
+                </If>
+              )}
+            </If>
+          </View>
         </Scroll>
       }
     >
@@ -1476,6 +1589,7 @@ function extractDeliveryMedia(markdown: string, cwd?: string, home?: string, row
 
 /** An answer delivered back from another session (`<pipi-message>`): one labelled divider, its text unfolds. */
 function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
+  const getStream = MediaStreamContext();
   const open = () => isOpen(props.row.id, false);
   const label = () =>
     props.row.status === "blocked"
@@ -1504,16 +1618,19 @@ function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
             }}
             onImagePress={({ image }) => {
               const resolved = resolveMediaTarget(image.src, workspacePath(), backend().home());
-              openMediaZoom({
-                id: `del-img:${image.src}`,
-                kind: "image",
-                title: image.title || image.alt || resolved?.title || "image",
-                ...(resolved?.path ? { path: resolved.path } : {}),
-                src: resolved?.src ?? image.src,
-                ...(resolved?.remoteUrl ? { remoteUrl: resolved.remoteUrl } : {}),
-                ...(resolved?.mimeType ? { mimeType: resolved.mimeType } : {}),
-                ...(resolved?.data ? { data: resolved.data } : {}),
-              });
+              openMediaZoom(
+                {
+                  id: `del-img:${image.src}`,
+                  kind: "image",
+                  title: image.title || image.alt || resolved?.title || "image",
+                  ...(resolved?.path ? { path: resolved.path } : {}),
+                  src: resolved?.src ?? image.src,
+                  ...(resolved?.remoteUrl ? { remoteUrl: resolved.remoteUrl } : {}),
+                  ...(resolved?.mimeType ? { mimeType: resolved.mimeType } : {}),
+                  ...(resolved?.data ? { data: resolved.data } : {}),
+                },
+                { gallery: getStream?.(), fallbackGallery: media() },
+              );
             }}
           />
           <If when={media().length > 0}>
@@ -1547,8 +1664,8 @@ function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
   );
 }
 
-/** A row of the chat's list: the projection's, with each reply as a row per block (and its actions after it, once finished). */
-export type ChatRow = Exclude<DisplayRow, { kind: "text" }> | ProseRow | ReplyActionsRow;
+/** A row of the chat's list: the projection's, with each reply as a row per block (or per SMS bubble in Pip mode). */
+export type ChatRow = Exclude<DisplayRow, { kind: "text" }> | ProseRow | PipBubbleRow | ReplyActionsRow;
 
 /** The room around a row: turns are set apart, a turn's steps sit close, a reply's blocks a line apart. */
 const SPACING: Record<ChatRow["kind"], string> = {
@@ -1557,10 +1674,11 @@ const SPACING: Record<ChatRow["kind"], string> = {
   // Selection drops target line boxes only, so room between a reply's blocks is
   // where a drag dead-ends back to the block before; keep it thin.
   prose: "py-0.5",
+  "pip-bubble": "py-[1.5px]",
   actions: "pb-1",
   media: "py-2",
-  "pip-sessions": "py-1.5",
-  "pip-footer": "pb-1",
+  "pip-sessions": "pt-1.5 pb-0.5",
+  "pip-footer": "pt-0.5 pb-1",
   thinking: "py-0.5",
   activity: "py-0.5",
   bash: "py-0.5",
@@ -1586,9 +1704,11 @@ export function TranscriptRow(props: { row: ChatRow; activityMaxHeight: number }
     isStreamingRow,
     () => {
       if (fold.isFolding()) return true;
+      // SMS bubbles (Pip incoming bubbles and outgoing user SMS bubbles) run their own
+      // corner-anchored iMessage pop-in animation (`useSmsBubbleEntrance`).
+      if (props.row.kind === "pip-bubble") return true;
+      if (props.row.kind === "user" && props.row.sms) return true;
       if (props.row.kind === "prose") {
-        // Normal coding mode settles prose through its streaming veil; Pip IM mode delivers
-        // complete messages that glide in once (skipping seeded historical rows on session switch).
         return !props.row.pip || isRowSeen(props.row.rowId);
       }
       return false;
@@ -1596,20 +1716,44 @@ export function TranscriptRow(props: { row: ChatRow; activityMaxHeight: number }
     () => props.row.kind === "user" || Boolean(pipSlot()),
   );
   const of = <K extends ChatRow["kind"]>(kind: K) => (props.row.kind === kind ? (props.row as Extract<ChatRow, { kind: K }>) : undefined);
-  const spacing = () => (pipSlot()?.lead ? "pt-4 pb-0.5" : SPACING[props.row.kind]);
+  const spacing = () => {
+    if (props.row.kind === "user" && props.row.sms) {
+      return props.row.sms.first ? "pt-3.5 pb-[1.5px]" : "py-[1.5px]";
+    }
+    if (props.row.kind === "pip-bubble") {
+      return props.row.pip.lead ? "pt-3.5 pb-[1.5px]" : "py-[1.5px]";
+    }
+    if (pipSlot()?.lead) return "pt-3.5 pb-0.5";
+    return SPACING[props.row.kind];
+  };
   const renderBody = () => (
     <>
       <If when={of("user")}>{(row) => <UserRow row={row()} />}</If>
       <If when={of("turn")}>{(row) => <TurnHeaderView row={row()} />}</If>
       <If when={of("activity")}>{(row) => <ActivityView row={row()} maxHeight={props.activityMaxHeight} />}</If>
       <If when={of("prose")}>{(row) => <ProseBlock row={row()} />}</If>
+      <If when={of("pip-bubble")}>
+        {(row) => (
+          <PipBubbleView
+            row={row()}
+            processOpen={() => {
+              const turnId = row().pip.meta?.turnId;
+              return turnId ? (chosen(turnId) ?? false) : false;
+            }}
+            onToggleProcess={() => {
+              const turnId = row().pip.meta?.turnId;
+              if (turnId) toggleTurn(turnId, chosen(turnId) ?? false, false);
+            }}
+          />
+        )}
+      </If>
       <If when={of("media")}>{(row) => <MediaGallery title={row().title} items={row().items} />}</If>
       <If when={of("pip-sessions")}>{(row) => <PipSessionsView row={row()} />}</If>
       <If when={of("pip-footer")}>
         {(row) => (
           <PipFooterView
             row={row()}
-            renderCopy={(id, text) => <CopyButton id={id} text={text} label={tr("Copy reply", "复制回复")} />}
+            renderCopy={(id, text, cls) => <CopyButton id={id} text={text} label={tr("Copy reply", "复制回复")} class={cls} />}
           />
         )}
       </If>
@@ -1622,6 +1766,11 @@ export function TranscriptRow(props: { row: ChatRow; activityMaxHeight: number }
     </>
   );
 
+  // `pip-bubble` owns its own bottom-left avatar gutter; other Pip rows (media,
+  // delegated session cards, footer) align cleanly to the same 40pt bubble edge.
+  const needsOuterPipAvatar = () => props.row.kind !== "pip-bubble" && Boolean(pipSlot()?.tail);
+  const needsOuterPipIndent = () => props.row.kind !== "pip-bubble" && Boolean(pipSlot()?.indent);
+
   return (
     <Collapsible
       open={fold.open()}
@@ -1630,10 +1779,10 @@ export function TranscriptRow(props: { row: ChatRow; activityMaxHeight: number }
         <View class={`w-full max-w-180 self-center ${spacing()}${fold.open() ? "" : " pointer-events-none"}`} style={entrance}>
           <View style={fold.style} class={!isPipProcess() && indentedProcess() ? "pl-7" : undefined}>
             <If
-              when={pipSlot()?.lead}
+              when={needsOuterPipAvatar()}
               else={
                 <If
-                  when={pipSlot()?.indent}
+                  when={needsOuterPipIndent()}
                   else={
                     <If when={isPipProcess()} else={renderBody()}>
                       <View class="pl-10">
@@ -1646,8 +1795,8 @@ export function TranscriptRow(props: { row: ChatRow; activityMaxHeight: number }
                 </If>
               }
             >
-              <View class="flex-row items-start gap-3">
-                <View class="w-7 shrink-0 pt-0.5">
+              <View class="flex-row items-end gap-3">
+                <View class="w-7 shrink-0 pb-0.5">
                   <PipAvatarBadge
                     rowId={() => props.row.id}
                     turnMeta={() => pipSlot()?.meta}

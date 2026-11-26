@@ -174,8 +174,15 @@ function ModelConfigPicker(props: { config: SessionModelConfig; onOpen?: () => v
 
 /** Every model-adjacent selector the active engine reported, beside the model itself as ACP asks. */
 export function ModelConfigPickers(props: { onOpen?: () => void }) {
+  let held: SessionModelConfig[] = [];
+  const configs = () => {
+    const now = sessionState()?.modelConfigs;
+    // As the model and thinking chips do: hold reported chips while an agent starts on a switch.
+    if (!now && held.length > 0 && sidecarPhase().name === "starting") return held;
+    return (held = now ?? []);
+  };
   return (
-    <Each of={sessionState()?.modelConfigs ?? []} key={(config) => config.id}>
+    <Each of={configs()} key={(config) => config.id}>
       {(config) => <ModelConfigPicker config={config()} onOpen={props.onOpen} />}
     </Each>
   );

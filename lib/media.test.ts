@@ -4,12 +4,15 @@ import { titleWords } from "./doc-wire";
 import { PENDING_LINK_URL } from "./mend";
 import {
   classifyMediaKind,
+  collectTranscriptImages,
   composeFileMessage,
   extensionLabel,
   extractBlockMedia,
+  extractMarkdownImages,
   extractMarkdownMediaPaths,
   extractPresentedMedia,
   extractToolResultMedia,
+  findMediaImageIndex,
   formatBytes,
   formatMediaDuration,
   isPresentFilesTool,
@@ -252,4 +255,75 @@ test("extractPresentedMedia handles Antigravity ACP args fallback and renamed pi
       "/repo",
     ),
   ).toBeUndefined();
+});
+
+test("extractMarkdownImages ignores code blocks/spans and remote URLs while keeping local embeds in order", () => {
+  const md = [
+    "Here is the first shot ![Light](./shots/light.png) and inline `![Fake](./ignored.png)`.",
+    "",
+    "```markdown",
+    "![CodeExample](./code.png)",
+    "```",
+    "",
+    '![Remote](https://example.com/remote.png) ![Dark](<./shots/dark mode.png> "Dark Mode")',
+  ].join("\n");
+  const imgs = extractMarkdownImages(md, "/repo");
+  expect(imgs.map((i) => ({ path: i.path, title: i.title }))).toEqual([
+    { path: "/repo/shots/light.png", title: "Light" },
+    { path: "/repo/shots/dark mode.png", title: "Dark Mode" },
+  ]);
+});
+
+test("collectTranscriptImages gathers stream images in chronological order and deduplicates turn echoes", () => {
+  const rows = [
+    {
+      kind: "user" as const,
+      id: "u1",
+      text: composeFileMessage("Check these", [{ path: "/repo/att.png", name: "att.png", kind: "image" as const }]),
+      images: 1,
+      imageBlocks: [{ type: "image" as const, data: "iVBORw0KGgo=", mimeType: "image/png" }],
+    },
+    {
+      kind: "tool" as const,
+      id: "t_read",
+      name: "read_file",
+      args: { path: "/repo/hidden-read.png" },
+      status: "done" as const,
+      output: "",
+      images: 1,
+      imageBlocks: [{ type: "image" as const, data: "AAAA", mimeType: "image/png" }],
+    },
+    {
+      kind: "media" as const,
+      id: "m1",
+      title: "Previews",
+      items: [
+        { id: "m1:0", kind: "image" as const, title: "Light", path: "/repo/light.png", src: "/repo/light.png" },
+        { id: "m1:1", kind: "image" as const, title: "Dark", path: "/repo/dark.png", src: "/repo/dark.png" },
+      ],
+    },
+    {
+      kind: "tool" as const,
+      id: "t_present",
+      name: "present_files",
+      args: { files: [{ path: "/repo/light.png", title: "Light Echo" }] },
+      status: "done" as const,
+      output: "",
+      images: 0,
+    },
+    {
+      kind: "text" as const,
+      id: "a1",
+      text: "Compare ![Summary](/repo/summary.png) and ![Missing](/repo/missing.png)",
+      streaming: false,
+      final: true,
+    },
+  ];
+
+  const stream = collectTranscriptImages(rows, {
+    cwd: "/repo",
+    isMissingPath: (p) => p === "/repo/missing.png",
+  });
+  expect(stream.map((i) => i.title)).toEqual(["Image", "att.png", "Summary", "Light", "Dark"]);
+  expect(findMediaImageIndex(stream, { id: "any", kind: "image", title: "Dark", path: "/repo/dark.png" })).toBe(4);
 });

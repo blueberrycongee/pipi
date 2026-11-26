@@ -119,3 +119,14 @@ test("the bezier sampler is the curve the compositor plays", () => {
     prev = v;
   }
 });
+
+test("in a larger stage viewport, fitted content centers and zoomed content expands across the whole stage", () => {
+  const content = { width: 600, height: 400 };
+  const stage = { width: 1200, height: 700 };
+  // At fit (z = 1), content centers inside the wider stage.
+  expect(clampPan({ z: 1, tx: 0, ty: 0 }, content, stage)).toEqual({ z: 1, tx: 300, ty: 150 });
+  // Zoomed 2× (content 1200×800): width exactly fills the 1200pt stage (tx = 0), height pans in [-100, 0].
+  const zoomed = zoomAtPoint({ z: 1, tx: 300, ty: 150 }, 2, 600, 350, content, stage);
+  expect(zoomed).toEqual({ z: 2, tx: 0, ty: -50 });
+  expect(clampPan({ z: 2, tx: 80, ty: -200 }, content, stage)).toEqual({ z: 2, tx: 0, ty: -100 });
+});
