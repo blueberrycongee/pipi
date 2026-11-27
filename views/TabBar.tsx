@@ -13,6 +13,7 @@ import {
   currentTitle,
   currentView,
   isSwitching,
+  isPersonaSession,
   isCurrentSessionArchived,
   isRenaming,
   openDaemonSession,
@@ -1241,7 +1242,7 @@ export function TabBar() {
               class="shrink-0 bg-muted text-muted-foreground"
             />
           </Presence>
-          <Presence show={!!worktree()}>
+          <Presence show={!!worktree() && !isPersonaSession()}>
             <If when={worktree()}>
               {(wt) => (
                 <BaseButton

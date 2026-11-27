@@ -4,7 +4,6 @@ import { runtimeModeRank } from "../agents/catalog";
 import type { RuntimeMode } from "../agents/types";
 import { basename, tildePath } from "../lib/format";
 import { DYNAMIC_WALLPAPER_ENABLED, isPausableWallpaper, WALLPAPER_PRESET_META, WALLPAPER_PRESETS } from "../lib/wallpaper";
-import { sessionTitle } from "../pi/sessions";
 import {
   activeAgent,
   activeAgentId,
@@ -25,6 +24,7 @@ import {
   currentView,
   currentRuntimeCeiling,
   daemonSessions,
+  daemonSessionTitle,
   duplicateSession,
   exportHtml,
   gitWorkspaceInfo,
@@ -36,6 +36,7 @@ import {
   restartPi,
   runtimeMode,
   savedSessions,
+  sessionDisplayTitle,
   sessionParentOf,
   sessionState,
   setCompareOpen,
@@ -222,7 +223,7 @@ export function Palette() {
         .map(({ cwd, session }): Action => {
           const folder = basename(cwd);
           const multi = recentWorkspaces().length > 1;
-          const rawTitle = sessionTitle(session, tr("New session", "新会话"));
+          const rawTitle = sessionDisplayTitle(session, tr("New session", "新会话"));
           const parent = sessionParentOf(session.path);
           const title = parent ? `${parent.title} › ${rawTitle}` : rawTitle;
           return {
@@ -287,12 +288,13 @@ export function Palette() {
           const folder = basename(cwd);
           const multi = recentWorkspaces().length > 1;
           const parent = ds.parentId ? daemonSessions().find((p) => p.id === ds.parentId) : undefined;
-          const title = parent ? `${parent.title} › ${ds.title}` : ds.title;
+          const ownTitle = daemonSessionTitle(ds);
+          const title = parent ? `${daemonSessionTitle(parent)} › ${ownTitle}` : ownTitle;
           return {
             id: `daemon-session:${ds.id}`,
             label: multi && folder ? `${folder} / ${title}` : title,
             group: tr("Sessions", "历史会话"),
-            keywords: [folder, title, ds.title, "session"],
+            keywords: [folder, title, ownTitle, "session"],
             icon: "message",
             checked: ds.id === currentDaemonId(),
             run: () => openDaemonSessionTab(ds.id),
@@ -303,7 +305,7 @@ export function Palette() {
         .map(({ cwd, session }): Action => {
           const folder = basename(cwd);
           const multi = recentWorkspaces().length > 1;
-          const title = sessionTitle(session, tr("New session", "新会话"));
+          const title = sessionDisplayTitle(session, tr("New session", "新会话"));
           return {
             id: `archived-session:${cwd}:${session.path}`,
             label: multi && folder ? `${folder} / ${title}` : title,

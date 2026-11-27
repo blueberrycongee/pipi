@@ -19,12 +19,14 @@ import {
   currentChildSessions,
   currentDaemonSession,
   daemonSessionOfId,
+  daemonSessionTitle,
   draftModel,
   headingDaemonSession,
   isLeavingSession,
   isRunning,
   openDaemonSession,
   pendingDialog,
+  personaAvatar,
   personaDisplayName,
   pipMood,
   runStart,
@@ -44,6 +46,7 @@ import {
 } from "../ui/motion";
 import { FOCUS_RING, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { uiHeight, uiType } from "../ui/typography";
+import { PersonaAvatar } from "./PersonaAvatar";
 import { PipBubbleBlocks, type PipBubbleRow } from "./Prose";
 
 const HOVER_OPEN_MS = 100;
@@ -200,6 +203,9 @@ function PipStatusCard(props: {
     >
       {/* Header: status dot + Pip · live phase + elapsed seconds */}
       <View class="flex-row items-center gap-2">
+        <View class="size-5 shrink-0 overflow-hidden rounded-full border-[0.5px] border-hairline bg-card">
+          <PersonaAvatar avatar={personaAvatar} size={20} still testID="pip-status-avatar" />
+        </View>
         <View class={`size-2 shrink-0 rounded-full ${phaseDotClass(status().phase)}`} />
         <Text class={`shrink-0 ${uiType("sm")} font-medium text-foreground`}>{status().name}</Text>
         <Text class={`shrink-0 ${uiType("xs")} text-subtle`}>·</Text>
@@ -434,9 +440,9 @@ export function PipAvatarBadge(props: {
           onMouseEnter={onEnter}
           onMouseLeave={onLeave}
           onPress={onToggle}
-          class={`relative ${boxClass()} shrink-0 select-none items-center justify-center rounded-full border-[0.5px] border-hairline bg-card/90 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:border-hairline-hover hover:bg-card`}
+          class={`relative ${boxClass()} shrink-0 select-none items-center justify-center overflow-hidden rounded-full border-[0.5px] border-hairline bg-card/90 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:border-hairline-hover hover:bg-card`}
         >
-          <Pip size={avatarSize()} mood={props.active ? pipMood() : "idle"} still={!props.active} />
+          <PersonaAvatar avatar={personaAvatar} size={personaAvatar() ? 28 : avatarSize()} mood={props.active ? pipMood() : "idle"} still={!props.active} />
         </View>
       }
     >
@@ -463,8 +469,8 @@ export function PipAvatarBadge(props: {
  * Reserves a constant 48pt (`h-12`) slot so starting and settling a run never
  * shifts the scroll content height.
  */
-export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) => void }) {
-  const isChatActive = () => isRunning() || waitingCount() > 0;
+export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) => void; hold?: () => boolean }) {
+  const isChatActive = () => isRunning() || waitingCount() > 0 || Boolean(props.hold?.());
   const alreadyWorking = untracked(() => isChatActive() && transcriptRows().length > 0);
   const shown = signal(alreadyWorking);
   const cardOpen = signal(false);
@@ -590,7 +596,7 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
  * - Soft neutral gray bubble (`bg-sms-incoming`) with cluster-aware corner radii
  *   and a crisp curved bottom-left tail on the last bubble of the cluster.
  * - Pip's hoverable avatar sits cleanly at the bottom-left beside the final bubble's tail.
- * - New live bubbles pop out from `left bottom` with brisk multi-bubble stagger.
+ * - New live bubbles pop out from `left bottom` as the reveal queue mounts them.
  */
 export function PipBubbleView(props: {
   row: PipBubbleRow;
@@ -604,7 +610,6 @@ export function PipBubbleView(props: {
     () => "left",
     {
       skip: () => Boolean(props.row.edited) || isRowSeen(props.row.rowId),
-      stagger: () => props.row.bubbleIndex,
     },
   );
 
@@ -703,7 +708,7 @@ function PipSessionChip(props: { session: PipDelegatedSession }) {
   const live = () => (props.session.sessionId ? daemonSessionOfId(props.session.sessionId) : undefined);
   const title = () => {
     const ds = live();
-    return (ds?.title && ds.title !== "New session" ? ds.title : undefined) ?? props.session.title;
+    return (ds ? daemonSessionTitle(ds, "") : "") || props.session.title;
   };
   const agent = () => live()?.agentName ?? props.session.agent;
   const status = () => (props.session.failed ? "failed" : live()?.status ?? "idle");

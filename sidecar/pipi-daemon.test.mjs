@@ -1270,6 +1270,13 @@ test("daemon retitles a session from the file it lands on, but keeps a given nam
   ctrl.client.send({ type: "file", sessionId: sid, file: namedFile });
   await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.title === "Named on disk");
 
+  // A delegated envelope on disk titles the file by the task inside it, never by the protocol head.
+  const envelopeFile = writePiFile("envelope.jsonl", [
+    userLine('<pipi-message from="s_pip" title="Pip" agent="Pi" status="idle">\ninspect the sidebar\n</pipi-message>'),
+  ]);
+  ctrl.client.send({ type: "file", sessionId: sid, file: envelopeFile });
+  await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.title === "inspect the sidebar");
+
   // A file that does not exist yet (a minted file that was never written) is no title.
   ctrl.client.send({ type: "file", sessionId: sid, file: path.join(workDir, "ghost.jsonl") });
   await ctrl.waitUntil(() => ctrl.sessions.get(sid)?.title === "New session");
@@ -1280,6 +1287,12 @@ test("daemon retitles a session from the file it lands on, but keeps a given nam
   ctrl.client.send({ type: "file", sessionId: namedId, file: namedFile });
   await ctrl.waitUntil(() => ctrl.sessions.get(namedId)?.file === namedFile);
   assert.equal(ctrl.sessions.get(namedId)?.title, "Named job");
+
+  // Even a mistaken or legacy given title cannot put pipi's transport envelope on screen.
+  const enveloped = await ctrl.call("start_session", {
+    input: { title: '<pipi-message from="s_pip" title="Pip" agent="Pi" status="idle">\ngiven envelope task\n</pipi-message>', agentId: "pi", cwd: workDir },
+  });
+  assert.equal(enveloped.session.title, "given envelope task");
 
   // `new_session` hands the name back: the next conversation tracks its file again.
   ctrl.client.send({ type: "in", sessionId: namedId, line: JSON.stringify({ id: "ns", type: "new_session" }) });
@@ -1820,12 +1833,9 @@ test("the personal agent: one per home, opens each fresh conversation with PERSO
   assert.match(await runCli(["pip"]), new RegExp(`^${id}\\t`));
 });
 
-test("workspaces_list names the app's open projects and the folders sessions ran in, never the personal agent's notes", async (t) => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-workspaces-"));
+test("multiple personal agents keep isolated folders, identities, avatars and deletion protection", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-personas-"));
   const homeDir = path.join(tmp, "home");
-  const openProject = path.join(tmp, "open-project");
-  const ranIn = path.join(tmp, "ran-in");
-  for (const dir of [openProject, ranIn]) fs.mkdirSync(dir, { recursive: true });
   const mockBin = writeMockAgent(tmp);
   const ctrl = await openControl(homeDir, { HOME: tmp });
   t.after(() => {
@@ -1835,8 +1845,114 @@ test("workspaces_list names the app's open projects and the folders sessions ran
     } catch {}
   });
   await configureMockAgents(ctrl, mockBin);
-  await ctrl.call("workspaces", { paths: [openProject, ranIn] });
+
+  // The legacy default stays exactly where existing users already have it.
+  const { session: pip } = await ctrl.call("start_session", { input: { persona: true, personaId: "default", agentId: "pi" } });
+  assert.equal(pip.personaId, "default");
+  assert.equal(pip.title, "Pip");
+  assert.equal(pip.cwd, path.join(homeDir, "persona"));
+
+  // Each custom persona is its own singleton, in its own private folder, with its own files.
+  const { session: nova } = await ctrl.call("start_session", {
+    input: { persona: true, personaId: "nova", personaName: "Nova", personaDescription: "A careful researcher.", agentId: "pi" },
+  });
+  const { session: orbit } = await ctrl.call("start_session", {
+    input: { persona: true, personaId: "orbit", personaName: "Orbit", personaDescription: "A fast implementer.", agentId: "pi" },
+  });
+  const novaDir = path.join(homeDir, "personas", "nova");
+  const orbitDir = path.join(homeDir, "personas", "orbit");
+  assert.equal(nova.cwd, novaDir);
+  assert.equal(orbit.cwd, orbitDir);
+  assert.notEqual(nova.id, orbit.id);
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(novaDir).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(path.join(novaDir, "PERSONA.md")).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(novaDir, "MEMORY.md")).mode & 0o777, 0o600);
+  }
+  assert.match(fs.readFileSync(path.join(novaDir, "PERSONA.md"), "utf8"), /^# Nova$/m);
+  assert.match(fs.readFileSync(path.join(novaDir, "PERSONA.md"), "utf8"), /careful researcher/);
+  assert.match(fs.readFileSync(path.join(orbitDir, "PERSONA.md"), "utf8"), /^# Orbit$/m);
+
+  // Only the same persona is singleton-protected; another persona never is.
+  await assert.rejects(ctrl.call("start_session", { input: { persona: true, personaId: "nova", agentId: "pi" } }), /already runs as/);
+  await assert.rejects(ctrl.call("start_session", { input: { persona: true, personaId: "default", agentId: "pi" } }), /already runs as/);
+
+  // A custom persona's first prompt carries its own persona files, not Pip's.
+  ctrl.client.send({ type: "in", sessionId: nova.id, line: JSON.stringify({ id: "np1", type: "prompt", message: "echo:who" }) });
+  await ctrl.waitUntil(async () => ((await ctrl.readMessages(nova.id)).lastAnswer ?? "").endsWith("echo:who"));
+  const novaAnswer = (await ctrl.readMessages(nova.id)).lastAnswer ?? "";
+  assert.ok(novaAnswer.includes('name="Nova"') && novaAnswer.includes("You are Nova."));
+  assert.ok(novaAnswer.includes("careful researcher"));
+  assert.ok(!novaAnswer.includes("You are Pip."));
+
+  // Renaming updates the live session title and the persona file heading together, and persists in the registry.
+  const renamed = await ctrl.call("persona_update", { sessionId: nova.id, name: "Nebula" });
+  assert.equal(renamed.session.title, "Nebula");
+  assert.match(fs.readFileSync(path.join(novaDir, "PERSONA.md"), "utf8"), /^# Nebula$/m);
+  await ctrl.waitUntil(() => ctrl.sessions.get(nova.id)?.title === "Nebula");
+  await ctrl.waitUntil(() => fs.readFileSync(path.join(homeDir, "sessions.jsonl"), "utf8").includes('"title":"Nebula"'));
+  const registry = fs.readFileSync(path.join(homeDir, "sessions.jsonl"), "utf8");
+  assert.ok(registry.includes('"personaId":"nova"'));
+
+  // Avatar files are copied into the persona's folder (so the source can disappear), kept private, and reset cleanly.
+  const source = path.join(tmp, "source-avatar.png");
+  const bytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  fs.writeFileSync(source, bytes);
+  const withAvatar = await ctrl.call("persona_update", { sessionId: nova.id, avatar: source });
+  assert.equal(withAvatar.session.avatar, path.join(novaDir, "avatar.png"));
+  assert.deepEqual(fs.readFileSync(withAvatar.session.avatar), bytes);
+  fs.unlinkSync(source);
+  assert.ok(fs.existsSync(withAvatar.session.avatar), "the copied avatar survives the source image being removed");
+  if (process.platform !== "win32") assert.equal(fs.statSync(withAvatar.session.avatar).mode & 0o777, 0o600);
+  const reset = await ctrl.call("persona_update", { sessionId: nova.id, avatar: null });
+  assert.equal(reset.session.avatar, undefined);
+  assert.ok(!fs.existsSync(path.join(novaDir, "avatar.png")));
+  await assert.rejects(ctrl.call("persona_update", { sessionId: nova.id, avatar: path.join(tmp, "avatar.exe") }), /png, jpg, jpeg, webp,? or gif/);
+
+  // The default persona is protected. A custom one deletes only its own folder and registry record.
+  await assert.rejects(ctrl.call("persona_delete", { sessionId: pip.id }), /default personal agent/);
+  assert.ok(fs.existsSync(path.join(homeDir, "persona")));
+  await ctrl.call("persona_delete", { sessionId: orbit.id });
+  await ctrl.waitUntil(() => !ctrl.sessions.has(orbit.id));
+  assert.ok(!fs.existsSync(orbitDir));
+  assert.ok(fs.existsSync(novaDir), "another persona's folder is untouched");
+  assert.ok(fs.existsSync(path.join(homeDir, "persona")), "the legacy Pip folder is untouched");
+
+  // Personas never become workspaces, however many of them exist.
+  await ctrl.call("workspaces", { paths: [tmp] });
+  const listed = await ctrl.call("list");
+  assert.ok(listed.sessions.filter((session) => session.persona).length >= 2);
+});
+
+test("workspaces_list names the app's open projects and the folders sessions ran in, never the personal agent's notes", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-workspaces-"));
+  const homeDir = path.join(tmp, "home");
+  const openProject = path.join(tmp, "open-project");
+  const ranIn = path.join(tmp, "ran-in");
+  const pushedWorktree = path.join(tmp, ".pipi-worktrees", "open-project", "pushed-task");
+  const legacyWorktree = path.join(tmp, ".pipi-worktrees", "ran-in", "legacy-task");
+  for (const dir of [openProject, ranIn, pushedWorktree, legacyWorktree]) fs.mkdirSync(dir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+  const ctrl = await openControl(homeDir, { HOME: tmp });
+  t.after(() => {
+    ctrl.client.close();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+  await execFileAsync("git", ["init"], { cwd: ranIn });
+  fs.writeFileSync(path.join(ranIn, "README.md"), "test\n");
+  await execFileAsync("git", ["add", "README.md"], { cwd: ranIn });
+  await execFileAsync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"], { cwd: ranIn });
+  await ctrl.call("workspaces", { paths: [openProject, pushedWorktree, ranIn] });
   const { session: worker } = await ctrl.call("start_session", { input: { title: "work", agentId: "pi", cwd: ranIn } });
+  await ctrl.call("start_session", { input: { title: "legacy worktree", agentId: "pi", cwd: legacyWorktree } });
+  const { session: realWorktree } = await ctrl.call("start_session", { input: { title: "real worktree", agentId: "pi", cwd: ranIn, worktree: true } });
+  await ctrl.waitUntil(() => Boolean(ctrl.sessions.get(realWorktree.id)?.worktree?.baseCwd));
+  const worktreeSession = ctrl.sessions.get(realWorktree.id);
+  assert.equal(fs.realpathSync(worktreeSession.worktree.baseCwd), fs.realpathSync(ranIn));
+  assert.ok(worktreeSession.cwd.includes(`${path.sep}.pipi-worktrees${path.sep}ran-in${path.sep}`));
   const { session: pip } = await ctrl.call("start_session", { input: { persona: true, agentId: "pi" } });
   await ctrl.waitUntil(() => ctrl.sessions.get(pip.id));
 
@@ -1850,12 +1966,13 @@ test("workspaces_list names the app's open projects and the folders sessions ran
   assert.deepEqual(
     workspaces.map((w) => [w.path, w.name, w.open, w.sessions]),
     [
-      [ranIn, "ran-in", true, 1],
+      [ranIn, "ran-in", true, 3],
       [openProject, "open-project", true, 0],
     ],
   );
   assert.ok(workspaces[0].lastActive >= worker.createdAt);
   assert.ok(!workspaces.some((w) => w.path === pip.cwd), "the personal agent's folder is not a project");
+  assert.ok(!workspaces.some((w) => w.path.includes("/.pipi-worktrees/")), "a task checkout is never a project");
 });
 
 test("present_files pushes a direct side-channel presented_media block into external sessions regardless of engine tool echoing", async (t) => {

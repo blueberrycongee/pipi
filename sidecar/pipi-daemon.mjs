@@ -50,6 +50,8 @@ const REGISTRY_FILE = path.join(home, "sessions.jsonl");
 const EXTERNAL_FILE = path.join(home, "external.json");
 const CATALOG_CACHE_FILE = path.join(home, "catalog-cache.json");
 const PERSONA_DIR = path.join(home, "persona");
+const PERSONAS_ROOT = path.join(home, "personas");
+const DEFAULT_PERSONA_ID = "default";
 const CONTROL_TOKEN = crypto.randomBytes(24).toString("hex");
 /** Cloud-hosted ACP agents whose `session/new` may allocate remote sessions: prewarm stops at `initialize`. */
 const CLOUD_ACP_AGENTS = new Set(["devin"]);
@@ -313,9 +315,13 @@ function hasSavedConversation(file) {
 
 function sessionInfo(session) {
   const initiator = session.initiator ?? session.upstreamInitiator;
+  // A registry written by an older daemon (or a mistaken agent) never puts
+  // pipi's transport envelope on screen as a title.
+  const cleanedTitle = typeof session.title === "string" ? titleWords(session.title).trim() : "";
+  const title = cleanedTitle || "New session";
   return {
     id: session.id,
-    title: session.title,
+    title,
     ...(session.titleLocked ? { titleLocked: true } : {}),
     cwd: session.cwd,
     file: session.file,
@@ -327,7 +333,13 @@ function sessionInfo(session) {
     upstreamInitiator: session.upstreamInitiator,
     runtimeMode: session.runtimeMode,
     worktree: session.worktree,
-    ...(session.persona ? { persona: true } : {}),
+    ...(session.persona
+      ? {
+          persona: true,
+          personaId: session.personaId || DEFAULT_PERSONA_ID,
+          ...(session.avatar ? { avatar: session.avatar } : {}),
+        }
+      : {}),
     status: session.status,
     ...(session.lastError && (session.status === "failed" || session.status === "interrupted") ? { error: session.lastError } : {}),
     unread: session.unread,
@@ -393,6 +405,8 @@ function buildSession(spec) {
     runtimeMode,
     worktree: spec.worktree,
     persona: spec.persona === true || undefined,
+    personaId: spec.persona === true ? spec.personaId || DEFAULT_PERSONA_ID : undefined,
+    avatar: spec.persona === true ? spec.avatar : undefined,
     status: "idle",
     unread: false,
     loaded: false,
@@ -627,40 +641,155 @@ Notes Pip keeps for itself across conversations: who the person is, how they lik
 /** How much of `MEMORY.md` a fresh conversation is handed; the file itself is never cut. */
 const MEMORY_INDEX_BYTES = 16 * 1024;
 
-function ensurePersonaDir() {
-  fs.mkdirSync(PERSONA_DIR, { recursive: true, mode: 0o700 });
-  for (const [name, text] of [["PERSONA.md", DEFAULT_PERSONA], ["MEMORY.md", DEFAULT_MEMORY]]) {
+function personaTemplate(name = "Pip", description = "") {
+  const display = cleanPersonaName(name) || "Pip";
+  let text = DEFAULT_PERSONA.replace(/^# Pip/m, `# ${display}`).replace(/\bPip\b/g, display);
+  const brief = typeof description === "string" ? description.trim() : "";
+  if (brief) text = text.replace(/^# .+?\n/m, (heading) => `${heading}\n${brief}\n`);
+  return text;
+}
+
+function memoryTemplate(name = "Pip") {
+  return DEFAULT_MEMORY.replace(/\bPip\b/g, cleanPersonaName(name) || "Pip");
+}
+
+function ensurePersonaDir(dir = PERSONA_DIR, options = {}) {
+  const existed = fs.existsSync(dir);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {}
+  const name = options.name || "Pip";
+  for (const [file, text] of [
+    ["PERSONA.md", personaTemplate(name, options.description)],
+    ["MEMORY.md", memoryTemplate(name)],
+  ]) {
+    const target = path.join(dir, file);
     try {
-      fs.writeFileSync(path.join(PERSONA_DIR, name), text, { flag: "wx", mode: 0o600 });
+      fs.writeFileSync(target, text, { flag: "wx", mode: 0o600 });
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
     }
+    try {
+      fs.chmodSync(target, 0o600);
+    } catch {}
   }
+  return { created: !existed };
 }
 
-const readPersonaFile = (name) => {
+const readPersonaFile = (name, dir = PERSONA_DIR) => {
   try {
-    return fs.readFileSync(path.join(PERSONA_DIR, name), "utf8");
+    return fs.readFileSync(path.join(dir, name), "utf8");
   } catch {
     return "";
   }
 };
 
 /** The persona's name: its `PERSONA.md` heading. */
-function personaName(persona = readPersonaFile("PERSONA.md")) {
-  return persona.match(/^#\s+(.+?)\s*$/m)?.[1] || "Pip";
+function personaName(persona = readPersonaFile("PERSONA.md"), fallback = "Pip") {
+  return persona.match(/^#\s+(.+?)\s*$/m)?.[1] || fallback;
+}
+
+function cleanPersonaName(name) {
+  return typeof name === "string" ? name.replace(/\s+/g, " ").trim().slice(0, 80) : "";
+}
+
+/** Persona ids are directory names too: stable lowercase slugs, never paths. */
+function normalizePersonaId(value) {
+  const raw = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!raw || raw === "pip" || raw === "default") return DEFAULT_PERSONA_ID;
+  const slug = raw.replace(/[^a-z0-9._-]+/g, "-").replace(/^[-.]+|[-.]+$/g, "").slice(0, 48);
+  return slug || DEFAULT_PERSONA_ID;
+}
+
+function personaDirFor(personaId = DEFAULT_PERSONA_ID) {
+  const id = normalizePersonaId(personaId);
+  return id === DEFAULT_PERSONA_ID ? PERSONA_DIR : path.join(PERSONAS_ROOT, id);
+}
+
+function isPersonaDir(dir) {
+  if (typeof dir !== "string" || !dir) return false;
+  const resolved = path.resolve(dir);
+  if (resolved === path.resolve(PERSONA_DIR)) return true;
+  const relative = path.relative(path.resolve(PERSONAS_ROOT), resolved);
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+const AVATAR_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
+
+function avatarFiles(dir) {
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((name) => /^avatar\.[^.]+$/i.test(name) && AVATAR_EXTENSIONS.has(path.extname(name).toLowerCase()))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+function detectPersonaAvatar(dir) {
+  const first = avatarFiles(dir)[0];
+  return first ? path.join(dir, first) : undefined;
+}
+
+function clearPersonaAvatar(dir) {
+  for (const name of avatarFiles(dir)) {
+    try {
+      fs.unlinkSync(path.join(dir, name));
+    } catch {}
+  }
+}
+
+/** Copies a chosen image into the persona's own folder, so the original may move or disappear. */
+function copyPersonaAvatar(dir, source) {
+  if (typeof source !== "string" || !source) throw new Error("choose an avatar image first");
+  const ext = path.extname(source).toLowerCase();
+  if (!AVATAR_EXTENSIONS.has(ext)) throw new Error("avatar images can be png, jpg, jpeg, webp or gif");
+  const stat = fs.statSync(source);
+  if (!stat.isFile()) throw new Error("the avatar image is not a file");
+  if (stat.size > 10 * 1024 * 1024) throw new Error("avatar images must be 10 MB or smaller");
+  ensurePersonaDir(dir);
+  const target = path.join(dir, `avatar${ext}`);
+  if (path.resolve(source) !== path.resolve(target)) {
+    const staging = path.join(dir, `.avatar-${process.pid}-${Date.now()}${ext}`);
+    fs.copyFileSync(source, staging);
+    try {
+      fs.chmodSync(staging, 0o600);
+    } catch {}
+    clearPersonaAvatar(dir);
+    fs.renameSync(staging, target);
+  }
+  fs.chmodSync(target, 0o600);
+  return target;
+}
+
+/** Rewrites only the persona document's first Markdown heading, preserving everything else. */
+function renamePersonaFile(dir, name) {
+  const display = cleanPersonaName(name);
+  if (!display) throw new Error("the personal agent needs a name");
+  ensurePersonaDir(dir);
+  const file = path.join(dir, "PERSONA.md");
+  const current = readPersonaFile("PERSONA.md", dir) || personaTemplate(display);
+  const next = /^#\s+.+?$/m.test(current) ? current.replace(/^#\s+.+?$/m, `# ${display}`) : `# ${display}\n\n${current}`;
+  fs.writeFileSync(file, next, { mode: 0o600 });
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {}
+  return display;
 }
 
 const escapeAttr = (text) => text.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 
-function personaBlock() {
-  const persona = readPersonaFile("PERSONA.md") || DEFAULT_PERSONA;
-  const memory = Buffer.from(readPersonaFile("MEMORY.md"));
+function personaBlock(session) {
+  const dir = session?.cwd || PERSONA_DIR;
+  const persona = readPersonaFile("PERSONA.md", dir) || personaTemplate(session?.title || "Pip");
+  const memory = Buffer.from(readPersonaFile("MEMORY.md", dir));
   let shown = memory.subarray(0, MEMORY_INDEX_BYTES).toString("utf8");
   if (memory.length > MEMORY_INDEX_BYTES) shown = shown.slice(0, Math.max(shown.lastIndexOf("\n"), 0));
-  const name = personaName(persona);
+  const name = personaName(persona, session?.title || "Pip");
   return [
-    `<pipi-persona name="${escapeAttr(name)}" dir="${escapeAttr(PERSONA_DIR)}">`,
+    `<pipi-persona name="${escapeAttr(name)}" dir="${escapeAttr(dir)}">`,
     `You are ${name}. PERSONA.md below says who you are; stay that character in every reply.`,
     `Your working directory holds PERSONA.md and MEMORY.md, and both outlast this conversation. MEMORY.md is yours: before you finish a turn in which you learned something worth keeping (a preference, a decision, a person, an open thread), write it there as one short line, and delete what has gone stale. Keep it under ${MEMORY_INDEX_BYTES / 1024} KB. Change PERSONA.md only when the person asks.`,
     "For coding work, start a session with a suitable agent (`agents_list`, `session_start`) and pass the project's directory as `cwd` (`workspaces_list` names the person's projects): your own directory holds only your notes.",
@@ -710,7 +839,7 @@ function withPersona(session, line) {
   session.personaDue ??= !conversationStarted(session.file);
   if (!session.personaDue || record.message.startsWith("/")) return line;
   session.personaDue = false;
-  return JSON.stringify({ ...record, message: `${personaBlock()}${record.message}` });
+  return JSON.stringify({ ...record, message: `${personaBlock(session)}${record.message}` });
 }
 
 function writeLine(session, rawLine) {
@@ -1355,8 +1484,8 @@ async function scanFileTitle(file) {
     }
     if (entry?.type === "session_info" && typeof entry.name === "string" && entry.name) name = entry.name;
     if (!firstMessage && entry?.type === "message" && entry.message?.role === "user") {
-      const text = textOfMessage(entry.message);
-      if (!text.trimStart().startsWith("<pipi-message")) firstMessage = text;
+      const text = titleWords(textOfMessage(entry.message));
+      if (text.trim()) firstMessage = text;
     }
     if (name && firstMessage) break;
   }
@@ -1388,8 +1517,7 @@ function syncTitle(session) {
 /** A session nobody named takes its title from its first user message — what the session list shows. */
 function learnTitle(session, message) {
   if (session.title && session.title !== "New session") return;
-  const text = textOfMessage(message);
-  if (text.trimStart().startsWith("<pipi-message")) return;
+  const text = titleWords(textOfMessage(message));
   const title = clip(text.replace(/\s+/g, " ").trim(), 48);
   if (!title) return;
   session.title = title;
@@ -1924,6 +2052,30 @@ function budgetMessages(messages, maxBytes = READ_BYTE_BUDGET) {
   return { messages: picked, truncated };
 }
 
+// A task checkout lives at `<projects>/.pipi-worktrees/<repo>/<task>`; the
+// project it belongs to is `<projects>/<repo>`, even for a registry entry
+// written before `baseCwd` was recorded.
+const PIPI_WORKTREE_MARKER = "/.pipi-worktrees/";
+
+function pipiWorktreeBaseCwd(cwd) {
+  if (typeof cwd !== "string") return undefined;
+  const clean = cwd.replace(/\/+$/, "");
+  const at = clean.indexOf(PIPI_WORKTREE_MARKER);
+  if (at <= 0) return undefined;
+  const rest = clean.slice(at + PIPI_WORKTREE_MARKER.length).split("/").filter(Boolean);
+  return rest.length >= 2 ? `${clean.slice(0, at)}/${rest[0]}` : undefined;
+}
+
+/** The only cwd pipi may call a project: a task checkout folds onto its repository; a malformed one names none. */
+function pipiProjectListPath(cwd) {
+  if (typeof cwd !== "string" || !cwd) return undefined;
+  return pipiWorktreeBaseCwd(cwd) || (cwd.includes(PIPI_WORKTREE_MARKER) ? undefined : cwd);
+}
+
+function sessionProjectCwd(session) {
+  return pipiProjectListPath(session.worktree?.path) || pipiProjectListPath(session.worktree?.baseCwd) || pipiProjectListPath(session.cwd);
+}
+
 /**
  * The folders work happens in: the app's open projects, then every folder a
  * session ran in (a worktree counts as the project it branched from). The
@@ -1932,7 +2084,7 @@ function budgetMessages(messages, maxBytes = READ_BYTE_BUDGET) {
 function knownWorkspaces() {
   const known = new Map();
   const note = (dir, open) => {
-    if (typeof dir !== "string" || !dir || dir === PERSONA_DIR) return undefined;
+    if (typeof dir !== "string" || !dir || isPersonaDir(dir)) return undefined;
     let entry = known.get(dir);
     if (!entry) {
       entry = { path: dir, name: path.basename(dir) || dir, open, sessions: 0, lastActive: 0 };
@@ -1943,7 +2095,7 @@ function knownWorkspaces() {
   };
   for (const dir of config.workspaces) note(dir, true);
   for (const session of sessions.values()) {
-    const entry = note(session.worktree?.baseCwd || session.cwd, false);
+    const entry = note(sessionProjectCwd(session), false);
     if (!entry) continue;
     entry.sessions += 1;
     entry.lastActive = Math.max(entry.lastActive, session.lastActive || 0);
@@ -2255,7 +2407,9 @@ async function readSessionFile(file, page) {
     if (entry.message?.role === "user") previousUser = entry.message;
     const message = editSnapshot([previousUser, entry.message], edits)[1];
     if (message?.role === "user" && !firstUser) {
-      firstUser = typeof message.content === "string" ? message.content : message.content?.find?.((b) => b?.type === "text")?.text;
+      const text = typeof message.content === "string" ? message.content : message.content?.find?.((b) => b?.type === "text")?.text;
+      const cleaned = typeof text === "string" ? titleWords(text) : text;
+      if (typeof cleaned === "string" && cleaned.trim()) firstUser = cleaned;
     }
     if (message?.role === "assistant" && Array.isArray(message.content)) {
       const text = message.content
@@ -2359,6 +2513,8 @@ async function controlOp(conn, msg) {
         session = takePooled(spec) ?? createSession({ ...spec, initialChoice, initiator: "user" });
         created = true;
       }
+      // An explicit fresh attach reuses the record's identity but not its old transcript file.
+      if (spec.fresh === true && session.file) setFile(session, undefined);
       // Re-key fileless sessions the moment a file is named for them.
       if (spec.file && !session.file) setFile(session, spec.file);
       let metaChanged = false;
@@ -2474,7 +2630,7 @@ async function controlOp(conn, msg) {
     }
     case "workspaces": {
       // The app's open projects, for workspaces_list; the standby pool needs no restart for them.
-      if (Array.isArray(msg.paths)) config.workspaces = msg.paths.filter((dir) => typeof dir === "string" && dir);
+      if (Array.isArray(msg.paths)) config.workspaces = [...new Set(msg.paths.map(pipiProjectListPath).filter(Boolean))];
       if (id) respond(conn, id, "ok", {});
       return;
     }
@@ -2485,6 +2641,49 @@ async function controlOp(conn, msg) {
         pushSession(session);
       }
       if (id) respond(conn, id, "ok", {});
+      return;
+    }
+    case "persona_update": {
+      try {
+        const session = sessions.get(msg.sessionId);
+        if (!session?.persona) throw new Error("no such personal agent");
+        if (typeof msg.name === "string") {
+          const name = renamePersonaFile(session.cwd, msg.name);
+          session.title = name;
+          session.titleLocked = true;
+        }
+        if (msg.avatar !== undefined) {
+          if (msg.avatar === null || msg.avatar === "") {
+            clearPersonaAvatar(session.cwd);
+            session.avatar = undefined;
+          } else {
+            session.avatar = copyPersonaAvatar(session.cwd, msg.avatar);
+          }
+        }
+        pushSession(session);
+        respond(conn, id, "persona", { session: sessionInfo(session) });
+      } catch (error) {
+        respondError(conn, id, error.message);
+      }
+      return;
+    }
+    case "persona_delete": {
+      try {
+        const session = sessions.get(msg.sessionId);
+        if (!session?.persona) throw new Error("no such personal agent");
+        const personaId = session.personaId || DEFAULT_PERSONA_ID;
+        if (personaId === DEFAULT_PERSONA_ID) throw new Error("the default personal agent cannot be deleted");
+        const personas = [...sessions.values()].filter((s) => s.persona);
+        const count = personas.length + (personas.some((s) => (s.personaId || DEFAULT_PERSONA_ID) === DEFAULT_PERSONA_ID) ? 0 : 1);
+        if (count <= 1) throw new Error("the last personal agent cannot be deleted");
+        killProcess(session);
+        const dir = session.cwd;
+        removeSessionRecord(session);
+        if (isPersonaDir(dir) && dir !== PERSONA_DIR) fs.rmSync(dir, { recursive: true, force: true });
+        respond(conn, id, "ok", {});
+      } catch (error) {
+        respondError(conn, id, error.message);
+      }
       return;
     }
     case "kill": {
@@ -2570,17 +2769,19 @@ async function controlOp(conn, msg) {
           };
         }
         let replacedPersona;
+        const personaId = input.persona === true ? normalizePersonaId(input.personaId) : undefined;
+        const personaDir = personaId ? personaDirFor(personaId) : undefined;
         if (input.persona === true) {
-          if (parent) throw new Error("the personal agent answers to the user, not to a session");
-          const held = [...sessions.values()].find((s) => s.persona);
-          if (held && input.replacePersona !== held.id) throw new Error(`the personal agent already runs as ${held.id}`);
+          if (parent) throw new Error("a personal agent answers to the user, not to a session");
+          const held = [...sessions.values()].find((s) => s.persona && (s.personaId || DEFAULT_PERSONA_ID) === personaId);
+          if (held && input.replacePersona !== held.id) throw new Error(`this personal agent already runs as ${held.id}`);
           if (input.replacePersona && !held) throw new Error("the personal agent changed; refresh before switching");
           if (input.worktree) throw new Error("the personal agent cannot use a worktree");
-          ensurePersonaDir();
+          ensurePersonaDir(personaDir, { name: input.personaName, description: input.personaDescription });
           replacedPersona = held;
           if (held) removeSessionRecord(held);
         }
-        const cwd = input.persona === true ? PERSONA_DIR : input.cwd || parent?.cwd || process.cwd();
+        const cwd = input.persona === true ? personaDir : input.cwd || parent?.cwd || process.cwd();
         // A child's mode never exceeds its parent's — the same clamp agents get.
         const parentCeiling = parent ? minMode(ancestorCeiling(parent), parent.runtimeMode) : undefined;
         const rawMode = parent
@@ -2589,11 +2790,13 @@ async function controlOp(conn, msg) {
             ? "full-access"
             : clampMode("full-access", input.runtimeMode);
         const runtimeMode = fitAgentModes(rawMode, agent.supportedRuntimeModes);
-        const title = input.persona === true ? personaName() : input.title;
+        const title = input.persona === true ? personaName(readPersonaFile("PERSONA.md", personaDir), cleanPersonaName(input.personaName) || "Pip") : input.title;
         const session = createSession({
           title,
           titleLocked: Boolean(title),
           persona: input.persona === true,
+          personaId,
+          avatar: input.persona === true ? detectPersonaAvatar(personaDir) : undefined,
           agentId: agent.id,
           agentName: agent.name,
           driver: agent.driver,
@@ -3109,6 +3312,11 @@ async function loadRegistry() {
           waiters: [],
           loaded: false,
         };
+        if (session.persona) {
+          session.personaId = normalizePersonaId(session.personaId);
+          session.cwd = session.cwd || personaDirFor(session.personaId);
+          session.avatar ||= detectPersonaAvatar(session.cwd);
+        }
         sessions.set(info.id, session);
         if (session.file) sessionsByFile.set(session.file, session.id);
       }

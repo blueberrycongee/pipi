@@ -6,6 +6,7 @@ import { topBarHeight } from "../lib/layout";
 import { basename, tildePath } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
 import { collectTranscriptImages } from "../lib/media";
+import { PipRevealController, type PipInterleaveRecord } from "../lib/pip-reveal";
 import { markPacersSeeded } from "../lib/stream-pacer";
 import { markVeilsSeeded } from "../lib/veil";
 import type { Mood } from "../mascot/geometry";
@@ -50,11 +51,12 @@ import {
   workspacePath,
 } from "../store/app";
 import { backend } from "../store/backend";
+import { pipInterleavesForSession, recordPipInterleave } from "../store/pip-interleaves";
 import { recentWorkspaces } from "../store/prefs";
 import { openNewChatTab } from "../store/tabs";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
-import { DURATION, EASING, enterStagger, keepLast, markRowsSeen, popupHiddenStyle, popupLeavingStyle, popupStyle, PATIENCE_MS, Presence, SPRING } from "../ui/motion";
+import { DURATION, EASING, enterStagger, isRowSeen, keepLast, markRowsSeen, popupHiddenStyle, popupLeavingStyle, popupStyle, PATIENCE_MS, Presence, SPRING } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
 import { tip } from "../ui/Tip";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
@@ -62,6 +64,7 @@ import { uiHeight, uiMinHeight, uiType } from "../ui/typography";
 import { Composer } from "./Composer";
 import { hasFormTakeover, hasInlinePrompt } from "./ExtensionDialog";
 import { isKnownMissingPath, MediaStreamContext } from "./Media";
+import { PersonaHeader, PERSONA_HEADER_HEIGHT } from "./PersonaHeader";
 import { PipWorkingFooter } from "./PipPresence";
 import { pipBubbleRows, proseRows } from "./Prose";
 import {
@@ -231,9 +234,11 @@ function Stage(props: { title: string | (() => string); detail?: string; size?: 
   const titleText = () => (typeof props.title === "function" ? props.title() : props.title);
   const mood = () => (props.mood ? props.mood() : pipMood());
   const pip = (
-    <View style={enterStagger(0)}>
-      <Pip size={props.size ?? 96} mood={mood()} />
-    </View>
+    <If when={!isPersonaSession()}>
+      <View style={enterStagger(0)}>
+        <Pip size={props.size ?? 96} mood={mood()} />
+      </View>
+    </If>
   );
   const words = (
     <View class="max-w-110 items-center gap-1.5" style={enterStagger(1)}>
@@ -838,6 +843,33 @@ export function Chat() {
     return (held = hasModel() ? "welcome" : "connect");
   });
   const stable = stableDisplayRows();
+  const pipRevealTick = signal(0);
+  const pipRevealPending = signal(false);
+  const unpersistedInterleaves: PipInterleaveRecord[] = [];
+  const sessionFileForOrder = () => sessionState()?.sessionFile ?? currentDaemonSession()?.file;
+  const persistPipInterleave = (record: PipInterleaveRecord) => {
+    const crossingFile = untracked(sessionFileForOrder);
+    queueMicrotask(() => {
+      const file = crossingFile ?? untracked(sessionFileForOrder);
+      if (file) recordPipInterleave(file, record);
+      else unpersistedInterleaves.push(record);
+    });
+  };
+  effect(() => {
+    const file = sessionFileForOrder();
+    if (!file || unpersistedInterleaves.length === 0) return;
+    untracked(() => {
+      for (const record of unpersistedInterleaves.splice(0)) recordPipInterleave(file, record);
+    });
+  });
+  const pipReveals = new PipRevealController({
+    notify: () => pipRevealTick.update((n) => n + 1),
+    isLiveRow: (rowId) => !isRowSeen(rowId),
+    reduceMotion,
+    onInterleave: persistPipInterleave,
+  });
+  cleanup(() => pipReveals.reset());
+  let pipRevealKey = untracked(conversationKey);
   let shown: ChatRow[] = [];
   let shownKey = -1;
   let enteredKey = -1;
@@ -925,18 +957,31 @@ export function Chat() {
         rows.push(...proseRows(row));
       }
     }
+    let visibleRows = rows;
+    if (isPersonaSession()) {
+      pipRevealTick();
+      const reveal = pipReveals.apply(rows, pipInterleavesForSession(sessionFileForOrder()));
+      visibleRows = reveal.rows;
+      untracked(() => {
+        if (pipRevealPending() !== reveal.pending) pipRevealPending.set(reveal.pending);
+      });
+    } else {
+      untracked(() => {
+        if (pipRevealPending()) pipRevealPending.set(false);
+      });
+    }
     // The rows a turn's fold shows, in order (commentary is a row per block, each the turn's its reply is).
     const folded = new Map<string, string>();
-    for (const row of rows) {
+    for (const row of visibleRows) {
       const turn = processOf.get(row.id) ?? (row.kind === "prose" || row.kind === "pip-bubble" || row.kind === "actions" ? processOf.get(row.rowId) : undefined);
       if (turn) folded.set(row.id, turn);
     }
     setProcessTurns(folded);
     // The same rows are the same list: an event that changed nothing on screen reaches the list as nothing.
-    if (key === shownKey && watching && rows.length === shown.length && rows.every((row, at) => row === shown[at])) return shown;
+    if (key === shownKey && watching && visibleRows.length === shown.length && visibleRows.every((row, at) => row === shown[at])) return shown;
     shownKey = key;
-    shown = rows;
-    return rows;
+    shown = visibleRows;
+    return visibleRows;
   });
 
   /**
@@ -1612,6 +1657,11 @@ export function Chat() {
       topRow.set(-1);
       bottomRow.set(-1);
       viewSpan = -1;
+      if (key !== pipRevealKey) {
+        pipRevealKey = key;
+        pipReveals.reset();
+        pipRevealPending.set(false);
+      }
       ensureEntered(key);
       pokeRepaint();
     });
@@ -1646,13 +1696,15 @@ export function Chat() {
       <View class={`relative flex-1 ${isLeavingSession() ? "pointer-events-none" : ""}`} style={{ opacity: pane }}>
         <If when={screen() === "transcript"}>
           <MediaStreamContext.Provider
-            value={() =>
-              collectTranscriptImages(untracked(transcriptRows), {
-                cwd: untracked(workspacePath),
-                home: backend().home(),
-                isMissingPath: isKnownMissingPath,
-              })
-            }
+            value={{
+              images: () =>
+                collectTranscriptImages(untracked(transcriptRows), {
+                  cwd: untracked(workspacePath),
+                  home: backend().home(),
+                  isMissingPath: isKnownMissingPath,
+                }),
+              isolateGroups: () => isPersonaSession(),
+            }}
           >
           <View
             selectable
@@ -1706,7 +1758,7 @@ export function Chat() {
                     class="flex-1"
                     contentStyle={{
                       paddingHorizontal: 24,
-                      paddingTop: topBarHeight() + (wallpaper() && !HEADER_BAND ? HEAD_FADE : 12),
+                      paddingTop: topBarHeight() + (wallpaper() && !HEADER_BAND ? HEAD_FADE : 12) + (isPersonaSession() ? PERSONA_HEADER_HEIGHT : 0),
                       paddingBottom: foot().end,
                     }}
                     accessibilityLabel={tr("Conversation", "对话")}
@@ -1725,6 +1777,7 @@ export function Chat() {
                         }
                       >
                         <PipWorkingFooter
+                          hold={() => pipRevealPending()}
                           anchor={(node) => {
                             if (node) ending = mountedEnding = node;
                             else if (ending === mountedEnding) ending = undefined;
@@ -1756,6 +1809,9 @@ export function Chat() {
           <Failure title={failure().title} detail={failure().detail} />
         </If>
       </View>
+      <If when={isPersonaSession()}>
+        <PersonaHeader />
+      </If>
       <Waiting show={isLeavingSession() && !hero()} />
       <HeaderBand show={screen() === "transcript"} height={topBarHeight()} />
       {/* The composer's column: the spacers over and under it are where it stands (`hero`). */}

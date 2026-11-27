@@ -419,19 +419,16 @@ export function chatTabTitle(tab: OpenTab): string {
   const ds = id ? daemonSessionOfId(id) : daemonSessionByFile(tab.ref);
   const file = id ? (ds?.file ?? tab.file) : tab.ref;
   if (file) {
-    const summary = findKnownSessionSummary(file);
-    if (summary) {
-      // A daemon child's sidebar row hangs under its tree as the daemon's name
-      // for it — a task's given title — not its file's first words; Pip is Pip.
-      if (ds?.parentId || ds?.persona) return daemonSessionTitle(ds);
-      // A saved conversation's name is stable even while its daemon is running
-      // and reports a transient title from the latest prompt.
-      return sessionTitle(summary, file.split("/").pop() ?? file);
-    }
-    if (ds) return daemonSessionTitle(ds);
     const base = file.split("/").pop() ?? file;
-    if (base && !base.endsWith(".jsonl")) return base;
-    return base.replace(/\.pipi-agent\.jsonl$|\.jsonl$/, "") || tr("Session", "会话");
+    const fallback = base && !base.endsWith(".jsonl")
+      ? base
+      : base.replace(/\.pipi-agent\.jsonl$|\.jsonl$/, "") || tr("Session", "会话");
+    // The daemon registry carries a delegated task's given title and a persona's
+    // name; `daemonSessionTitle` still lets a user-renamed saved file win.
+    if (ds) return daemonSessionTitle(ds, fallback);
+    const summary = findKnownSessionSummary(file);
+    if (summary) return sessionTitle(summary, fallback);
+    return fallback;
   }
   // The daemon calls an untitled session "New session": `daemonSessionTitle`
   // reads that as untitled and answers in the reader's language.

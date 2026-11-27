@@ -450,9 +450,9 @@ test("a child session archives from its row in the tree, and comes back when res
   expect(app.count(`id:sidebar-recents >> text:${title}`)).toBe(0);
   expect(app.count(`id:sidebar-workspaces >> text:${sibling}`)).toBe(1);
   expect(app.count(`id:sidebar-recents >> text:${sibling}`)).toBe(1);
-  // In the archive it reads as any saved session does: by its own title.
+  // In the archive it keeps the same real daemon title its tree row had.
   await app.waitFor("text:Archived");
-  const saved = "id:sidebar-archived >> text:Audit security and add rate limiting";
+  const saved = `id:sidebar-archived >> text:${title}`;
   if (app.count(saved) === 0) await app.press("text:Archived");
   await app.waitUntil(() => app.count(saved) === 1);
 
@@ -848,4 +848,137 @@ test("collapsed workspace running dot stays steady across every 16ms frame durin
 
   expect(seen.every((f) => f.runningDot === 1)).toBe(true);
   expect(seen.every((f) => f.pipiCollapsed === 1 && f.recentsCollapsed === 1)).toBe(true);
+});
+
+test("a worktree delegation is live under its real project at once, with protocol envelopes never becoming titles", async () => {
+  const now = Date.now();
+  const baseCwd = "/Users/pip/code/pipi";
+  const worktreeCwd = "/Users/pip/code/.pipi-worktrees/pipi/pip-live-task";
+  const envelope = (body: string) => `<pipi-message from="s_pip" title="Pip" agent="Pi" status="idle">\n${body}\n</pipi-message>`;
+  const summaries = [
+    {
+      path: "/sessions/delegated.jsonl",
+      id: "delegated",
+      firstMessage: envelope("Envelope body should not lead"),
+      messageCount: 3,
+      created: now - 2_000,
+      modified: now - 2_000,
+    },
+    {
+      path: "/sessions/legacy.jsonl",
+      id: "legacy",
+      firstMessage: envelope("Legacy readable task"),
+      messageCount: 2,
+      created: now - 3_000,
+      modified: now - 3_000,
+    },
+  ];
+  const base = {
+    agentId: "pi",
+    agentName: "Pi",
+    driver: "pi",
+    runtimeMode: "full-access",
+    unread: false,
+    loaded: true,
+  };
+  const seeded = [
+    {
+      ...base,
+      id: "s_pip",
+      persona: true,
+      title: "Pip",
+      titleLocked: true,
+      cwd: "/Users/pip/.pipi/persona",
+      status: "idle",
+      depth: 0,
+      createdAt: now - 10_000,
+      lastActive: now - 10_000,
+    },
+    {
+      ...base,
+      id: "s_delegated_file",
+      title: "Delegated registry title",
+      titleLocked: true,
+      cwd: baseCwd,
+      file: "/sessions/delegated.jsonl",
+      parentId: "s_pip",
+      initiator: "s_pip",
+      status: "idle",
+      depth: 1,
+      createdAt: now - 1_000,
+      lastActive: now - 1_000,
+    },
+    {
+      ...base,
+      id: "s_legacy_registry",
+      title: envelope("Registry envelope task"),
+      titleLocked: true,
+      cwd: baseCwd,
+      parentId: "s_pip",
+      initiator: "s_pip",
+      status: "idle",
+      depth: 1,
+      createdAt: now - 500,
+      lastActive: now - 500,
+    },
+    {
+      ...base,
+      id: "s_live_worktree",
+      title: "Live worktree task",
+      titleLocked: true,
+      cwd: worktreeCwd,
+      // Old daemon registry entries have no baseCwd here: the path itself must still file the task under pipi.
+      worktree: { path: worktreeCwd, branch: "pipi/live-task" },
+      parentId: "s_pip",
+      initiator: "s_pip",
+      status: "working",
+      depth: 1,
+      createdAt: now,
+      lastActive: now,
+    },
+  ];
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 900,
+    platform: "macos",
+    locale: "en-US",
+    reducedMotion: true,
+    storage: {
+      "harness.scenario": "multi",
+      "harness.sessions": JSON.stringify(summaries),
+      "harness.daemonSessions": JSON.stringify(seeded),
+    },
+  });
+  await app.waitFor("text:What are we building?");
+
+  for (const group of ["sidebar-recents", "sidebar-workspaces"]) {
+    expect(app.count(`id:${group} >> text:Live worktree task`)).toBe(1);
+    expect(app.count(`id:${group} >> text:Delegated registry title`)).toBe(1);
+    expect(app.count(`id:${group} >> text:Registry envelope task`)).toBe(1);
+    expect(app.count(`id:${group} >> text:Legacy readable task`)).toBe(1);
+    expect(app.count(`id:${group} >> id:sidebar-child-running`)).toBeGreaterThan(0);
+  }
+  const liveRecent = app.layout("id:sidebar-recents >> text:Live worktree task")!;
+  const legacyRecent = app.layout("id:sidebar-recents >> text:Legacy readable task")!;
+  const registryRecent = app.layout("id:sidebar-recents >> text:Registry envelope task")!;
+  const liveWorkspace = app.layout("id:sidebar-workspaces >> text:Live worktree task")!;
+  const registryWorkspace = app.layout("id:sidebar-workspaces >> text:Registry envelope task")!;
+  const legacyWorkspace = app.layout("id:sidebar-workspaces >> text:Legacy readable task")!;
+  expect(liveRecent.y).toBeLessThan(registryRecent.y);
+  expect(liveRecent.y).toBeLessThan(legacyRecent.y);
+  expect(liveWorkspace.y).toBeLessThan(registryWorkspace.y);
+  expect(liveWorkspace.y).toBeLessThan(legacyWorkspace.y);
+  expect(app.texts().some((text) => text.includes("<pipi-message"))).toBe(false);
+  expect(app.texts()).not.toContain("Envelope body should not lead");
+  expect(app.texts()).not.toContain("pip-live-task");
+  expect(JSON.parse(app.storage()["pipi.prefs.v1"] ?? "{}").workspaces ?? []).not.toContain(worktreeCwd);
+
+  // Opening the fileless worktree session attaches in its checkout, but the
+  // project list still records only the repository it belongs to.
+  await app.press("id:sidebar-recents >> text:Live worktree task");
+  await app.waitUntil(() => app.count("id:tab-0 >> text:Live worktree task") === 1);
+  const workspaces = JSON.parse(app.storage()["pipi.prefs.v1"] ?? "{}").workspaces ?? [];
+  expect(workspaces).toContain(baseCwd);
+  expect(workspaces.some((path: string) => path.includes("/.pipi-worktrees/"))).toBe(false);
+  expect(app.texts()).not.toContain("pip-live-task");
 });

@@ -13,12 +13,13 @@ import type {
 } from "../agents/types";
 import { basename, tildePath } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
-import { composeDocMessage } from "../lib/doc-wire";
+import { composeDocMessage, titleWords } from "../lib/doc-wire";
 import { classifyMediaKind, composeFileMessage, isMarkdownPath, mimeTypeForPath, type FileAttachment } from "../lib/media";
 import { formAnswerText } from "../lib/form-answers";
 import { answersTo, type ComposerCommand, parseSlashLine } from "../lib/slash";
 import { markPacersSeeded } from "../lib/stream-pacer";
 import { markVeilsSeeded, reseedVeils } from "../lib/veil";
+import { pipiWorktreeBaseCwd, projectListPath } from "../lib/worktree-path";
 import {
   chooseRandomWallpaperCandidate,
   DEFAULT_WALLPAPER_ADJUSTMENT,
@@ -66,6 +67,7 @@ import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
 import { backend, NoPickerError } from "./backend";
+import { loadPipInterleaves } from "./pip-interleaves";
 import { startAppUpdateChecks, stopAppUpdateChecks } from "./update";
 import {
   addCustomAgentPref,
@@ -92,6 +94,8 @@ import {
   preferredRuntimeMode,
   recentWorkspaces,
   rememberAutoRetry,
+  rememberPersonaAgentChoice,
+  rememberPersonaChoice,
   rememberSessionChoice,
   rememberWorkspace as listWorkspace,
   removeCustomAgentPref,
@@ -117,8 +121,11 @@ import {
   setWallpaperThemeColorsPref,
   setWallpaperVideoClickActionPref,
   setWorkspaceCollapsed,
+  seedPersonaChoice,
   storedAgentOverrides,
   storedCustomAgents,
+  storedPersonaAgentChoice,
+  storedPersonaChoice,
   storedSessionChoice,
   storedSessionChoices,
   wallpaper,
@@ -403,7 +410,7 @@ export const archivedSessionItems = computed<ArchivedSessionItem[]>(() => {
     const meta = held.file ? map[held.file] : undefined;
     if (!held.file || !meta || meta.gone || seen.has(held.file)) continue;
     seen.add(held.file);
-    const named = held.title && held.title !== "New session" ? held.title : "";
+    const named = held.title && held.title !== "New session" ? titleWords(held.title).replace(/\s+/g, " ").trim() : "";
     out.push({
       id: `archived:${held.file}`,
       session: {
@@ -735,13 +742,15 @@ const daemonIndex = computed(() => {
   return { byId, byFile, byParent };
 });
 
-/** Pip, the personal agent: the one session the daemon keeps in its own folder of notes. */
-export const personalAgent = computed(() => daemonSessionList().find((s) => s.persona));
+/** Every personal agent the daemon keeps, stable in creation order. */
+export const personalAgents = computed(() => daemonSessionList().filter((s) => s.persona).sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)));
 
-/** Whether `cwd` is Pip's folder of notes, which is never a project. */
+/** The legacy default personal agent (Pip), kept as the zero-configuration entry. */
+export const personalAgent = computed(() => personalAgents().find((s) => (s.personaId ?? "default") === "default") ?? personalAgents()[0]);
+
+/** Whether `cwd` is any personal agent's folder of notes, which is never a project. */
 export function isPersonaFolder(cwd: string | undefined) {
-  const pip = personalAgent();
-  return pip !== undefined && pip.cwd === cwd;
+  return Boolean(cwd && personalAgents().some((persona) => persona.cwd === cwd));
 }
 
 /** Lists a project folder as the active workspace; Pip's folder of notes is not one. */
@@ -826,6 +835,9 @@ export function daemonTreePlace(session: DaemonSession, files: ReadonlySet<strin
     const up = byId.get(cur.parentId);
     if (!up || up.persona) break;
     if (up.file && files.has(up.file)) return { claimed: up, top: up };
+    // A personal agent is a sidebar boundary, not a parent row: coding sessions
+    // it starts stand beside the user's own sessions rather than nesting under Pip.
+    if (up.persona) return { top: cur };
     cur = up;
   }
   return { top: cur };
@@ -863,7 +875,12 @@ export function childSessionsOfOpen(): DaemonSession[] {
 /** Maps a child worktree directory back to its owning project folder so child worktrees don't clutter Workspaces. */
 export function projectCwdOf(cwd: string, session?: DaemonSession): string {
   if (!cwd) return cwd;
-  if (session?.worktree?.baseCwd) return session.worktree.baseCwd;
+  const worktreeBase = projectListPath(session?.worktree?.path);
+  if (worktreeBase) return worktreeBase;
+  const declaredBase = projectListPath(session?.worktree?.baseCwd);
+  if (declaredBase) return declaredBase;
+  const layoutBase = pipiWorktreeBaseCwd(cwd);
+  if (layoutBase) return layoutBase;
   if (session?.parentId && cwd.includes("/.pipi-worktrees/")) {
     const { byId } = daemonIndex();
     const seen = new Set<string>([session.id]);
@@ -872,7 +889,8 @@ export function projectCwdOf(cwd: string, session?: DaemonSession): string {
       seen.add(cur.parentId);
       const up = byId.get(cur.parentId);
       if (!up || up.persona) break;
-      if (up.worktree?.baseCwd) return up.worktree.baseCwd;
+      const parentBase = projectListPath(up.worktree?.path) ?? projectListPath(up.worktree?.baseCwd);
+      if (parentBase) return parentBase;
       if (!up.cwd.includes("/.pipi-worktrees/")) return up.cwd;
       cur = up;
     }
@@ -897,25 +915,32 @@ export const headingDaemonSession = computed(() => {
   return target.daemonId ? daemonSessionOfId(target.daemonId) : daemonSessionByFile(target.file);
 });
 
-/** Whether the conversation currently shown (or immediately landing) is Pip, the personal agent. */
-export const isPersonaSession = computed(() => {
+/** The personal-agent session currently shown (or immediately landing), if the conversation is one. */
+export const activePersonaSession = computed(() => {
   const target = !leaving() ? heading() : undefined;
   if (target) {
     const ds = target.daemonId ? daemonSessionOfId(target.daemonId) : daemonSessionByFile(target.file);
-    return Boolean(ds?.persona);
+    if (ds?.persona) return ds;
+    return undefined;
   }
-  return Boolean(currentDaemonSession()?.persona);
+  const current = currentDaemonSession();
+  return current?.persona ? current : undefined;
 });
 
-/** Display name of the active persona (from `PERSONA.md`, defaulting to `"Pip"`). */
+/** Whether the conversation currently shown (or immediately landing) is a personal agent. */
+export const isPersonaSession = computed(() => Boolean(activePersonaSession()));
+
+/** The shown persona's stable id (`"default"` is the legacy Pip). */
+export const activePersonaId = computed(() => activePersonaSession()?.personaId ?? (activePersonaSession() ? "default" : undefined));
+
+/** Display name of the active persona (its daemon title, defaulting to `"Pip"`). */
 export const personaDisplayName = computed(() => {
-  const target = !leaving() ? heading() : undefined;
-  const ds = target
-    ? (target.daemonId ? daemonSessionOfId(target.daemonId) : daemonSessionByFile(target.file))
-    : currentDaemonSession();
-  const pip = ds?.persona ? ds : personalAgent();
-  return pip ? daemonSessionTitle(pip) : "Pip";
+  const persona = activePersonaSession() ?? personalAgent();
+  return persona ? daemonSessionTitle(persona) : "Pip";
 });
+
+/** Custom avatar image of the active persona, copied inside its folder; undefined means the Pip mascot. */
+export const personaAvatar = computed(() => activePersonaSession()?.avatar);
 
 /** Descendant sessions under the currently open (or landing) session, in tree order. */
 export const currentChildSessions = computed<DaemonSession[]>(() => {
@@ -1090,7 +1115,7 @@ export const draftModel = computed<Model | undefined>(() => {
 /** Optimistic thinking depth for a fresh draft session shown ahead of the agent (`isDraftAhead`). */
 export const draftThinkingLevel = computed<ThinkingLevel | undefined>(() => {
   if (!isDraftAhead()) return undefined;
-  return storedSessionChoice(sessionChoiceKey())?.thinkingLevel;
+  return currentSessionChoice()?.thinkingLevel;
 });
 
 /** The session's title: its name, else the start of its first message. */
@@ -1104,17 +1129,17 @@ export const currentTitle = computed(() => {
     if (!target.file) return tr("New session", "新会话");
     const list = target.cwd === workspace() ? sessions() : (sessionsByWorkspace()[target.cwd] ?? []);
     const found = list.find((s) => s.path === target.file) ?? sessions().find((s) => s.path === target.file);
-    if (found) return sessionTitle(found, tr("New session", "新会话"));
+    if (found) return sessionDisplayTitle(found, tr("New session", "新会话"));
   }
-  const pip = currentDaemonSession();
-  if (pip?.persona) return daemonSessionTitle(pip);
+  const ds = currentDaemonSession();
+  if (ds?.persona) return daemonSessionTitle(ds);
   const name = state()?.sessionName;
   if (name) return name;
+  if (ds?.title && ds.title !== "New session") return daemonSessionTitle(ds);
   const first = rows().find((row) => row.kind === "user");
   if (first?.kind === "user" && first.text) {
     return sessionTitle({ firstMessage: first.text }, tr("New session", "新会话"));
   }
-  const ds = currentDaemonSession();
   if (isDaemonTaskSession(ds)) {
     return daemonSessionTitle(ds!);
   }
@@ -1554,17 +1579,27 @@ const recoveredZombieIds = new Set<string>();
 
 /** What a daemon session is called on screen: localized when untitled, synced with its saved file when renamed. */
 export function daemonSessionTitle(session: DaemonSession, fallback = tr("New session", "新会话")): string {
-  const summary = session.file
-    ? ((session.cwd === workspace() ? sessions() : (sessionsByWorkspace()[session.cwd] ?? [])).find((s) => s.path === session.file) ??
-       sessions().find((s) => s.path === session.file))
-    : undefined;
-  if (session.titleLocked && session.title && session.title !== "New session") {
-    return session.title;
+  const summary = session.file ? findKnownSessionSummary(session.file) : undefined;
+  // Defense in depth for a registry written before titles were cleaned: the
+  // transport envelope is never the words a row is titled by.
+  const registryTitle = session.title && session.title !== "New session" ? titleWords(session.title).replace(/\s+/g, " ").trim() : "";
+  if (session.titleLocked && registryTitle) {
+    return registryTitle;
   }
   if (summary?.name) return sessionTitle(summary, fallback);
-  if (session.title && session.title !== "New session") return session.title;
+  if (registryTitle) return registryTitle;
   if (summary) return sessionTitle(summary, fallback);
   return fallback;
+}
+
+/**
+ * What a saved session file is called wherever it is listed. A file the daemon
+ * holds is titled by the daemon registry first (a locked delegation title is
+ * the task's real name); otherwise its indexed first message is the fallback.
+ */
+export function sessionDisplayTitle(session: SessionSummary, fallback = tr("New session", "新会话")): string {
+  const held = daemonSessionByFile(session.path);
+  return held ? daemonSessionTitle(held, fallback) : sessionTitle(session, fallback);
 }
 
 function removeDaemonSessionLocal(sessionId: string) {
@@ -1775,49 +1810,116 @@ async function ensureDaemon(): Promise<DaemonClient | undefined> {
   return daemonStarting;
 }
 
-function sessionChoiceKey() {
-  return isPersonaSession() ? `persona:${currentAgentId()}` : currentAgentId();
-}
-
-let personalAgentStarting: Promise<string | undefined> | undefined;
-
-/** Pip's session id, starting Pip on the preferred agent the first time it is asked for. */
-export function ensurePersonalAgent(): Promise<string | undefined> {
-  if (!personalAgentStarting) personalAgentStarting = startPersonalAgent().finally(() => { personalAgentStarting = undefined; });
-  return personalAgentStarting;
-}
-
-async function startPersonalAgent(): Promise<string | undefined> {
-  const held = personalAgent();
+/** A persona's session id, starting it on its own preferred engine the first time it is asked for. */
+export async function ensurePersonalAgent(personaId = "default", options?: { name?: string; description?: string }): Promise<string | undefined> {
+  const held = personalAgents().find((persona) => (persona.personaId ?? "default") === personaId);
   if (held) {
-    setPreferredPersonalAgentId(held.agentId);
+    if (personaId === "default" && held.agentId && storedPersonaChoice("default")?.agentId !== held.agentId) {
+      rememberPersonaChoice("default", { agentId: held.agentId });
+    }
     return held.id;
   }
   const daemon = await ensureDaemon();
   if (!daemon) return undefined;
-  const restored = personalAgent();
-  if (restored) {
-    setPreferredPersonalAgentId(restored.agentId);
-    return restored.id;
-  }
+  seedPersonaChoice(personaId);
+  const stored = storedPersonaChoice(personaId);
+  const agentId = stored?.agentId ?? preferredAgentId();
+  const choice = storedPersonaAgentChoice(personaId, agentId);
   try {
-    const agentId = preferredPersonalAgentId();
-    const choice = storedSessionChoice(`persona:${agentId}`) ?? storedSessionChoice(agentId);
     const session = await daemon.startSession({
       persona: true,
+      personaId,
+      personaName: options?.name,
+      personaDescription: options?.description,
       agentId,
       model: choice?.model && `${choice.model.provider}/${choice.model.id}`,
       thinking: choice?.thinkingLevel,
       modelConfigs: choice?.modelConfigs,
       runtimeMode: preferredRuntimeMode(),
     });
-    setPreferredPersonalAgentId(agentId);
     upsertDaemonSession(session);
     return session.id;
   } catch (error) {
-    toast("warning", `${tr("Pip could not start", "Pip 启动失败")}: ${message(error)}`);
+    const label = options?.name?.trim() || (personaId === "default" ? "Pip" : tr("the personal agent", "个人智能体"));
+    toast("warning", `${tr(`${label} could not start`, `${label} 启动失败`)}: ${message(error)}`);
     return undefined;
   }
+}
+
+/** Creates a custom persona in its own daemon folder, then answers with its new session id. */
+export async function createPersonalAgent(name: string, description?: string): Promise<string | undefined> {
+  const display = name.replace(/\s+/g, " ").trim();
+  if (!display) return undefined;
+  const base = display.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^[-.]+|[-.]+$/g, "").slice(0, 32) || "persona";
+  const taken = new Set(personalAgents().map((persona) => persona.personaId ?? "default"));
+  const root = base === "pip" || base === "default" ? "persona" : base;
+  let personaId = root;
+  for (let n = 2; taken.has(personaId); n++) personaId = `${root}-${n}`.slice(0, 48);
+  seedPersonaChoice(personaId);
+  return ensurePersonalAgent(personaId, { name: display, description });
+}
+
+/** Renames a persona: the daemon owns the session title and the `PERSONA.md` heading together. */
+export async function renamePersonalAgent(sessionId: string, name: string): Promise<boolean> {
+  const display = name.replace(/\s+/g, " ").trim();
+  if (!display) return false;
+  const daemon = await ensureDaemon();
+  if (!daemon) return false;
+  const updated = await attempt(tr("Could not rename the personal agent", "无法重命名个人智能体"), () => daemon.updatePersona(sessionId, { name: display }));
+  if (!updated) return false;
+  upsertDaemonSession(updated);
+  if (openDaemonId() === sessionId) state.update((s) => s && { ...s, sessionName: updated.title });
+  return true;
+}
+
+/** Copies a picked avatar image into the persona's own folder and puts it on every avatar surface. */
+export async function setPersonalAgentAvatar(sessionId: string, sourcePath: string): Promise<boolean> {
+  const daemon = await ensureDaemon();
+  if (!daemon) return false;
+  const updated = await attempt(tr("Could not change the avatar", "无法更换头像"), () => daemon.updatePersona(sessionId, { avatar: sourcePath }));
+  if (!updated) return false;
+  upsertDaemonSession(updated);
+  return true;
+}
+
+/** Removes the persona's custom avatar, returning every avatar surface to the Pip mascot. */
+export async function resetPersonalAgentAvatar(sessionId: string): Promise<boolean> {
+  const daemon = await ensureDaemon();
+  if (!daemon) return false;
+  const updated = await attempt(tr("Could not reset the avatar", "无法恢复默认头像"), () => daemon.updatePersona(sessionId, { avatar: null }));
+  if (!updated) return false;
+  upsertDaemonSession(updated);
+  return true;
+}
+
+/** Deletes a custom persona after the caller's confirmation; default and last persona are protected here too. */
+export async function deletePersonalAgent(sessionId: string): Promise<boolean> {
+  const persona = daemonSessionOfId(sessionId);
+  if (!persona?.persona) return false;
+  const personaId = persona.personaId ?? "default";
+  if (personaId === "default") {
+    toast("warning", tr("The default personal agent cannot be deleted.", "默认个人智能体不能删除。"));
+    return false;
+  }
+  const personaCount = personalAgents().length + (personalAgents().some((s) => (s.personaId ?? "default") === "default") ? 0 : 1);
+  if (personaCount <= 1) {
+    toast("warning", tr("The last personal agent cannot be deleted.", "最后一个个人智能体不能删除。"));
+    return false;
+  }
+  const daemon = await ensureDaemon();
+  if (!daemon) return false;
+  if (openDaemonId() === sessionId) {
+    const left = await switchInto(lastProject(), undefined, preferredAgentId());
+    if (!left) return false;
+  }
+  const gone = await attempt(tr("Could not delete the personal agent", "无法删除个人智能体"), async () => {
+    await daemon.deletePersona(sessionId);
+    return true;
+  });
+  if (!gone) return false;
+  removeDaemonSessionLocal(sessionId);
+  toast("success", tr(`“${daemonSessionTitle(persona)}” deleted.`, `「${daemonSessionTitle(persona)}」已删除。`));
+  return true;
 }
 
 /** Tells the daemon which project folders are open, for agents asking `workspaces_list`. */
@@ -1937,7 +2039,7 @@ export async function boot() {
   unlistenDaemonPrefs = onDaemonPrefsChange(() => pushDaemonConfig());
   unlistenWorkspaces = onWorkspacesChange(pushWorkspaces);
 
-  await loadPrefs();
+  await Promise.all([loadPrefs(), loadPipInterleaves()]);
   batch(() => {
     currentAgentId.set(preferredAgentId());
     currentRuntimeMode.set(preferredRuntimeMode());
@@ -1994,9 +2096,10 @@ function start(
   targetAgentId = currentAgentId(),
   preserveRows?: { previousRows: Row[]; handoffTitle: string; handoffDetail: string },
   daemonId?: string,
+  freshDaemonRecord = false,
 ) {
   return headFor({ cwd, file: reopen, daemonId, agentId: targetAgentId, keepTitle: Boolean(preserveRows) }, () =>
-    launch(cwd, reopen, targetAgentId, preserveRows, daemonId),
+    launch(cwd, reopen, targetAgentId, preserveRows, daemonId, freshDaemonRecord),
   );
 }
 
@@ -2006,6 +2109,7 @@ async function launch(
   targetAgentId: string,
   preserveRows?: { previousRows: Row[]; handoffTitle: string; handoffDetail: string },
   daemonId?: string,
+  freshDaemonRecord = false,
 ) {
   const mine = ++generation;
   closeActive();
@@ -2066,7 +2170,7 @@ async function launch(
 
   try {
     const agentLabel = spec?.name ?? "Pi";
-    const started = await connect(cwd, effectiveAgentId, mine, reopen, daemonId);
+    const started = await connect(cwd, effectiveAgentId, mine, reopen, daemonId, freshDaemonRecord);
     if (!started) return;
     if ((reopen || daemonId) && !preserveRows) {
       let first = await withStartupTimeout(started.request("get_state"), agentLabel);
@@ -2222,7 +2326,7 @@ async function launch(
  * answering) — and makes it the open agent, not yet asked anything.
  * `undefined` when another start overtook this one (`mine`).
  */
-async function connect(cwd: string, agentId: string, mine: number, reopen?: string, daemonId?: string): Promise<PiClient | undefined> {
+async function connect(cwd: string, agentId: string, mine: number, reopen?: string, daemonId?: string, freshDaemonRecord = false): Promise<PiClient | undefined> {
   const spec = agents().find((a) => a.id === agentId);
   const driver = spec?.driver ?? (agentId === "pi" ? "pi" : "acp");
   const agentLabel = spec?.name ?? "Pi";
@@ -2250,7 +2354,8 @@ async function connect(cwd: string, agentId: string, mine: number, reopen?: stri
   const { transport, session } = await daemon.attach({
     id: targetId,
     file: reopen,
-    title: known ? sessionTitle(known, "") : undefined,
+    fresh: freshDaemonRecord,
+    title: known ? sessionDisplayTitle(known, "") : undefined,
     cwd,
     agentId,
     agentName: spec?.name ?? agentId,
@@ -2425,7 +2530,8 @@ export async function switchAgentHarness(nextAgentId: string) {
     if (busy()) return;
     const previousRows = rows();
     const handoff = buildPortableHandoff({ rows: previousRows, fromAgentName: activeAgent().name, toAgentName: target.name });
-    const choice = storedSessionChoice(`persona:${nextAgentId}`) ?? storedSessionChoice(nextAgentId);
+    const personaId = pip.personaId ?? "default";
+    const choice = storedPersonaAgentChoice(personaId, nextAgentId);
     const previousName = activeAgent().name;
     busy.set(true);
     try {
@@ -2433,6 +2539,7 @@ export async function switchAgentHarness(nextAgentId: string) {
       const session = await attempt(tr("Could not switch Pip's engine", "无法切换 Pip 引擎"), () => daemon.startSession({
         persona: true,
         replacePersona: pip.id,
+        personaId,
         agentId: nextAgentId,
         model: choice?.model && `${choice.model.provider}/${choice.model.id}`,
         thinking: choice?.thinkingLevel,
@@ -2443,7 +2550,7 @@ export async function switchAgentHarness(nextAgentId: string) {
         await start(pip.cwd, pip.file, pip.agentId, undefined, pip.id);
         return;
       }
-      setPreferredPersonalAgentId(nextAgentId);
+      rememberPersonaChoice(personaId, { agentId: nextAgentId });
       upsertDaemonSession(session);
       pendingHandoff.set(handoff.formattedContext ? { fromAgent: previousName, toAgent: target.name, context: handoff.formattedContext } : undefined);
       await start(session.cwd, undefined, nextAgentId, previousRows.length ? {
@@ -2459,40 +2566,22 @@ export async function switchAgentHarness(nextAgentId: string) {
   }
 
   const prevName = activeAgent().name;
-  setPreferredAgentId(nextAgentId);
-
   const currentRows = rows();
   const hasConversation = currentRows.some((r) => r.kind === "user" || r.kind === "text");
+  let preserve: { previousRows: Row[]; handoffTitle: string; handoffDetail: string } | undefined;
   if (hasConversation) {
-    const handoff = buildPortableHandoff({
-      rows: currentRows,
-      fromAgentName: prevName,
-      toAgentName: target.name,
-    });
-    pendingHandoff.set(
-      handoff.formattedContext
-        ? { fromAgent: prevName, toAgent: target.name, context: handoff.formattedContext }
-        : undefined,
-    );
-    const title = tr(
-      `Switched agent from ${prevName} to ${target.name}`,
-      `已从 ${prevName} 切换至 ${target.name}`,
-    );
-    const detail = handoff.items.length
-      ? tr(
-          `Portable context handoff ready: ${handoff.items.length} intact items (${Math.ceil(handoff.byteCount / 1024)} KB)${handoff.omittedCount ? `, ${handoff.omittedCount} older items omitted` : ""}. Delivered automatically with your next message.`,
-          `便携上下文交接已就绪：保留 ${handoff.items.length} 条完整记录（${Math.ceil(handoff.byteCount / 1024)} KB）${handoff.omittedCount ? `，省略 ${handoff.omittedCount} 条较早记录` : ""}。将在下次发送消息时自动注入。`,
-        )
-      : "";
-    await start(workspace(), undefined, nextAgentId, {
+    const handoff = buildPortableHandoff({ rows: currentRows, fromAgentName: prevName, toAgentName: target.name });
+    pendingHandoff.set(handoff.formattedContext ? { fromAgent: prevName, toAgent: target.name, context: handoff.formattedContext } : undefined);
+    preserve = {
       previousRows: currentRows,
-      handoffTitle: title,
-      handoffDetail: detail,
-    });
+      handoffTitle: tr(`Switched agent from ${prevName} to ${target.name}`, `已从 ${prevName} 切换至 ${target.name}`),
+      handoffDetail: "",
+    };
   } else {
     pendingHandoff.set(undefined);
-    await start(workspace(), undefined, nextAgentId);
   }
+  setPreferredAgentId(nextAgentId);
+  await start(workspace(), undefined, nextAgentId, preserve);
   focusComposer();
 }
 
@@ -3002,6 +3091,20 @@ async function syncSession() {
   void refreshStats();
 }
 
+/** Model/thinking picks in the active session's preference scope: a persona's own when it is one, else the engine-wide pick. */
+function currentSessionChoice() {
+  const persona = activePersonaSession();
+  if (persona) return storedPersonaAgentChoice(persona.personaId ?? "default", currentAgentId());
+  return storedSessionChoice(currentAgentId());
+}
+
+/** Remembers a picker choice in the same scope `currentSessionChoice` reads. */
+function rememberCurrentSessionChoice(patch: { model?: { provider: string; id: string }; thinkingLevel?: ThinkingLevel; modelConfigs?: Record<string, string | boolean> }) {
+  const persona = activePersonaSession();
+  if (persona) rememberPersonaAgentChoice(persona.personaId ?? "default", currentAgentId(), patch);
+  else rememberSessionChoice(currentAgentId(), patch);
+}
+
 /**
  * Re-applies the model and thinking depth the user last picked for the active
  * agent. A fresh session opens on the harness's own configured default (Pi on
@@ -3010,7 +3113,7 @@ async function syncSession() {
  * keeps the model its own history recorded.
  */
 async function applySessionChoices(initialState?: SessionState, commit = true): Promise<SessionState | undefined> {
-  const choice = storedSessionChoice(sessionChoiceKey());
+  const choice = currentSessionChoice();
   // Compare against the fresh session's own state without flashing intermediate defaults on screen.
   let known = initialState ?? (await request("get_state").catch(() => undefined));
   const wantedModel = choice?.model;
@@ -3046,7 +3149,7 @@ async function applySessionChoices(initialState?: SessionState, commit = true): 
 }
 
 async function applyThinkingChoice(known: SessionState | undefined, commit = true): Promise<SessionState | undefined> {
-  const wantedLevel = storedSessionChoice(sessionChoiceKey())?.thinkingLevel;
+  const wantedLevel = currentSessionChoice()?.thinkingLevel;
   if (!wantedLevel || !known) return known;
   if ((!isPersonaSession() && !levels().includes(wantedLevel)) || wantedLevel === known.thinkingLevel) return known;
   await request("set_thinking_level", { level: wantedLevel }).catch(() => undefined);
@@ -4411,6 +4514,14 @@ export function newSession() {
   return changeSession(tr("Could not start a session", "无法新建会话"), requestNewSession, {});
 }
 
+/** Starts a clean conversation inside the same personal agent, keeping its identity, folder, engine and picker preferences. */
+export function newPersonaConversation() {
+  if (!isPersonaSession()) return newSession();
+  if (phase().name !== "ready" || isSwitching()) return focusComposer();
+  if (!rows().length && !(state()?.messageCount)) return focusComposer();
+  return changeSession(tr("Could not start a conversation", "无法新建对话"), requestNewSession, {});
+}
+
 async function openSessionFile(path: string, ownerAgentId?: string) {
   const held = daemonSessionByFile(path);
   const targetCwd = held?.cwd ?? activeProjectPath() ?? workspace();
@@ -4533,7 +4644,7 @@ export async function archiveSession(path: string, cwd = workspace(), options?: 
     path === state()?.sessionFile
       ? currentTitle()
       : summary
-        ? sessionTitle(summary, tr("Conversation", "对话"))
+        ? sessionDisplayTitle(summary, tr("Conversation", "对话"))
         : (daemonSessionByFile(path) ? daemonSessionTitle(daemonSessionByFile(path)!, tr("Conversation", "对话")) : tr("Conversation", "对话"));
   const held = daemonSessionByFile(path);
   const open = path === state()?.sessionFile;
@@ -4765,17 +4876,16 @@ export async function copyMessage(text: string): Promise<boolean> {
 
 export async function chooseModel(model: Model) {
   const mine = generation;
-  const key = sessionChoiceKey();
   const persona = isPersonaSession();
   // During an optimistic new session or switch, remember the pick immediately so the
   // chip updates with zero wait and `finishFreshLaunch` applies it as soon as connected.
   if (phase().name === "starting" || isSwitching() || !client) {
-    rememberSessionChoice(key, { model: { provider: model.provider, id: model.id }, ...(persona ? { modelConfigs: {} } : {}) });
+    rememberCurrentSessionChoice({ model: { provider: model.provider, id: model.id }, ...(persona ? { modelConfigs: {} } : {}) });
     return;
   }
   const chosen = await attempt(tr("Could not switch model", "无法切换模型"), () => request("set_model", { provider: model.provider, modelId: model.id }));
   if (!chosen) return;
-  rememberSessionChoice(key, { model: { provider: chosen.provider, id: chosen.id }, ...(persona ? { modelConfigs: {} } : {}) });
+  rememberCurrentSessionChoice({ model: { provider: chosen.provider, id: chosen.id }, ...(persona ? { modelConfigs: {} } : {}) });
   if (mine !== generation) return;
   state.update((s) => s && { ...s, model: chosen });
   await Promise.all([refreshLevels(), refreshState().catch(() => undefined), refreshStats()]);
@@ -4783,7 +4893,7 @@ export async function chooseModel(model: Model) {
 
 export async function chooseThinkingLevel(level: ThinkingLevel) {
   if (phase().name === "starting" || isSwitching() || !client) {
-    rememberSessionChoice(sessionChoiceKey(), { thinkingLevel: level });
+    rememberCurrentSessionChoice({ thinkingLevel: level });
     return;
   }
   const applied = await attempt(tr("Could not change thinking", "无法更改思考深度"), async () => {
@@ -4793,7 +4903,7 @@ export async function chooseThinkingLevel(level: ThinkingLevel) {
   if (!applied) return;
   // The preference is the user's abstract pick; the session state is the engine's truth
   // (an ACP model may clamp max to the highest rung it actually offers).
-  rememberSessionChoice(sessionChoiceKey(), { thinkingLevel: level });
+  rememberCurrentSessionChoice({ thinkingLevel: level });
   const actual = await refreshState().catch(() => undefined);
   if (!actual) state.update((s) => s && { ...s, thinkingLevel: level });
 }
@@ -4806,8 +4916,7 @@ export async function chooseModelConfig(configId: string, value: string | boolea
   });
   if (!applied) return;
   if (isPersonaSession()) {
-    const key = sessionChoiceKey();
-    rememberSessionChoice(key, { modelConfigs: { ...storedSessionChoice(key)?.modelConfigs, [configId]: value } });
+    rememberCurrentSessionChoice({ modelConfigs: { ...currentSessionChoice()?.modelConfigs, [configId]: value } });
   }
   await refreshState().catch(() => undefined);
 }

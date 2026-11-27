@@ -81,11 +81,7 @@ export function formatDocEditorContext(ctx: DocEditorContext): string {
 
 /** Strips a trailing `<doc_editor_context>` block appended for the model, keeping everything else intact. */
 export function stripDocEditorContext(text: string): string {
-  const marker = "\n\n<doc_editor_context ";
-  const idx = text.lastIndexOf(marker);
-  if (idx < 0) return text;
-  const tail = text.slice(idx + 2);
-  return /^<doc_editor_context\b[^>]*>[\s\S]*?<\/doc_editor_context>\s*$/.test(tail) ? text.slice(0, idx) : text;
+  return text.replace(/\s*<doc_editor_context\b[^>]*>[\s\S]*?<\/doc_editor_context>\s*$/, "");
 }
 
 /**
@@ -144,6 +140,36 @@ export function splitDocMessage(text: string): { said: string; docs: DocPart[] }
   return { said: cleaned, docs: [] };
 }
 
+// Fixed protocol wrappers pipi prepends or wraps around a prompt. They are
+// addressing/context for the agent, never the words a session is titled by.
+// The Node side keeps the same reading in `sidecar/session-index.mjs`.
+const PERSONA_PREFIX = /^<pipi-persona\b[^>]*>[\s\S]*?<\/pipi-persona>\s*/;
+const HANDOFF_PREFIX = /^<conversation_handoff\b[^>]*>[\s\S]*?<\/conversation_handoff>\s*(?:User message:\n)?/;
+const PIPI_MESSAGE = /<pipi-message\b[^>]*>([\s\S]*?)<\/pipi-message>/g;
+const PIPI_MESSAGE_OPEN = /^\s*<pipi-message\b[^>]*>\s*/;
+const PIPI_MESSAGE_CLOSE = /\s*<\/pipi-message>\s*$/;
+const PIPI_MESSAGE_TRUNCATED = /^\s*<pipi-message\b[^>]*$/;
+const DOC_EDITOR_CONTEXT_PREFIX = /^<doc_editor_context\b[^>]*>[\s\S]*?<\/doc_editor_context>\s*/;
+
+/** Removes pipi's fixed protocol shells, keeping the task or words inside them. */
+function withoutProtocolShells(text: string): string {
+  let out = text;
+  for (let round = 0; round < 4; round++) {
+    const before = out;
+    out = out.replace(PERSONA_PREFIX, "");
+    out = out.replace(HANDOFF_PREFIX, "");
+    out = out.replace(PIPI_MESSAGE, (_tag, body: string) => body.trim());
+    // An old index or external header may already have clipped the envelope
+    // before its closing tag: still drop the protocol head and keep what body
+    // survived rather than titling the session `<pipi-message from="…"`.
+    out = out.replace(PIPI_MESSAGE_OPEN, "").replace(PIPI_MESSAGE_CLOSE, "");
+    if (PIPI_MESSAGE_TRUNCATED.test(out)) out = "";
+    out = out.replace(DOC_EDITOR_CONTEXT_PREFIX, "");
+    if (out === before) break;
+  }
+  return out;
+}
+
 /**
  * The words a message is titled by: what was typed, or — when the message
  * was only documents — what the first one says. Read loosely, so a text
@@ -151,8 +177,9 @@ export function splitDocMessage(text: string): { said: string; docs: DocPart[] }
  * `sidecar/session-index.mjs` is the same reading on the Node side).
  */
 export function titleWords(text: string): string {
-  const { said: withoutAttach, firstAttachmentName } = stripTrailingAttachments(text);
-  const target = withoutAttach.trim() ? withoutAttach : firstAttachmentName ?? text;
+  const clean = stripDocEditorContext(withoutProtocolShells(text));
+  const { said: withoutAttach, firstAttachmentName } = stripTrailingAttachments(clean);
+  const target = withoutAttach.trim() ? withoutAttach : firstAttachmentName ?? clean;
   if (!target.includes(' path="')) return target;
   const said = target.replace(/(?:^|\s)<(?:document|selection) path="[^"]*">[\s\S]*$/, "").trim();
   if (said) return said;

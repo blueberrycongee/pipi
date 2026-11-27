@@ -26,11 +26,18 @@ import { closeZoom, isZoomOpen, openZoom } from "../ui/Zoom";
 import { ZoomImage, type ZoomGalleryEntry } from "./ZoomImage";
 
 /**
- * Supplies the enclosing conversation's ordered previewable image stream so
- * opening any photo in the transcript lets `←` / `→` step across neighboring
- * photos (scoped per pane, including split chat panes).
+ * The enclosing conversation's ordered previewable image stream, plus whether
+ * its lightboxes use that stream at all. Normal sessions do: opening any photo
+ * lets `←` / `→` step across neighboring photos. A personal agent instead
+ * keeps each lightbox inside the clicked message or presented-file group — a
+ * long-running companionship never becomes one endless filmstrip.
  */
-export const MediaStreamContext = context<(() => readonly MediaItem[]) | undefined>(undefined);
+export interface MediaStreamScope {
+  images: () => readonly MediaItem[];
+  isolateGroups?: () => boolean;
+}
+
+export const MediaStreamContext = context<MediaStreamScope | undefined>(undefined);
 
 // ── File probe cache & single-playback coordination ───────────────────────────
 
@@ -134,6 +141,17 @@ export interface MediaZoomOptions {
   gallery?: readonly MediaItem[];
   /** Local sibling gallery fallback when the clicked item isn't in `gallery`. */
   fallbackGallery?: readonly MediaItem[];
+}
+
+/**
+ * Resolves the gallery a clicked image belongs to. The stream remains primary
+ * in ordinary coding sessions; an isolated scope (Personal Agent) makes the
+ * clicked item's own siblings the whole gallery, with an empty array standing
+ * for "just this one" rather than asking for the transcript fallback.
+ */
+export function mediaZoomOptions(scope: MediaStreamScope | undefined, siblings?: readonly MediaItem[]): MediaZoomOptions {
+  if (scope?.isolateGroups?.()) return { gallery: siblings ?? [] };
+  return { gallery: scope?.images(), fallbackGallery: siblings };
 }
 
 function mediaImageSrc(item: MediaItem): string | undefined {
@@ -452,11 +470,8 @@ export function InlineImageCard(props: {
   compact?: boolean;
   siblings?: readonly MediaItem[];
 }) {
-  const getStream = MediaStreamContext();
-  const zoomOptions = (): MediaZoomOptions => ({
-    gallery: getStream?.(),
-    fallbackGallery: props.siblings,
-  });
+  const stream = MediaStreamContext();
+  const zoomOptions = (): MediaZoomOptions => mediaZoomOptions(stream, props.siblings);
   const src = () => props.item.src ?? (props.item.data ? `data:${props.item.mimeType ?? "image/png"};base64,${props.item.data}` : undefined);
   const probe = useFileProbe(
     () => props.item.path,

@@ -30,8 +30,11 @@ export interface DaemonSession {
   driver: string;
   parentId?: string;
   initiator?: string;
-  /** The personal agent (Pip): one per home, in its own folder of notes. */
+  /** A personal agent: one per persona id, in its own folder of notes. */
   persona?: boolean;
+  personaId?: string;
+  /** Copied into the persona folder, so it survives the original image moving away. */
+  avatar?: string;
   runtimeMode: RuntimeMode;
   worktree?: WorktreeInfo;
   status: "idle" | "working" | "blocked" | "failed" | "interrupted";
@@ -46,6 +49,8 @@ export interface DaemonSession {
 export interface DaemonAttachSpec {
   id?: string;
   file?: string;
+  /** Reuse the record but start a new conversation rather than reopening its last file. */
+  fresh?: boolean;
   title?: string;
   cwd: string;
   agentId: string;
@@ -419,6 +424,17 @@ export class DaemonClient {
     this.notify("file", { sessionId, file: file ?? null });
   }
 
+  /** Renames a personal agent and/or replaces (`undefined` leaves, `null` resets) its avatar. */
+  async updatePersona(sessionId: string, update: { name?: string; avatar?: string | null }): Promise<DaemonSession> {
+    const res = await this.call<{ session: DaemonSession }>("persona_update", { sessionId, ...update });
+    return res.session;
+  }
+
+  /** Deletes a custom personal agent, its registry record, and its folder after the UI's confirmation. */
+  async deletePersona(sessionId: string): Promise<void> {
+    await this.call("persona_delete", { sessionId });
+  }
+
   /** Starts a detached-or-child session (the compare flow): its answer goes to the user. */
   async startSession(input: {
     title?: string;
@@ -429,6 +445,9 @@ export class DaemonClient {
     model?: string;
     thinking?: ThinkingLevel;
     modelConfigs?: Record<string, string | boolean>;
+    personaId?: string;
+    personaName?: string;
+    personaDescription?: string;
     message?: string;
     parentId?: string;
     runtimeMode?: RuntimeMode;

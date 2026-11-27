@@ -3,8 +3,16 @@ import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } f
 import { PiClient, type Transport } from "./client";
 import { DaemonClient } from "./daemon";
 import { createLineSplitter } from "./jsonl";
+import { sessionTitle } from "./sessions";
 import { firstVisualRowDiff, type Row, sameVisualRows, Transcript, toolSummary, withoutPreamble, withoutImageNotes } from "./transcript";
 import { type ActivityRow, buildDisplayRows, classifyTool, describeActivity, describeToolCall, describeToolsSummary, displayRowIds, elapsedSeconds, spokenDuration, stableDisplayRows, type TurnHeaderRow } from "./turns";
+
+
+test("session titles unwrap delegated-task envelopes into readable words", () => {
+  const firstMessage = '<pipi-message from="s_pip" title="Pip" agent="Pi" status="idle">\nFix the sidebar title\n</pipi-message>';
+  expect(sessionTitle({ firstMessage })).toBe("Fix the sidebar title");
+  expect(sessionTitle({ firstMessage: "Please refactor the sidebar" })).toBe("Please refactor the sidebar");
+});
 
 test("splits records on LF only, across chunks, keeping U+2028", () => {
   const lines: string[] = [];

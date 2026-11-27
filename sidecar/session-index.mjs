@@ -15,7 +15,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { agentDirPath } from "./env-paths.mjs";
 
-const INDEX_VERSION = 1;
+const INDEX_VERSION = 2;
 
 export function indexPath() {
   return path.join(agentDirPath(), "pipi-session-index.json");
@@ -70,8 +70,39 @@ function stripTrailingAttachments(text) {
   return { said: text };
 }
 
+// Fixed protocol wrappers pipi prepends or wraps around a prompt. They are
+// addressing/context for the agent, never the words a session is titled by.
+// The app side keeps the same reading in `lib/doc-wire.ts`.
+const PERSONA_WRAPPER = /^<pipi-persona\b[^>]*>[\s\S]*?<\/pipi-persona>\s*/;
+const HANDOFF_WRAPPER = /^<conversation_handoff\b[^>]*>[\s\S]*?<\/conversation_handoff>\s*(?:User message:\n)?/;
+const PIPI_MESSAGE_WRAPPER = /<pipi-message\b[^>]*>([\s\S]*?)<\/pipi-message>/g;
+const PIPI_MESSAGE_OPEN = /^\s*<pipi-message\b[^>]*>\s*/;
+const PIPI_MESSAGE_CLOSE = /\s*<\/pipi-message>\s*$/;
+const PIPI_MESSAGE_TRUNCATED = /^\s*<pipi-message\b[^>]*$/;
+const DOC_EDITOR_CONTEXT = /^<doc_editor_context\b[^>]*>[\s\S]*?<\/doc_editor_context>\s*/;
+const DOC_EDITOR_CONTEXT_TRAILING = /\s*<doc_editor_context\b[^>]*>[\s\S]*?<\/doc_editor_context>\s*$/;
+
+function withoutProtocolShells(text) {
+  let out = text;
+  for (let round = 0; round < 4; round++) {
+    const before = out;
+    out = out.replace(PERSONA_WRAPPER, "");
+    out = out.replace(HANDOFF_WRAPPER, "");
+    out = out.replace(PIPI_MESSAGE_WRAPPER, (_tag, body) => body.trim());
+    // An old index or external header may already have clipped the envelope
+    // before its closing tag: still drop the protocol head and keep what body
+    // survived rather than titling the session `<pipi-message from="…"`.
+    out = out.replace(PIPI_MESSAGE_OPEN, "").replace(PIPI_MESSAGE_CLOSE, "");
+    if (PIPI_MESSAGE_TRUNCATED.test(out)) out = "";
+    out = out.replace(DOC_EDITOR_CONTEXT, "").replace(DOC_EDITOR_CONTEXT_TRAILING, "");
+    if (out === before) break;
+  }
+  return out;
+}
+
 export function titleWords(text) {
   if (typeof text !== "string") return text;
+  text = withoutProtocolShells(text);
   const { said: withoutAttach, first } = stripTrailingAttachments(text);
   const target = withoutAttach.trim() ? withoutAttach : first ?? text;
   if (!target.includes(' path="')) return target;
@@ -188,7 +219,7 @@ export async function scanSessionFile(full, stat) {
     entry.created = header.created || Date.now();
     entry.modified = 0;
     entry.name = header.name;
-    entry.firstMessage = clip(header.firstMessage ?? "");
+    entry.firstMessage = clip(titleWords(String(header.firstMessage ?? "")));
   }
 
   for (const line of lines.slice(1)) {

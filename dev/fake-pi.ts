@@ -735,12 +735,13 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         const custom = /show media:\s*([^\s,]+)\s*,\s*([^\s,]+)/.exec(prompt);
         const firstPath = custom?.[1] ?? "icon.png";
         const secondPath = custom?.[2] ?? "assets/brand/dmg-background@2x.png";
+        const customTitle = (path: string, fallback: string) => (custom ? path.split(/[\\/]/).pop() || fallback : fallback);
         const presentedDetails = {
           pipiMedia: true,
           title: "Generated deliverables",
           items: [
-            { path: firstPath, kind: "image", title: "App icon", caption: "1024x1024 PNG" },
-            { path: secondPath, kind: "image", title: "Background artwork" },
+            { path: firstPath, kind: "image", title: customTitle(firstPath, "App icon"), caption: "1024x1024 PNG" },
+            { path: secondPath, kind: "image", title: customTitle(secondPath, "Background artwork") },
           ],
         };
         const firstMedia: AgentMessage = {
@@ -898,6 +899,18 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
       });
       isStreaming = false;
       emit({ type: "agent_settled", aborted });
+      // "cross": another client writes into the settled session a beat later, as the daemon can relay it.
+      if (prompt.includes("cross")) {
+        void (async () => {
+          await later(1);
+          if (gone) return;
+          const crossed: AgentMessage = { role: "user", content: [{ type: "text", text: "wait, one more thing" }], timestamp: Date.now() };
+          emit({ type: "message_start", message: crossed });
+          emit({ type: "message_end", message: crossed });
+          messages = [...messages, crossed];
+          if (sessionFile) sessionMessages.set(sessionFile, messages);
+        })();
+      }
       aborted = false;
     }
 
@@ -1100,6 +1113,8 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   let worktreeSeq = 1;
   let daemonSeq = 0;
   const FAKE_PERSONA_DIR = "/Users/pip/.pipi/persona";
+  const FAKE_PERSONAS_ROOT = "/Users/pip/.pipi/personas";
+  const fakePersonaDir = (personaId = "default") => (personaId === "default" ? FAKE_PERSONA_DIR : `${FAKE_PERSONAS_ROOT}/${personaId}`);
   let daemonCmdSeq = 0;
   const fakeWorktrees: WorktreeInfo[] = [];
 
@@ -1203,8 +1218,9 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             const text = Array.isArray(msg.content)
               ? msg.content.filter((b): b is { type: string; text: string } => (b as { type?: string }).type === "text" && typeof (b as { text?: unknown }).text === "string").map((b) => b.text).join(" ")
               : "";
-            if (text.trim() && !text.trimStart().startsWith("<pipi-message")) {
-              s.title = titleWords(text).replace(/\s+/g, " ").trim().slice(0, 48);
+            const titled = titleWords(text).replace(/\s+/g, " ").trim().slice(0, 48);
+            if (titled) {
+              s.title = titled;
               pushDaemon(s);
             }
           }
@@ -1331,8 +1347,11 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     async createWorktree(cwd, label) {
       const idx = worktreeSeq++;
       const clean = label.replace(/[^a-z0-9-]+/gi, "-").toLowerCase();
+      const root = cwd.replace(/\/+$/, "");
+      const repo = root.split("/").pop() || "repo";
+      const beside = root.split("/").slice(0, -1).join("/") || "/";
       const wt: WorktreeInfo = {
-        path: `/Users/pip/code/.pipi-worktrees/${clean}-${idx}`,
+        path: `${beside}/.pipi-worktrees/${repo}/${clean}-${idx}`,
         branch: `pipi/${clean}-${idx}`,
         baseCwd: cwd,
         headCommit: "abc1234",
@@ -1380,6 +1399,13 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             pushDaemon(s);
           }
           if (spec.title && !s.persona) s.title = spec.title;
+          if (spec.fresh) s.file = undefined;
+          if (!s.inner && spec.agentId && s.agentId !== spec.agentId) {
+            s.agentId = spec.agentId;
+            s.agentName = spec.agentName ?? agentNameOf(spec.agentId);
+            s.driver = spec.driver ?? driverOf(spec.agentId);
+            s.custom = spec.customAgent;
+          }
           const file = spec.file ?? s.file;
           if (!s.inner) {
             const inner = await spawnDaemonProcess(s);
@@ -1521,19 +1547,34 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
             pushDaemon(s);
           }
         },
+        async updatePersona(sessionId: string, update: { name?: string; avatar?: string | null }) {
+          const s = daemonSessions.get(sessionId);
+          if (!s?.persona) throw new Error("no such personal agent");
+          if (update.name?.trim()) s.title = update.name.trim();
+          if (update.avatar !== undefined) s.avatar = update.avatar || undefined;
+          pushDaemon(s);
+          return daemonInfo(s);
+        },
+        async deletePersona(sessionId: string) {
+          const s = daemonSessions.get(sessionId);
+          if (!s?.persona) throw new Error("no such personal agent");
+          if ((s.personaId ?? "default") === "default") throw new Error("the default personal agent cannot be deleted");
+          removeFakeDaemon(s);
+        },
         async startSession(input: Parameters<DaemonClient["startSession"]>[0]) {
           const parent = input.parentId ? daemonSessions.get(input.parentId) : undefined;
-          // As the real daemon does: `worktree` asks for an isolated branch under the given cwd.
-          const held = input.persona ? [...daemonSessions.values()].find((known) => known.persona) : undefined;
-          if (held && input.replacePersona !== held.id) throw new Error(`the personal agent already runs as ${held.id}`);
+          const personaId = input.persona ? input.personaId || "default" : undefined;
+          const held = input.persona ? [...daemonSessions.values()].find((known) => known.persona && (known.personaId ?? "default") === personaId) : undefined;
+          if (held && input.replacePersona !== held.id) throw new Error(`this personal agent already runs as ${held.id}`);
+          if (input.replacePersona && !held) throw new Error("the personal agent changed; refresh before switching");
           if (held) removeFakeDaemon(held);
-          const cwd = input.persona ? FAKE_PERSONA_DIR : (input.cwd ?? "");
+          const cwd = input.persona ? fakePersonaDir(personaId) : (input.cwd ?? "");
           const wt = input.worktree && api.createWorktree ? await api.createWorktree(cwd, input.agentId) : undefined;
           const s: FakeDaemonSession = {
             id: `s_fake_${++daemonSeq}`,
-            title: input.title || (input.persona ? "Pip" : "New session"),
+            title: input.title || (input.persona ? input.personaName || held?.title || "Pip" : "New session"),
             ...(input.title || input.persona ? { titleLocked: true } : {}),
-            ...(input.persona ? { persona: true } : {}),
+            ...(input.persona ? { persona: true, personaId } : {}),
             cwd: wt?.path ?? cwd,
             agentId: input.agentId,
             agentName: agentNameOf(input.agentId),

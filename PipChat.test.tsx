@@ -296,3 +296,143 @@ test("switching Pip's engine during a run preserves the visible conversation and
   await app.submit("label:Message");
   await app.waitFor("id:pip-typing-bubble");
 });
+
+const REVEAL_REPLY = "Alpha one.\n\nBeta two.\n\nGamma three.";
+const orderOf = (app: App, parts: string[]) => {
+  const texts = app.texts();
+  return parts.map((part) => texts.indexOf(part));
+};
+
+test("a live multi-bubble Pip reply reveals one bubble at a time behind a quiet typing bubble", async () => {
+  const app = await launch({ "harness.reply": REVEAL_REPLY });
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:Hey, what's up?");
+  await app.type("label:Message", "plain reveal");
+  await app.submit("label:Message");
+  await app.waitFor("text:Alpha one.");
+  expect(app.count("id:pip-sms-bubble")).toBe(1);
+  expect(showsInChat(app, "Beta two.")).toBe(false);
+  expect(showsInChat(app, "Gamma three.")).toBe(false);
+  expect(app.shows("id:pip-typing-bubble")).toBe(true);
+  expect(app.shows("label:Copy reply")).toBe(false);
+
+  await app.wait(350);
+  expect(app.count("id:pip-sms-bubble")).toBe(2);
+  expect(showsInChat(app, "Beta two.")).toBe(true);
+  expect(showsInChat(app, "Gamma three.")).toBe(false);
+  expect(app.shows("id:pip-typing-bubble")).toBe(true);
+  expect(app.shows("label:Copy reply")).toBe(false);
+
+  await app.wait(350);
+  expect(app.count("id:pip-sms-bubble")).toBe(3);
+  expect(showsInChat(app, "Gamma three.")).toBe(true);
+  await app.waitFor("label:Copy reply");
+  await app.wait(180);
+  expect(app.shows("id:pip-typing-bubble")).toBe(false);
+  expect(app.storage()["pipi.interleaves.v1"]).toBeUndefined();
+});
+
+test("a user message during reveal lands immediately and later Pip bubbles interleave after it, then reload statically in that order", async () => {
+  const app = await launch({ "harness.reply": REVEAL_REPLY });
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:Hey, what's up?");
+  await app.type("label:Message", "plain cross reveal");
+  await app.submit("label:Message");
+  await app.waitFor("text:Alpha one.");
+  expect(app.count("id:pip-sms-bubble")).toBe(1);
+
+  await app.waitFor("text:wait, one more thing");
+  expect(showsInChat(app, "wait, one more thing")).toBe(true);
+  let order = orderOf(app, ["Alpha one.", "wait, one more thing"]);
+  expect(order[0]).toBeGreaterThanOrEqual(0);
+  expect(order[1]).toBeGreaterThan(order[0]);
+
+  await app.wait(350);
+  expect(showsInChat(app, "Beta two.")).toBe(true);
+  order = orderOf(app, ["Alpha one.", "wait, one more thing", "Beta two."]);
+  expect(order[0]).toBeLessThan(order[1]);
+  expect(order[1]).toBeLessThan(order[2]);
+  await app.wait(350);
+  expect(showsInChat(app, "Gamma three.")).toBe(true);
+  order = orderOf(app, ["Alpha one.", "wait, one more thing", "Beta two.", "Gamma three."]);
+  expect(order[0]).toBeLessThan(order[1]);
+  expect(order[1]).toBeLessThan(order[2]);
+  expect(order[2]).toBeLessThan(order[3]);
+
+  await app.wait(100);
+  const raw = app.storage()["pipi.interleaves.v1"];
+  expect(typeof raw).toBe("string");
+  const journal = JSON.parse(raw) as Record<string, unknown[]>;
+  const record = Object.values(journal).flat()[0];
+  expect(record).toBeTruthy();
+
+  // The same crossing, read back with the engine's chronological history, restores the visual order without replaying it.
+  const cold = await launch({
+    "harness.scenario": "history",
+    "harness.history": JSON.stringify([
+      { role: "user", content: "plain cross reveal", timestamp: 1 },
+      { role: "assistant", content: [{ type: "text", text: REVEAL_REPLY }], provider: "test", model: "test", timestamp: 2, stopReason: "stop" },
+      { role: "user", content: "wait, one more thing", timestamp: 3 },
+    ]),
+    "pipi.interleaves.v1": JSON.stringify({ "/sessions/one.jsonl": [record] }),
+  });
+  await cold.press("id:sidebar-pip");
+  await cold.waitFor("text:Alpha one.");
+  expect(cold.count("id:pip-sms-bubble")).toBe(3);
+  order = orderOf(cold, ["Alpha one.", "wait, one more thing", "Beta two.", "Gamma three."]);
+  expect(order[0]).toBeLessThan(order[1]);
+  expect(order[1]).toBeLessThan(order[2]);
+  expect(order[2]).toBeLessThan(order[3]);
+  expect(cold.shows("id:pip-typing-bubble")).toBe(false);
+});
+
+test("history and Reduced Motion render every Pip bubble at once without entering the reveal queue", async () => {
+  const history = await launch({
+    "harness.scenario": "history",
+    "harness.history": JSON.stringify([
+      { role: "user", content: "plain reveal", timestamp: 1 },
+      { role: "assistant", content: [{ type: "text", text: REVEAL_REPLY }], provider: "test", model: "test", timestamp: 2, stopReason: "stop" },
+    ]),
+  });
+  await history.press("id:sidebar-pip");
+  await history.waitFor("text:Alpha one.");
+  expect(history.count("id:pip-sms-bubble")).toBe(3);
+  expect(history.shows("id:pip-typing-bubble")).toBe(false);
+
+  const reduced = await open("./Harness.tsx", {
+    width: 1180,
+    height: 1100,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    reducedMotion: true,
+    storage: { "harness.scenario": "stream", "harness.reply": REVEAL_REPLY },
+  });
+  await reduced.press("id:sidebar-pip");
+  await reduced.waitFor("text:Hey, what's up?");
+  await reduced.type("label:Message", "plain reveal");
+  await reduced.submit("label:Message");
+  await reduced.waitFor("text:Alpha one.");
+  expect(reduced.count("id:pip-sms-bubble")).toBe(3);
+  await reduced.wait(500);
+  expect(reduced.shows("id:pip-typing-bubble")).toBe(false);
+});
+
+test("leaving Pip mid-reveal settles the turn, and returning shows every bubble statically", async () => {
+  const app = await launch({ "harness.reply": REVEAL_REPLY });
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:Hey, what's up?");
+  await app.type("label:Message", "plain reveal");
+  await app.submit("label:Message");
+  await app.waitFor("text:Alpha one.");
+  expect(app.count("id:pip-sms-bubble")).toBe(1);
+
+  await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
+  await app.waitFor("label:Conversation");
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:Alpha one.");
+  expect(app.count("id:pip-sms-bubble")).toBe(3);
+  expect(showsInChat(app, "Beta two.")).toBe(true);
+  expect(showsInChat(app, "Gamma three.")).toBe(true);
+  expect(app.shows("id:pip-typing-bubble")).toBe(false);
+});

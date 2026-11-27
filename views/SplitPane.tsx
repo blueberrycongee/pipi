@@ -24,7 +24,7 @@ import type { ExtensionUiDialog, Model, ThinkingLevel } from "../pi/protocol";
 import { providerName } from "../pi/providers";
 import type { Row, ToolRow } from "../pi/transcript";
 import { describeToolCall, elapsedSeconds, reasoningPreview } from "../pi/turns";
-import { availableAgents, currentRuntimeCeiling, isChatFolder, placeLabel, showAgentSettings, wallpaper } from "../store/app";
+import { availableAgents, currentRuntimeCeiling, daemonSessionOfId, isChatFolder, placeLabel, showAgentSettings, wallpaper } from "../store/app";
 import { backend } from "../store/backend";
 import { docTabTitle } from "../store/docs";
 import {
@@ -887,13 +887,15 @@ function SplitChatView(props: { chat: SplitChatController }) {
         }
       >
         <MediaStreamContext.Provider
-          value={() =>
-            collectTranscriptImages(untracked(props.chat.rows), {
-              cwd: untracked(props.chat.cwd),
-              home: backend().home(),
-              isMissingPath: isKnownMissingPath,
-            })
-          }
+          value={{
+            images: () =>
+              collectTranscriptImages(untracked(props.chat.rows), {
+                cwd: untracked(props.chat.cwd),
+                home: backend().home(),
+                isMissingPath: isKnownMissingPath,
+              }),
+            isolateGroups: () => daemonSessionOfId(props.chat.daemonId())?.persona === true,
+          }}
         >
         <Scroll
           ref={(ref) => {

@@ -61,7 +61,7 @@ import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { readingType, codeType, uiHeight, uiType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
-import { MediaGallery, MediaStreamContext, openMediaZoom } from "./Media";
+import { MediaGallery, MediaStreamContext, mediaZoomOptions, openMediaZoom } from "./Media";
 import { BubbleTail, PipAvatarBadge, PipBubbleView, PipFooterView, PipSessionsView } from "./PipPresence";
 import { clearProseState, proseClasses, ProseBlock, proseVeilUntil, type PipBubbleRow, type ProseRow } from "./Prose";
 
@@ -535,7 +535,7 @@ function UserImages(props: {
               onPress={() => {
                 const local = mediaItems();
                 const picked = local[index()];
-                if (picked) openMediaZoom(picked, { gallery: getStream?.(), fallbackGallery: local });
+                if (picked) openMediaZoom(picked, mediaZoomOptions(getStream, local));
               }}
               onContextMenu={props.onContextMenu}
               accessibilityLabel={
@@ -1624,7 +1624,7 @@ function DeliveryRow(props: { row: Extract<Row, { kind: "delivery" }> }) {
                   ...(resolved?.mimeType ? { mimeType: resolved.mimeType } : {}),
                   ...(resolved?.data ? { data: resolved.data } : {}),
                 },
-                { gallery: getStream?.(), fallbackGallery: media() },
+                mediaZoomOptions(getStream, media()),
               );
             }}
           />

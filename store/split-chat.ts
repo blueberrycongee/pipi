@@ -23,6 +23,7 @@ import type {
   SlashCommand,
   ThinkingLevel,
 } from "../pi/protocol";
+import { sessionTitle } from "../pi/sessions";
 import { Transcript, type Row } from "../pi/transcript";
 import { displayRowIds } from "../pi/turns";
 import { markRowsSeen } from "../ui/motion";
@@ -40,6 +41,7 @@ import {
   currentRuntimeCeiling,
   daemonSessionByFile,
   daemonSessionOfId,
+  daemonSessionTitle,
   docRefText,
   draftModel,
   draftThinkingLevel,
@@ -439,9 +441,8 @@ export function createSplitChatController(target: Extract<SplitTarget, { kind: "
     held?.cwd ?? target.cwd ?? (untracked(activeProjectPath) || untracked(workspacePath));
   const initialTitle =
     target.title ||
-    (held?.title && held.title !== "New session" ? held.title : "") ||
-    summary?.name ||
-    summary?.firstMessage ||
+    (held ? daemonSessionTitle(held, "") : "") ||
+    (summary ? sessionTitle(summary, "") : "") ||
     "";
 
   const s: SplitChatInternal = {

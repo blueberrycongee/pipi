@@ -107,3 +107,29 @@ test("inline document editor context instructs direct edits while staying invisi
     docs: [{ path: NOTE, text: "# Doc" }],
   });
 });
+
+test("titles unwrap pipi-message envelopes and never expose their protocol head", () => {
+  const envelope = '<pipi-message from="s_pip" title="Pip" agent="Pi" status="idle">\nFix the sidebar title\n</pipi-message>';
+  expect(titleWords(envelope)).toBe("Fix the sidebar title");
+  expect(titleWords(`<pipi-persona name="Pip">persona</pipi-persona>\n\n${envelope}`)).toBe("Fix the sidebar title");
+});
+
+test("titles strip handoff and editor protocol prefixes inside an envelope", () => {
+  const text = [
+    '<pipi-message from="s_pip" title="Pip" agent="Pi" status="idle">',
+    '<conversation_handoff from="pi">notes</conversation_handoff>',
+    'User message:',
+    'Readable task title',
+    '<doc_editor_context path="/tmp/a.md">edit instructions</doc_editor_context>',
+    '</pipi-message>',
+  ].join("\n");
+  expect(titleWords(text)).toBe("Readable task title");
+});
+
+test("a clipped pipi-message envelope still loses its protocol head", () => {
+  expect(titleWords('<pipi-message from="s_pip" title="Pip" agent="Pi" status="idle">\nReadable words survived…')).toBe("Readable words survived…");
+});
+
+test("ordinary title words are unchanged", () => {
+  expect(titleWords("Please refactor the sidebar")).toBe("Please refactor the sidebar");
+});

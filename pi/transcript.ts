@@ -336,9 +336,9 @@ export function withoutImageNotes(text: string): string {
   return kept.length ? `${head}\n\n${kept.join("\n")}` : head;
 }
 
-const HANDOFF_PREFIX = /^<conversation_handoff\b[^>]*>[\s\S]*?<\/conversation_handoff>\n\nUser message:\n/;
+const HANDOFF_PREFIX = /^<conversation_handoff\b[^>]*>[\s\S]*?<\/conversation_handoff>\s*User message:\n/;
 /** What the daemon opens a fresh conversation with the personal agent with (`withPersona` in `sidecar/pipi-daemon.mjs`). */
-const PERSONA_PREFIX = /^<pipi-persona\b[^>]*>[\s\S]*?<\/pipi-persona>\n\n/;
+const PERSONA_PREFIX = /^<pipi-persona\b[^>]*>[\s\S]*?<\/pipi-persona>\s*/;
 
 interface StagedUserEntry {
   row: Extract<Row, { kind: "user" }>;

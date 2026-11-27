@@ -50,7 +50,7 @@ import { tip } from "../ui/Tip";
 import { readingType, codeType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
 import { openZoom } from "../ui/Zoom";
-import { MediaGallery, MediaStreamContext, openMediaZoom } from "./Media";
+import { MediaGallery, MediaStreamContext, mediaZoomOptions, openMediaZoom, type MediaStreamScope } from "./Media";
 
 /** Shared typography classes for `TextView` fallback blocks (alerts, math, settled code). */
 export const proseClasses = computed(() => ({
@@ -111,7 +111,7 @@ function zoomTable(block: Extract<TextViewBlock, { type: "table" }>) {
 }
 
 /** Opens an image in the same zoom layer (`TextView`'s `onImagePress`). */
-function zoomImage(image: TextViewImage, gallery?: readonly MediaItem[]) {
+function zoomImage(image: TextViewImage, stream?: MediaStreamScope) {
   const resolved = resolveMediaTarget(image.src, workspacePath(), backend().home());
   const item: MediaItem = resolved
     ? {
@@ -130,7 +130,7 @@ function zoomImage(image: TextViewImage, gallery?: readonly MediaItem[]) {
         title: image.title || image.alt || "image",
         src: image.src,
       };
-  openMediaZoom(item, gallery ? { gallery } : undefined);
+  openMediaZoom(item, mediaZoomOptions(stream, [item]));
 }
 
 /** A block's hover-revealed expand button: a floating chip at its top-right corner that opens it in the zoom layer. */
@@ -747,7 +747,7 @@ function FallbackTextViewBlock(props: { block: TextViewBlock; settled: boolean; 
       codeBlockScrollbar={false}
       tableScrollbar={false}
       codeBlockActions={props.settled ? [{ id: "copy", label: tr("Copy code", "复制代码") }] : undefined}
-      onImagePress={({ image }) => zoomImage(image, getStream?.())}
+      onImagePress={({ image }) => zoomImage(image, getStream)}
     />
   );
 }

@@ -156,6 +156,32 @@ function makeCardPng(width: number, height: number, bg: [number, number, number]
   return out;
 }
 
+function makeSolidBmp(width: number, height: number, r: number, g: number, b: number): Uint8Array {
+  const rowSize = (width * 3 + 3) & ~3;
+  const pixelsSize = rowSize * height;
+  const out = new Uint8Array(54 + pixelsSize);
+  const view = new DataView(out.buffer);
+  out[0] = 0x42;
+  out[1] = 0x4d;
+  view.setUint32(2, out.length, true);
+  view.setUint32(10, 54, true);
+  view.setUint32(14, 40, true);
+  view.setInt32(18, width, true);
+  view.setInt32(22, height, true);
+  view.setUint16(26, 1, true);
+  view.setUint16(28, 24, true);
+  view.setUint32(34, pixelsSize, true);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const px = 54 + y * rowSize + x * 3;
+      out[px] = b;
+      out[px + 1] = g;
+      out[px + 2] = r;
+    }
+  }
+  return out;
+}
+
 function makeSilentWav(): Uint8Array {
   const sampleCount = 800; // 0.1s at 8kHz mono PCM
   const dataSize = sampleCount * 2;
@@ -301,6 +327,111 @@ test("present_files and tool ImageContent surface outside collapsed turn folds",
   } finally {
     await fs.unlink(iconTmp).catch(() => undefined);
     await fs.unlink(bannerTmp).catch(() => undefined);
+    await fs.rmdir(tmpDir).catch(() => undefined);
+  }
+}, 120000);
+
+test("personal agent lightboxes stay inside the clicked media group", async () => {
+  const tmpDir = `/tmp/pipi-persona-media-${Date.now()}`;
+  await fs.mkdir(tmpDir, { recursive: true });
+  const a1 = `${tmpDir}/a1.png`;
+  const a2 = `${tmpDir}/a2.png`;
+  const b1 = `${tmpDir}/b1.png`;
+  const b2 = `${tmpDir}/b2.png`;
+  const u1 = `${tmpDir}/u1.png`;
+  const u2 = `${tmpDir}/u2.png`;
+  const f1 = `${tmpDir}/f1.bmp`;
+  const f2 = `${tmpDir}/f2.bmp`;
+  await fs.writeFile(a1, makeSolidPng(96, 96, 46, 178, 172));
+  await fs.writeFile(a2, makeSolidPng(96, 96, 99, 102, 241));
+  await fs.writeFile(b1, makeSolidPng(96, 96, 234, 88, 12));
+  await fs.writeFile(b2, makeSolidPng(96, 96, 22, 163, 74));
+  await fs.writeFile(u1, makeSolidPng(96, 96, 220, 38, 127));
+  await fs.writeFile(u2, makeSolidPng(96, 96, 250, 204, 21));
+  await fs.writeFile(f1, makeSolidBmp(96, 96, 14, 165, 233));
+  await fs.writeFile(f2, makeSolidBmp(96, 96, 168, 85, 247));
+
+  const showMedia = async (app: App, first: string, second: string) => {
+    await app.type("label:Message", `show media: ${first},${second}`);
+    await app.submit("label:Message");
+  };
+
+  try {
+    const app = await open("./Harness.tsx", {
+      width: 1120,
+      height: 1100,
+      platform: "macos",
+      locale: "en-US",
+      colorScheme: "dark",
+      storage: {
+        "harness.scenario": "welcome",
+        "harness.reply": "Here are the images.",
+      },
+    });
+    await app.waitFor("text:What are we building?");
+    await app.press("id:sidebar-pip");
+    await app.waitFor("text:Hey, what's up?");
+
+    // Two Pip turns each present a two-image group plus one separate screenshot card.
+    await showMedia(app, a1, a2);
+    await app.waitUntil(() => app.count("text:Generated deliverables") === 1);
+    await app.waitFor("label:a1.png");
+    await showMedia(app, b1, b2);
+    await app.waitUntil(() => app.count("text:Generated deliverables") === 2);
+    await app.waitFor("label:b1.png");
+
+    // The second present_files group browses as exactly two photos, never as part of the whole conversation.
+    await app.press("label:b1.png");
+    await app.waitFor("label:Close preview");
+    await app.waitFor("text:1 / 2");
+    expect(app.count("id:zoom-thumb")).toBe(2);
+    await app.press("label:Next image");
+    await app.waitFor("text:2 / 2");
+    await app.keyboard.press("escape");
+    await app.waitUntil(() => app.count("label:Close preview") === 0);
+
+    // The separate screenshot card is a single-photo preview: no badge, arrows, or filmstrip.
+    await app.press("label:image.png >> nth=0");
+    await app.waitFor("label:Close preview");
+    await app.wait(120);
+    expect(app.count("id:zoom-thumb")).toBe(0);
+    expect(app.count("label:Next image")).toBe(0);
+    expect(app.count("label:Previous image")).toBe(0);
+    await app.keyboard.press("escape");
+    await app.waitUntil(() => app.count("label:Close preview") === 0);
+
+    // A user message's two attachments likewise form their own closed group.
+    await app.paste("label:Message", { uris: [`file://${u1}`, `file://${u2}`] });
+    await app.waitFor("label:u1.png");
+    await app.waitFor("label:u2.png");
+    await app.type("label:Message", "these two are mine");
+    await app.submit("label:Message");
+    await app.waitFor("label:Preview image 1");
+    await app.press("label:Preview image 1");
+    await app.waitFor("label:Close preview");
+    await app.waitFor("text:1 / 2");
+    expect(app.count("id:zoom-thumb")).toBe(2);
+    await app.press("label:Next image");
+    await app.waitFor("text:2 / 2");
+    await app.keyboard.press("escape");
+    await app.waitUntil(() => app.count("label:Close preview") === 0);
+
+    // Image files attached as files (rather than pasted pixels) stay grouped by that user message too.
+    await app.paste("label:Message", { uris: [`file://${f1}`, `file://${f2}`] });
+    await app.waitUntil(() => app.count("id:composer-file") === 2);
+    await app.type("label:Message", "and these as files");
+    await app.submit("label:Message");
+    await app.waitFor("label:f1.bmp");
+    await app.press("label:f1.bmp");
+    await app.waitFor("label:Close preview");
+    await app.waitFor("text:1 / 2");
+    expect(app.count("id:zoom-thumb")).toBe(2);
+    await app.press("label:Next image");
+    await app.waitFor("text:2 / 2");
+    await app.keyboard.press("escape");
+    await app.waitUntil(() => app.count("label:Close preview") === 0);
+  } finally {
+    for (const path of [a1, a2, b1, b2, u1, u2, f1, f2]) await fs.unlink(path).catch(() => undefined);
     await fs.rmdir(tmpDir).catch(() => undefined);
   }
 }, 120000);

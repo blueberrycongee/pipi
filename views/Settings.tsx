@@ -24,7 +24,7 @@ import { Pip } from "../mascot/Pip";
 import { agentDir } from "../pi/credentials";
 import type { QueueMode } from "../pi/protocol";
 import { PROVIDERS, type ProviderInfo, providerName } from "../pi/providers";
-import { type SessionSummary, sessionTitle } from "../pi/sessions";
+import type { SessionSummary } from "../pi/sessions";
 import { compactNumber } from "../pi/transcript";
 import {
   activeAgent,
@@ -58,6 +58,7 @@ import {
   saveAgentApiKey,
   saveCustomAgent,
   saveProviderKey,
+  sessionDisplayTitle,
   sessionState,
   sessionsReady,
   type SettingsSection,
@@ -1461,7 +1462,7 @@ function ArchivePage() {
     const validFilter = filterCwd === "all" || allCwds().includes(filterCwd) ? filterCwd : "all";
     const grouped = new Map<string, { cwd: string; projectName: string; items: ArchivedSessionItem[] }>();
     for (const item of allItems()) {
-      const title = sessionTitle(item.session, tr("New session", "新会话"));
+      const title = sessionDisplayTitle(item.session, tr("New session", "新会话"));
       if (validFilter !== "all" && item.cwd !== validFilter) continue;
       if (q && !title.toLowerCase().includes(q) && !basename(item.cwd).toLowerCase().includes(q)) continue;
       const key = item.cwd || "no-workspace";
@@ -1478,7 +1479,7 @@ function ArchivePage() {
   const noMatches = () => allItems().length > 0 && groups().length === 0;
 
   const confirmDeleteOne = async (session: SessionSummary, cwd: string) => {
-    const title = sessionTitle(session, tr("New session", "新会话"));
+    const title = sessionDisplayTitle(session, tr("New session", "新会话"));
     const { action } = await AlertDialog.show({
       title: tr("Delete this archived session?", "删除此归档会话？"),
       description: tr(
@@ -1685,7 +1686,7 @@ function ArchivePage() {
                 <View class="overflow-hidden rounded-xl corner-squircle bg-muted/50 px-4">
                   <Each of={group().items} key={(item) => item.id}>
                     {(entry, index) => {
-                      const title = () => sessionTitle(entry().session, tr("New session", "新会话"));
+                      const title = () => sessionDisplayTitle(entry().session, tr("New session", "新会话"));
                       return (
                         <View>
                           <If when={index() > 0}>

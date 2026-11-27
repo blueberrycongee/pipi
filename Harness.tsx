@@ -114,13 +114,19 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
     await fs.mkdir(path.split("/").slice(0, -1).join("/"), { recursive: true }).catch(() => undefined);
     await fs.writeFile(path, content).catch(() => undefined);
   }
+  const harnessSessions = JSON.parse((await Storage.getItem("harness.sessions")) ?? "null") as typeof sessions | null;
+  const listedSessions = harnessSessions ?? sessions;
+  const listedWorkspaceSessions =
+    scenario === "multi" || scenario === "multi-slow"
+      ? { ...workspaceSessions, "/Users/pip/code/pipi": listedSessions }
+      : undefined;
   useBackend(
     fakeBackend({
       noModels: scenario === "connect",
       failStart: scenario === "failed",
       history: scenario === "history" ? (JSON.parse((await Storage.getItem("harness.history")) ?? "null") ?? sampleHistory()) : [],
-      sessions: scenario === "connect" || scenario === "failed" ? [] : sessions,
-      workspaceSessions: scenario === "multi" || scenario === "multi-slow" ? workspaceSessions : undefined,
+      sessions: scenario === "connect" || scenario === "failed" ? [] : listedSessions,
+      workspaceSessions: listedWorkspaceSessions,
       daemonSessions: JSON.parse((await Storage.getItem("harness.daemonSessions")) ?? "null") ?? undefined,
       pickedFolder: (await Storage.getItem("harness.pickedFolder")) ?? "/Users/pip/code/new-app",
       pickedImage: (await Storage.getItem("harness.pickedImage")) ?? undefined,

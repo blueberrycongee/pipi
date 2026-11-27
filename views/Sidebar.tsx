@@ -24,7 +24,7 @@ import { basename, tildePath } from "../lib/format";
 import { tr } from "../lib/i18n";
 import { Pip } from "../mascot/Pip";
 import type { DaemonSession } from "../pi/daemon";
-import { type SessionSummary, sessionTitle } from "../pi/sessions";
+import type { SessionSummary } from "../pi/sessions";
 import { AgentLogo } from "../ui/AgentLogo";
 import {
   activeAgentId,
@@ -67,6 +67,7 @@ import {
   removeDaemonSession,
   removeSession,
   savedSessions,
+  sessionDisplayTitle,
   sessionsReady,
   sessionState,
   showChat,
@@ -232,7 +233,7 @@ const shownProjects = computed(
 /** The folders 最近 gathers sessions from: every open project, and the chat folder. */
 const recentFolders = computed(() => [...projects(), chatFolder()], { equals: sameItems });
 
-const titleOf = (session: SessionSummary) => sessionTitle(session, tr("New session", "新会话"));
+const titleOf = (session: SessionSummary) => sessionDisplayTitle(session, tr("New session", "新会话"));
 
 /** The daemon session open on screen (or where a session change is heading). */
 const openDaemon = computed(() => {
@@ -2443,12 +2444,17 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; c
       if (props.collapsed()) return lastItems;
       const rows: FolderItem[] = [];
       const listed = new Set(folderSessions().map((s) => s.path));
+      const daemonRoots: DaemonSession[] = [];
       for (const ds of daemonSessions()) {
         if (ds.persona || sidebarSessionParent(ds) || (ds.file && listed.has(ds.file))) continue;
         if (isSessionArchived(ds.file)) continue;
         if (projectCwdOf(ds.cwd, ds) !== props.cwd) continue;
         if (!daemonRootEarnsRow(ds)) continue;
         if (isDraftSession() && ds.id === openDaemonId()) continue;
+        daemonRoots.push(ds);
+      }
+      daemonRoots.sort((a, b) => b.lastActive - a.lastActive || b.createdAt - a.createdAt || a.id.localeCompare(b.id));
+      for (const ds of daemonRoots) {
         rows.push(reuseFolderItem(`child:${ds.id}`, undefined, ds));
         for (const child of childSessionsOfDaemon(ds.id)) rows.push(reuseFolderItem(`child:${child.id}`, undefined, child));
       }

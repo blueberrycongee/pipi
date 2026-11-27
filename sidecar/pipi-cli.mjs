@@ -136,7 +136,8 @@ async function main() {
     }
     case "pip": {
       const message = f._.join(" ").trim();
-      const held = (await call("list")).sessions.find((s) => s.persona);
+      const known = (await call("list")).sessions;
+      const held = known.find((s) => s.persona && (s.personaId ?? "default") === "default") ?? known.find((s) => s.persona);
       if (!held || (f.agent && f.agent !== held.agentId)) {
         const res = await call("start_session", { input: { persona: true, replacePersona: held?.id, agentId: f.agent || "pi", model: f.model, thinking: f.thinking, ...(message ? { message } : {}) } });
         print(res.session.id);

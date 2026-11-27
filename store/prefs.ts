@@ -22,6 +22,7 @@ import {
   type WallpaperPauseMode,
   type WallpaperVideoClickAction,
 } from "../lib/wallpaper";
+import { isPipiWorktreePath, projectListPath } from "../lib/worktree-path";
 
 /** What pipi remembers between launches, kept in the app's own storage. */
 export type Appearance = "system" | "light" | "dark";
@@ -76,6 +77,13 @@ export interface AgentSessionChoice {
   /** Thinking depth: pipi's levels, or an ACP harness's own advertised effort value. */
   thinkingLevel?: ThinkingLevel;
   modelConfigs?: Record<string, string | boolean>;
+}
+
+/** A personal agent's own engine and per-engine session picks, independent of the coding-session defaults. */
+export interface PersonaSessionChoice extends AgentSessionChoice {
+  agentId?: string;
+  /** Model/thinking picks by the persona's engine, so switching engines never overwrites another engine's picks. */
+  agents?: Record<string, AgentSessionChoice>;
 }
 
 interface Prefs {
@@ -143,6 +151,8 @@ interface Prefs {
   customAgents: CustomAgentConfig[];
   /** Per-agent last model + thinking picks, restored onto each fresh session. */
   agentSessionChoices: Record<string, AgentSessionChoice>;
+  /** Per-persona engine + model + thinking picks (`"default"` is the legacy Pip). */
+  personaSessionChoices: Record<string, PersonaSessionChoice>;
   /** The wallpaper laid under the whole window. */
   wallpaper: WallpaperConfig | null;
   /** Visual shader effect the wallpaper is drawn through. */
@@ -206,6 +216,7 @@ const DEFAULTS: Prefs = {
   agentOverrides: {},
   customAgents: [],
   agentSessionChoices: {},
+  personaSessionChoices: {},
   wallpaper: null,
   wallpaperEffect: "none",
   wallpaperHistory: [],
@@ -239,7 +250,7 @@ function normalizeArchivedSessions(raw: unknown): Record<string, ArchivedSession
       const m = meta as Partial<ArchivedSessionMeta>;
       out[path] = {
         archivedAt: typeof m.archivedAt === "number" ? m.archivedAt : 0,
-        ...(typeof m.cwd === "string" && m.cwd ? { cwd: m.cwd } : {}),
+        ...(typeof m.cwd === "string" && m.cwd && projectListPath(m.cwd) ? { cwd: projectListPath(m.cwd)! } : {}),
         ...(m.gone === true ? { gone: true as const } : {}),
       };
     }
@@ -286,12 +297,29 @@ function normalizeRanks(raw: unknown): Record<string, number> {
   return out;
 }
 
+/** Open projects, with pipi's temporary task checkouts folded back onto the repository they branched from. */
+function normalizeWorkspacePaths(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string" || !item) continue;
+    const path = projectListPath(item);
+    if (path && !out.includes(path)) out.push(path);
+  }
+  return out.slice(-MAX_WORKSPACES);
+}
+
+function normalizeWorkspacePath(raw: unknown): string | undefined {
+  return typeof raw === "string" && raw ? projectListPath(raw) : undefined;
+}
+
 function normalizeRankMap(raw: unknown): Record<string, Record<string, number>> {
   const out: Record<string, Record<string, number>> = {};
   if (!raw || typeof raw !== "object") return out;
-  for (const [cwd, ranks] of Object.entries(raw as Record<string, unknown>)) {
+  for (const [rawCwd, ranks] of Object.entries(raw as Record<string, unknown>)) {
+    const cwd = projectListPath(rawCwd);
     const inner = normalizeRanks(ranks);
-    if (Object.keys(inner).length) out[cwd] = inner;
+    if (cwd && Object.keys(inner).length) out[cwd] = { ...(out[cwd] ?? {}), ...inner };
   }
   return out;
 }
@@ -310,6 +338,31 @@ function normalizeOpenTabs(raw: unknown): StoredOpenTab[] {
       ref: t.ref,
       ...(typeof t.file === "string" && t.file ? { file: t.file } : {}),
     });
+  }
+  return out;
+}
+
+function normalizePersonaSessionChoices(raw: unknown): Record<string, PersonaSessionChoice> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, PersonaSessionChoice> = {};
+  for (const [personaId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!personaId || !value || typeof value !== "object") continue;
+    const choice = value as Partial<PersonaSessionChoice>;
+    const model =
+      choice.model && typeof choice.model === "object" && typeof choice.model.provider === "string" && typeof choice.model.id === "string" && choice.model.id
+        ? { provider: choice.model.provider, id: choice.model.id }
+        : undefined;
+    const thinkingLevel = typeof choice.thinkingLevel === "string" && choice.thinkingLevel ? (choice.thinkingLevel as ThinkingLevel) : undefined;
+    const agentId = typeof choice.agentId === "string" && choice.agentId ? choice.agentId : undefined;
+    const agents = normalizeSessionChoices(choice.agents);
+    if (agentId || model || thinkingLevel || Object.keys(agents).length) {
+      out[personaId] = {
+        ...(agentId ? { agentId } : {}),
+        ...(model ? { model } : {}),
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+        ...(Object.keys(agents).length ? { agents } : {}),
+      };
+    }
   }
   return out;
 }
@@ -351,6 +404,26 @@ export async function loadPrefs() {
       const effectiveWallpaperEffect: WallpaperEffect = isAvailableWallpaperEffect(parsed.wallpaperEffect)
         ? parsed.wallpaperEffect
         : "none";
+      const agentChoices = normalizeSessionChoices(parsed.agentSessionChoices);
+      const personaChoices = normalizePersonaSessionChoices(parsed.personaSessionChoices);
+      // Before personas had their own preference scope, Pip simply used the
+      // global default agent and that agent's picks. Carry those exact picks
+      // onto the legacy persona once; afterwards it drifts independently.
+      if (parsed.personaSessionChoices === undefined) {
+        const agentId = typeof parsed.personalAgentId === "string" && parsed.personalAgentId ? parsed.personalAgentId : typeof parsed.defaultAgentId === "string" && parsed.defaultAgentId ? parsed.defaultAgentId : DEFAULTS.defaultAgentId;
+        const legacyChoice = agentChoices[`persona:${agentId}`] ?? agentChoices[agentId];
+        personaChoices.default = { agentId, ...(legacyChoice ?? {}), ...(legacyChoice ? { agents: { [agentId]: legacyChoice } } : {}) };
+      }
+      const archivedRaw = parsed.archivedSessions && typeof parsed.archivedSessions === "object" && !Array.isArray(parsed.archivedSessions)
+        ? Object.values(parsed.archivedSessions as Record<string, unknown>)
+        : [];
+      const workspacePollution =
+        (Array.isArray(parsed.workspaces) && parsed.workspaces.some((path) => typeof path === "string" && isPipiWorktreePath(path))) ||
+        (Array.isArray(parsed.collapsedWorkspaces) && parsed.collapsedWorkspaces.some((path) => typeof path === "string" && isPipiWorktreePath(path))) ||
+        isPipiWorktreePath(parsed.activeWorkspace) ||
+        (parsed.sessionRanks && typeof parsed.sessionRanks === "object" && !Array.isArray(parsed.sessionRanks) &&
+          Object.keys(parsed.sessionRanks as Record<string, unknown>).some((path) => isPipiWorktreePath(path))) ||
+        archivedRaw.some((meta) => Boolean(meta && typeof meta === "object" && isPipiWorktreePath((meta as { cwd?: unknown }).cwd as string | undefined)));
       prefs.set({
         ...DEFAULTS,
         ...parsed,
@@ -361,8 +434,11 @@ export async function loadPrefs() {
         },
         agentOverrides: parsed.agentOverrides ?? {},
         customAgents: Array.isArray(parsed.customAgents) ? parsed.customAgents : [],
-        agentSessionChoices: normalizeSessionChoices(parsed.agentSessionChoices),
-        collapsedWorkspaces: Array.isArray(parsed.collapsedWorkspaces) ? parsed.collapsedWorkspaces : [],
+        workspaces: normalizeWorkspacePaths(parsed.workspaces),
+        activeWorkspace: normalizeWorkspacePath(parsed.activeWorkspace),
+        agentSessionChoices: agentChoices,
+        personaSessionChoices: personaChoices,
+        collapsedWorkspaces: normalizeWorkspacePaths(parsed.collapsedWorkspaces),
         recentRanks: normalizeRanks(parsed.recentRanks),
         sessionRanks: normalizeRankMap(parsed.sessionRanks),
         docRanks: normalizeRanks(parsed.docRanks),
@@ -409,6 +485,9 @@ export async function loadPrefs() {
           (!DYNAMIC_WALLPAPER_ENABLED || isPausableWallpaper(normalizedWallpaper, effectiveWallpaperEffect)),
         wallpaperMuted: parsed.wallpaperMuted !== undefined ? Boolean(parsed.wallpaperMuted) : true,
       });
+      // Migration, not just masking: a polluted worktree path is written out of
+      // storage once, so old ghost folders never come back on the next boot.
+      if (workspacePollution) await Storage.setItem(KEY, JSON.stringify(prefs())).catch(() => undefined);
     }
   } catch {
     // Unreadable preferences are replaced by the defaults at the next change.
@@ -523,6 +602,18 @@ export const storedSessionChoices = (): Record<string, AgentSessionChoice> => st
 export const preferredPersonalAgentId = computed(() => prefs().personalAgentId ?? preferredAgentId());
 export function setPreferredPersonalAgentId(agentId: string) {
   change({ personalAgentId: agentId });
+}
+export const storedPersonaChoice = (personaId: string): PersonaSessionChoice | undefined => prefs().personaSessionChoices[personaId || "default"];
+
+/** The persona-scoped model/thinking pick for one engine: top-level legacy fields first, per-engine picks winning. */
+export function storedPersonaAgentChoice(personaId: string, agentId: string): AgentSessionChoice | undefined {
+  const choice = storedPersonaChoice(personaId);
+  if (!choice) return undefined;
+  const legacy: AgentSessionChoice = { ...(choice.model ? { model: choice.model } : {}), ...(choice.thinkingLevel ? { thinkingLevel: choice.thinkingLevel } : {}), ...(choice.modelConfigs ? { modelConfigs: choice.modelConfigs } : {}) };
+  const legacyCompatible = (personaId || "default") === "default" ? storedSessionChoice(`persona:${agentId}`) : undefined;
+  const specific = { ...(legacyCompatible ?? {}), ...(choice.agents?.[agentId] ?? {}) };
+  const merged = { ...legacy, ...specific, modelConfigs: { ...(legacy.modelConfigs ?? {}), ...(specific.modelConfigs ?? {}) } };
+  return merged.model || merged.thinkingLevel || Object.keys(merged.modelConfigs ?? {}).length ? merged : undefined;
 }
 // The stored wallpaper/effect may name a dynamic kind the feature gate hides;
 // readers must agree with the render gate (`EffectSurface.canRender`), so the
@@ -663,6 +754,42 @@ export function rememberSessionChoice(agentId: string, patch: Partial<AgentSessi
   notifyDaemonPrefs();
 }
 
+/** Merges a personal agent's own engine/model/thinking picks, keyed by persona id rather than agent id. */
+export function rememberPersonaChoice(personaId: string, patch: Partial<PersonaSessionChoice>) {
+  const id = personaId || "default";
+  const current = prefs().personaSessionChoices[id] ?? {};
+  change({ personaSessionChoices: { ...prefs().personaSessionChoices, [id]: { ...current, ...patch } } });
+  // The original single-Pip preference shape remains the compatibility mirror
+  // for the default persona; custom personas live only in personaSessionChoices.
+  if (id === "default" && typeof patch.agentId === "string" && patch.agentId) {
+    change({ personalAgentId: patch.agentId });
+  }
+}
+
+/** A new persona starts from the user's current default harness and that harness's picks, then drifts independently. */
+export function seedPersonaChoice(personaId: string, agentId = personaId === "default" ? (prefs().personalAgentId ?? prefs().defaultAgentId) : prefs().defaultAgentId) {
+  const id = personaId || "default";
+  if (prefs().personaSessionChoices[id]) return;
+  const base = prefs().agentSessionChoices[agentId];
+  rememberPersonaChoice(id, { agentId, ...(base ?? {}), ...(base ? { agents: { [agentId]: base } } : {}) });
+}
+
+/** Merges model/thinking picks for one engine within one persona's independent preference scope. */
+export function rememberPersonaAgentChoice(personaId: string, agentId: string, patch: Partial<AgentSessionChoice>) {
+  const id = personaId || "default";
+  if (!agentId) return;
+  const current = prefs().personaSessionChoices[id] ?? {};
+  const agents = { ...(current.agents ?? {}) };
+  agents[agentId] = { ...(agents[agentId] ?? {}), ...patch };
+  rememberPersonaChoice(id, { agents });
+  if (id === "default") {
+    const legacyKey = `persona:${agentId}`;
+    const legacy = prefs().agentSessionChoices[legacyKey] ?? {};
+    change({ agentSessionChoices: { ...prefs().agentSessionChoices, [legacyKey]: { ...legacy, ...patch } } });
+    notifyDaemonPrefs();
+  }
+}
+
 export function addCustomAgentPref(agent: CustomAgentConfig) {
   change({ customAgents: [...prefs().customAgents.filter((c) => c.id !== agent.id), agent] });
 }
@@ -675,7 +802,8 @@ export function removeCustomAgentPref(agentId: string) {
 }
 
 /** Ensures a folder is in the open projects list (preserving existing order) and marks it active. */
-export function rememberWorkspace(path: string) {
+export function rememberWorkspace(rawPath: string) {
+  const path = projectListPath(rawPath);
   if (!path) return;
   const current = prefs().workspaces;
   const alreadyListed = current.includes(path);
@@ -685,7 +813,8 @@ export function rememberWorkspace(path: string) {
 }
 
 /** Ensures a folder is in the open projects list without changing which workspace is active. */
-export function ensureWorkspaceListed(path: string) {
+export function ensureWorkspaceListed(rawPath: string) {
+  const path = projectListPath(rawPath);
   if (!path) return;
   const current = prefs().workspaces;
   if (current.includes(path)) return;
@@ -699,7 +828,7 @@ export function setSessionArchived(path: string, archived: boolean, cwd?: string
   const next = { ...current };
   if (archived) {
     const prevCwd = current[path]?.cwd;
-    const effectiveCwd = cwd || prevCwd;
+    const effectiveCwd = (cwd && projectListPath(cwd)) || prevCwd;
     next[path] = {
       archivedAt: Date.now(),
       ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
@@ -717,7 +846,8 @@ export function archiveSessionsBatch(entries: readonly { path: string; cwd?: str
   const next = { ...current };
   for (const { path, cwd } of entries) {
     if (!path || path in next) continue;
-    next[path] = { archivedAt, ...(cwd ? { cwd } : {}) };
+    const listedCwd = cwd ? projectListPath(cwd) : undefined;
+    next[path] = { archivedAt, ...(listedCwd ? { cwd: listedCwd } : {}) };
     changed = true;
   }
   if (changed) change({ archivedSessions: next });
@@ -768,7 +898,8 @@ export function forgetDocRank(path: string) {
   change({ docRanks });
 }
 
-export function forgetWorkspace(path: string) {
+export function forgetWorkspace(rawPath: string) {
+  const path = projectListPath(rawPath) ?? rawPath;
   const workspaces = prefs().workspaces.filter((p) => p !== path);
   const sessionRanks = { ...prefs().sessionRanks };
   delete sessionRanks[path];
@@ -780,7 +911,9 @@ export function forgetWorkspace(path: string) {
   });
 }
 
-export function setWorkspaceCollapsed(path: string, collapsed: boolean) {
+export function setWorkspaceCollapsed(rawPath: string, collapsed: boolean) {
+  const path = projectListPath(rawPath);
+  if (!path) return;
   if (prefs().collapsedWorkspaces.includes(path) === collapsed) return;
   const list = prefs().collapsedWorkspaces.filter((p) => p !== path);
   change({ collapsedWorkspaces: collapsed ? [...list, path] : list });

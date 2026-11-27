@@ -604,7 +604,7 @@ export function ZoomImage(props: {
                     accessibilityLabel={item().title || tr(`Image ${i() + 1}`, `第 ${i() + 1} 张图片`)}
                     tooltip={active() ? undefined : tip(item().title || tr(`Image ${i() + 1}`, `第 ${i() + 1} 张图片`), undefined, "top")}
                     class={`relative h-9 w-12 shrink-0 overflow-hidden rounded-md corner-squircle bg-sunken ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} ${
-                      active() ? "opacity-100 ring-2 ring-brand" : "border-[0.5px] border-hairline opacity-55 hover:opacity-90"
+                      active() ? "opacity-100 ring-2 ring-foreground/70" : "border-[0.5px] border-hairline opacity-55 hover:opacity-90"
                     }`}
                   >
                     <Image src={item().src} class="size-full" style={{ objectFit: "cover" }} accessibilityElementsHidden />
