@@ -202,7 +202,7 @@ test("reopening a draft while its reveal is closing keeps the draft row alive", 
   expect(quiet.count(RECENT_DRAFT)).toBe(1);
 });
 
-test("a running session shows Pip on every row it has unless both its folder and Recent are folded", async () => {
+test("a running session shows its mark on every row it has unless both its folder and Recent are folded", async () => {
   const app = await open("./Harness.tsx", {
     width: 1180,
     height: 780,
@@ -224,10 +224,91 @@ test("a running session shows Pip on every row it has unless both its folder and
   // Expanded active folder and inactive folders never duplicate Pip.
   expect(app.count("id:sidebar-project-running")).toBe(0);
 
-  // Folding both the active folder and Recent hands the running Pip up to the folded project row.
+  // Folding both the active folder and Recent hands the running mark up to the folded project row.
   await app.press("label:Collapse pipi");
   await app.press("label:Collapse Recent");
   expect(app.count("id:sidebar-project-running")).toBe(1);
+});
+
+test("running marks distinguish persona-driven sessions from user-started sessions in both groups", async () => {
+  const now = Date.now();
+  const base = {
+    cwd: "/Users/pip/code/pipi",
+    agentId: "pi",
+    agentName: "Pi",
+    driver: "pi",
+    runtimeMode: "full-access",
+    unread: false,
+    loaded: true,
+    createdAt: now,
+    lastActive: now,
+  };
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 900,
+    platform: "macos",
+    locale: "en-US",
+    reducedMotion: true,
+    storage: {
+      "harness.scenario": "multi",
+      "harness.daemonSessions": JSON.stringify([
+        { ...base, id: "s_pip", persona: true, title: "Pip", titleLocked: true, cwd: "/Users/pip/.pipi/persona", status: "idle", depth: 0 },
+        {
+          ...base,
+          id: "s_persona_work",
+          title: "Refactor the transcript reducer",
+          file: "/sessions/two.jsonl",
+          parentId: "s_pip",
+          initiator: "s_pip",
+          upstreamInitiator: "s_pip",
+          status: "working",
+          depth: 1,
+        },
+        {
+          ...base,
+          id: "s_persona_grandchild",
+          title: "Nested persona repair",
+          parentId: "s_persona_work",
+          initiator: "s_persona_work",
+          upstreamInitiator: "s_persona_work",
+          status: "working",
+          depth: 2,
+        },
+        {
+          ...base,
+          id: "s_user_work",
+          title: "Look around and tell me what this project is",
+          file: "/sessions/one.jsonl",
+          initiator: "user",
+          upstreamInitiator: "user",
+          status: "working",
+          depth: 0,
+        },
+      ]),
+    },
+  });
+  await app.waitFor("text:What are we building?");
+
+  const layouts = (selector: string) => {
+    const count = app.count(selector);
+    return Array.from({ length: count }, (_, i) => app.layout(`${selector} >> nth=${i}`)).filter((box) => box !== null);
+  };
+  const center = (box: { y: number; height: number }) => box.y + box.height / 2;
+  const nearestMarkDelta = (group: string, title: string, mark: "sidebar-running-pip" | "sidebar-running-spinner") => {
+    const text = app.layout(`id:${group} >> text:${title}`);
+    if (!text) return Number.POSITIVE_INFINITY;
+    const deltas = layouts(`id:${group} >> id:${mark}`).map((box) => Math.abs(center(box) - center(text)));
+    return deltas.length ? Math.min(...deltas) : Number.POSITIVE_INFINITY;
+  };
+
+  for (const group of ["sidebar-workspaces", "sidebar-recents"]) {
+    expect(app.count(`id:${group} >> id:sidebar-running-pip`)).toBe(2);
+    expect(app.count(`id:${group} >> id:sidebar-running-spinner`)).toBe(1);
+    expect(nearestMarkDelta(group, "Refactor the transcript reducer", "sidebar-running-pip")).toBeLessThan(10);
+    expect(nearestMarkDelta(group, "Nested persona repair", "sidebar-running-pip")).toBeLessThan(10);
+    expect(nearestMarkDelta(group, "Look around and tell me what this project is", "sidebar-running-spinner")).toBeLessThan(10);
+    expect(nearestMarkDelta(group, "Look around and tell me what this project is", "sidebar-running-pip")).toBeGreaterThan(10);
+  }
 });
 
 test("a run parked by a session switch keeps its mark on every row the session has", async () => {

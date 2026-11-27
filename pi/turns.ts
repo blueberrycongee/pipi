@@ -1133,28 +1133,21 @@ export function buildDisplayRows(
     const running = sessionRunning && rows.slice(i).every((rest) => rest.kind === "user" && rest.queued) && !answered && !tailClosed;
 
     if (persona) {
-      // Pip (personal agent) uses non-streaming IM delivery: while a turn is still
-      // running, its thinking/tool calls/streaming tokens stay off the main stream
-      // and surface exclusively through the bottom active Pip avatar + hover status card.
-      if (running) continue;
-
+      // Pip (personal agent) uses non-streaming IM delivery: thinking, tool calls
+      // and half-written prose stay off the main stream and surface through the
+      // bottom active Pip avatar + hover status card, while each prose block lands
+      // as an SMS bubble once the block itself is complete — never held back until
+      // the whole turn ends.
       const id = `turn:${first.id}`;
-      let messages: DisplayTextRow[] = answer.filter((m) => !m.streaming && m.text.trim().length > 0);
-      let remainingProcess = process;
+      const spoken = process.filter((item): item is DisplayTextRow => item.kind === "text" && !item.streaming && item.text.trim().length > 0);
+      const spokenIds = new Set(spoken.map((row) => row.id));
+      let messages: DisplayTextRow[] = [
+        ...spoken.map((row) => ({ ...row, streaming: false, final: true })),
+        ...answer.filter((m) => !m.streaming && m.text.trim().length > 0),
+      ];
+      let remainingProcess = process.filter((item) => !spokenIds.has(item.id));
       const edited = first.silentEdit || turnTools.some((tool) => normalizeMcpToolName(tool.name) === "message_edit" && tool.status === "done");
       if (edited && messages.length === 0 && surfacedMedia.length === 0) continue;
-      // Fallback for settled/interrupted turns that only wrote completed prose before tool calls
-      // and ended without a separate final message: surface the prose so nothing is ever lost.
-      if (messages.length === 0) {
-        const fallbackTexts = process.filter(
-          (item): item is DisplayTextRow => item.kind === "text" && !item.streaming && item.text.trim().length > 0,
-        );
-        if (fallbackTexts.length > 0) {
-          const fallbackIds = new Set(fallbackTexts.map((t) => t.id));
-          messages = fallbackTexts.map((t) => ({ ...t, streaming: false, final: true }));
-          remainingProcess = process.filter((item) => !fallbackIds.has(item.id));
-        }
-      }
 
       const delegated = extractDelegatedSessions(turnTools);
       const hasDetails = remainingProcess.length > 0;
@@ -1212,7 +1205,7 @@ export function buildDisplayRows(
         });
       }
 
-      if (copyText) {
+      if (!running && copyText) {
         out.push({
           kind: "pip-footer",
           id: `pipfoot:${first.id}`,

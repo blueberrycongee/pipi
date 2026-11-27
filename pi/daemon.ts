@@ -30,6 +30,8 @@ export interface DaemonSession {
   driver: string;
   parentId?: string;
   initiator?: string;
+  /** The upstream caller the daemon keeps for this session's current chain (`user`, `external`, or a session id). */
+  upstreamInitiator?: string;
   /** A personal agent: one per persona id, in its own folder of notes. */
   persona?: boolean;
   personaId?: string;

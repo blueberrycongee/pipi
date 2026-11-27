@@ -250,6 +250,43 @@ test("a turn held in one message (the bridge's play of ACP harnesses) marks its 
   expect(reloaded.filter((row) => row.kind === "turn")).toMatchObject([{ open: false }, { open: false }]);
 });
 
+test("persona projects each completed prose block while an ACP turn is still running", () => {
+  const t = new Transcript();
+  const update = (assistantMessageEvent: object) => t.apply({ type: "message_update", assistantMessageEvent } as never);
+  const shown = () => buildDisplayRows(t.rows(), true, {}, undefined, { persona: true });
+
+  t.apply({ type: "message_start", message: { role: "user", content: "do a long task", timestamp: 1 } });
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+
+  // The bridge's ACP shape: one long assistant message holds the whole turn. A
+  // prose block that has reached `text_end` is complete even though the turn is
+  // nowhere near `message_end` yet.
+  update({ type: "thinking_start", contentIndex: 0 });
+  update({ type: "thinking_end", contentIndex: 0, content: "Plan the work." });
+  update({ type: "text_start", contentIndex: 1 });
+  update({ type: "text_end", contentIndex: 1, content: "First completed update." });
+  update({ type: "toolcall_start", contentIndex: 2, id: "c1", toolName: "bash" });
+  update({ type: "toolcall_end", contentIndex: 2, toolCall: { type: "toolCall", id: "c1", name: "bash", arguments: { command: "npm test" } } });
+  t.apply({ type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args: { command: "npm test" } });
+  t.apply({ type: "tool_execution_end", toolCallId: "c1", toolName: "bash", result: { content: [{ type: "text", text: "ok" }] }, isError: false });
+  t.apply({ type: "message_end", message: { role: "toolResult", toolCallId: "c1", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 2 } as never });
+
+  expect(shown().filter((row) => row.kind === "text").map((row) => row.text)).toEqual(["First completed update."]);
+
+  update({ type: "thinking_start", contentIndex: 3 });
+  update({ type: "thinking_end", contentIndex: 3, content: "Check the result." });
+  update({ type: "text_start", contentIndex: 4 });
+  update({ type: "text_end", contentIndex: 4, content: "Second completed update." });
+  expect(shown().filter((row) => row.kind === "text").map((row) => row.text)).toEqual(["First completed update.", "Second completed update."]);
+
+  // Pip still never publishes half-written prose: the open block appears only at `text_end`.
+  update({ type: "text_start", contentIndex: 5 });
+  update({ type: "text_delta", contentIndex: 5, delta: "The final answer is still typing" });
+  expect(shown().filter((row) => row.kind === "text").map((row) => row.text)).toEqual(["First completed update.", "Second completed update."]);
+  update({ type: "text_end", contentIndex: 5, content: "The final answer." });
+  expect(shown().filter((row) => row.kind === "text").map((row) => row.text)).toEqual(["First completed update.", "Second completed update.", "The final answer."]);
+});
+
 test("tool results read ahead of the merged message do not scramble its blocks on reload", () => {
   // The bridge writes a turn's tool results as their own messages, ahead of the
   // one assistant message holding every block (calls included). A result waits

@@ -55,6 +55,7 @@ import {
   isChatFolder,
   isDaemonTaskSession,
   isDraftAhead,
+  isPersonaDrivenSession,
   isPersonaFolder,
   isRunning,
   isSessionRunning,
@@ -116,6 +117,7 @@ import {
   toggleWorkspaceCollapsed,
 } from "../store/prefs";
 import { IconButton } from "../ui/Button";
+import { DotMatrixSpinner } from "../ui/DotMatrixSpinner";
 import { Icon, type IconName } from "../ui/Icon";
 import { animateNextLayout, delayedFade, EASING, Presence, Reveal } from "../ui/motion";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, WALLPAPER_FROST } from "../ui/styles";
@@ -1411,6 +1413,35 @@ function engineOf(id: string | undefined) {
   return { id: key, name, available };
 }
 
+/**
+ * A folded project is one aggregate mark. Pip is reserved for the unambiguous
+ * case — every hidden run inside is persona-driven; any user-started run makes
+ * the aggregate neutral rather than borrowing Pip's identity.
+ */
+function projectMarkIsPersonaOnly(
+  cwd: string,
+  rows: readonly SessionSummary[],
+  hiddenSession: (path: string | undefined) => boolean,
+  hiddenDaemon: (session: DaemonSession) => boolean,
+  activeHidden: boolean,
+): boolean {
+  let persona = false;
+  let user = false;
+  const mark = (driven: boolean) => {
+    if (driven) persona = true;
+    else user = true;
+  };
+  for (const row of rows) {
+    if (isSessionRunning(row.path) && hiddenSession(row.path)) mark(isPersonaDrivenSession(daemonSessionByFile(row.path)));
+  }
+  for (const ds of daemonSessions()) {
+    if (projectCwdOf(ds.cwd, ds) !== cwd || (ds.status !== "working" && ds.status !== "blocked") || !hiddenDaemon(ds)) continue;
+    mark(isPersonaDrivenSession(ds));
+  }
+  if (activeHidden && isRunning()) mark(isPersonaDrivenSession(currentDaemonSession()));
+  return persona && !user;
+}
+
 async function confirmDelete(session: SessionSummary, cwd: string) {
   const name = titleOf(session);
   const { action } = await AlertDialog.show({
@@ -1676,6 +1707,15 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
   const collapsedRunning = computed(
     () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents())),
   );
+  const collapsedPersonaDriven = computed(() =>
+    projectMarkIsPersonaOnly(
+      props.cwd,
+      sessions(),
+      (path) => !shownInRecents(path),
+      (ds) => !daemonShownInRecents(ds),
+      active() && isRunning() && !activeShownInRecents(),
+    ),
+  );
   /** A folded folder surfaces an answer that finished out of sight the same way. */
   const collapsedUnread = computed(
     () =>
@@ -1769,7 +1809,7 @@ function ProjectRow(props: { cwd: string; first: boolean; allProjects: readonly 
             accessibilityLabel={tr("Running in the background", "后台运行中")}
             class="absolute inset-0 items-center justify-center"
           >
-            <Pip size={16} mood="work" />
+            <RunningCue personaDriven={collapsedPersonaDriven()} />
           </Presence>
           <Presence
             show={collapsedUnread()}
@@ -1829,6 +1869,15 @@ function ChatWorkspaceRow(props: { first: boolean }) {
     );
   const collapsedRunning = computed(
     () => collapsed() && (hiddenRunningInside() || (active() && isRunning() && !activeShownInRecents())),
+  );
+  const collapsedPersonaDriven = computed(() =>
+    projectMarkIsPersonaOnly(
+      cwd(),
+      sessions(),
+      (path) => !shownInRecents(path),
+      (ds) => !daemonShownInRecents(ds),
+      active() && isRunning() && !activeShownInRecents(),
+    ),
   );
   const collapsedUnread = computed(
     () =>
@@ -1933,7 +1982,7 @@ function ChatWorkspaceRow(props: { first: boolean }) {
             accessibilityLabel={tr("Running in the background", "后台运行中")}
             class="absolute inset-0 items-center justify-center"
           >
-            <Pip size={16} mood="work" />
+            <RunningCue personaDriven={collapsedPersonaDriven()} />
           </Presence>
           <Presence
             show={collapsedUnread()}
@@ -1990,6 +2039,20 @@ const sessionTitleClass = (selected: boolean) =>
 /** Fades its content in after the shared patience delay, so a state that ends sooner (a quick restart) never shows at all. */
 function FadeIn(props: { children: JSX.Element }) {
   return <View style={{ opacity: delayedFade() }}>{props.children}</View>;
+}
+
+/** The running mark: Pip where a personal agent drives the work, the neutral dot-matrix loader where the user started it. */
+function RunningCue(props: { personaDriven: boolean; size?: number }) {
+  const size = props.size ?? 16;
+  return props.personaDriven ? (
+    <View testID="sidebar-running-pip" class="items-center justify-center">
+      <Pip size={size} mood="work" />
+    </View>
+  ) : (
+    <View testID="sidebar-running-spinner" class="items-center justify-center">
+      <DotMatrixSpinner size={size === 16 ? 14 : size} />
+    </View>
+  );
 }
 
 /** A row's engine mark; switching the engine settles the new mark in rather than swapping it in one frame. */
@@ -2062,7 +2125,7 @@ function DraftSessionRow(props: { cwd: string; group: GroupId; indent?: boolean 
       </View>
       <View class={TRAILING_SLOT} style={{ top: rowTrailingTop() }}>
         <Presence show={running()} testID="sidebar-draft-running" class="items-center justify-center">
-          <Pip size={16} mood="work" />
+          <RunningCue personaDriven={false} />
         </Presence>
       </View>
     </View>
@@ -2078,8 +2141,11 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
   );
   const owns = computed(() => ownsActiveSession(props.group, path(), props.cwd));
   const primary = computed(() => active() && owns());
-  const waitingHere = computed(() => childSessionsOf(path()).some((c) => c.status === "working" || c.status === "blocked"));
+  const runningChildren = computed(() => childSessionsOf(path()).filter((c) => c.status === "working" || c.status === "blocked"));
+  const waitingHere = computed(() => runningChildren().length > 0);
   const daemonRunning = computed(() => isSessionRunning(path()) || waitingHere());
+  /** The mark follows the work the row represents: a persona-driven session or descendant gets Pip; user-started work gets the dot matrix. */
+  const personaDriven = computed(() => isPersonaDrivenSession(daemon()) || runningChildren().some((child) => isPersonaDrivenSession(child)));
   /** A run kept going off screen marks every row the session has — whichever group the reader is looking at. */
   const backgroundRunning = computed(() => !active() && daemonRunning());
   /** The on-screen run marks all of the session's rows too; `owns` picks where the highlight sits, not the mark. */
@@ -2149,7 +2215,7 @@ function SessionRow(props: { session: SessionSummary; cwd: string; group: GroupI
           accessibilityLabel={backgroundRunning() ? tr("Running in the background", "后台运行中") : undefined}
           class="items-center justify-center"
         >
-          <Pip size={16} mood="work" />
+          <RunningCue personaDriven={personaDriven()} />
         </Presence>
         <Presence
           show={blocked()}
@@ -2312,7 +2378,7 @@ function DaemonSessionRow(props: { session: DaemonSession; group: GroupId; neste
           accessibilityLabel={tr("Running in the background", "后台运行中")}
           class="items-center justify-center"
         >
-          <Pip size={16} mood="work" />
+          <RunningCue personaDriven={isPersonaDrivenSession(session())} />
         </Presence>
         <Presence
           show={blocked()}

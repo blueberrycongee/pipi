@@ -767,6 +767,35 @@ export function daemonSessionByFile(path: string | undefined) {
   return path ? daemonIndex().byFile.get(path) : undefined;
 }
 
+/** Whether `start` or any session above it in the daemon's ownership tree is a personal agent. */
+function chainReachesPersona(start: DaemonSession, byId: ReadonlyMap<string, DaemonSession>): boolean {
+  const seen = new Set<string>();
+  let cur: DaemonSession | undefined = start;
+  while (cur && !seen.has(cur.id)) {
+    if (cur.persona) return true;
+    seen.add(cur.id);
+    cur = cur.parentId ? byId.get(cur.parentId) : undefined;
+  }
+  return false;
+}
+
+/**
+ * Whether a session is persona-driven: started under a personal agent, or handed
+ * to one upstream (`initiator` is the live turn's caller, `upstreamInitiator`
+ * the chain the daemon keeps after the turn settles). User/external starts are not.
+ */
+export function isPersonaDrivenSession(session: DaemonSession | undefined): boolean {
+  if (!session) return false;
+  const { byId } = daemonIndex();
+  if (chainReachesPersona(session, byId)) return true;
+  for (const id of [session.initiator, session.upstreamInitiator]) {
+    if (!id || id === "user" || id === "external") continue;
+    const source = byId.get(id);
+    if (source && chainReachesPersona(source, byId)) return true;
+  }
+  return false;
+}
+
 /**
  * Cycle-safe depth-first walk of every descendant session under `rootId`.
  * `listed` leaves out what the reader archived, with everything under it: the

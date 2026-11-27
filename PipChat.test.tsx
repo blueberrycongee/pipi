@@ -7,11 +7,12 @@ import type { App } from "nsh/test";
 //
 // Verifies that:
 // 1. While Pip is thinking, calling tools, and streaming text, the main conversation stays clean
-//    (no streaming half-sentences, no "Working" header, no tool log wall).
+//    (no streaming half-sentences, no "Working" header, no tool log wall); each prose block lands
+//    as a complete SMS bubble as soon as the block itself finishes.
 // 2. A quiet active Pip avatar appears at the bottom; hovering it reveals a real-time status card
 //    describing what Pip is doing right now (and any active child sessions).
-// 3. When Pip finishes a turn, the complete message lands cleanly as an IM message with Pip's
-//    avatar (which shares the same hover status card) and a quiet collapsed process disclosure.
+// 3. When Pip finishes a turn, the complete messages stand as IM messages with Pip's avatar
+//    (which shares the same hover status card) and a quiet collapsed process disclosure.
 // 4. Normal coding sessions remain 100% unchanged (streaming + live process rows).
 
 const launch = (storage: Record<string, string> = {}) =>
@@ -85,15 +86,15 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
     await app.wait(16);
   }
 
-  // Main chat stream stayed completely clean. Thinking and tool work used the quiet label;
-  // only writing used the SMS typing bubble, and the read receipt still landed.
+  // Main chat stream stayed clean of process rows and half-written prose. Thinking and tool
+  // work used the quiet label; completed commentary landed as soon as its own block finished.
   expect(sawThinkingLabelDuringRun).toBe(true);
   expect(sawWorkingLabelDuringRun).toBe(true);
   expect(sawTypingBubbleDuringRun).toBe(true);
   expect(sawReadReceiptDuringRun).toBe(true);
   expect(sawWorkingHeaderDuringRun).toBe(false);
   expect(sawToolWallDuringRun).toBe(false);
-  expect(sawCommentaryDuringRun).toBe(false);
+  expect(sawCommentaryDuringRun).toBe(true);
 
   // Hovering the active Pip avatar surfaced the live status card with real-time state.
   expect(sawLiveCard).toBe(true);
@@ -103,14 +104,15 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
   await app.hover("id:sidebar-pip");
   await app.wait(300);
 
-  // Once settled, the typing bubble disappears and the reply lands as iMessage SMS bubbles alongside Pip's avatar.
-  // The stream itself carries no process pill: it stays clean, the steps stay hidden until opened from the avatar's card.
+  // Once settled, the typing bubble disappears and every completed block stands as iMessage SMS
+  // bubbles alongside Pip's avatar. The stream itself carries no process pill: steps stay hidden
+  // until opened from the avatar's card.
   await app.waitUntil(() => showsInChat(app, "Everything else is as it was, and the tests pass."), { timeout: 10_000 });
   expect(app.shows("id:pip-typing-bubble")).toBe(false);
   expect(app.count("id:pip-sms-bubble")).toBeGreaterThanOrEqual(1);
   expect(app.count("id:pip-message-avatar")).toBeGreaterThanOrEqual(1);
   expect(app.count("id:pip-process-toggle")).toBe(0);
-  expect(showsInChat(app, "The list follows by hand. Let me check the tests before changing it.")).toBe(false);
+  expect(showsInChat(app, "The list follows by hand. Let me check the tests before changing it.")).toBe(true);
 
   // Hovering the delivered message's Pip avatar opens the consistent status card (idle + turn summary),
   // which carries the one door to the turn's process.
@@ -120,9 +122,9 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
 
   // Pressing it unfolds the process into the stream while the card stays open; pressing it again folds it back.
   await app.press("id:pip-process-toggle");
-  await app.waitUntil(() => showsInChat(app, "The list follows by hand. Let me check the tests before changing it."));
+  await app.waitUntil(() => showsInChat(app, "View reasoning"));
   await app.press("id:pip-process-toggle");
-  await app.waitUntil(() => !showsInChat(app, "The list follows by hand. Let me check the tests before changing it."));
+  await app.waitUntil(() => !showsInChat(app, "View reasoning"));
 });
 
 test("Pip hover card surfaces active child sessions and error notices never vanish; normal coding sessions keep streaming", async () => {

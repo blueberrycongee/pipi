@@ -94,7 +94,8 @@ never does.
 - Minimum size 16px wide. Below 24px use `still` (no loops) unless Pip *is*
   the status indicator (activity line, running session row, update card).
 - Clear space: leave breathing room around the 64-unit frame.
-- One animated Pip per surface; the sidebar carries one per working session.
+- One animated Pip per surface; the sidebar uses Pip only for working sessions a
+  personal agent drives. User-started work uses the neutral dot-matrix loader.
   Pip never overlaps text and never talks.
 - With reduced motion Pip holds the mood's pose and does not move.
 
@@ -105,7 +106,8 @@ never does.
 | App icon (`icon.png`) | 620 of 1024 | idle (`ghost`) |
 | Welcome / waking / failure stage (`views/Chat.tsx`) | 96 (welcome) / 80 (waking, failure) | from `pipMood` |
 | Activity line under the transcript (`views/Chat.tsx`) | 22 | from `pipMood`; alone once the run has rows of its own, with words only for what no row says |
-| Running session, draft, child session, or collapsed running project in the sidebar (`views/Sidebar.tsx`) | 16 | work |
+| Persona-driven running session, child session, or all-persona collapsed running project in the sidebar (`views/Sidebar.tsx`) | 16 | work |
+| User-started running session, draft, child session, or mixed collapsed running project in the sidebar (`ui/DotMatrixSpinner.tsx`) | 14 | neutral dot matrix, 8×90ms steps; one static frame under reduced motion |
 | Running session in the tab strip (`views/TabBar.tsx`) | 14 | work |
 | Pip's own row, pinned above the sidebar's lists (`views/PipRow.tsx`) | 16, still | idle; work while it runs |
 | Empty single-folder sidebar (`views/Sidebar.tsx`) | 40, still | sleep |
