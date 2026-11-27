@@ -23,6 +23,7 @@ export interface FoundUpdate {
   notes?: string | null;
   /** "package": a signed code package, the small incremental download; "app": the whole installer. */
   kind: "package" | "app";
+  build?: number;
   /** The download's size, when the manifest says it (packages always carry one). */
   size?: number | null;
   /** Full-app updates: where the user gets it by hand when it cannot install here. */
@@ -77,7 +78,7 @@ async function findUpdate(b: Backend): Promise<FoundUpdate | null> {
     try {
       const pkg = await b.checkAppPackage();
       if (pkg) {
-        return { version: pkg.version, notes: pkg.notes, kind: "package", size: pkg.size };
+        return { version: pkg.version, notes: pkg.notes, kind: "package", build: pkg.build, size: pkg.size };
       }
     } catch (error) {
       packageError = error;
@@ -91,64 +92,113 @@ async function findUpdate(b: Backend): Promise<FoundUpdate | null> {
   return null;
 }
 
+const sameOffer = (a: FoundUpdate, b: FoundUpdate) => a.version === b.version && a.kind === b.kind && a.build === b.build;
+
+let activeCheck: Promise<void> | undefined;
+
+async function performCheck(b: Backend, manual: boolean, quietFailure = false) {
+  const before = state();
+  if (inFlight()) {
+    if (manual) dismissedVersion.set(undefined);
+    return;
+  }
+  const previous = before.phase === "available" ? before.update : undefined;
+  if (manual || !previous) state.set({ phase: "checking" });
+  try {
+    const update = await findUpdate(b);
+    if (update) {
+      const changed = !previous || !sameOffer(previous, update);
+      state.set({ phase: "available", update });
+      if (changed) dismissedVersion.set(undefined);
+    } else {
+      state.set({ phase: "idle" });
+      dismissedVersion.set(undefined);
+      if (manual) toast("success", tr("pipi is up to date", "pipi 已是最新版本"));
+    }
+  } catch (error) {
+    state.set(previous ? { phase: "available", update: previous } : { phase: "idle" });
+    if (!quietFailure) {
+      toast(manual ? "error" : "warning", `${tr("Could not check for updates", "无法检查更新")}: ${errorMessage(error)}`);
+    }
+  }
+}
+
+function requestCheck(b: Backend, manual: boolean, quietFailure = false): Promise<void> {
+  if (activeCheck) return activeCheck;
+  const tracked = performCheck(b, manual, quietFailure);
+  activeCheck = tracked;
+  void tracked.then(
+    () => {
+      if (activeCheck === tracked) activeCheck = undefined;
+    },
+    () => {
+      if (activeCheck === tracked) activeCheck = undefined;
+    },
+  );
+  return tracked;
+}
+
 /**
  * Asks the update source for a newer version. `manual` is the user's own ask
  * (About → Check for Updates): its failure is an error toast and a quiet
  * "up to date" is said; a background check's failure is a warning and its
  * quiet result says nothing.
  */
-export async function checkForAppUpdate(manual = false) {
+export function checkForAppUpdate(manual = false): Promise<void> {
   const b = backend();
   if (!b.checkAppUpdate && !b.checkAppPackage) {
     if (manual) toast("info", tr("Updates are not available in this build", "此构建不支持自动更新"));
-    return;
+    return Promise.resolve();
   }
-  if (state().phase === "checking") return;
-  if (inFlight()) {
-    if (manual) dismissedVersion.set(undefined);
-    return;
-  }
-  // A background check while the card is up only blinks it out and back — the
-  // card already says what the last check found.
-  if (!manual && state().phase === "available") return;
-  state.set({ phase: "checking" });
-  try {
-    const update = await findUpdate(b);
-    if (update) {
-      state.set({ phase: "available", update });
-      dismissedVersion.set(undefined);
-    } else {
-      state.set({ phase: "idle" });
-      if (manual) toast("success", tr("pipi is up to date", "pipi 已是最新版本"));
-    }
-  } catch (error) {
-    state.set({ phase: "idle" });
-    toast(manual ? "error" : "warning", `${tr("Could not check for updates", "无法检查更新")}: ${errorMessage(error)}`);
-  }
+  return requestCheck(b, manual);
 }
 
 /** Starts the download of a found update; progress lands on the card. */
 export async function beginAppUpdate() {
+  if (state().phase !== "available") return;
+  if (activeCheck) await activeCheck;
   const s = state();
   if (s.phase !== "available") return;
-  const update = s.update;
+  const original = s.update;
+  state.set({ phase: "downloading", update: original, received: 0, total: original.size });
+
+  let update: FoundUpdate;
+  try {
+    const fresh = await findUpdate(backend());
+    if (!fresh) {
+      state.set({ phase: "idle" });
+      dismissedVersion.set(undefined);
+      toast("info", tr("pipi is up to date", "pipi 已是最新版本"));
+      return;
+    }
+    update = fresh;
+    state.set({ phase: "downloading", update, received: 0, total: update.size });
+  } catch (error) {
+    state.set({ phase: "available", update: original });
+    toast("error", `${tr("Could not check for updates", "无法检查更新")}: ${errorMessage(error)}`);
+    return;
+  }
+
   const download = update.kind === "package" ? backend().downloadAppPackage : backend().downloadAppUpdate;
-  if (!download) return;
-  state.set({ phase: "downloading", update, received: 0, total: update.size });
+  if (!download) {
+    state.set({ phase: "available", update });
+    return;
+  }
   try {
     await download((progress) => {
       const now = state();
-      if (now.phase === "downloading" && now.update.version === update.version) {
+      if (now.phase === "downloading" && sameOffer(now.update, update)) {
         state.set({ ...now, received: progress.received, total: progress.total ?? now.total });
       }
     });
     const now = state();
-    if (now.phase === "downloading" && now.update.version === update.version) {
+    if (now.phase === "downloading" && sameOffer(now.update, update)) {
       state.set({ phase: "ready", update });
     }
   } catch (error) {
     if (state().phase === "downloading") state.set({ phase: "available", update });
     toast("error", `${tr("Could not download the update", "无法下载更新")}: ${errorMessage(error)}`);
+    await requestCheck(backend(), false, true);
   }
 }
 
@@ -171,6 +221,13 @@ export async function installAppUpdate() {
 export function dismissAppUpdate() {
   const s = state();
   if (s.phase === "available" || s.phase === "ready") dismissedVersion.set(s.update.version);
+}
+
+export function _resetAppUpdateForTests() {
+  stopAppUpdateChecks();
+  activeCheck = undefined;
+  state.set({ phase: "idle" });
+  dismissedVersion.set(undefined);
 }
 
 // ── Scheduled checks ────────────────────────────────────────────────────────

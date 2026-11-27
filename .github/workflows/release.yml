@@ -196,6 +196,7 @@ jobs:
             "dist/pipi-$v-macos-aarch64.tar.gz" \
             "dist/pipi-$v-windows-x86_64.zip" \
             "dist/pipi-$v-linux-x86_64.tar.gz" \
+            --base-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG" \
             --package "$PACKAGE" \
             --key "$RUNNER_TEMP/keys/update.secret" \
             --notes release-notes.md -o dist

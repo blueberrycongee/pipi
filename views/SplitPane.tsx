@@ -5,6 +5,7 @@ import {
   createAnimatedValue,
   effect,
   List,
+  platform,
   reduceMotion,
   Scroll,
   signal,
@@ -48,6 +49,7 @@ import {
   splitTarget,
   swapSplitSide,
   workspaceBounds,
+  type SplitDragState,
   type SplitSide,
   type SplitTarget,
 } from "../store/split";
@@ -132,6 +134,122 @@ function DropZoneCard(props: { side: SplitSide; active: () => boolean }) {
   );
 }
 
+/** The ghost's tilt cap while it trails the pointer (degrees). */
+const GHOST_MAX_TILT = 7;
+/** Pointer speed (px/ms) that reaches full tilt. */
+const GHOST_TILT_SPEED = 0.7;
+/** Horizontal follow: near-critical so the card tracks the pointer within ~20px. */
+/** Tilt wobble: underdamped so a flick swings past center and settles. */
+const GHOST_TILT_SPRING = { stiffness: 190, damping: 13, mass: 0.9 };
+/** Pickup pop: a quick slightly-overshooting lift when the card appears. */
+const GHOST_PICK_SPRING = { stiffness: 420, damping: 16, mass: 0.9 };
+/** Pointer-quiet window after which the tilt eases back to level. */
+const GHOST_TILT_REST_MS = 140;
+
+/** Where the ghost's leading corner sits for pointer `(x, y)`, clamped inside the workspace. */
+function ghostTarget(x: number, y: number) {
+  const rect = workspaceBounds();
+  if (!rect) return null;
+  return {
+    left: Math.max(12, Math.min(rect.width - 212, x - rect.left + 14)),
+    top: Math.max(12, Math.min(rect.height - 44, y - rect.top - 16)),
+  };
+}
+
+/**
+ * The dragged card: a small preview pill that trails the pointer on springs.
+ * Horizontal pointer velocity leans it a few degrees (a card held by a corner);
+ * appearing it pops up with a deeper shadow, and on drop or cancel it shrinks
+ * out under the overlay's own fade. `reduceMotion` keeps it rigid and level.
+ */
+function SplitDragGhost(props: { drag: () => SplitDragState; exiting: () => boolean }) {
+  const first = ghostTarget(props.drag().x, props.drag().y) ?? { left: 12, top: 12 };
+  const gx = createAnimatedValue(first.left);
+  const gy = createAnimatedValue(first.top);
+  const tilt = createAnimatedValue(0);
+  const lift = createAnimatedValue(1);
+  let lastX = props.drag().x;
+  let lastT = Date.now();
+  let lastVx = 0;
+  let tiltTimer: ReturnType<typeof setTimeout> | undefined;
+
+  if (!reduceMotion()) {
+    lift.set(0.9);
+    void lift.spring(1, GHOST_PICK_SPRING);
+  }
+
+  effect(() => {
+    const d = props.drag();
+    const pos = ghostTarget(d.x, d.y);
+    if (!pos) return;
+    const now = Date.now();
+    const dt = now - lastT;
+    let vx = lastVx;
+    if (dt > 0) vx = (d.x - lastX) / dt;
+    lastX = d.x;
+    lastT = now;
+    lastVx = vx;
+    untracked(() => {
+      if (reduceMotion()) {
+        gx.set(pos.left);
+        gy.set(pos.top);
+        tilt.set(0);
+        return;
+      }
+      gx.set(pos.left);
+      gy.set(pos.top);
+      const lean = Math.max(-GHOST_MAX_TILT, Math.min(GHOST_MAX_TILT, (vx / GHOST_TILT_SPEED) * GHOST_MAX_TILT));
+      void tilt.spring(lean, GHOST_TILT_SPRING);
+      clearTimeout(tiltTimer);
+      tiltTimer = setTimeout(() => {
+        tiltTimer = undefined;
+        void tilt.spring(0, GHOST_TILT_SPRING);
+      }, GHOST_TILT_REST_MS);
+    });
+  });
+
+  effect(() => {
+    const off = props.exiting();
+    untracked(() => {
+      if (reduceMotion() || !off) return;
+      void lift.timing(0.92, { duration: DURATION.instant, easing: EASING.exit });
+      void tilt.spring(0, GHOST_TILT_SPRING);
+    });
+  });
+
+  cleanup(() => {
+    clearTimeout(tiltTimer);
+    void gx.stop();
+    void gy.stop();
+    void tilt.stop();
+    void lift.stop();
+  });
+
+  const d = props.drag();
+  return (
+    <View
+      testID="split-drag-ghost"
+      class={`pointer-events-none absolute left-0 top-0 max-w-56 flex-row items-center gap-2 rounded-xl corner-squircle border-[0.5px] border-hairline px-2.5 py-1.5 shadow-toast ${
+        platform.os === "linux" ? "bg-popover" : "bg-popover/72 dark:bg-popover/68"
+      }`}
+      style={{
+        ...GLASS_REGULAR,
+        transformOrigin: "18% 0%",
+        transform: [{ translateX: gx }, { translateY: gy }, { rotate: tilt }, { scale: lift }],
+      }}
+    >
+      {d.target.kind === "doc" ? (
+        <Icon name="file" size={13} tone="foreground" class="shrink-0" />
+      ) : d.agentId ? (
+        <AgentLogo id={d.agentId} size={13} tone="foreground" />
+      ) : (
+        <Icon name="terminal" size={13} tone="foreground" class="shrink-0" />
+      )}
+      <Text class={`min-w-0 flex-1 truncate ${uiType("sm")} font-medium text-foreground`}>{d.title}</Text>
+    </View>
+  );
+}
+
 /**
  * Arc/Dia-style split drop overlay shown over the workspace while a sidebar row
  * or tab pill is dragged into the canvas. Left and right dashed drop zones let
@@ -171,15 +289,6 @@ export function SplitDropOverlay() {
 
   const shownDrag = keepLast(() => (splitDrag()?.overWorkspace ? splitDrag() : undefined));
 
-  const ghostPos = () => {
-    const d = shownDrag();
-    const rect = workspaceBounds();
-    if (!d || !rect) return null;
-    const left = Math.max(12, Math.min(rect.width - 212, d.x - rect.left + 14));
-    const top = Math.max(12, Math.min(rect.height - 44, d.y - rect.top - 16));
-    return { left, top };
-  };
-
   return (
     <If when={mounted()}>
       <View
@@ -189,27 +298,8 @@ export function SplitDropOverlay() {
       >
         <DropZoneCard side="left" active={() => splitDrag()?.hoverSide === "left"} />
         <DropZoneCard side="right" active={() => splitDrag()?.hoverSide === "right"} />
-        <If when={shownDrag() && ghostPos()}>
-          {() => {
-            const d = shownDrag()!;
-            const pos = ghostPos()!;
-            return (
-              <View
-                testID="split-drag-ghost"
-                class={`pointer-events-none absolute max-w-56 flex-row items-center gap-2 rounded-lg corner-squircle px-2.5 py-1.5 ${POPUP}`}
-                style={{ ...GLASS_REGULAR, left: pos.left, top: pos.top }}
-              >
-                {d.target.kind === "doc" ? (
-                  <Icon name="file" size={13} tone="foreground" class="shrink-0" />
-                ) : d.agentId ? (
-                  <AgentLogo id={d.agentId} size={13} tone="foreground" />
-                ) : (
-                  <Icon name="terminal" size={13} tone="foreground" class="shrink-0" />
-                )}
-                <Text class={`min-w-0 flex-1 truncate ${uiType("sm")} font-medium text-foreground`}>{d.title}</Text>
-              </View>
-            );
-          }}
+        <If when={shownDrag()}>
+          {(d) => <SplitDragGhost drag={d} exiting={() => !active()} />}
         </If>
       </View>
     </If>

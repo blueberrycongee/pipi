@@ -1,6 +1,6 @@
 {
   "name": "pipi",
-  "version": "0.2.37",
+  "version": "0.2.38",
   "private": true,
   "description": "A native desktop control surface for coding agents, built with Native Shell (nsh)",
   "type": "module",
