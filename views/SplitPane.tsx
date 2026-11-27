@@ -4,13 +4,18 @@ import {
   computed,
   createAnimatedValue,
   effect,
+  List,
   reduceMotion,
   Scroll,
   signal,
   Text,
   untracked,
   View,
+  type ListRef,
+  type ScrollEvent,
   type ScrollRef,
+  type ViewRef,
+  type WheelEvent,
 } from "nsh";
 import { Button as BaseButton, Command, type CommandItem, Input, Popover } from "nsh/base";
 import { runtimeModeRank } from "../agents/catalog";
@@ -64,10 +69,11 @@ import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { codeType, readingType, uiHeight, uiIconSize, uiRowHeight, uiType } from "../ui/typography";
+import { FOLLOW_THRESHOLD, footOf, HORIZON_GAP, INPUT_WINDOW_MS, RELEASE_SETTLE_MS, ScrollToBottomPill, type ScrollMode, UPWARD_GUARD_MS } from "./chat-scroll";
 import { Composer, type ComposerStore } from "./Composer";
 import { DocEditor } from "./DocEditor";
 import { isKnownMissingPath, MediaStreamContext } from "./Media";
-import { ProseBlock, proseRows } from "./Prose";
+import { ProseBlock, proseRows, type ProseRow } from "./Prose";
 
 const RUNTIME_MODES: readonly RuntimeMode[] = ["approval-required", "auto-accept-edits", "full-access"];
 const modelKey = (model: { provider: string; id: string }) => `${model.provider}/${model.id}`;
@@ -361,7 +367,7 @@ export function SplitResizeSash() {
 
 function SplitToolRow(props: { row: ToolRow }) {
   const open = signal(false);
-  const info = () => describeToolCall(props.row, activeLanguage());
+  const info = () => describeToolCall({ ...props.row, name: props.row.name ?? "" }, activeLanguage());
   const hasOutput = () => Boolean(props.row.output?.trim());
 
   return (
@@ -434,61 +440,76 @@ function SplitThinkingRow(props: { text: string; streaming: boolean; durationMs?
   );
 }
 
-function SplitRowItem(props: { row: Row }) {
-  const r = () => props.row;
-  if (r().kind === "user") {
-    const user = r() as Extract<Row, { kind: "user" }>;
-    if (!user.text.trim()) return null;
-    return (
-      <View class="w-full items-end pt-3 pb-1.5">
-        <View class="max-w-[82%] rounded-2xl corner-squircle bg-secondary px-3.5 py-2">
-          <Text class={`select-text ${readingType()} leading-relaxed text-secondary-foreground`}>
-            {user.text}
+type SplitListRow = Row | ProseRow;
+
+function SplitUserRow(props: { row: Extract<Row, { kind: "user" }>; anchor?: () => string | undefined; onAnchor?: (node: ViewRef | undefined) => void }) {
+  const hostNode = signal<ViewRef | undefined>(undefined);
+  effect(() => {
+    const target = props.anchor?.();
+    const node = hostNode();
+    if (target !== props.row.id || !node) return;
+    untracked(() => props.onAnchor?.(node));
+    cleanup(() => props.onAnchor?.(undefined));
+  });
+  if (!props.row.text.trim()) return null;
+  return (
+    <View ref={(node: ViewRef) => hostNode.set(node)} class="w-full items-end pt-3 pb-1.5">
+      <View class="max-w-[82%] rounded-2xl corner-squircle bg-secondary px-3.5 py-2">
+        <Text class={`select-text ${readingType()} leading-relaxed text-secondary-foreground`}>
+          {props.row.text}
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+function SplitNoticeRow(props: { row: Extract<Row, { kind: "notice" }> }) {
+  const isErr = props.row.tone === "error";
+  return (
+    <View
+      class={`my-1.5 flex-row items-start gap-2 rounded-xl corner-squircle border px-3 py-2 ${
+        isErr ? "border-destructive/30 bg-destructive/8" : "border-border bg-card"
+      }`}
+    >
+      <Icon name={isErr ? "alert" : "info"} size={14} tone={isErr ? "destructive" : "subtle"} class="mt-0.5 shrink-0" />
+      <View class="min-w-0 flex-1 gap-0.5">
+        <Text class={`${uiType("sm")} font-medium ${isErr ? "text-destructive" : "text-foreground"}`}>{props.row.title}</Text>
+        <If when={props.row.text}>
+          <Text class={`select-text ${uiType("xs")} text-muted-foreground`}>
+            {props.row.text}
           </Text>
-        </View>
+        </If>
       </View>
-    );
-  }
-  if (r().kind === "text") {
-    const textRow = r() as Extract<Row, { kind: "text" }>;
-    const blocks = () => proseRows({ id: textRow.id, text: textRow.text, streaming: textRow.streaming });
-    return (
-      <View class="w-full gap-1.5 py-1">
-        <Each of={blocks()} key={(b) => b.id}>
-          {(b) => <ProseBlock row={b()} />}
-        </Each>
-      </View>
-    );
-  }
-  if (r().kind === "thinking") {
-    const t = r() as Extract<Row, { kind: "thinking" }>;
-    return <SplitThinkingRow text={t.text} streaming={t.streaming} durationMs={t.durationMs} />;
-  }
-  if (r().kind === "tool") {
-    return <SplitToolRow row={r() as ToolRow} />;
-  }
-  if (r().kind === "notice") {
-    const n = r() as Extract<Row, { kind: "notice" }>;
-    const isErr = n.tone === "error";
-    return (
-      <View
-        class={`my-1.5 flex-row items-start gap-2 rounded-xl corner-squircle border px-3 py-2 ${
-          isErr ? "border-destructive/30 bg-destructive/8" : "border-border bg-card"
-        }`}
-      >
-        <Icon name={isErr ? "alert" : "info"} size={14} tone={isErr ? "destructive" : "subtle"} class="mt-0.5 shrink-0" />
-        <View class="min-w-0 flex-1 gap-0.5">
-          <Text class={`${uiType("sm")} font-medium ${isErr ? "text-destructive" : "text-foreground"}`}>{n.title}</Text>
-          <If when={n.text}>
-            <Text class={`select-text ${uiType("xs")} text-muted-foreground`}>
-              {n.text}
-            </Text>
-          </If>
-        </View>
-      </View>
-    );
-  }
-  return null;
+    </View>
+  );
+}
+
+function SplitRowItem(props: { row: SplitListRow; anchor?: () => string | undefined; onAnchor?: (node: ViewRef | undefined) => void }) {
+  const of = <K extends SplitListRow["kind"]>(kind: K) => (props.row.kind === kind ? (props.row as Extract<SplitListRow, { kind: K }>) : undefined);
+  return (
+    <View class="w-full">
+      <If when={of("user")}>{(row) => <SplitUserRow row={row()} anchor={props.anchor} onAnchor={props.onAnchor} />}</If>
+      <If when={of("prose")}>
+        {(row) => (
+          <View class="w-full py-1">
+            <ProseBlock row={row()} />
+          </View>
+        )}
+      </If>
+      <If when={of("text")}>
+        {(row) => (
+          <View class="w-full gap-1.5 py-1">
+            <Each of={proseRows({ id: row().id, text: row().text, streaming: row().streaming })} key={(b) => b.id}>
+              {(b) => <ProseBlock row={b()} />}
+            </Each>
+          </View>
+        )}
+      </If>
+      <If when={of("thinking")}>{(row) => <SplitThinkingRow text={row().text} streaming={row().streaming} durationMs={row().durationMs} />}</If>
+      <If when={of("tool")}>{(row) => <SplitToolRow row={row()} />}</If>
+      <If when={of("notice")}>{(row) => <SplitNoticeRow row={row()} />}</If>
+    </View>
+  );
 }
 
 function SplitDialogPrompt(props: { dialog: ExtensionUiDialog; onAnswer: (id: string, answer: any) => void }) {
@@ -811,9 +832,30 @@ function SplitPermissionPicker(props: { chat: SplitChatController; onOpen?: () =
 // ── Live split chat view ────────────────────────────────────────────────────
 
 function SplitChatView(props: { chat: SplitChatController }) {
-  let scrollRef: ScrollRef | null = null;
-  const following = signal(true);
+  let list: ListRef | undefined;
+  let ending: ViewRef | undefined;
+  const scrollMode = signal<ScrollMode>("tail");
+  const bottomFollowing = computed(() => scrollMode() === "tail" || scrollMode() === "horizon");
+  const distanceFromEnd = signal(0);
+  const activePromptId = signal<string | undefined>(undefined);
+  let stagedPromptSeen = "";
+  let horizonNode: ViewRef | undefined;
+  let checkingHorizon = false;
+  let inputAt = 0;
+  let releasedAt = 0;
+  let lastUpwardInputAt = 0;
+  let isDragging = false;
+  let wheelDirection = 0;
+  let lastY: number | undefined;
+  let lastDistance = 0;
+  let lastMax = 0;
+  let lastScrollDir = 0;
+  let endSettlePasses = 0;
+  let endSettleEpoch = 0;
+  const figure = signal(0);
+  const foot = computed(() => footOf(figure()), { equals: (a, b) => a.end === b.end });
   const waitVisible = signal(false);
+
   effect(() => {
     const waiting = props.chat.loading() && props.chat.rows().length === 0;
     if (!waiting) {
@@ -844,17 +886,242 @@ function SplitChatView(props: { chat: SplitChatController }) {
     }
   };
 
-  // Auto-follow bottom while reading at tail.
+  const disengageFollow = (upward = false) => {
+    endSettleEpoch++;
+    endSettlePasses = 0;
+    releasedAt = Date.now();
+    if (upward) lastUpwardInputAt = releasedAt;
+    if (untracked(scrollMode) !== "free") scrollMode.set("free");
+  };
+
+  const measureEnd = () => {
+    if (untracked(bottomFollowing)) return;
+    const pad = untracked(foot).end;
+    void Promise.all([list?.measure(), ending?.measure()]).then(([frame, end]) => {
+      if (!frame || !end || untracked(bottomFollowing)) return;
+      const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
+      lastMax = Math.max(0, (lastY ?? 0) + gap);
+      distanceFromEnd.set(Math.max(0, gap));
+    });
+  };
+
+  const checkHorizon = () => {
+    if (checkingHorizon || untracked(scrollMode) !== "horizon" || !untracked(props.chat.running)) return;
+    if (isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS || Date.now() - lastUpwardInputAt <= UPWARD_GUARD_MS) return;
+    const targetList = list;
+    const targetNode = horizonNode;
+    if (!targetList || !targetNode) return;
+    checkingHorizon = true;
+    void Promise.all([targetList.measure(), targetNode.measure(), ending?.measure()]).then(([frame, prompt, end]) => {
+      checkingHorizon = false;
+      if (list !== targetList || horizonNode !== targetNode) return;
+      if (untracked(scrollMode) !== "horizon" || !untracked(props.chat.running)) return;
+      if (isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS || Date.now() - lastUpwardInputAt <= UPWARD_GUARD_MS) return;
+      if (!frame || !prompt || frame.bounds.size.height <= 0) return;
+      const pad = untracked(foot).end;
+      const frameBottom = frame.pagePosition.y + frame.bounds.size.height;
+      if (end && end.pagePosition.y + end.bounds.size.height + pad < frameBottom - 24) return;
+      const hTop = frame.pagePosition.y + HORIZON_GAP;
+      const readableBottom = frameBottom - pad;
+      const readableH = Math.max(120, readableBottom - hTop);
+      const promptTop = prompt.pagePosition.y;
+      const promptBottom = promptTop + prompt.bounds.size.height;
+      const reached = prompt.bounds.size.height <= readableH * 0.4 ? promptTop <= hTop + 24 : promptBottom <= hTop + readableH * 0.32;
+      if (!reached) return;
+      endSettleEpoch++;
+      endSettlePasses = 0;
+      scrollMode.set("horizon-held");
+      if (promptTop < frame.pagePosition.y + 4) {
+        const promptId = untracked(activePromptId);
+        const promptIndex = promptId ? untracked(listRows).findIndex((row) => row.id === promptId) : -1;
+        if (promptIndex >= 0) targetList.scrollToIndex({ index: promptIndex, viewPosition: 0, viewOffset: HORIZON_GAP, animated: false });
+      }
+      measureEnd();
+    });
+  };
+
+  const onWheel = (e: WheelEvent) => {
+    inputAt = Date.now();
+    wheelDirection = Math.sign(e.delta.y);
+    if (e.delta.y < -0.1) {
+      disengageFollow(true);
+      return;
+    }
+    if (e.delta.y > 0.1 && untracked(scrollMode) === "horizon-held") scrollMode.set("free");
+  };
+
+  const onDragStart = () => {
+    isDragging = true;
+    wheelDirection = 0;
+    inputAt = Date.now();
+    endSettleEpoch++;
+    endSettlePasses = 0;
+  };
+
+  const onDragEnd = () => {
+    isDragging = false;
+    inputAt = Date.now();
+    const now = Date.now();
+    const reattachThreshold = props.chat.running() ? 24 : FOLLOW_THRESHOLD;
+    if (
+      !untracked(bottomFollowing) &&
+      lastScrollDir > 0 &&
+      lastDistance <= reattachThreshold &&
+      now - lastUpwardInputAt > UPWARD_GUARD_MS &&
+      now - releasedAt > RELEASE_SETTLE_MS
+    ) {
+      scrollMode.set("tail");
+    }
+  };
+
+  const onScroll = (e: ScrollEvent) => {
+    const y = e.offset.y;
+    const max = Math.max(0, e.contentSize.height - e.size.height);
+    const distance = Math.max(0, e.contentSize.height - (y + e.size.height));
+    const now = Date.now();
+    const movedWithinContent = lastY !== undefined && lastY >= 0 && lastY <= lastMax + 0.5 && Math.abs(max - lastMax) <= 0.5;
+
+    if (now - inputAt < INPUT_WINDOW_MS) {
+      if (movedWithinContent && lastY !== undefined && Math.abs(y - lastY) > 0.5) {
+        lastScrollDir = y < lastY ? -1 : 1;
+      }
+      if (
+        untracked(bottomFollowing) &&
+        isDragging &&
+        wheelDirection <= 0 &&
+        movedWithinContent &&
+        lastY !== undefined &&
+        y < lastY - 0.5 &&
+        distance > lastDistance + 0.5
+      ) {
+        disengageFollow(true);
+      } else if (untracked(scrollMode) === "horizon-held" && movedWithinContent && lastY !== undefined && Math.abs(y - lastY) > 0.5) {
+        releasedAt = now;
+        if (y < lastY - 0.5) lastUpwardInputAt = now;
+        scrollMode.set("free");
+      } else if (!untracked(bottomFollowing) && lastY !== undefined && y > lastY + 0.5) {
+        const reattachThreshold = props.chat.running() ? 24 : 40;
+        if (
+          distance <= reattachThreshold &&
+          now - lastUpwardInputAt > UPWARD_GUARD_MS &&
+          now - releasedAt > RELEASE_SETTLE_MS
+        ) {
+          scrollMode.set("tail");
+        }
+      }
+    }
+    lastY = y;
+    lastDistance = distance;
+    lastMax = max;
+    distanceFromEnd.set(distance);
+    if (untracked(scrollMode) === "horizon") checkHorizon();
+
+    if (endSettlePasses > 0) {
+      endSettlePasses--;
+      if (untracked(bottomFollowing) && !isDragging && now - inputAt > INPUT_WINDOW_MS && Math.abs(distance) > 1) {
+        list?.scrollTo({ y: Math.max(0, e.contentSize.height - e.size.height), animated: false });
+      }
+    }
+  };
+
+  const scheduleEndSettle = (passes = 2) => {
+    const epoch = ++endSettleEpoch;
+    const targetList = list;
+    if (!targetList) return;
+    endSettlePasses = passes;
+    void Promise.all([targetList.measure(), ending?.measure()]).then(([frame, end]) => {
+      if (epoch !== endSettleEpoch) return;
+      if (!untracked(bottomFollowing) || isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
+      if (!frame || list !== targetList) return;
+      const pad = untracked(foot).end;
+      if (end && frame.bounds.size.height > 0) {
+        const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
+        if (Math.abs(gap) <= 1 || (gap < 0 && (lastY === undefined || lastY <= 0.5))) {
+          endSettlePasses = 0;
+          distanceFromEnd.set(0);
+          return;
+        }
+        if (lastY !== undefined) {
+          targetList.scrollTo({ y: Math.max(0, lastY + gap), animated: false });
+          return;
+        }
+      }
+      targetList.scrollToEnd({ animated: false });
+    });
+  };
+
+  const follow = (animated: boolean) => {
+    inputAt = 0;
+    lastUpwardInputAt = 0;
+    isDragging = false;
+    scrollMode.set("tail");
+    if (animated) list?.scrollToEnd({ animated: true });
+    else scheduleEndSettle(2);
+  };
+  const jumpToLatest = () => follow(!reduceMotion());
+
+  // A newly staged prompt starts the same reading contract as the primary chat:
+  // with history above it rides toward the horizon; at the conversation's start it simply follows the tail.
   effect(() => {
-    props.chat.rows();
-    props.chat.running();
-    if (!untracked(following)) return;
-    queueMicrotask(() => {
-      scrollRef?.scrollToEnd({ animated: false });
+    const staged = props.chat.stagedUser();
+    const rowsNow = props.chat.rows();
+    if (!staged) return;
+    untracked(() => {
+      const index = rowsNow.findIndex((row) => row.id === staged.id);
+      if (index < 0 || staged.id === stagedPromptSeen) return;
+      stagedPromptSeen = staged.id;
+      const hasHistoryAbove = index > 0;
+      activePromptId.set(hasHistoryAbove ? staged.id : undefined);
+      inputAt = 0;
+      lastUpwardInputAt = 0;
+      isDragging = false;
+      scrollMode.set(hasHistoryAbove ? "horizon" : "tail");
+      scheduleEndSettle(2);
     });
   });
 
-  const hasRows = () => props.chat.rows().length > 0;
+  // Growth under a released reader measures the real end rather than trusting a stale scroll report.
+  effect(() => {
+    props.chat.rows();
+    foot();
+    untracked(() => {
+      if (scrollMode() === "horizon") checkHorizon();
+      measureEnd();
+    });
+  });
+
+  // A short reply stays at the tail; one held at the reading horizon becomes the reader's on settle.
+  effect(() => {
+    const running = props.chat.running();
+    untracked(() => {
+      if (running) return;
+      const mode = scrollMode();
+      if (mode === "horizon") scrollMode.set("tail");
+      else if (mode === "horizon-held") {
+        scrollMode.set("free");
+        measureEnd();
+      }
+    });
+  });
+
+  // The composer rising under a following view raises the conversation's end with it.
+  let footEnd = untracked(foot).end;
+  effect(() => {
+    const end = foot().end;
+    const rose = end > footEnd;
+    footEnd = end;
+    if (!rose || !untracked(bottomFollowing) || isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
+    scheduleEndSettle(2);
+  });
+
+  // Like the primary transcript, long prose is projected into row-sized blocks before
+  // virtualization; one monolithic reply cell is both unmeasureable and easy to cull.
+  const listRows = computed<SplitListRow[]>(() =>
+    props.chat.rows().flatMap((row): SplitListRow[] =>
+      row.kind === "text" ? proseRows({ id: row.id, text: row.text, streaming: row.streaming }) : [row],
+    ),
+  );
+  const hasRows = () => listRows().length > 0;
 
   const composerStore: ComposerStore = {
     isActive: () => isSplitOpen(),
@@ -887,7 +1154,11 @@ function SplitChatView(props: { chat: SplitChatController }) {
     answerDialog: props.chat.answerDialog,
     contextUsage: () => ({ stats: props.chat.sessionStats(), hasRows: props.chat.rows().length > 0 }),
     send: async (mode) => {
-      following.set(true);
+      inputAt = 0;
+      lastUpwardInputAt = 0;
+      isDragging = false;
+      if (untracked(scrollMode) !== "horizon") scrollMode.set("tail");
+      scheduleEndSettle(2);
       await props.chat.send(mode);
     },
     stop: props.chat.stop,
@@ -954,55 +1225,78 @@ function SplitChatView(props: { chat: SplitChatController }) {
             isolateGroups: () => daemonSessionOfId(props.chat.daemonId())?.persona === true,
           }}
         >
-        <Scroll
-          ref={(ref) => {
-            scrollRef = ref;
-          }}
-          accessibilityLabel={tr("Split conversation", "分屏对话内容")}
-          class="min-h-0 flex-1"
-          contentClass="px-5 pt-3 pb-4"
-          onScroll={(e) => {
-            const distFromBottom = e.contentSize.height - (e.offset.y + e.size.height);
-            following.set(distFromBottom <= 48);
-          }}
-        >
-          <View class="mx-auto w-full max-w-180">
-            <Each of={props.chat.rows()} key={(r) => r.id}>
-              {(r) => <SplitRowItem row={r()} />}
-            </Each>
-            <View class="h-9 justify-center">
-              <Presence show={props.chat.running() || props.chat.mood() === "happy"} scaleFrom={0.96} duration={150}>
-                <View class="flex-row items-center gap-2 pt-1">
-                  <Pip size={20} mood={props.chat.mood()} />
-                  <If when={activityText()}>
-                    <RollingText text={activityText} class={`${uiType("xs")} text-muted-foreground`} />
-                  </If>
-                </View>
-              </Presence>
-            </View>
-          </View>
-        </Scroll>
+          <List
+            ref={(node) => {
+              list = node;
+            }}
+            each={listRows()}
+            initialScrollAtEnd
+            estimatedItemSize={44}
+            keyExtractor={(row) => row.id}
+            onScroll={onScroll}
+            scrollEventThrottle={16}
+            onScrollDragStart={onDragStart}
+            onScrollDragEnd={onDragEnd}
+            onMomentumStart={() => {
+              inputAt = Date.now();
+            }}
+            onWheel={onWheel}
+            maintainVisibleContentPosition={bottomFollowing() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
+            accessibilityLabel={tr("Split conversation", "分屏对话内容")}
+            class="min-h-0 flex-1"
+            contentStyle={{
+              paddingHorizontal: 20,
+              paddingTop: 12,
+              paddingBottom: foot().end,
+            }}
+            footer={
+              <View
+                ref={(node: ViewRef) => {
+                  ending = node;
+                }}
+                class="mx-auto h-9 w-full max-w-180 justify-center"
+              >
+                <Presence show={props.chat.running() || props.chat.mood() === "happy"} scaleFrom={0.96} duration={150}>
+                  <View class="flex-row items-center gap-2 pt-1">
+                    <Pip size={20} mood={props.chat.mood()} />
+                    <If when={activityText()}>
+                      <RollingText text={activityText} class={`${uiType("xs")} text-muted-foreground`} />
+                    </If>
+                  </View>
+                </Presence>
+              </View>
+            }
+          >
+            {(row) => (
+              <View class="mx-auto w-full max-w-180">
+                <SplitRowItem
+                  row={row()}
+                  anchor={() => activePromptId()}
+                  onAnchor={(node) => {
+                    horizonNode = node;
+                  }}
+                />
+              </View>
+            )}
+          </List>
         </MediaStreamContext.Provider>
       </If>
 
-      {/* Jump to latest button when scrolled up */}
-      <If when={hasRows() && !following()}>
-        <View class="pointer-events-none absolute inset-x-0 bottom-28 z-10 items-center">
-          <BaseButton
-            onPress={() => {
-              following.set(true);
-              scrollRef?.scrollToEnd({ animated: !reduceMotion() });
-            }}
-            class={`pointer-events-auto flex-row items-center gap-1 rounded-full border-[0.5px] border-hairline bg-popover/95 px-2.5 py-1 shadow-popover ${PRESS}`}
-          >
-            <Icon name="chevronDown" size={12} tone="muted-foreground" />
-            <Text class={`${uiType("xs")} text-muted-foreground`}>{tr("Jump to latest", "回到底部")}</Text>
-          </BaseButton>
-        </View>
-      </If>
+      <ScrollToBottomPill
+        visible={hasRows() && !bottomFollowing() && distanceFromEnd() > FOLLOW_THRESHOLD}
+        bottom={foot().end}
+        onPress={() => {
+          jumpToLatest();
+        }}
+      />
 
-      {/* Unified Composer — exact same component & capabilities as the primary pane */}
-      <Composer store={composerStore} />
+      {/* Unified Composer — exact same component & capabilities as the primary pane, docked over the transcript's measured foot. */}
+      <View
+        class="pointer-events-none absolute inset-x-0 bottom-0 z-20"
+        onLayout={(e) => figure.set(Math.round(e.bounds.size.height))}
+      >
+        <Composer store={composerStore} />
+      </View>
     </View>
   );
 }

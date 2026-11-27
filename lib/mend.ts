@@ -481,6 +481,70 @@ export function closeHangingInline(tail: string): string {
   return `${tail.slice(0, trimEnd)}${closerStr}${tail.slice(trimEnd)}`;
 }
 
+
+/**
+ * Repairs one settled-display-only strong-emphasis mistake agents make often:
+ * edge whitespace inside a paired `**…**` (`** text**`, `**text **`).
+ * CommonMark's flanking rules render those delimiters literally. This is not a
+ * streaming mender: it is deliberately conservative, same-line only, and skips
+ * fences plus lines carrying code/math/escapes rather than risking semantics.
+ * Whitespace is moved outside the delimiters instead of dropped.
+ */
+export function mendSettledStrongEmphasis(source: string): string {
+  if (!source.includes("**")) return source;
+
+  const lines = source.split(/(?<=\n)/);
+  let fence: { ch: "`" | "~"; len: number } | null = null;
+  const out: string[] = [];
+
+  const fenceMarker = (line: string): { ch: "`" | "~"; len: number; info: string } | null => {
+    const body = line.replace(/\r?\n$/, "");
+    let indent = 0;
+    while (indent < body.length && indent < 3 && body[indent] === " ") indent++;
+    const ch = body[indent];
+    if (ch !== "`" && ch !== "~") return null;
+    let end = indent;
+    while (end < body.length && body[end] === ch) end++;
+    const len = end - indent;
+    if (len < 3) return null;
+    return { ch, len, info: body.slice(end) };
+  };
+
+  const repairLine = (line: string): string => {
+    // Inline code, TeX, and escapes can make `**` literal on purpose. Skipping the
+    // whole line is intentionally conservative; a missed repair is better than a false one.
+    if (line.includes("`") || line.includes("$") || line.includes("\\")) return line;
+    return line.replace(/(^|[^*])\*\*([^*\n]*?)\*\*(?!\*)/g, (whole, prefix: string, inner: string) => {
+      const lead = inner.match(/^[ \t]+/)?.[0] ?? "";
+      const trail = inner.match(/[ \t]+$/)?.[0] ?? "";
+      if (!lead && !trail) return whole;
+      const core = inner.slice(lead.length, inner.length - trail.length);
+      if (!core.trim()) return whole;
+      return `${prefix}${lead}**${core}**${trail}`;
+    });
+  };
+
+  for (const line of lines) {
+    const marker = fenceMarker(line);
+    if (fence) {
+      out.push(line);
+      if (marker && marker.ch === fence.ch && marker.len >= fence.len && /^[ \t]*$/.test(marker.info)) fence = null;
+      continue;
+    }
+    if (marker) {
+      // Backtick fences may not carry another backtick in their info string.
+      if (marker.ch !== "`" || !marker.info.includes("`")) {
+        fence = { ch: marker.ch, len: marker.len };
+        out.push(line);
+        continue;
+      }
+    }
+    out.push(repairLine(line));
+  }
+
+  return out.join("");
+}
+
 /**
  * Mends a live-streaming markdown buffer for zero-jitter display parsing.
  * Scans fences cleanly and mends only the trailing non-fence block (`O(tail)` inline scan).

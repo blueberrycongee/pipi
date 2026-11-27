@@ -110,6 +110,8 @@ export interface SplitChatController {
   runtimeMode: () => RuntimeMode;
   daemonId: () => string | undefined;
   sessionFile: () => string | undefined;
+  /** The user row staged by the latest send from this surface, as soon as it appears. */
+  stagedUser: () => { id: string } | undefined;
   pendingDialog: () => ExtensionUiDialog | undefined;
   error: () => string | undefined;
   send: (modeOrText?: "steer" | "followUp", textOverride?: string) => Promise<void>;
@@ -150,6 +152,7 @@ interface SplitChatInternal {
   runtimeMode: Signal<RuntimeMode | undefined>;
   daemonId: Signal<string | undefined>;
   sessionFile: Signal<string | undefined>;
+  stagedUser: Signal<{ id: string } | undefined>;
   dialogs: Signal<ExtensionUiDialog[]>;
   error: Signal<string | undefined>;
   client: PiClient | undefined;
@@ -473,6 +476,7 @@ export function createSplitChatController(target: Extract<SplitTarget, { kind: "
     runtimeMode: signal<RuntimeMode | undefined>(held?.runtimeMode),
     daemonId: signal<string | undefined>(held?.id ?? target.daemonId),
     sessionFile: signal<string | undefined>(held?.file ?? target.file),
+    stagedUser: signal<{ id: string } | undefined>(undefined, { equals: false }),
     dialogs: signal<ExtensionUiDialog[]>([]),
     error: signal<string | undefined>(undefined),
     client: undefined,
@@ -803,7 +807,8 @@ export function createSplitChatController(target: Extract<SplitTarget, { kind: "
         if (mode === "steer") await client.request("steer", { message: wire, ...(images.length ? { images } : {}) });
         else await client.request("follow_up", { message: wire, ...(images.length ? { images } : {}) });
       } else {
-        s.transcript.stageUser(wire, images);
+        const stagedId = s.transcript.stageUser(wire, images);
+        if (stagedId) s.stagedUser.set({ id: stagedId });
         flushNow(s);
         batch(() => {
           s.runStartedAt.set(Date.now());
@@ -942,6 +947,7 @@ export function createSplitChatController(target: Extract<SplitTarget, { kind: "
     runtimeMode: () => effectiveRuntimeMode(),
     daemonId: () => s.daemonId(),
     sessionFile: () => s.sessionFile(),
+    stagedUser: () => s.stagedUser(),
     pendingDialog: () => s.dialogs()[0],
     error: () => s.error(),
     send,

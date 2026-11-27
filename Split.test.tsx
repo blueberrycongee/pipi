@@ -18,7 +18,13 @@ const launch = (scenario = "welcome", extra: Record<string, string> = {}) =>
 
 const REFACTOR = "Refactor the transcript reducer";
 const NOTES = "Release notes for 0.1";
+const LOOK = "Look around and tell me what this project is";
 const row = (title: string) => `id:sidebar-recents >> text:${title}`;
+
+const SPLIT_LONG_REPLY = Array.from(
+  { length: 12 },
+  (_, i) => `### Part ${i + 1} of the plan\n\nSection ${i + 1} explains a step of the work in a few lines, so the reply grows past the viewport while it streams.`,
+).join("\n\n");
 
 test("dragging a sidebar session into the right drop zone opens a live split chat", async () => {
   const app = await launch();
@@ -144,6 +150,85 @@ test("dragging the resize sash tracks the pointer, double-click reset, and width
   await app.drag("id:split-resize-sash-hit", { x: 100 });
   expectDelta(width() - narrowest, 100);
 });
+
+test("split chat uses the primary conversation's release, reattach, and jump-to-latest behavior", async () => {
+  const app = await launch("stream", { "harness.reply": SPLIT_LONG_REPLY });
+  await app.waitFor("text:What are we building?");
+  await app.press(row(REFACTOR));
+  await app.waitFor("label:Refactor the transcript reducer");
+  await app.rightClick(row(LOOK));
+  await app.chooseMenuItem("Split Right");
+  await app.waitFor("id:split-pane");
+  await app.waitFor(`id:split-pane >> text:${LOOK}`);
+
+  const pill = "id:split-pane >> label:Scroll to bottom";
+  await app.type("id:split-composer-input", "make a long plan");
+  await app.press("id:split-send");
+  await app.waitFor("id:split-pane >> text:Part 4 of the plan", { timeout: 20000 });
+  expect(app.shows(pill)).toBe(false);
+
+  // Any deliberate upward scroll releases the split transcript, and growth never pulls it back.
+  await app.scroll("label:Split conversation", -400);
+  await app.waitFor(pill, { timeout: 3000 });
+  for (let i = 0; i < 5; i++) {
+    await app.wait(240);
+    expect(app.shows(pill)).toBe(true);
+  }
+
+  // The explicit way back animates to the tail and reattaches following — and the jump sticks.
+  await app.press(pill);
+  await app.waitUntil(() => !app.shows(pill), { timeout: 4000 });
+  for (let i = 0; i < 4; i++) {
+    await app.wait(240);
+    expect(app.shows(pill)).toBe(false);
+  }
+
+  // Dragging the sash changes the viewport, not the reader's contract: a following split stays at its end.
+  await app.drag("id:split-resize-sash-hit", { x: -120 });
+  await app.wait(240);
+  expect(app.shows(pill)).toBe(false);
+}, 90000);
+
+test("a long split reply pauses at the reading horizon instead of yanking to the end on settle", async () => {
+  const app = await launch("stream", { "harness.reply": SPLIT_LONG_REPLY });
+  await app.waitFor("text:What are we building?");
+  await app.press(row(REFACTOR));
+  await app.waitFor("label:Refactor the transcript reducer");
+  await app.rightClick(row(LOOK));
+  await app.chooseMenuItem("Split Right");
+  await app.waitFor("id:split-pane");
+  await app.waitFor(`id:split-pane >> text:${LOOK}`);
+
+  await app.type("id:split-composer-input", "make a long plan");
+  await app.press("id:split-send");
+  await app.waitUntil(() => app.count("id:split-stop") === 0, { timeout: 60000 });
+  const pill = "id:split-pane >> label:Scroll to bottom";
+  await app.waitFor(pill, { timeout: 5000 });
+  await app.press(pill);
+  await app.waitFor(pill, { state: "gone", timeout: 5000 });
+}, 90000);
+
+test("the split jump pill rides the composer as the composer grows", async () => {
+  const app = await launch("stream", { "harness.reply": SPLIT_LONG_REPLY });
+  await app.waitFor("text:What are we building?");
+  await app.press(row(REFACTOR));
+  await app.waitFor("label:Refactor the transcript reducer");
+  await app.rightClick(row(LOOK));
+  await app.chooseMenuItem("Split Right");
+  await app.waitFor("id:split-pane");
+  await app.waitFor(`id:split-pane >> text:${LOOK}`);
+
+  await app.type("id:split-composer-input", "make a long plan");
+  await app.press("id:split-send");
+  await app.waitFor("id:split-pane >> text:Part 4 of the plan", { timeout: 20000 });
+  const pill = "id:split-pane >> label:Scroll to bottom";
+  await app.scroll("label:Split conversation", -400);
+  await app.waitFor(pill, { timeout: 3000 });
+  const before = app.layout(pill)!.y;
+  await app.type("id:split-composer-input", "\n".repeat(7));
+  await app.waitUntil(() => (app.layout(pill)?.y ?? before) < before - 20, { timeout: 3000 });
+  expect(app.layout(pill)!.y).toBeLessThan(before - 20);
+}, 90000);
 
 test("context menu, toolbar toggle, and ⌘\\ split documents and chats", async () => {
   const dir = `/tmp/pipi-split-docs-${Date.now()}`;

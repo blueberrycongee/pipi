@@ -22,7 +22,7 @@ import { Button as BaseButton, TextView } from "nsh/base";
 import type { TextViewBlock, TextViewDocument, TextViewImage, TextViewInline, TextViewListItem } from "nsh/base";
 import { tr } from "../lib/i18n";
 import { extractBlockMedia, resolveMediaTarget, type MediaItem } from "../lib/media";
-import { mendStreamingMarkdown, PENDING_LINK_URL } from "../lib/mend";
+import { mendSettledStrongEmphasis, mendStreamingMarkdown, PENDING_LINK_URL } from "../lib/mend";
 import { groupPipMessageBlocks } from "../lib/pip-bubbles";
 import { clearPacers, pacedStreamText } from "../lib/stream-pacer";
 import {
@@ -1004,7 +1004,7 @@ export function pipBubbleRows(row: { id: string; text: string; pip?: PipRowSlot;
     return before.rows;
   }
 
-  const doc = TextView.parse(row.text, { streaming: false });
+  const doc = TextView.parse(mendSettledStrongEmphasis(row.text), { streaming: false });
   const groups = groupPipMessageBlocks(doc.blocks, row.text.trim());
   const basePip: PipRowSlot = row.pip ?? { lead: true, tail: true, indent: true };
   const fullText = basePip.fullText || row.text;

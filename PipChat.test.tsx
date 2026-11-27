@@ -208,6 +208,32 @@ test("Pip hover card surfaces active child sessions and error notices never vani
   await app.waitUntil(() => showsInChat(app, "Reading package.json"), { timeout: 15_000 });
 });
 
+test("Pip SMS bubbles display malformed strong emphasis edge whitespace as bold text", async () => {
+  const reply = [
+    "Here are the directions:",
+    "",
+    "4. ** prototype 方向**",
+    "5. **release 计划 **",
+    "6. ** final 验收 **",
+  ].join("\n");
+  const app = await launch({
+    "harness.scenario": "history",
+    "harness.history": JSON.stringify([
+      { role: "user", content: "show malformed emphasis", timestamp: 1 },
+      { role: "assistant", content: [{ type: "text", text: reply }], provider: "test", model: "test", timestamp: 2, stopReason: "stop" },
+    ]),
+  });
+  await app.press("id:sidebar-pip");
+  await app.waitUntil(() => showsInChat(app, "Here are the directions:"));
+
+  expect(showsInChat(app, "** prototype 方向**")).toBe(false);
+  expect(showsInChat(app, "**release 计划 **")).toBe(false);
+  expect(showsInChat(app, "** final 验收 **")).toBe(false);
+  expect(showsInChat(app, "prototype 方向")).toBe(true);
+  expect(showsInChat(app, "release 计划")).toBe(true);
+  expect(showsInChat(app, "final 验收")).toBe(true);
+});
+
 test("edited Pip messages show only the latest SMS bubbles, with bounded scrollable version history", async () => {
   const versions = Array.from({ length: 9 }, (_, i) => ({ content: `Progress version ${i}\n${"Earlier details. ".repeat(15)}`, at: 1000 + i * 1000 }));
   const latest = "All tasks finished.\n\nReady for review.";
@@ -310,90 +336,48 @@ const orderOf = (app: App, parts: string[]) => {
   return parts.map((part) => texts.indexOf(part));
 };
 
-test("a live multi-bubble Pip reply reveals one bubble at a time behind a quiet typing bubble", async () => {
+test("a live multi-bubble Pip reply lands whole at once, in order, without a performed reveal", async () => {
   const app = await launch({ "harness.reply": REVEAL_REPLY });
   await app.press("id:sidebar-pip");
   await app.waitFor("text:Hey, what's up?");
   await app.type("label:Message", "plain reveal");
   await app.submit("label:Message");
+
+  // The completed message lands as it is: every bubble present in the same commit,
+  // in reading order, with no typing bubble performing a backlog and no hidden tail.
   await app.waitFor("text:Alpha one.");
-  expect(app.count("id:pip-sms-bubble")).toBe(1);
-  expect(showsInChat(app, "Beta two.")).toBe(false);
-  expect(showsInChat(app, "Gamma three.")).toBe(false);
-  expect(app.shows("id:pip-typing-bubble")).toBe(true);
-  expect(app.shows("label:Copy reply")).toBe(false);
-
-  await app.wait(350);
-  expect(app.count("id:pip-sms-bubble")).toBe(2);
-  expect(showsInChat(app, "Beta two.")).toBe(true);
-  expect(showsInChat(app, "Gamma three.")).toBe(false);
-  expect(app.shows("id:pip-typing-bubble")).toBe(true);
-  expect(app.shows("label:Copy reply")).toBe(false);
-
-  await app.wait(350);
   expect(app.count("id:pip-sms-bubble")).toBe(3);
+  expect(showsInChat(app, "Beta two.")).toBe(true);
   expect(showsInChat(app, "Gamma three.")).toBe(true);
+  const order = orderOf(app, ["Alpha one.", "Beta two.", "Gamma three."]);
+  expect(order[0]).toBeLessThan(order[1]);
+  expect(order[1]).toBeLessThan(order[2]);
   await app.waitFor("label:Copy reply");
-  await app.wait(180);
-  expect(app.shows("id:pip-typing-bubble")).toBe(false);
-  expect(app.storage()["pipi.interleaves.v1"]).toBeUndefined();
+  await app.waitUntil(() => !app.shows("id:pip-typing-bubble"));
 });
 
-test("a user message during reveal lands immediately and later Pip bubbles interleave after it, then reload statically in that order", async () => {
+test("a steering message lands after the reply it did not shape, in causal reading order", async () => {
   const app = await launch({ "harness.reply": REVEAL_REPLY });
   await app.press("id:sidebar-pip");
   await app.waitFor("text:Hey, what's up?");
   await app.type("label:Message", "plain cross reveal");
   await app.submit("label:Message");
-  await app.waitFor("text:Alpha one.");
-  expect(app.count("id:pip-sms-bubble")).toBe(1);
-
   await app.waitFor("text:wait, one more thing");
   expect(showsInChat(app, "wait, one more thing")).toBe(true);
-  let order = orderOf(app, ["Alpha one.", "wait, one more thing"]);
-  expect(order[0]).toBeGreaterThanOrEqual(0);
-  expect(order[1]).toBeGreaterThan(order[0]);
 
-  await app.wait(350);
-  expect(showsInChat(app, "Beta two.")).toBe(true);
-  order = orderOf(app, ["Alpha one.", "wait, one more thing", "Beta two."]);
-  expect(order[0]).toBeLessThan(order[1]);
-  expect(order[1]).toBeLessThan(order[2]);
-  await app.wait(350);
-  expect(showsInChat(app, "Gamma three.")).toBe(true);
-  order = orderOf(app, ["Alpha one.", "wait, one more thing", "Beta two.", "Gamma three."]);
+  // The reply answers the first message only: it lands whole, ahead of the steering note
+  // that will shape the next turn. No rearrangement, no persisted crossing anchors.
+  await app.waitFor("text:Alpha one.");
+  expect(app.count("id:pip-sms-bubble")).toBe(3);
+  const order = orderOf(app, ["plain cross reveal", "Alpha one.", "Beta two.", "Gamma three.", "wait, one more thing"]);
   expect(order[0]).toBeLessThan(order[1]);
   expect(order[1]).toBeLessThan(order[2]);
   expect(order[2]).toBeLessThan(order[3]);
-
-  await app.wait(100);
-  const raw = app.storage()["pipi.interleaves.v1"];
-  expect(typeof raw).toBe("string");
-  const journal = JSON.parse(raw) as Record<string, unknown[]>;
-  const record = Object.values(journal).flat()[0];
-  expect(record).toBeTruthy();
-
-  // The same crossing, read back with the engine's chronological history, restores the visual order without replaying it.
-  const cold = await launch({
-    "harness.scenario": "history",
-    "harness.history": JSON.stringify([
-      { role: "user", content: "plain cross reveal", timestamp: 1 },
-      { role: "assistant", content: [{ type: "text", text: REVEAL_REPLY }], provider: "test", model: "test", timestamp: 2, stopReason: "stop" },
-      { role: "user", content: "wait, one more thing", timestamp: 3 },
-    ]),
-    "pipi.interleaves.v1": JSON.stringify({ "/sessions/one.jsonl": [record] }),
-  });
-  await cold.press("id:sidebar-pip");
-  await cold.waitFor("text:Alpha one.");
-  expect(cold.count("id:pip-sms-bubble")).toBe(3);
-  order = orderOf(cold, ["Alpha one.", "wait, one more thing", "Beta two.", "Gamma three."]);
-  expect(order[0]).toBeLessThan(order[1]);
-  expect(order[1]).toBeLessThan(order[2]);
-  expect(order[2]).toBeLessThan(order[3]);
-  expect(cold.shows("id:pip-typing-bubble")).toBe(false);
+  expect(order[3]).toBeLessThan(order[4]);
+  expect(app.storage()["pipi.interleaves.v1"]).toBeUndefined();
 });
 
-test("history and Reduced Motion render every Pip bubble at once without entering the reveal queue", async () => {
+test("history and Reduced Motion render every Pip bubble at once in order", async () => {
   const history = await launch({
     "harness.scenario": "history",
     "harness.history": JSON.stringify([
@@ -425,14 +409,14 @@ test("history and Reduced Motion render every Pip bubble at once without enterin
   expect(reduced.shows("id:pip-typing-bubble")).toBe(false);
 });
 
-test("leaving Pip mid-reveal settles the turn, and returning shows every bubble statically", async () => {
+test("leaving Pip and returning shows every bubble statically", async () => {
   const app = await launch({ "harness.reply": REVEAL_REPLY });
   await app.press("id:sidebar-pip");
   await app.waitFor("text:Hey, what's up?");
   await app.type("label:Message", "plain reveal");
   await app.submit("label:Message");
   await app.waitFor("text:Alpha one.");
-  expect(app.count("id:pip-sms-bubble")).toBe(1);
+  expect(app.count("id:pip-sms-bubble")).toBe(3);
 
   await app.press("id:sidebar-recents >> text:Refactor the transcript reducer");
   await app.waitFor("label:Conversation");
@@ -443,3 +427,4 @@ test("leaving Pip mid-reveal settles the turn, and returning shows every bubble 
   expect(showsInChat(app, "Gamma three.")).toBe(true);
   expect(app.shows("id:pip-typing-bubble")).toBe(false);
 });
+

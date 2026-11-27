@@ -17,6 +17,48 @@ async function shot(app: App, name: string) {
   }
 }
 
+test("composer image thumbnails open the zoom preview while remove only removes", async () => {
+  const app = await open("./Harness.tsx", {
+    width: 1080,
+    height: 760,
+    platform: "macos",
+    locale: "en-US",
+    colorScheme: "dark",
+    storage: { "harness.scenario": "welcome", "harness.reply": "Got it." },
+  });
+  await app.waitFor("text:What are we building?");
+
+  await app.paste("label:Message", { files: ["icon.png", "assets/brand/dmg-background@2x.png"] });
+  await app.waitFor("label:Attachments");
+  await app.waitUntil(() => app.count("id:composer-image") === 2);
+  await app.waitUntil(() => app.count("label:Remove image") === 2);
+
+  // The thumbnail body is a preview control: the two waiting images form the gallery.
+  await app.press("id:composer-image >> nth=0");
+  await app.waitFor("label:Close preview");
+  await app.waitFor("text:1 / 2");
+  await shot(app, "composer-image-zoom-dark");
+  await app.press("label:Next image");
+  await app.waitFor("text:2 / 2");
+  await app.waitFor("text:1320 × 840");
+  await app.keyboard.press("escape");
+  await app.waitUntil(() => app.count("label:Close preview") === 0);
+
+  // The small × removes its own attachment and never falls through to the thumbnail's preview.
+  await app.press("label:Remove image >> nth=0");
+  await app.waitUntil(() => app.count("label:Remove image") === 1);
+  await app.wait(150);
+  expect(app.count("label:Close preview")).toBe(0);
+
+  // The first attachment is the one that left: the remaining preview is the second image.
+  await app.press("id:composer-image >> nth=0");
+  await app.waitFor("label:Close preview");
+  await app.waitFor("text:1320 × 840");
+  expect(app.count("text:1 / 2")).toBe(0);
+  await app.keyboard.press("escape");
+  await app.waitUntil(() => app.count("label:Close preview") === 0);
+}, 60000);
+
 test("sent images render previews above a text-only bubble, omit the bubble when sent alone, and zoom on press", async () => {
   for (const scheme of ["dark", "light"] as const) {
     const app = await open("./Harness.tsx", {

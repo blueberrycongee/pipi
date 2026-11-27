@@ -67,7 +67,6 @@ import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
 import { backend, NoPickerError } from "./backend";
-import { loadPipInterleaves } from "./pip-interleaves";
 import { startAppUpdateChecks, stopAppUpdateChecks } from "./update";
 import {
   addCustomAgentPref,
@@ -2039,7 +2038,7 @@ export async function boot() {
   unlistenDaemonPrefs = onDaemonPrefsChange(() => pushDaemonConfig());
   unlistenWorkspaces = onWorkspacesChange(pushWorkspaces);
 
-  await Promise.all([loadPrefs(), loadPipInterleaves()]);
+  await loadPrefs();
   batch(() => {
     currentAgentId.set(preferredAgentId());
     currentRuntimeMode.set(preferredRuntimeMode());

@@ -558,14 +558,14 @@ function TypingDots() {
  * Reserves a constant 48pt (`h-12`) slot so starting and settling a run never
  * shifts the scroll content height.
  */
-export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) => void; hold?: () => boolean }) {
-  const isChatActive = () => isRunning() || waitingCount() > 0 || Boolean(props.hold?.());
+export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) => void }) {
+  const isChatActive = () => isRunning() || waitingCount() > 0;
   const alreadyWorking = untracked(() => isChatActive() && transcriptRows().length > 0);
   const shown = signal(alreadyWorking);
   const cardOpen = signal(false);
   const opacity = createAnimatedValue(alreadyWorking ? 1 : 0);
   const label = signal("");
-  const composing = () => Boolean(props.hold?.()) || pipLiveStatus().phase === "writing";
+  const composing = () => pipLiveStatus().phase === "writing";
   const typing = signal(untracked(() => isChatActive() && composing()));
   let exitTimer: ReturnType<typeof setTimeout> | undefined;
   let openTimer: ReturnType<typeof setTimeout> | undefined;
@@ -696,6 +696,7 @@ export function PipBubbleView(props: {
     () => "left",
     {
       skip: () => Boolean(props.row.edited) || isRowSeen(props.row.rowId),
+      stagger: () => props.row.bubbleIndex,
     },
   );
 

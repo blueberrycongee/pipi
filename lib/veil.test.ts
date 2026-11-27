@@ -17,7 +17,7 @@ import {
   veilOpacity,
   type RowVeil,
 } from "./veil";
-import { closeHangingInline, mendStreamingMarkdown, PENDING_LINK_URL } from "./mend";
+import { closeHangingInline, mendSettledStrongEmphasis, mendStreamingMarkdown, PENDING_LINK_URL } from "./mend";
 
 const fresh = (): RowVeil => ({ elems: new Map(), seeding: false, initialized: false, seenBlocks: 0, blockNodes: new Map() });
 const seeded = (v: RowVeil): RowVeil => { v.initialized = true; return v; };
@@ -182,6 +182,18 @@ test("closeHangingInline mends hanging inline edge cases", () => {
   // Closed code fence with blank lines inside does not confuse trailing inline mending
   const withFence = "```ts\nconst a = 1;\n\nconst b = 2;\n```\n**trailing bold ";
   expect(mendStreamingMarkdown(withFence).source).toBe("```ts\nconst a = 1;\n\nconst b = 2;\n```\n**trailing bold** ");
+});
+
+test("settled strong emphasis edge whitespace is repaired conservatively for display", () => {
+  expect(mendSettledStrongEmphasis("4. ** prototype 方向**")).toBe("4.  **prototype 方向**");
+  expect(mendSettledStrongEmphasis("5. **release 计划 **")).toBe("5. **release 计划** ");
+  expect(mendSettledStrongEmphasis("6. ** final 验收 **")).toBe("6.  **final 验收** ");
+  expect(mendSettledStrongEmphasis("normal **bold** text")).toBe("normal **bold** text");
+
+  const fenced = "```md\n** literal **\n```\n** repair me **";
+  expect(mendSettledStrongEmphasis(fenced)).toBe("```md\n** literal **\n```\n **repair me** ");
+  expect(mendSettledStrongEmphasis("use `** literal **` code")).toBe("use `** literal **` code");
+  expect(mendSettledStrongEmphasis("math $**x**$ stays put")).toBe("math $**x**$ stays put");
 });
 
 test("a chunk's fade travels word by word: the head leads, each word takes its turn, all settled together", () => {

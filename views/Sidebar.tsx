@@ -216,6 +216,16 @@ const projects = computed(
 
 const WORKSPACE_LIMIT = 6;
 const workspacesExpanded = signal(false);
+/** A workspace folder lists its sessions in batches: eight at first, eight more per 展开更多. */
+const WORKSPACE_SESSION_BATCH = 8;
+/** How many batches each folder has revealed — remembered across a fold, reset only with the app. */
+const workspaceSessionBatches = signal<Record<string, number>>({});
+const workspaceBatchCount = (cwd: string) => workspaceSessionBatches()[cwd] ?? 1;
+const revealWorkspaceBatch = (cwd: string) =>
+  workspaceSessionBatches.update((all) => ({ ...all, [cwd]: workspaceBatchCount(cwd) + 1 }));
+const ensureWorkspaceBatches = (cwd: string, batches: number) => {
+  if (batches > workspaceBatchCount(cwd)) workspaceSessionBatches.update((all) => ({ ...all, [cwd]: batches }));
+};
 const shownProjects = computed(
   () => {
     const all = projects();
@@ -2439,10 +2449,10 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; c
     if (prev && prev.session === session && prev.child === child) return prev;
     return { id, ...(session ? { session } : {}), ...(child ? { child } : {}) };
   };
-  const items = computed<FolderItem[]>(
+  /** Every root row with its nested children as one unit: a batch never splits a family. */
+  const units = computed<FolderItem[][]>(
     () => {
-      if (props.collapsed()) return lastItems;
-      const rows: FolderItem[] = [];
+      const out: FolderItem[][] = [];
       const listed = new Set(folderSessions().map((s) => s.path));
       const daemonRoots: DaemonSession[] = [];
       for (const ds of daemonSessions()) {
@@ -2455,13 +2465,42 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; c
       }
       daemonRoots.sort((a, b) => b.lastActive - a.lastActive || b.createdAt - a.createdAt || a.id.localeCompare(b.id));
       for (const ds of daemonRoots) {
-        rows.push(reuseFolderItem(`child:${ds.id}`, undefined, ds));
-        for (const child of childSessionsOfDaemon(ds.id)) rows.push(reuseFolderItem(`child:${child.id}`, undefined, child));
+        out.push([
+          reuseFolderItem(`child:${ds.id}`, undefined, ds),
+          ...childSessionsOfDaemon(ds.id).map((child) => reuseFolderItem(`child:${child.id}`, undefined, child)),
+        ]);
       }
       for (const session of sortedFolderSessions(props.cwd)) {
-        rows.push(reuseFolderItem(`session:${session.path}`, session, undefined));
-        for (const child of childSessionsOf(session.path)) rows.push(reuseFolderItem(`child:${child.id}`, undefined, child));
+        out.push([
+          reuseFolderItem(`session:${session.path}`, session, undefined),
+          ...childSessionsOf(session.path).map((child) => reuseFolderItem(`child:${child.id}`, undefined, child)),
+        ]);
       }
+      return out;
+    },
+    { equals: (a, b) => a.length === b.length && a.every((unit, i) => sameItems(unit, b[i] ?? [])) },
+  );
+  /** Opening a session past the visible batches reveals through the batch holding it — and keeps it there. */
+  effect(() => {
+    const file = openFile();
+    const daemonId = openDaemonId();
+    if (!file && !daemonId) return;
+    const index = units().findIndex((unit) =>
+      unit.some(
+        (item) =>
+          (item.session && item.session.path === file) ||
+          (item.child && (item.child.id === daemonId || (item.child.file !== undefined && item.child.file === file))),
+      ),
+    );
+    if (index >= 0) ensureWorkspaceBatches(props.cwd, Math.ceil((index + 1) / WORKSPACE_SESSION_BATCH));
+  });
+  const hiddenUnits = computed(() => Math.max(0, units().length - workspaceBatchCount(props.cwd) * WORKSPACE_SESSION_BATCH));
+  const items = computed<FolderItem[]>(
+    () => {
+      if (props.collapsed()) return lastItems;
+      const rows = units()
+        .slice(0, workspaceBatchCount(props.cwd) * WORKSPACE_SESSION_BATCH)
+        .flat();
       const nextById = new Map<string, FolderItem>();
       for (const item of rows) nextById.set(item.id, item);
       prevById = nextById;
@@ -2491,6 +2530,19 @@ function ProjectSessions(props: { cwd: string; allProjects: readonly string[]; c
           )
         }
       </Each>
+      <If when={hiddenUnits() > 0}>
+        <BaseButton
+          testID="sidebar-workspace-sessions-more"
+          onPress={() => {
+            animateSidebarList();
+            revealWorkspaceBatch(props.cwd);
+          }}
+          accessibilityLabel={tr("Show more", "展开更多")}
+          class={`${uiHeight(26)} w-full min-w-0 flex-row items-center rounded-md corner-squircle pl-8 pr-2.5 ${ROW_PRESS}`}
+        >
+          <Text class={`truncate ${uiType("xs")} text-subtle/80`}>{tr("Show more", "展开更多")}</Text>
+        </BaseButton>
+      </If>
     </View>
   );
 }

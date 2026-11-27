@@ -6,7 +6,6 @@ import { topBarHeight } from "../lib/layout";
 import { basename, tildePath } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
 import { collectTranscriptImages } from "../lib/media";
-import { PipRevealController, type PipInterleaveRecord } from "../lib/pip-reveal";
 import { markPacersSeeded } from "../lib/stream-pacer";
 import { markVeilsSeeded } from "../lib/veil";
 import type { Mood } from "../mascot/geometry";
@@ -51,7 +50,6 @@ import {
   workspacePath,
 } from "../store/app";
 import { backend } from "../store/backend";
-import { pipInterleavesForSession, recordPipInterleave } from "../store/pip-interleaves";
 import { recentWorkspaces } from "../store/prefs";
 import { openNewChatTab } from "../store/tabs";
 import { Button } from "../ui/Button";
@@ -87,6 +85,7 @@ import {
 } from "./Rows";
 import { HEADER_BAND, HeaderBand, PaneVeil } from "./Wallpaper";
 import { buildDisplayRows, displayRowIds, stableDisplayRows } from "../pi/turns";
+import { FIGURE_REST, FOLLOW_THRESHOLD, footOf, HORIZON_GAP, INPUT_WINDOW_MS, RELEASE_SETTLE_MS, ScrollToBottomPill, type ScrollMode, UPWARD_GUARD_MS } from "./chat-scroll";
 
 /** Whether the displayed conversation is actively running. */
 function isChatActive() {
@@ -546,38 +545,9 @@ function Failure(props: { title: string; detail: string }) {
   );
 }
 
-/** How near the end of the conversation (pt) counts as at it: the list follows from within it, and a released
- * reader who scrolls back down re-attaches from within it too — a moving end can never be landed on exactly,
- * and the pill would hide at this distance anyway. */
-const FOLLOW_THRESHOLD = 48;
-
-/** How long (ms) after a scroll gesture of the reader's begins its scroll events are read as theirs. */
-const INPUT_WINDOW_MS = 1500;
-
-/** After the reader releases the view, how long (ms) a move towards the end is not read as theirs: the list settles its layout once as it is released. */
-const RELEASE_SETTLE_MS = 300;
-
-/** After an upward wheel/trackpad gesture, how long (ms) bottom re-attachment is suppressed so trackpad bounce never snaps back. */
-const UPWARD_GUARD_MS = 350;
-
-/** Reading horizon below the title bar: where a newly sent prompt pauses gently when a long reply pushes it there. */
-const HORIZON_GAP = 28;
-
 /** How long (ms) a selection drag that has left the pane goes on scrolling after the selection last grew: the button going up out there is not heard. */
 const EDGE_BEAT_MS = 250;
 
-/**
- * The foot of the conversation, measured up from the pane's lower edge. What stands there is the composer's
- * figure as laid out (`figure`, its height): 20 under the composer, the composer, whatever stands on it — the
- * attachments, a long draft, an inline prompt — and 12 over that. At rest that is 124 (a 92pt composer), its
- * top edge at 112; the edge is wherever the figure puts it, and what meets it is placed from it, so the three
- * move together and nothing the composer grows by covers the reply:
- * - `end`: the conversation ends 16 above the edge, a container's pad. The activity line's 36pt slot is the last
- *   thing in it, so a reply at rest stands 52 clear of the composer and Pip, working, about 20.
- * - "Jump to latest" stands on that same line.
- * - `fade`: rows fade out as they pass under that edge.
- */
-const FIGURE_REST = 124;
 const HEAD_FADE = 24;
 const MASK_STEPS = 6;
 const smoothMask = (t: number) => t * t * (3 - 2 * t);
@@ -596,10 +566,6 @@ function maskRamp(from: number, to: number, start: number, end: number): string[
   return stops;
 }
 
-function footOf(figure: number) {
-  const edge = (figure || FIGURE_REST) - 12;
-  return { edge, end: edge + 16 };
-}
 
 /**
  * One top-to-bottom mask (`maskImage` takes a single gradient) fading rows out
@@ -658,76 +624,6 @@ function dockFrames() {
 }
 
 type Screen = "starting" | "failed" | "connect" | "welcome" | "transcript";
-type ScrollMode = "tail" | "horizon" | "horizon-held" | "free";
-
-/** Floating pill shown when the reader scrolls up past the follow threshold,
- * or when a long reply pauses at the reading horizon, offering a crisp return to the bottom. */
-function ScrollToBottomPill(props: { visible: boolean; bottom: number; onPress: () => void }) {
-  const mounted = signal(false);
-  const opacity = createAnimatedValue(0);
-  const translateY = createAnimatedValue(8);
-  const scale = createAnimatedValue(0.94);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-
-  effect(() => {
-    const show = props.visible;
-    const reduced = reduceMotion();
-    untracked(() => {
-      clearTimeout(timer);
-      if (show) {
-        mounted.set(true);
-        if (reduced) {
-          opacity.set(1);
-          translateY.set(0);
-          scale.set(1);
-        } else {
-          void opacity.timing(1, { duration: 160, easing: EASING.entrance });
-          void translateY.spring(0, SPRING.snappy);
-          void scale.spring(1, SPRING.snappy);
-        }
-      } else if (mounted()) {
-        if (reduced) {
-          opacity.set(0);
-          mounted.set(false);
-        } else {
-          void opacity.timing(0, { duration: 140, easing: EASING.exit });
-          void translateY.timing(6, { duration: 140, easing: EASING.exit });
-          void scale.timing(0.95, { duration: 140, easing: EASING.exit });
-          timer = setTimeout(() => mounted.set(false), 150);
-        }
-      }
-    });
-  });
-
-  cleanup(() => {
-    clearTimeout(timer);
-    void opacity.stop();
-    void translateY.stop();
-    void scale.stop();
-  });
-
-  return (
-    <If when={mounted()}>
-      <View
-        class="pointer-events-none absolute inset-x-0 z-10 items-center"
-        style={{ bottom: props.bottom, opacity, transform: [{ translateY }, { scale }] }}
-      >
-        <BaseButton
-          onPress={props.onPress}
-          accessibilityLabel={tr("Scroll to bottom", "滚动到底部")}
-          class={`pointer-events-auto ${uiHeight(28)} flex-row items-center gap-1.5 rounded-full px-3 ${POPUP} ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} hover:bg-muted/80 active:bg-muted`}
-          style={GLASS_REGULAR}
-        >
-          <Text class={`${uiType("xs")} font-medium text-foreground`}>{tr("Jump to latest", "回到最新")}</Text>
-          <View class="rotate-180">
-            <Icon name="arrowUp" size={12} tone="muted-foreground" />
-          </View>
-        </BaseButton>
-      </View>
-    </If>
-  );
-}
-
 /**
  * A floating bubble at the pane's top-right, on the line a sent prompt lands:
  * the reader's own last question, in its own words and in the user bubble's own
@@ -842,33 +738,6 @@ export function Chat() {
     return (held = hasModel() ? "welcome" : "connect");
   });
   const stable = stableDisplayRows();
-  const pipRevealTick = signal(0);
-  const pipRevealPending = signal(false);
-  const unpersistedInterleaves: PipInterleaveRecord[] = [];
-  const sessionFileForOrder = () => sessionState()?.sessionFile ?? currentDaemonSession()?.file;
-  const persistPipInterleave = (record: PipInterleaveRecord) => {
-    const crossingFile = untracked(sessionFileForOrder);
-    queueMicrotask(() => {
-      const file = crossingFile ?? untracked(sessionFileForOrder);
-      if (file) recordPipInterleave(file, record);
-      else unpersistedInterleaves.push(record);
-    });
-  };
-  effect(() => {
-    const file = sessionFileForOrder();
-    if (!file || unpersistedInterleaves.length === 0) return;
-    untracked(() => {
-      for (const record of unpersistedInterleaves.splice(0)) recordPipInterleave(file, record);
-    });
-  });
-  const pipReveals = new PipRevealController({
-    notify: () => pipRevealTick.update((n) => n + 1),
-    isLiveRow: (rowId) => !isRowSeen(rowId),
-    reduceMotion,
-    onInterleave: persistPipInterleave,
-  });
-  cleanup(() => pipReveals.reset());
-  let pipRevealKey = untracked(conversationKey);
   let shown: ChatRow[] = [];
   let shownKey = -1;
   let enteredKey = -1;
@@ -956,19 +825,7 @@ export function Chat() {
         rows.push(...proseRows(row));
       }
     }
-    let visibleRows = rows;
-    if (isPersonaSession()) {
-      pipRevealTick();
-      const reveal = pipReveals.apply(rows, pipInterleavesForSession(sessionFileForOrder()));
-      visibleRows = reveal.rows;
-      untracked(() => {
-        if (pipRevealPending() !== reveal.pending) pipRevealPending.set(reveal.pending);
-      });
-    } else {
-      untracked(() => {
-        if (pipRevealPending()) pipRevealPending.set(false);
-      });
-    }
+    const visibleRows = rows;
     // The rows a turn's fold shows, in order (commentary is a row per block, each the turn's its reply is).
     const folded = new Map<string, string>();
     for (const row of visibleRows) {
@@ -1656,11 +1513,6 @@ export function Chat() {
       topRow.set(-1);
       bottomRow.set(-1);
       viewSpan = -1;
-      if (key !== pipRevealKey) {
-        pipRevealKey = key;
-        pipReveals.reset();
-        pipRevealPending.set(false);
-      }
       ensureEntered(key);
       pokeRepaint();
     });
@@ -1776,7 +1628,6 @@ export function Chat() {
                         }
                       >
                         <PipWorkingFooter
-                          hold={() => pipRevealPending()}
                           anchor={(node) => {
                             if (node) ending = mountedEnding = node;
                             else if (ending === mountedEnding) ending = undefined;

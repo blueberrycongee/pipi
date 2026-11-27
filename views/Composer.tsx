@@ -673,6 +673,17 @@ function fileCardIcon(kind: FileAttachment["kind"]): IconName {
   return "file";
 }
 
+function pastedImageItem(image: Attachment, index: number) {
+  return {
+    id: `paste:${index}:${image.name}`,
+    kind: "image" as const,
+    title: image.name,
+    src: `data:${image.mimeType};base64,${image.data}`,
+    mimeType: image.mimeType,
+    data: image.data,
+  };
+}
+
 function composerImageGallery(store: ComposerStore) {
   const fromFiles = store
     .files()
@@ -686,14 +697,7 @@ function composerImageGallery(store: ComposerStore) {
       mimeType: f.mimeType,
       size: f.size,
     }));
-  const fromPasted = store.attachments().map((img, idx) => ({
-    id: `paste:${idx}:${img.name}`,
-    kind: "image" as const,
-    title: img.name,
-    src: `data:${img.mimeType};base64,${img.data}`,
-    mimeType: img.mimeType,
-    data: img.data,
-  }));
+  const fromPasted = store.attachments().map((img, idx) => pastedImageItem(img, idx));
   return [...fromFiles, ...fromPasted];
 }
 
@@ -776,12 +780,20 @@ function AttachmentTray(props: { store: ComposerStore }) {
           <Each of={shown()?.images ?? []} key="index">
             {(image, index) => (
               <View class="group relative size-14 shrink-0 overflow-hidden rounded-lg corner-squircle bg-muted" style={enter("zoomIn")}>
-                <Image
-                  src={`data:${image().mimeType};base64,${image().data}`}
-                  class="size-full"
-                  style={{ objectFit: "cover" }}
+                <BaseButton
+                  testID="composer-image"
+                  onPress={() => openMediaZoom(pastedImageItem(image(), index()), { gallery: composerImageGallery(s) })}
                   accessibilityLabel={image().name}
-                />
+                  tooltip={tip(image().name)}
+                  class={`size-full rounded-lg corner-squircle ${PRESS} ${PRESS_SCALE} ${FOCUS_RING}`}
+                >
+                  <Image
+                    src={`data:${image().mimeType};base64,${image().data}`}
+                    class="size-full"
+                    style={{ objectFit: "cover" }}
+                    accessibilityElementsHidden
+                  />
+                </BaseButton>
                 {/* The edge is drawn over the pixels, so a white screenshot still has one. */}
                 <View class="pointer-events-none absolute inset-0 rounded-lg corner-squircle border-[0.5px] border-hairline-hover" />
                 <BaseButton

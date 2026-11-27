@@ -345,7 +345,7 @@ export function useRowEntrance(id: () => string, streaming?: () => boolean, skip
 export function useSmsBubbleEntrance(
   id: () => string,
   side: () => "left" | "right",
-  options?: { enabled?: () => boolean; skip?: () => boolean },
+  options?: { enabled?: () => boolean; skip?: () => boolean; stagger?: () => number },
 ): ViewStyle {
   const item = leanMotion(["opacity", "translateX", "translateY", "scale"] as const);
   let lastId = "";
@@ -368,6 +368,7 @@ export function useSmsBubbleEntrance(
       seenRowIds.add(currentId);
       const isLeft = side() === "left";
       const spec = isLeft ? SMS_INCOMING_SPEC : SMS_OUTGOING_SPEC;
+      const delay = isLeft ? Math.min(Math.max(0, options?.stagger?.() ?? 0), 4) * 85 : 0;
       if (reduceMotion()) {
         item.reset();
         return;
@@ -375,7 +376,7 @@ export function useSmsBubbleEntrance(
       for (const channel of ["opacity", "translateX", "translateY", "scale"] as const) {
         item.values[channel].set(spec.tracks[channel][0].value);
       }
-      item.play(spec);
+      item.play(spec, delay);
     });
   });
   cleanup(() => item.stop());
