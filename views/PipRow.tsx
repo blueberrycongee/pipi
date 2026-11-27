@@ -1,15 +1,15 @@
-import { platform, signal, Text, View } from "nsh";
+import { platform, Text, View } from "nsh";
 import type { JSX, MouseEvent, PressEvent } from "nsh";
-import { Input } from "nsh/base";
 import { tr } from "../lib/i18n";
 import type { DaemonSession } from "../pi/daemon";
-import { createPersonalAgent, currentDaemonId, currentView, ensurePersonalAgent, isRunning, pendingSession, personalAgents } from "../store/app";
+import { currentDaemonId, currentView, ensurePersonalAgent, isRunning, pendingSession, personalAgents } from "../store/app";
 import { openDaemonSessionTab } from "../store/tabs";
-import { Button, IconButton } from "../ui/Button";
+import { IconButton } from "../ui/Button";
 import { uiHeight, uiType } from "../ui/typography";
-import { FIELD_SURFACE, FOCUS_RING, HOVER_REVEAL, PRESS } from "../ui/styles";
+import { FOCUS_RING, HOVER_REVEAL, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { PersonaAvatar } from "./PersonaAvatar";
+import { openPersonaCreate } from "./PersonaCreateDialog";
 
 const isModPress = (e?: { modifiers?: { platform?: boolean; control?: boolean } }) =>
   Boolean(platform.os === "macos" ? e?.modifiers?.platform : e?.modifiers?.control);
@@ -77,31 +77,11 @@ function PersonaRowItem(props: { persona: PersonaListEntry; trailing?: JSX.Eleme
 /**
  * The personal agents pinned above the sidebar's lists. One persona stays a
  * single compact row; more get a quiet section heading. The `+` opens a small
- * inline creation form and the new persona opens straight into conversation.
+ * floating creation surface and the new persona opens straight into conversation.
  */
 export function PipRow() {
-  const creating = signal(false);
-  const busy = signal(false);
-  const name = signal("");
-  const description = signal("");
   const entries = () => personaEntries();
   const many = () => entries().length > 1;
-
-  const submit = async () => {
-    if (busy() || !name().trim()) return;
-    busy.set(true);
-    try {
-      const id = await createPersonalAgent(name(), description());
-      if (id) {
-        creating.set(false);
-        name.set("");
-        description.set("");
-        openDaemonSessionTab(id);
-      }
-    } finally {
-      busy.set(false);
-    }
-  };
 
   const addButton = (className = "") => (
     <IconButton
@@ -111,7 +91,7 @@ export function PipRow() {
       testID="sidebar-persona-add"
       class={className}
       onPress={() => {
-        creating.set(true);
+        openPersonaCreate();
       }}
     />
   );
@@ -134,42 +114,6 @@ export function PipRow() {
           }
         />
       ))}
-      {creating() ? (
-        <View testID="persona-create-form" class="mt-1 rounded-lg corner-squircle border-[0.5px] border-hairline bg-card p-2">
-          <Input
-            autoFocus
-            value={name()}
-            placeholder={tr("Name", "名字")}
-            accessibilityLabel={tr("Personal agent name", "个人智能体名字")}
-            testID="persona-name-input"
-            onChange={({ value }) => name.set(value)}
-            onSubmit={() => void submit()}
-            class={`${uiHeight(26)} rounded-md corner-squircle px-2 ${uiType("sm")} text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
-          />
-          <Input
-            value={description()}
-            placeholder={tr("Role or personality (optional)", "角色或性格（可选）")}
-            accessibilityLabel={tr("Personal agent description", "个人智能体描述")}
-            testID="persona-description-input"
-            onChange={({ value }) => description.set(value)}
-            onSubmit={() => void submit()}
-            class={`${uiHeight(26)} mt-1.5 rounded-md corner-squircle px-2 ${uiType("sm")} text-foreground caret-brand placeholder:text-subtle ${FIELD_SURFACE}`}
-          />
-          <View class="mt-2 flex-row justify-end gap-1.5">
-            <Button
-              size="sm"
-              variant="ghost"
-              label={tr("Cancel", "取消")}
-              onPress={() => {
-                creating.set(false);
-                name.set("");
-                description.set("");
-              }}
-            />
-            <Button size="sm" variant="primary" testID="persona-create-submit" disabled={!name().trim() || busy()} label={tr("Create", "创建")} onPress={() => void submit()} />
-          </View>
-        </View>
-      ) : null}
     </View>
   );
 }

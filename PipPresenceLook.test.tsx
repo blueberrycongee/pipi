@@ -1,4 +1,6 @@
 import { expect, open, test } from "nsh/test";
+import type { App } from "nsh/test";
+import { decodeLumGrid, pixelDiff } from "./dev/frames";
 
 for (const colorScheme of ["light", "dark"] as const) {
   test(`Pip quiet working states ${colorScheme}`, async () => {
@@ -47,3 +49,47 @@ for (const colorScheme of ["light", "dark"] as const) {
     expect(app.count("id:pip-status-child-s_child_1")).toBe(1);
   });
 }
+
+async function typingBubbleDiff(app: App): Promise<number> {
+  await app.waitFor("id:pip-typing-bubble", { timeout: 20_000 });
+  const box = app.layout("id:pip-typing-bubble")!;
+  const first = decodeLumGrid(await app.screenshot(), 2);
+  await app.wait(140);
+  const second = decodeLumGrid(await app.screenshot(), 2);
+  expect(app.layout("id:pip-typing-bubble")).toEqual(box);
+  const x0 = Math.max(0, Math.floor(box.x) - 4);
+  const x1 = Math.min(first.width, Math.ceil(box.x + box.width) + 4);
+  const y0 = Math.max(0, Math.floor(box.y) - 4);
+  const y1 = Math.min(first.height, Math.ceil(box.y + box.height) + 4);
+  return pixelDiff(first, second, x0, x1, y0, y1, 4);
+}
+
+test("Pip typing dots animate inside a fixed bubble, and Reduced Motion holds them still", async () => {
+  const reply = `A quiet answer. ${"The reply keeps writing so the typing indicator stays visible. ".repeat(8)}`;
+  const launch = (reducedMotion: boolean) =>
+    open("./Harness.tsx", {
+      width: 1180,
+      height: 780,
+      platform: "macos",
+      locale: "en-US",
+      colorScheme: "light",
+      clock: {},
+      reducedMotion,
+      storage: { "harness.scenario": "stream", "harness.reply": reply },
+    });
+  const send = async (app: App) => {
+    await app.waitFor("id:sidebar-pip");
+    await app.press("id:sidebar-pip");
+    await app.waitFor("text:Hey, what's up?");
+    await app.type("label:Message", "hello Pip");
+    await app.submit("label:Message");
+  };
+
+  const live = await launch(false);
+  await send(live);
+  expect(await typingBubbleDiff(live)).toBeGreaterThan(0);
+
+  const reduced = await launch(true);
+  await send(reduced);
+  expect(await typingBubbleDiff(reduced)).toBe(0);
+}, 60000);

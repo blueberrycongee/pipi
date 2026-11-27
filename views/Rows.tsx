@@ -1454,7 +1454,7 @@ function TurnHeaderView(props: { row: TurnHeaderRow }) {
   };
   const shownPreview = keepLast(() => preview() || undefined, "");
   return (
-    <View class="pb-0.5">
+    <View testID="turn-process-header" class="pb-0.5">
       <ProcessLine
         open={props.row.open}
         onPress={props.row.hasDetails ? () => toggleTurn(props.row.id, props.row.open, props.row.running) : undefined}

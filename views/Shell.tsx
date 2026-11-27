@@ -82,6 +82,7 @@ import { CompareDialog } from "./AgentPicker";
 import { Chat } from "./Chat";
 import { DocDeck, notifyDocPointerUp } from "./DocEditor";
 import { ExtensionDialog, hasInlinePrompt } from "./ExtensionDialog";
+import { PersonaCreateDialog } from "./PersonaCreateDialog";
 import { Palette } from "./Palette";
 import { Settings } from "./Settings";
 import { notifySidebarPointerMove, notifySidebarPointerUp, Sidebar } from "./Sidebar";
@@ -915,6 +916,7 @@ export function Shell() {
       <Palette />
       <CompareDialog />
       <Settings />
+      <PersonaCreateDialog />
       <WallpaperAdjustDialog />
       <ZoomLayer />
       <ExtensionDialog />

@@ -102,6 +102,41 @@ test("a conversation seen before is on screen with the click", async () => {
   expect(seen.every(Boolean)).toBe(true);
 });
 
+test("returning to a running session never doubles Pip under its turn", async () => {
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 780,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    storage: {
+      "harness.scenario": "stream",
+      "harness.distinct": "1",
+      "harness.then": "1000:/sessions/one.jsonl;2500:send:make a plan in steps;7000:/sessions/two.jsonl;7800:/sessions/one.jsonl",
+    },
+  });
+
+  // The switchback lands on a turn whose own header is on screen. Since that header
+  // already anchors the one working Pip, the footer's first frame must not add another.
+  let left = false;
+  let returned = false;
+  const pips: number[] = [];
+  for (let elapsed = 0; elapsed < 10000 && pips.length < 32; elapsed += 16) {
+    await app.wait(16);
+    if (shows(app, REFACTOR) && app.texts().includes("Ask Pi…")) left = true;
+    const back =
+      left &&
+      shows(app, "make a plan in steps") &&
+      app.count("label:Conversation >> text:Working") > 0 &&
+      app.texts().includes("Steer Pi…");
+    if (!returned && back) returned = true;
+    if (returned) pips.push(app.count("label:Conversation >> label:pipi"));
+  }
+  expect(returned).toBe(true);
+  expect(pips.length).toBeGreaterThan(0);
+  expect(Math.max(...pips)).toBeLessThanOrEqual(1);
+});
+
 test("a conversation not seen yet lands from its file at once and never moves again", async () => {
   const app = await launch("welcome");
   await app.waitFor("text:What are we building?");

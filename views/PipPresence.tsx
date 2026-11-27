@@ -1,5 +1,5 @@
-import { Canvas, cleanup, computed, createAnimatedValue, effect, Path2D, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
-import type { CanvasRenderingContext2D, JSX, ScrollRef, ViewRef } from "nsh";
+import { Animated, Canvas, cleanup, computed, createAnimatedValue, effect, Path2D, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
+import type { CanvasRenderingContext2D, CompositeAnimation, JSX, ScrollRef, ViewRef } from "nsh";
 import { Button as BaseButton, Popover } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { activeLanguage, tr } from "../lib/i18n";
@@ -464,6 +464,95 @@ export function PipAvatarBadge(props: {
   );
 }
 
+function TypingDots() {
+  const dots = [0, 1, 2].map(() => ({
+    opacity: createAnimatedValue(0.36),
+    scale: createAnimatedValue(0.88),
+    translateY: createAnimatedValue(0),
+  }));
+
+  effect(() => {
+    if (reduceMotion()) {
+      const staticAlphas = [0.45, 0.72, 0.96];
+      dots.forEach((dot, index) => {
+        void dot.opacity.stop();
+        void dot.scale.stop();
+        void dot.translateY.stop();
+        dot.opacity.set(staticAlphas[index]);
+        dot.scale.set(1);
+        dot.translateY.set(0);
+      });
+      return;
+    }
+
+    const running: CompositeAnimation[] = [];
+    dots.forEach((dot, index) => {
+      const delay = index * 165;
+      const anim = Animated.parallel([
+        Animated.keyframes(dot.opacity, {
+          keyframes: [
+            { offset: 0, value: 0.36, easing: "easeInOut" },
+            { offset: 0.28, value: 0.96, easing: "easeInOut" },
+            { offset: 0.62, value: 0.36, easing: "easeInOut" },
+            { offset: 1, value: 0.36 },
+          ],
+          duration: 1180,
+          delay,
+          iterations: "infinite",
+        }),
+        Animated.keyframes(dot.scale, {
+          keyframes: [
+            { offset: 0, value: 0.88, easing: "easeInOut" },
+            { offset: 0.28, value: 1.12, easing: "easeInOut" },
+            { offset: 0.62, value: 0.88, easing: "easeInOut" },
+            { offset: 1, value: 0.88 },
+          ],
+          duration: 1180,
+          delay,
+          iterations: "infinite",
+        }),
+        Animated.keyframes(dot.translateY, {
+          keyframes: [
+            { offset: 0, value: 0, easing: "easeInOut" },
+            { offset: 0.28, value: -1.8, easing: "easeInOut" },
+            { offset: 0.62, value: 0, easing: "easeInOut" },
+            { offset: 1, value: 0 },
+          ],
+          duration: 1180,
+          delay,
+          iterations: "infinite",
+        }),
+      ]);
+      void anim.start();
+      running.push(anim);
+    });
+
+    cleanup(() => {
+      for (const anim of running) anim.stop();
+      for (const dot of dots) {
+        void dot.opacity.stop();
+        void dot.scale.stop();
+        void dot.translateY.stop();
+      }
+    });
+  });
+
+  return (
+    <>
+      {dots.map((dot, index) => (
+        <View
+          testID={`pip-typing-dot-${index}`}
+          class="size-[5px] rounded-full bg-muted-foreground"
+          style={{
+            opacity: dot.opacity,
+            transform: [{ translateY: dot.translateY }, { scale: dot.scale }],
+          }}
+        />
+      ))}
+    </>
+  );
+}
+
 /**
  * Quiet working row for Pip conversations; the avatar and label share a live status card.
  * Reserves a constant 48pt (`h-12`) slot so starting and settling a run never
@@ -476,7 +565,8 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
   const cardOpen = signal(false);
   const opacity = createAnimatedValue(alreadyWorking ? 1 : 0);
   const label = signal("");
-  const waiting = signal(false);
+  const composing = () => Boolean(props.hold?.()) || pipLiveStatus().phase === "writing";
+  const typing = signal(untracked(() => isChatActive() && composing()));
   let exitTimer: ReturnType<typeof setTimeout> | undefined;
   let openTimer: ReturnType<typeof setTimeout> | undefined;
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -547,7 +637,7 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
   effect(() => {
     if (isChatActive() && !isLeavingSession()) {
       label.set(status().headline);
-      waiting.set(["waiting_sessions", "waiting_user", "retrying", "compacting"].includes(status().phase));
+      typing.set(composing());
     }
   });
 
@@ -573,16 +663,12 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
             class={`h-7 min-w-0 flex-1 justify-center items-start rounded-sm ${FOCUS_RING}`}
           >
             <If
-              when={waiting()}
-              else={
-                <View testID="pip-typing-bubble" class="h-7 w-14 flex-row items-center justify-center gap-[5px] rounded-full bg-sms-incoming">
-                  <View class="size-[5px] rounded-full bg-muted-foreground/50" />
-                  <View class="size-[5px] rounded-full bg-muted-foreground/70" />
-                  <View class="size-[5px] rounded-full bg-muted-foreground/90" />
-                </View>
-              }
+              when={typing()}
+              else={<Text testID="pip-waiting-label" class={`truncate ${uiType("xs")} text-muted-foreground`}>{label()}</Text>}
             >
-              <Text testID="pip-waiting-label" class={`truncate ${uiType("xs")} text-muted-foreground`}>{label()}</Text>
+              <View testID="pip-typing-bubble" class="h-7 w-14 flex-row items-center justify-center gap-[5px] rounded-full bg-sms-incoming">
+                <TypingDots />
+              </View>
             </If>
           </View>
         </View>

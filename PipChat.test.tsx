@@ -39,12 +39,14 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
   await app.submit("label:Message");
   await app.waitFor("text:make a plan in steps");
 
-  // While Pip is working: wait until the active Pip avatar + iMessage typing bubble are visible, then sample frames through the run.
+  // While Pip is working: the quiet status label carries thinking/tool phases, and the iMessage
+  // typing bubble appears only once Pip is writing. Sample frames through the whole run.
   await app.waitFor("id:pip-active-avatar");
-  await app.waitFor("id:pip-typing-bubble");
   let hoveredDuringRun = false;
   let sawLiveCard = false;
   let sawLivePhase = false;
+  let sawThinkingLabelDuringRun = false;
+  let sawWorkingLabelDuringRun = false;
   let sawTypingBubbleDuringRun = false;
   let sawReadReceiptDuringRun = false;
   let sawToolWallDuringRun = false;
@@ -55,8 +57,10 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
     const stillRunning = !app.shows("label:Send");
     if (stillRunning) {
       if (app.shows("id:pip-typing-bubble")) sawTypingBubbleDuringRun = true;
+      if (app.count("id:pip-working-label >> text:Thinking") > 0) sawThinkingLabelDuringRun = true;
+      if (app.count("id:pip-working-label >> text:Working") > 0) sawWorkingLabelDuringRun = true;
       if (app.shows("id:sms-receipt")) sawReadReceiptDuringRun = true;
-      if (showsInChat(app, "Working")) sawWorkingHeaderDuringRun = true;
+      if (app.count("id:turn-process-header") > 0) sawWorkingHeaderDuringRun = true;
       if (showsInChat(app, "Reading package.json")) sawToolWallDuringRun = true;
       if (showsInChat(app, "The list follows by hand. Let me check the tests before changing it.")) {
         sawCommentaryDuringRun = true;
@@ -81,7 +85,10 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
     await app.wait(16);
   }
 
-  // Main chat stream stayed completely clean during Pip's run while showing the SMS typing bubble & read receipt.
+  // Main chat stream stayed completely clean. Thinking and tool work used the quiet label;
+  // only writing used the SMS typing bubble, and the read receipt still landed.
+  expect(sawThinkingLabelDuringRun).toBe(true);
+  expect(sawWorkingLabelDuringRun).toBe(true);
   expect(sawTypingBubbleDuringRun).toBe(true);
   expect(sawReadReceiptDuringRun).toBe(true);
   expect(sawWorkingHeaderDuringRun).toBe(false);

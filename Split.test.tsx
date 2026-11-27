@@ -100,6 +100,51 @@ test("dragging a tab pill down into the workspace opens split view", async () =>
   await app.waitFor(`id:split-pane >> text:${REFACTOR}`);
 });
 
+test("dragging the resize sash tracks the pointer, double-click reset, and width floor", async () => {
+  const app = await launch();
+  await app.waitFor("text:What are we building?");
+  await app.press(row(REFACTOR));
+  await app.waitFor("label:Refactor the transcript reducer");
+  await app.rightClick(row(NOTES));
+  await app.chooseMenuItem("Split Right");
+  await app.waitFor("id:split-pane");
+
+  const width = () => app.layout("id:split-pane")?.width ?? 0;
+  const expectDelta = (actual: number, expected: number) => {
+    expect(actual).toBeGreaterThan(expected - 8);
+    expect(actual).toBeLessThan(expected + 8);
+  };
+
+  const initial = width();
+  await app.dragAndHold("id:split-resize-sash-hit", { x: -100 });
+  expectDelta(width() - initial, 100);
+  await app.drop();
+  const widenedRightSplit = width();
+  expectDelta(widenedRightSplit - initial, 100);
+  await app.drag("id:split-resize-sash-hit", { x: 70 });
+  expectDelta(widenedRightSplit - width(), 70);
+
+  await app.press("id:split-swap");
+  await app.waitFor("label:Left split pane");
+  const beforeLeftSplit = width();
+  await app.drag("id:split-resize-sash-hit", { x: 80 });
+  const widenedLeftSplit = width();
+  expectDelta(widenedLeftSplit - beforeLeftSplit, 80);
+  await app.drag("id:split-resize-sash-hit", { x: -50 });
+  expectDelta(widenedLeftSplit - width(), 50);
+
+  await app.wait(700);
+  await app.drag("id:split-resize-sash-hit", { x: 0 });
+  await app.drag("id:split-resize-sash-hit", { x: 0 });
+  expectDelta(width() - initial, 0);
+
+  await app.drag("id:split-resize-sash-hit", { x: -300 });
+  const narrowest = width();
+  expectDelta(narrowest - 280, 0);
+  await app.drag("id:split-resize-sash-hit", { x: 100 });
+  expectDelta(width() - narrowest, 100);
+});
+
 test("context menu, toolbar toggle, and ⌘\\ split documents and chats", async () => {
   const dir = `/tmp/pipi-split-docs-${Date.now()}`;
   const app = await launch("welcome", {

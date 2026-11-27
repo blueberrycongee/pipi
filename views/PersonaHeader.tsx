@@ -1,4 +1,4 @@
-import { cleanup, effect, keymap, signal, Text, View } from "nsh";
+import { cleanup, effect, keymap, platform, signal, Text, View } from "nsh";
 import { AlertDialog, Button as BaseButton, Input } from "nsh/base";
 import { Menu, type MenuItem } from "nsh/desktop";
 import { tr } from "../lib/i18n";
@@ -16,13 +16,12 @@ import {
 } from "../store/app";
 import { backend } from "../store/backend";
 import { IconButton } from "../ui/Button";
-import { PRESS } from "../ui/styles";
+import { GLASS_REGULAR, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { uiHeight, uiType } from "../ui/typography";
 import { PersonaAvatar } from "./PersonaAvatar";
 
-/** Vertical room the centered persona identity reserves at the transcript's top. */
-export const PERSONA_HEADER_HEIGHT = 76;
+const CAPSULE_SURFACE = `rounded-full border-[0.5px] border-hairline shadow-popover ${platform.os === "linux" ? "bg-popover" : "bg-popover/95 dark:bg-popover/90"}`;
 
 async function confirmDeletePersona(sessionId: string, title: string) {
   const { action } = await AlertDialog.show({
@@ -40,9 +39,9 @@ async function confirmDeletePersona(sessionId: string, title: string) {
 }
 
 /**
- * The personal agent's Messages-style identity at the top of its conversation:
- * a centered circular avatar with its name underneath. The avatar chooses a
- * picture; the name edits inline; everything else stays inside the quiet `…`.
+ * The personal agent's identity at the top of its conversation: one compact
+ * centered capsule carrying the avatar, name and quiet `…`. The avatar chooses
+ * a picture; the name edits inline.
  */
 export function PersonaHeader() {
   const editing = signal(false);
@@ -112,21 +111,24 @@ export function PersonaHeader() {
       <View
         testID="persona-header"
         class="pointer-events-none absolute inset-x-0 z-10 items-center"
-        style={{ top: topBarHeight() + 4, height: PERSONA_HEADER_HEIGHT - 4 }}
+        style={{ top: topBarHeight() + 2 }}
       >
-        <View class="pointer-events-auto items-center">
-        <BaseButton
-          testID="persona-avatar-button"
-          onPress={() => void chooseAvatar()}
-          accessibilityLabel={tr("Change avatar", "更换头像")}
-          tooltip={tip(tr("Change avatar", "更换头像"))}
-          class={`group size-11 items-center justify-center rounded-full ${PRESS}`}
+        <View
+          testID="persona-header-capsule"
+          class={`pointer-events-auto ${uiHeight(36)} flex-row items-center gap-1 pl-0.5 pr-1 ${CAPSULE_SURFACE}`}
+          style={GLASS_REGULAR}
         >
-          <View class="size-11 overflow-hidden rounded-full border-[0.5px] border-hairline bg-card shadow-sm">
-            <PersonaAvatar avatar={() => persona()?.avatar} size={31} mood="idle" still testID="persona-header-avatar" />
-          </View>
-        </BaseButton>
-        <View class="mt-1 h-6 flex-row items-center justify-center">
+          <BaseButton
+            testID="persona-avatar-button"
+            onPress={() => void chooseAvatar()}
+            accessibilityLabel={tr("Change avatar", "更换头像")}
+            tooltip={tip(tr("Change avatar", "更换头像"))}
+            class={`group size-7 items-center justify-center rounded-full ${PRESS}`}
+          >
+            <View class="size-7 overflow-hidden rounded-full border-[0.5px] border-hairline bg-card">
+              <PersonaAvatar avatar={() => persona()?.avatar} size={20} mood="idle" still testID="persona-header-avatar" />
+            </View>
+          </BaseButton>
           {editing() ? (
             <Input
               autoFocus
@@ -136,7 +138,7 @@ export function PersonaHeader() {
               onBlur={commitEdit}
               accessibilityLabel={tr("Personal agent name", "个人智能体名字")}
               testID="persona-name-input"
-              class={`${uiHeight(24)} w-40 rounded-md corner-squircle px-2 text-center ${uiType("sm")} font-medium text-foreground caret-brand`}
+              class={`${uiHeight(24)} w-40 rounded-full px-2 text-center ${uiType("sm")} font-medium text-foreground caret-brand`}
             />
           ) : (
             <BaseButton
@@ -144,23 +146,21 @@ export function PersonaHeader() {
               onPress={beginEdit}
               accessibilityLabel={tr("Rename personal agent", "重命名个人智能体")}
               tooltip={tip(tr("Rename", "重命名"))}
-              class={`${uiHeight(24)} max-w-56 items-center justify-center rounded-md corner-squircle px-1.5 ${PRESS}`}
+              class={`${uiHeight(24)} max-w-44 items-center justify-center rounded-full px-1.5 ${PRESS}`}
             >
               <Text class={`truncate text-center ${uiType("sm")} font-medium text-foreground`}>{title()}</Text>
             </BaseButton>
           )}
-          <View class="w-6 items-center">
-            <IconButton
-              icon="more"
-              size="sm"
-              label={tr("Personal agent actions", "个人智能体操作")}
-              testID="persona-actions-button"
-              class="size-5"
-              onPress={() => void Menu.popup(menuItems())}
-            />
-          </View>
+          <IconButton
+            icon="more"
+            size="sm"
+            label={tr("Personal agent actions", "个人智能体操作")}
+            testID="persona-actions-button"
+            class="size-5"
+            hitSlop={4}
+            onPress={() => void Menu.popup(menuItems())}
+          />
         </View>
-      </View>
       </View>
     </If>
   );

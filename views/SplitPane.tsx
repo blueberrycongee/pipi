@@ -35,6 +35,8 @@ import {
   promoteSplitToPrimary,
   setSplitRatio,
   SPLIT_RATIO_DEFAULT,
+  SPLIT_RATIO_MAX,
+  SPLIT_RATIO_MIN,
   splitDrag,
   splitRatio,
   splitSide,
@@ -210,33 +212,61 @@ export function SplitDropOverlay() {
 
 // ── Draggable resize sash between primary and split panes ───────────────────
 
+const SPLIT_PANE_MIN_WIDTH = 280;
 const sashDragging = signal(false);
 let sashStartX = 0;
 let sashStartRatio = SPLIT_RATIO_DEFAULT;
+let sashLastDeltaX = 0;
+let sashPanActive = false;
+let sashPressClickCount = 0;
+let sashDragMoved = false;
 
 export const isSplitSashDragging = () => sashDragging();
+
+function clampSplitSashRatio(ratio: number, width: number) {
+  const minRatio = Math.min(SPLIT_RATIO_MAX, Math.max(SPLIT_RATIO_MIN, SPLIT_PANE_MIN_WIDTH / width));
+  return Math.min(SPLIT_RATIO_MAX, Math.max(minRatio, ratio));
+}
+
+function updateSplitSashDrag(deltaX: number) {
+  if (!untracked(sashDragging)) return;
+  const rect = workspaceBounds();
+  if (!rect || rect.width <= 0) return;
+  sashLastDeltaX = deltaX;
+  if (Math.abs(deltaX) >= 4) sashDragMoved = true;
+  const delta = deltaX / rect.width;
+  const raw = splitSide() === "left" ? sashStartRatio + delta : sashStartRatio - delta;
+  setSplitRatio(clampSplitSashRatio(raw, rect.width));
+}
+
+function finishSplitSashDrag(deltaX = sashLastDeltaX) {
+  if (!untracked(sashDragging)) return;
+  updateSplitSashDrag(deltaX);
+  sashDragging.set(false);
+  sashPanActive = false;
+}
+
+function resetSplitSashForDoubleClick() {
+  if (sashPressClickCount >= 2 && !sashDragMoved) setSplitRatio(SPLIT_RATIO_DEFAULT);
+}
 
 export function notifySplitSashMove(pageX: number, pressed: boolean) {
   if (!untracked(sashDragging)) return;
   if (!pressed) {
-    sashDragging.set(false);
+    if (!sashPanActive) finishSplitSashDrag();
     return;
   }
-  const rect = workspaceBounds();
-  if (!rect || rect.width <= 0) return;
-  const delta = (pageX - sashStartX) / rect.width;
-  const next = splitSide() === "left" ? sashStartRatio + delta : sashStartRatio - delta;
-  setSplitRatio(next);
+  updateSplitSashDrag(pageX - sashStartX);
 }
 
 export function notifySplitSashUp(pageX?: number) {
-  if (!untracked(sashDragging)) return;
-  if (pageX !== undefined) notifySplitSashMove(pageX, true);
-  sashDragging.set(false);
+  if (!untracked(sashDragging) || sashPanActive) return;
+  finishSplitSashDrag(pageX === undefined ? sashLastDeltaX : pageX - sashStartX);
 }
 
 export function SplitResizeSash() {
   const hovered = signal(false);
+  const panX = createAnimatedValue(0);
   let hoverTimer: ReturnType<typeof setTimeout> | undefined;
 
   const clearHover = () => {
@@ -248,6 +278,7 @@ export function SplitResizeSash() {
   cleanup(() => {
     clearHover();
     sashDragging.set(false);
+    sashPanActive = false;
   });
 
   return (
@@ -261,7 +292,20 @@ export function SplitResizeSash() {
       style={{ paddingTop: topBarHeight() }}
     >
       <View
+        testID="split-resize-sash-hit"
         style={{ position: "absolute", top: topBarHeight(), bottom: 0, left: -4, width: 9, zIndex: 25, cursor: "col-resize" }}
+        pan={{ x: panX }}
+        panActivation={{ activeOffsetX: 4 }}
+        onPanStart={() => {
+          sashPanActive = true;
+        }}
+        onPanEnd={(e) => {
+          sashPanActive = false;
+          panX.set(0);
+          finishSplitSashDrag(e.translation.x);
+          resetSplitSashForDoubleClick();
+          hovered.set(false);
+        }}
         onMouseEnter={() => {
           if (sashDragging()) return;
           clearHover();
@@ -275,18 +319,31 @@ export function SplitResizeSash() {
           if (!sashDragging()) hovered.set(false);
         }}
         onPressDown={(e) => {
-          if (e.clickCount >= 2) {
-            setSplitRatio(SPLIT_RATIO_DEFAULT);
-            return;
-          }
           clearHover();
+          sashPressClickCount = e.clickCount;
           sashStartX = e.pagePosition.x;
-          sashStartRatio = splitRatio();
+          const width = workspaceBounds()?.width;
+          sashStartRatio = width ? clampSplitSashRatio(splitRatio(), width) : splitRatio();
+          sashLastDeltaX = 0;
+          sashDragMoved = false;
+          sashPanActive = false;
+          panX.set(0);
           sashDragging.set(true);
         }}
-        onPressUp={(e) => {
-          notifySplitSashUp(e.pagePosition.x);
+        onPressUp={() => {
+          if (!sashPanActive) {
+            finishSplitSashDrag();
+            resetSplitSashForDoubleClick();
+          }
           hovered.set(false);
+        }}
+        onTouchMove={(e) => updateSplitSashDrag(e.pageX - sashStartX)}
+        onTouchEnd={(e) => {
+          if (!sashPanActive) finishSplitSashDrag(e.pageX - sashStartX);
+          resetSplitSashForDoubleClick();
+        }}
+        onTouchCancel={() => {
+          if (!sashPanActive) finishSplitSashDrag();
         }}
       >
         <View
@@ -1015,7 +1072,7 @@ export function SplitPane() {
             class={`relative min-w-0 shrink-0 ${wallpaper() ? "bg-background/88" : "bg-background"}`}
             style={{
               width: widthPercent(),
-              minWidth: 280,
+              minWidth: SPLIT_PANE_MIN_WIDTH,
               paddingTop: topBarHeight(),
             }}
             onPressDown={() => focusPane("split")}

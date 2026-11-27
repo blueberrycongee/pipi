@@ -64,7 +64,7 @@ import { uiHeight, uiMinHeight, uiType } from "../ui/typography";
 import { Composer } from "./Composer";
 import { hasFormTakeover, hasInlinePrompt } from "./ExtensionDialog";
 import { isKnownMissingPath, MediaStreamContext } from "./Media";
-import { PersonaHeader, PERSONA_HEADER_HEIGHT } from "./PersonaHeader";
+import { PersonaHeader } from "./PersonaHeader";
 import { PipWorkingFooter } from "./PipPresence";
 import { pipBubbleRows, proseRows } from "./Prose";
 import {
@@ -141,12 +141,6 @@ function activityLabel(said: boolean) {
  * shifts the scroll content height or causes a layout jump at the end of a stream.
  * It is the last thing in the list, so where it stands is where the conversation ends (`anchor`). */
 function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void; said: () => boolean; hostedByTurn: () => boolean }) {
-  const alreadyWorking = untracked(() => (isChatActive() || pipMood() === "happy") && transcriptRows().some((row) => row.kind !== "user"));
-  const shown = signal(alreadyWorking);
-  const opacity = createAnimatedValue(alreadyWorking ? 1 : 0);
-  const translateY = createAnimatedValue(alreadyWorking ? 0 : 4);
-  let exitTimer: ReturnType<typeof setTimeout> | undefined;
-
   const reason = () => {
     const activity = currentActivity();
     return activity.kind === "retrying" ? activity.reason : "";
@@ -156,6 +150,11 @@ function ActivityLine(props: { anchor?: (node: ViewRef | undefined) => void; sai
   // extra status label to announce, keep this foot slot quietly empty so Pip
   // is never duplicated underneath the running turn.
   const activeHere = () => (isChatActive() && (!props.hostedByTurn() || label() !== "")) || pipMood() === "happy";
+  const alreadyWorking = untracked(() => activeHere() && transcriptRows().some((row) => row.kind !== "user"));
+  const shown = signal(alreadyWorking);
+  const opacity = createAnimatedValue(alreadyWorking ? 1 : 0);
+  const translateY = createAnimatedValue(alreadyWorking ? 0 : 4);
+  let exitTimer: ReturnType<typeof setTimeout> | undefined;
 
   effect(() => {
     if (isLeavingSession()) return;
@@ -606,8 +605,8 @@ function footOf(figure: number) {
  * One top-to-bottom mask (`maskImage` takes a single gradient) fading rows out
  * at both ends of what can be read:
  * - Above: without a wallpaper the title bar's own glass blurs rows behind it,
- *   so the fade runs inside the bar (`top - HEAD_FADE` → `top`) right up to its
- *   hairline; over a wallpaper the title bar has no band of its own, so the
+ *   so the fade runs inside the bar (`top - HEAD_FADE` → `top`) right up to
+ *   its hairline; over a wallpaper the title bar has no band of its own, so the
  *   bar's whole height stays transparent (`0` → `top`) and rows fade in below
  *   it (`top` → `top + HEAD_FADE`), never crossing the title text.
  * - Below: rows fade out as they pass under the composer's top `edge`.
@@ -1758,7 +1757,7 @@ export function Chat() {
                     class="flex-1"
                     contentStyle={{
                       paddingHorizontal: 24,
-                      paddingTop: topBarHeight() + (wallpaper() && !HEADER_BAND ? HEAD_FADE : 12) + (isPersonaSession() ? PERSONA_HEADER_HEIGHT : 0),
+                      paddingTop: topBarHeight() + (wallpaper() && !HEADER_BAND ? HEAD_FADE : 12),
                       paddingBottom: foot().end,
                     }}
                     accessibilityLabel={tr("Conversation", "对话")}
