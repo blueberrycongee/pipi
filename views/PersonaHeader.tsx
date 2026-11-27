@@ -1,4 +1,5 @@
-import { cleanup, effect, keymap, platform, signal, Text, View } from "nsh";
+import { cleanup, createAnimatedValue, effect, keymap, Overlay, platform, reduceMotion, signal, Text, token, View } from "nsh";
+import type { InputRef } from "nsh";
 import { AlertDialog, Button as BaseButton, Input } from "nsh/base";
 import { Menu, type MenuItem } from "nsh/desktop";
 import { tr } from "../lib/i18n";
@@ -8,20 +9,54 @@ import {
   deletePersonalAgent,
   newPersonaConversation,
   openLocalFile,
-  personalAgents,
   renamePersonalAgent,
   resetPersonalAgentAvatar,
   setPersonalAgentAvatar,
   toast,
 } from "../store/app";
 import { backend } from "../store/backend";
-import { IconButton } from "../ui/Button";
-import { GLASS_REGULAR, PRESS } from "../ui/styles";
+import { Icon } from "../ui/Icon";
+import { EASING } from "../ui/motion";
+import { FOCUS_RING, GLASS_REGULAR, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { uiHeight, uiType } from "../ui/typography";
+import { uiHeight, uiRowHeight, uiType } from "../ui/typography";
 import { PersonaAvatar } from "./PersonaAvatar";
 
-const CAPSULE_SURFACE = `rounded-full border-[0.5px] border-hairline shadow-popover ${platform.os === "linux" ? "bg-popover" : "bg-popover/95 dark:bg-popover/90"}`;
+const AVATAR_SIZE = 48;
+const NAMEPLATE_OVERLAP = 8;
+const HEADER_TOP = 6;
+const HEADER_BOTTOM_GAP = 16;
+
+/** Room a persona conversation leaves under the title bar for the floating identity. */
+export function personaHeaderClearance() {
+  return HEADER_TOP + AVATAR_SIZE - NAMEPLATE_OVERLAP + uiRowHeight(28) + HEADER_BOTTOM_GAP;
+}
+
+const SCRIM_STEPS = 8;
+const smoothstep = (t: number) => t * t * (3 - 2 * t);
+const alphaHex = (alpha: number) =>
+  Math.round(Math.max(0, Math.min(1, alpha)) * 255)
+    .toString(16)
+    .padStart(2, "0");
+
+/** The page-colored scrim rows recede into, eased at both ends so no fade line shows. */
+function personaScrim(height: number): string {
+  const base = String(token("background")).slice(0, 7);
+  const fade = 52;
+  const start = Math.max(0, height - fade);
+  const stops = [`${base}ff 0px`, `${base}ff ${start}px`];
+  for (let i = 1; i <= SCRIM_STEPS; i++) {
+    const t = i / SCRIM_STEPS;
+    const at = Math.round((start + fade * t) * 10) / 10;
+    stops.push(`${base}${alphaHex(1 - smoothstep(t))} ${at}px`);
+  }
+  return `linear-gradient(to bottom, ${stops.join(", ")})`;
+}
+
+function capsuleSurface(active: boolean) {
+  const tint = platform.os === "linux" ? "bg-popover" : active ? "bg-popover/96 dark:bg-popover/90" : "bg-popover/84 dark:bg-popover/78";
+  return `rounded-full border-[0.5px] ${active ? "border-hairline-hover" : "border-hairline"} shadow-popover transition-colors duration-200 ease-out-quint motion-reduce:transition-none ${tint}`;
+}
 
 async function confirmDeletePersona(sessionId: string, title: string) {
   const { action } = await AlertDialog.show({
@@ -39,15 +74,38 @@ async function confirmDeletePersona(sessionId: string, title: string) {
 }
 
 /**
- * The personal agent's identity at the top of its conversation: one compact
- * centered capsule carrying the avatar, name and quiet `…`. The avatar chooses
- * a picture; the name edits inline.
+ * The personal agent's identity floating over its conversation: a prominent
+ * circular avatar with a small frosted nameplate tucked onto its lower edge.
+ * The avatar chooses a picture; the name edits inline. At rest the badge is
+ * just those two shapes — its `…` arrives with the pointer, keyboard focus, or
+ * its own open menu.
  */
-export function PersonaHeader() {
+export function PersonaHeader(props: { reading?: boolean }) {
   const editing = signal(false);
   const name = signal("");
+  const nameWidth = signal(0);
+  const inputRef = signal<InputRef | undefined>(undefined);
+  const hovered = signal(false);
+  const menuOpen = signal(false);
+  const hoverAmount = createAnimatedValue(0);
   const persona = () => activePersonaSession();
   const title = () => persona()?.title || "Pip";
+
+  const driveHover = (on: boolean) => {
+    if (hovered() === on) return;
+    hovered.set(on);
+    void hoverAmount.stop();
+    if (reduceMotion()) {
+      hoverAmount.set(on ? 1 : 0);
+      return;
+    }
+    void hoverAmount.timing(on ? 1 : 0, { duration: 180, easing: EASING.entrance });
+  };
+  let menuTicket = 0;
+  cleanup(() => {
+    menuTicket++;
+    void hoverAmount.stop();
+  });
 
   const beginEdit = () => {
     name.set(title());
@@ -106,62 +164,133 @@ export function PersonaHeader() {
     ];
   };
 
+  const openActions = () => {
+    const ticket = ++menuTicket;
+    menuOpen.set(true);
+    void Menu.popup(menuItems()).then(
+      () => {
+        if (ticket === menuTicket) menuOpen.set(false);
+      },
+      () => {
+        if (ticket === menuTicket) menuOpen.set(false);
+      },
+    );
+  };
+
+  const active = () => hovered() || editing() || menuOpen();
+  const mascot = () => !persona()?.avatar;
+  const playful = () => hovered() && mascot();
+  const avatarLift = hoverAmount.interpolate({ inputRange: [0, 1], outputRange: [0, -1.5] });
+  const avatarScale = hoverAmount.interpolate({ inputRange: [0, 1], outputRange: [1, 1.045] });
+  const scrimHeight = () => topBarHeight() + personaHeaderClearance() + 30;
+
   return (
-    <If when={Boolean(persona())}>
-      <View
-        testID="persona-header"
-        class="pointer-events-none absolute inset-x-0 z-10 items-center"
-        style={{ top: topBarHeight() + 2 }}
-      >
+    <>
+      <If when={Boolean(persona()) && props.reading}>
         <View
-          testID="persona-header-capsule"
-          class={`pointer-events-auto ${uiHeight(36)} flex-row items-center gap-1 pl-0.5 pr-1 ${CAPSULE_SURFACE}`}
-          style={GLASS_REGULAR}
+          testID="persona-header-scrim"
+          class="pointer-events-none absolute inset-x-0 top-0 z-10"
+          style={{ height: scrimHeight(), backgroundImage: personaScrim(scrimHeight()) }}
+        />
+      </If>
+      <If when={Boolean(persona())}>
+        <View
+          testID="persona-header"
+          class="pointer-events-none absolute inset-x-0 z-20 items-center"
+          style={{ top: topBarHeight() + HEADER_TOP }}
         >
-          <BaseButton
-            testID="persona-avatar-button"
-            onPress={() => void chooseAvatar()}
-            accessibilityLabel={tr("Change avatar", "更换头像")}
-            tooltip={tip(tr("Change avatar", "更换头像"))}
-            class={`group size-7 items-center justify-center rounded-full ${PRESS}`}
+          <View
+            testID="persona-header-hitarea"
+            class="group pointer-events-auto items-center"
+            onMouseEnter={() => driveHover(true)}
+            onMouseLeave={() => driveHover(false)}
           >
-            <View class="size-7 overflow-hidden rounded-full border-[0.5px] border-hairline bg-card">
-              <PersonaAvatar avatar={() => persona()?.avatar} size={20} mood="idle" still testID="persona-header-avatar" />
-            </View>
-          </BaseButton>
-          {editing() ? (
-            <Input
-              autoFocus
-              value={name()}
-              onChange={({ value }) => name.set(value)}
-              onSubmit={commitEdit}
-              onBlur={commitEdit}
-              accessibilityLabel={tr("Personal agent name", "个人智能体名字")}
-              testID="persona-name-input"
-              class={`${uiHeight(24)} w-40 rounded-full px-2 text-center ${uiType("sm")} font-medium text-foreground caret-brand`}
-            />
-          ) : (
             <BaseButton
-              testID="persona-name-button"
-              onPress={beginEdit}
-              accessibilityLabel={tr("Rename personal agent", "重命名个人智能体")}
-              tooltip={tip(tr("Rename", "重命名"))}
-              class={`${uiHeight(24)} max-w-44 items-center justify-center rounded-full px-1.5 ${PRESS}`}
+              testID="persona-avatar-button"
+              onPress={() => void chooseAvatar()}
+              accessibilityLabel={tr("Change avatar", "更换头像")}
+              tooltip={tip(tr("Change avatar", "更换头像"))}
+              hitSlop={4}
+              class={`size-12 items-center justify-center rounded-full ${PRESS} ${FOCUS_RING}`}
+              style={{ transform: [{ translateY: avatarLift }, { scale: avatarScale }] }}
             >
-              <Text class={`truncate text-center ${uiType("sm")} font-medium text-foreground`}>{title()}</Text>
+              <View class="size-12 overflow-hidden rounded-full border-[0.5px] border-hairline bg-card shadow-raised">
+                <PersonaAvatar
+                  avatar={() => persona()?.avatar}
+                  size={34}
+                  mood={playful() ? "happy" : "idle"}
+                  still={!playful()}
+                  testID="persona-header-avatar"
+                />
+              </View>
+              <View
+                testID="persona-avatar-edit-hint"
+                class="pointer-events-none absolute -right-0.5 -top-0.5 size-4 items-center justify-center rounded-full border-[0.5px] border-hairline bg-popover shadow-raised"
+                style={{ opacity: hoverAmount }}
+              >
+                <Icon name="image" size={9} tone="muted-foreground" />
+              </View>
             </BaseButton>
-          )}
-          <IconButton
-            icon="more"
-            size="sm"
-            label={tr("Personal agent actions", "个人智能体操作")}
-            testID="persona-actions-button"
-            class="size-5"
-            hitSlop={4}
-            onPress={() => void Menu.popup(menuItems())}
-          />
+            <View
+              testID="persona-header-capsule"
+              class={`pointer-events-auto -mt-2 ${uiHeight(28)} min-w-20 max-w-60 flex-row items-center px-1 ${capsuleSurface(active())}`}
+              style={GLASS_REGULAR}
+            >
+              <View class="w-5 shrink-0" />
+              {editing() ? (
+                <>
+                  <Input
+                    ref={(ref) => {
+                      if (ref) inputRef.set(ref);
+                    }}
+                    autoFocus
+                    value={name()}
+                    onChange={({ value }) => name.set(value)}
+                    onSubmit={commitEdit}
+                    onBlur={commitEdit}
+                    scrollbar={false}
+                    accessibilityLabel={tr("Personal agent name", "个人智能体名字")}
+                    testID="persona-name-input"
+                    class={`${uiHeight(24)} rounded-full px-1 text-center ${uiType("sm")} font-medium text-foreground caret-brand`}
+                    style={{ width: Math.max(72, nameWidth() + 8) }}
+                  />
+                  <If when={inputRef()}>
+                    {(field) => <Overlay anchor={field()} onPressOutside={commitEdit} onCancel={cancelEdit} />}
+                  </If>
+                </>
+              ) : (
+                <BaseButton
+                  testID="persona-name-button"
+                  onPress={beginEdit}
+                  onLayout={(e) => {
+                    const width = Math.ceil(e.bounds.size.width);
+                    if (!editing() && width > 0 && width !== nameWidth()) nameWidth.set(width);
+                  }}
+                  accessibilityLabel={tr("Rename personal agent", "重命名个人智能体")}
+                  tooltip={tip(tr("Rename", "重命名"))}
+                  class={`${uiHeight(24)} max-w-44 items-center justify-center rounded-full px-1 ${PRESS} ${FOCUS_RING}`}
+                >
+                  <Text class={`truncate text-center ${uiType("sm")} font-medium text-foreground`}>{title()}</Text>
+                </BaseButton>
+              )}
+              <View class="w-5 shrink-0 items-center justify-center">
+                <BaseButton
+                  testID="persona-actions-button"
+                  onPress={openActions}
+                  accessibilityLabel={tr("Personal agent actions", "个人智能体操作")}
+                  tooltip={tip(tr("Personal agent actions", "个人智能体操作"))}
+                  hitSlop={4}
+                  class={`size-5 items-center justify-center rounded-full ${PRESS} ${FOCUS_RING} hover:bg-accent active:bg-accent transition-opacity duration-200 ease-out-quint motion-reduce:transition-none`}
+                  style={{ opacity: editing() || menuOpen() ? 1 : hoverAmount }}
+                  focusVisibleStyle={{ opacity: 1 }}
+                >
+                  <Icon name="more" size={12} tone="muted-foreground" />
+                </BaseButton>
+              </View>
+            </View>
+          </View>
         </View>
-      </View>
-    </If>
+      </If>
+    </>
   );
 }

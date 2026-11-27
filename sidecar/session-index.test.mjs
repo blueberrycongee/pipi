@@ -77,6 +77,20 @@ test("an external header's clipped firstMessage is cleaned before it is clipped 
   assert.equal(entry?.firstMessage, "Legacy delegated title");
 });
 
+test("a pipi-reply prefix is stripped before the title but the reply words remain", async () => {
+  const wire = '<pipi-reply target="a:1#b0" author="Pip">quoted context</pipi-reply>\n\nThis is the actual reply title';
+  assert.equal(titleWords(wire), "This is the actual reply title");
+  const entry = await scanPi(wire);
+  assert.equal(entry.firstMessage, "This is the actual reply title");
+  assert.ok(!entry.firstMessage.includes("<pipi-reply"));
+});
+
+test("persona-wrapped quote replies index by their visible reply words", async () => {
+  const wire = '<pipi-persona name="Pip">persona instructions</pipi-persona>\n\n<pipi-reply target="u:1" author="You">earlier question</pipi-reply>\n\nFollow-up answer title';
+  const entry = await scanPi(wire);
+  assert.equal(entry.firstMessage, "Follow-up answer title");
+});
+
 test("an ordinary first message is unchanged", async () => {
   const entry = await scanPi("Please refactor the sidebar");
   assert.equal(entry.firstMessage, "Please refactor the sidebar");

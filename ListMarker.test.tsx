@@ -45,3 +45,51 @@ test("ordered list markers past one digit stay on one line", async () => {
   expect(app.shows("text:10.")).toBe(true);
   expect(app.shows("text:100.")).toBe(true);
 }, 150000);
+
+const BASELINE_REPLY = `1. **不硬塞** \`image\` **block**，避免上游直接 400 把任务打挂；
+   1. 嵌套有序列表的纯中文首行
+2. **自动降级为路径 + 元数据透传**（文件名、路径、尺寸、大小...）；
+3. \`session_start\` / \`session_send\` **显式返回降级回执 / \`warnings\`**...
+
+- 无序纯中文首行
+  - 嵌套无序中文首行
+- [ ] 任务复选框首行对齐
+- [x] 已完成任务首行对齐
+`;
+
+function layoutOf(app: Awaited<ReturnType<typeof open>>, query: string) {
+  const box = app.layout(query);
+  if (!box) throw new Error(`missing layout for ${query}`);
+  return box;
+}
+
+function boxY(app: Awaited<ReturnType<typeof open>>, query: string): number {
+  return layoutOf(app, query).y;
+}
+
+test("ordered and unordered list markers align with the first body baseline", async () => {
+  const app = await open("./Harness.tsx", {
+    width: 990,
+    height: 780,
+    platform: "macos",
+    locale: "zh-Hans-CN",
+    colorScheme: "light",
+    storage: { "harness.scenario": "stream", "harness.reply": BASELINE_REPLY },
+  });
+  await app.waitFor("text:今天要构建什么？", { timeout: 20000 });
+  await app.type("label:消息", "baseline please");
+  await app.submit("label:消息");
+  await app.waitFor("label:复制回复", { timeout: 90000 });
+  await app.wait(600);
+  await app.screenshot(".nsh/shots/prose-list-baseline.png");
+
+  // With the same explicit point line height, aligned first baselines put the
+  // text boxes at the same top. Inline-code-first rows exercise the nested
+  // 0.9em span that used to recompute the whole paragraph line height.
+  expect(Math.abs(boxY(app, "text:2.") - boxY(app, "text:自动降级为路径 + 元数据透传（文件名、路径、尺寸、大小...）；"))).toBeLessThanOrEqual(0.5);
+  expect(Math.abs(boxY(app, "text:3.") - boxY(app, "text:session_start / session_send 显式返回降级回执 / warnings..."))).toBeLessThanOrEqual(0.5);
+  expect(Math.abs(boxY(app, "text:◦") - boxY(app, "text:嵌套无序中文首行"))).toBeLessThanOrEqual(0.5);
+  for (const query of ["text:2.", "text:自动降级为路径 + 元数据透传（文件名、路径、尺寸、大小...）；", "text:session_start / session_send 显式返回降级回执 / warnings..."]) {
+    expect(Math.abs(layoutOf(app, query).height - 23)).toBeLessThanOrEqual(0.5);
+  }
+}, 150000);

@@ -349,3 +349,95 @@ rl.on("line", (line) => {
   const doneAssistant = finalMsgs.data.messages.find((m) => m.role === "assistant");
   assert.ok(doneAssistant?.content?.some((b) => b.type === "presented_media" && b.items[0]?.width === 320));
 });
+
+function writeAcpPromptImageMock(file, logFile, { capability, modelImages = true, rejectImages = false }) {
+  fs.writeFileSync(
+    file,
+    `#!/usr/bin/env node
+import fs from "node:fs";
+import readline from "node:readline";
+const CAPABILITY = ${JSON.stringify(capability)};
+const MODEL_IMAGES = ${JSON.stringify(modelImages)};
+const REJECT_IMAGES = ${JSON.stringify(rejectImages)};
+const LOG = ${JSON.stringify(logFile)};
+const rl = readline.createInterface({ input: process.stdin });
+const send = (msg) => console.log(JSON.stringify(msg));
+rl.on("line", (line) => {
+  const msg = JSON.parse(line);
+  if (msg.id === undefined) return;
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: CAPABILITY }, sessionCapabilities: {} }, agentInfo: { name: "mock-acp", version: "1" } } });
+    return;
+  }
+  if (msg.method === "session/new") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        sessionId: "acp-img",
+        models: { currentModelId: "m1", availableModels: [{ modelId: "m1", name: "M1", _meta: { "cognition.ai/supportsImages": MODEL_IMAGES } }] },
+      },
+    });
+    return;
+  }
+  if (msg.method === "session/prompt") {
+    fs.appendFileSync(LOG, JSON.stringify(msg.params.prompt) + "\\n");
+    if (REJECT_IMAGES && msg.params.prompt.some((block) => block.type === "image")) {
+      send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "unsupported image input for this model" } });
+      return;
+    }
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "acp-img", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "done" } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    return;
+  }
+  send({ jsonrpc: "2.0", id: msg.id, result: {} });
+});
+`,
+    { mode: 0o755 },
+  );
+}
+
+async function runAcpImageCase(t, options) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-acp-image-cap-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const bin = path.join(dir, "mock-acp.mjs");
+  const logFile = path.join(dir, "prompts.jsonl");
+  writeAcpPromptImageMock(bin, logFile, options);
+  const bridge = startBridge(t, "acp", "dsh", bin);
+  const images = [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }];
+  await bridge.request("prompt", { message: "look", images });
+  await bridge.waitUntil(() => bridge.records.some((r) => r.type === "agent_settled"));
+  const prompts = fs
+    .readFileSync(logFile, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  return { bridge, prompts };
+}
+
+test("ACP prompt images are forwarded when transport and model both accept images", async (t) => {
+  const { prompts } = await runAcpImageCase(t, { capability: true, modelImages: true });
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0].some((block) => block.type === "image" && block.data === "aGVsbG8="));
+});
+
+test("ACP prompt images are withheld when either prompt capability or model metadata is text-only", async (t) => {
+  for (const options of [
+    { capability: false, modelImages: true },
+    { capability: true, modelImages: false },
+  ]) {
+    const { bridge, prompts } = await runAcpImageCase(t, options);
+    assert.equal(prompts.length, 1);
+    assert.ok(!prompts[0].some((block) => block.type === "image"));
+    assert.equal(prompts[0][0]?.type, "text");
+    assert.ok(!bridge.records.some((r) => r.type === "message_end" && r.message?.stopReason === "error"));
+  }
+});
+
+test("ACP retries a rejected image prompt as text-only instead of failing the turn", async (t) => {
+  const { bridge, prompts } = await runAcpImageCase(t, { capability: true, modelImages: true, rejectImages: true });
+  assert.equal(prompts.length, 2);
+  assert.ok(prompts[0].some((block) => block.type === "image"));
+  assert.ok(!prompts[1].some((block) => block.type === "image"));
+  assert.ok(!bridge.records.some((r) => r.type === "message_end" && r.message?.stopReason === "error"));
+});

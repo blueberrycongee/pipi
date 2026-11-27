@@ -50,6 +50,7 @@ import {
   waitingCount,
 } from "../store/app";
 import { docAt } from "../store/docs";
+import { clearPipReply, pipReplyTarget, type PipReplyTarget } from "../store/pip-interactions";
 import { readingSize, FONT_SIZES, SEND_MODES, sendMode, setSendMode, type SendMode } from "../store/prefs";
 import { focusedPane, focusPane, isSplitOpen } from "../store/split";
 import { attachDocToCurrentComposer, draftToDoc, mentionableDocs, openDocTab } from "../store/tabs";
@@ -162,6 +163,8 @@ export interface ComposerStore {
   renderLeftPickers?: (dismissMenus: () => void) => JSX.Element;
   renderPermissionPicker?: (dismissMenus: () => void) => JSX.Element;
   renderExtensionPrompt?: () => JSX.Element;
+  replyTarget?: () => PipReplyTarget | undefined;
+  clearReplyTarget?: () => void;
   inputTestID?: string;
   inputLabel?: string;
   sendTestID?: string;
@@ -210,6 +213,8 @@ const primaryComposerStore: ComposerStore = {
   contextUsage: () => ({ stats: sessionStats(), hasRows: transcriptRows().length > 0 }),
   send,
   stop,
+  replyTarget: pipReplyTarget,
+  clearReplyTarget: clearPipReply,
   autoFocus: true,
 };
 
@@ -1007,6 +1012,23 @@ export function Composer(props?: { store?: ComposerStore }) {
     if (!id && untracked(composeDuringForm)) composeDuringForm.set(undefined);
   });
 
+  const replyTarget = () => s.replyTarget?.();
+  const replyLabel = (target: PipReplyTarget) =>
+    target.author === "You" ? tr("Replying to yourself", "回复自己") : tr(`Replying to ${target.author}`, `回复 ${target.author}`);
+  const replySummary = (target: PipReplyTarget) => {
+    if (target.excerpt.trim()) return target.excerpt;
+    const images = target.images ?? 0;
+    return images > 0 ? (images === 1 ? tr("[Image]", "[图片]") : tr(`[${images} images]`, `[${images} 张图片]`)) : "";
+  };
+
+  // Entering reply focus is a composer focus request; Escape is the quiet way back out.
+  effect(() => {
+    const target = replyTarget();
+    if (!target || !s.isActive()) return;
+    s.requestFocus();
+    cleanup(keymap.bind("escape", () => s.clearReplyTarget?.(), { when: "always" }));
+  });
+
   effect(() => {
     s.focusTick();
     // The keyboard is the composer's only while this surface is active & focused
@@ -1173,6 +1195,7 @@ export function Composer(props?: { store?: ComposerStore }) {
     // A document rides on the message: words are what to do with it, and none sends it as it is.
     if (s.docs().length) return tr("Say what to do with it, or just send", "说说要怎么处理，或直接发送");
     if (questionOpen()) return tr("Queue a follow-up…", "排队发送后续消息…");
+    if (replyTarget()) return tr("Reply…", "回复…");
     const persona = s.personaName?.();
     if (persona) return tr(`Message ${persona}…`, `给 ${persona} 发消息…`);
     if (s.running()) return tr(`Steer ${name}…`, `引导 ${name}…`);
@@ -1222,7 +1245,26 @@ export function Composer(props?: { store?: ComposerStore }) {
             when={showFormTakeover() ? formDialog() : undefined}
             else={
               <View>
+                {replyTarget() ? (
+                  <View testID="composer-reply-strip" class="mx-2 mt-2 flex-row items-center gap-2 rounded-xl corner-squircle border-[0.5px] border-hairline bg-sms-incoming/75 px-2.5 py-1.5">
+                    <Icon name="quote" size={13} tone="muted-foreground" />
+                    <View class="min-w-0 flex-1">
+                      <Text class={`${uiType("2xs")} font-medium text-muted-foreground`}>{replyLabel(replyTarget()!)}</Text>
+                      <Text class={`truncate ${uiType("xs")} text-muted-foreground/85`}>{replySummary(replyTarget()!)}</Text>
+                    </View>
+                    <IconButton
+                      testID="composer-reply-cancel"
+                      icon="x"
+                      size="sm"
+                      tone="subtle"
+                      label={tr("Cancel reply", "取消回复")}
+                      tipPlacement="top"
+                      onPress={() => s.clearReplyTarget?.()}
+                    />
+                  </View>
+                ) : null}
                 <ExtensionLines store={s} below={false} />
+                <View class="relative">
                 <Input
                   testID={s.inputTestID}
                   ref={input}
@@ -1284,6 +1326,7 @@ export function Composer(props?: { store?: ComposerStore }) {
                     <Text class={`truncate ${readingType()} text-subtle`}>{placeholder()}</Text>
                   </View>
                 </If>
+                </View>
                 <ExtensionLines store={s} below />
                 <View class="flex-row items-end justify-between gap-2 pb-2 pl-2.5 pr-2 pt-2">
                   <View class="min-w-0 flex-1 flex-row items-center gap-1 overflow-hidden">

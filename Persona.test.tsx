@@ -95,6 +95,7 @@ test("creating personal agents keeps each in the top persona area and their work
   await app.type("id:persona-name-input", "Nova");
   await app.type("id:persona-description-input", "A careful researcher");
   await app.press("id:persona-create-submit");
+  await app.waitUntil(() => app.count("id:persona-create-form") === 0);
   await app.waitFor("id:persona-header");
   expect(app.count("id:sidebar-persona-nova >> text:Nova")).toBe(1);
   expect(app.count("id:sidebar-workspaces >> text:personas")).toBe(0);
@@ -115,15 +116,16 @@ test("the centered persona header renames inline and puts a custom avatar on eve
   await app.waitFor("id:persona-create-form");
   await app.type("id:persona-name-input", "Nova");
   await app.press("id:persona-create-submit");
+  await app.waitUntil(() => app.count("id:persona-create-form") === 0);
   await app.waitFor("id:persona-header");
   await app.waitUntil(() => app.count("id:persona-header >> text:Nova") > 0);
 
   // Rename inline from the centered identity; sidebar and tab follow the daemon title.
   await app.press("id:persona-name-button");
-  await app.waitFor("label:Personal agent name");
-  await app.clear("label:Personal agent name");
-  await app.type("label:Personal agent name", "Nebula");
-  await app.submit("label:Personal agent name");
+  await app.waitFor("id:persona-header >> label:Personal agent name");
+  await app.clear("id:persona-header >> label:Personal agent name");
+  await app.type("id:persona-header >> label:Personal agent name", "Nebula");
+  await app.submit("id:persona-header >> label:Personal agent name");
   await app.waitUntil(() => app.count("id:sidebar-persona-nova >> text:Nebula") === 1);
   expect(app.count("id:tab-0 >> text:Nebula")).toBe(1);
   expect(app.count("id:persona-header >> text:Nebula")).toBe(1);
@@ -131,13 +133,26 @@ test("the centered persona header renames inline and puts a custom avatar on eve
 
   // Escape cancels a second edit without touching the saved name.
   await app.press("id:persona-name-button");
-  await app.waitFor("label:Personal agent name");
-  await app.clear("label:Personal agent name");
-  await app.type("label:Personal agent name", "Discarded");
+  await app.waitFor("id:persona-header >> label:Personal agent name");
+  await app.clear("id:persona-header >> label:Personal agent name");
+  await app.type("id:persona-header >> label:Personal agent name", "Discarded");
   await app.keyboard.press("escape");
-  await app.waitUntil(() => app.count("label:Personal agent name") === 0);
+  await app.waitUntil(() => app.count("id:persona-header >> label:Personal agent name") === 0);
   expect(app.texts()).not.toContain("Discarded");
   expect(app.count("id:persona-header >> text:Nebula")).toBe(1);
+
+  // Clicking anywhere outside the editor commits it like Enter: native AppKit
+  // never moves first responder to the plain transcript, so the header listens
+  // for the outside press itself. The mouse lands in the plain conversation,
+  // away from every badge control.
+  await app.press("id:persona-name-button");
+  await app.waitFor("id:persona-header >> label:Personal agent name");
+  await app.clear("id:persona-header >> label:Personal agent name");
+  await app.type("id:persona-header >> label:Personal agent name", "Nova Prime");
+  await app.drag("text:Hey, what's up?", { x: 1, y: 0 });
+  await app.waitUntil(() => app.count("id:persona-header >> label:Personal agent name") === 0);
+  expect(app.count("id:persona-header >> text:Nova Prime")).toBe(1);
+  expect(app.count("id:sidebar-persona-nova >> text:Nova Prime")).toBe(1);
 
   // Choosing an image uses the native picker answer and exposes image-backed avatars
   // in the centered header and the pinned sidebar row (the mascot itself has no such label).
@@ -174,6 +189,7 @@ test("engine choices are remembered independently for each personal agent", asyn
   await app.waitFor("id:persona-create-form");
   await app.type("id:persona-name-input", "Nova");
   await app.press("id:persona-create-submit");
+  await app.waitUntil(() => app.count("id:persona-create-form") === 0);
   await app.waitFor("id:persona-header");
   await app.press("id:agent-chip");
   await app.waitFor("id:agent-picker");
@@ -211,6 +227,7 @@ test("model and thinking choices drift independently per personal agent", async 
   await app.waitFor("id:persona-create-form");
   await app.type("id:persona-name-input", "Nova");
   await app.press("id:persona-create-submit");
+  await app.waitUntil(() => app.count("id:persona-create-form") === 0);
   await app.waitFor("id:persona-header");
   await app.waitUntil(() => app.texts().includes("Claude Sonnet 4.5"));
 
@@ -272,6 +289,7 @@ test("delete is protected on the default persona and removes a confirmed custom 
   await app.waitFor("id:persona-create-form");
   await app.type("id:persona-name-input", "Nova");
   await app.press("id:persona-create-submit");
+  await app.waitUntil(() => app.count("id:persona-create-form") === 0);
   await app.waitFor("id:persona-header");
   expect(app.count("id:sidebar-persona-nova")).toBe(1);
 

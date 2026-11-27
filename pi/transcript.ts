@@ -1,4 +1,5 @@
 import type { Lang } from "../lib/i18n";
+import { type ReplyPart, splitReplyMessage } from "../lib/doc-wire";
 import { mediaRowFromProtocolBlock, type MediaItem } from "../lib/media";
 import type {
   AgentMessage,
@@ -25,7 +26,7 @@ import type {
  */
 export type Row =
   /** `queued`: staged behind the agent's queue — on screen, but not sent into the run yet. */
-  | { kind: "user"; id: string; text: string; images: number; imageBlocks?: ImageContent[]; queued?: boolean }
+  | { kind: "user"; id: string; text: string; images: number; imageBlocks?: ImageContent[]; queued?: boolean; reply?: ReplyPart }
   | ({ kind: "text"; id: string; text: string; streaming: boolean; editKey?: string; versions?: MessageVersion[]; /** The prose of a message that called no tools: the turn's answer. Known once the message ended. */ final?: boolean } & TurnStamp)
   | ({ kind: "thinking"; id: string; text: string; streaming: boolean; redacted: boolean; durationMs?: number } & TurnStamp)
   | ({ kind: "media"; id: string; title?: string; items: MediaItem[] } & TurnStamp)
@@ -123,7 +124,8 @@ export function sameVisualRow(a: Row, b: Row): boolean {
         a.text === bu.text &&
         a.images === bu.images &&
         (a.imageBlocks?.length ?? 0) === (bu.imageBlocks?.length ?? 0) &&
-        Boolean(a.queued) === Boolean(bu.queued)
+        Boolean(a.queued) === Boolean(bu.queued) &&
+        sameJsonValue(a.reply, bu.reply)
       );
     }
     case "text": {
@@ -211,7 +213,7 @@ export function firstVisualRowDiff(
 const signature = (row: Row): string => {
   switch (row.kind) {
     case "user":
-      return `user\n${row.images}\n${row.text}`;
+      return `user\n${row.images}\n${row.reply?.target ?? ""}\n${row.text}`;
     case "text":
     case "thinking":
       return `${row.kind}\n${row.text}`;
@@ -352,9 +354,15 @@ interface StagedUserEntry {
  * Strips the context pipi prepends to a prompt — the personal agent's persona,
  * a Portable Context Handoff — so the user bubble shows only what the person wrote.
  */
-export function withoutPreamble(text: string): string {
+export function withoutPreamble(text: string, options?: { keepReply?: boolean }): string {
   const said = text.startsWith("<pipi-persona") ? text.replace(PERSONA_PREFIX, "") : text;
-  return said.startsWith("<conversation_handoff") ? said.replace(HANDOFF_PREFIX, "") : said;
+  const clean = said.startsWith("<conversation_handoff") ? said.replace(HANDOFF_PREFIX, "") : said;
+  return options?.keepReply ? clean : splitReplyMessage(clean).said;
+}
+
+/** Reads the quote prefix a persona reply carries, apart from the words the person wrote. */
+function splitUserWire(text: string): { said: string; reply?: ReplyPart } {
+  return splitReplyMessage(withoutPreamble(text, { keepReply: true }));
 }
 
 /**
@@ -982,7 +990,8 @@ export class Transcript {
 
   /** Stages an outgoing user message so its bubble appears on send, ahead of the agent's echo. */
   stageUser(rawText: string, images: number | readonly ImageContent[] = 0, queued = false): string | undefined {
-    const text = withoutPreamble(withoutImageNotes(rawText));
+    const split = splitUserWire(withoutImageNotes(rawText));
+    const text = split.said;
     const imageCount = typeof images === "number" ? images : images.length;
     const imageBlocks =
       typeof images === "number"
@@ -997,6 +1006,7 @@ export class Transcript {
         text,
         images: imageCount,
         ...(imageBlocks.length ? { imageBlocks } : {}),
+        ...(split.reply ? { reply: split.reply } : {}),
         ...(queued ? { queued } : {}),
       },
       t0: Date.now(),
@@ -1777,7 +1787,8 @@ export class Transcript {
     }
     switch (message.role) {
       case "user": {
-        const text = withoutPreamble(withoutImageNotes(textOf(message.content)));
+        const split = splitUserWire(withoutImageNotes(textOf(message.content)));
+        const text = split.said;
         const images = imagesOf(message.content);
         const imageBlocks = imageBlocksOf(message.content);
         const deliveries = images ? undefined : pippiDeliveries(text);
@@ -1788,15 +1799,22 @@ export class Transcript {
           const staged = this.#clock === undefined ? this.#takeStaged(text, images) : undefined;
           const keptImages = imageBlocks.length ? imageBlocks : staged?.row.imageBlocks;
           const sameStagedImages = (staged?.row.imageBlocks?.length ?? 0) === (keptImages?.length ?? 0);
+          const keepsStaged = staged && staged.row.text === text && staged.row.images === images && sameStagedImages && !staged.row.queued;
+          const stagedRow =
+            staged && keepsStaged
+              ? split.reply && !sameJsonValue(staged.row.reply, split.reply)
+                ? { ...staged.row, reply: split.reply }
+                : staged.row
+              : undefined;
           const row: Row =
-            staged && staged.row.text === text && staged.row.images === images && sameStagedImages && !staged.row.queued
-              ? staged.row
-              : {
+            stagedRow
+              ?? {
                   kind: "user",
                   id: staged ? staged.row.id : this.#id("u"),
                   text,
                   images,
                   ...(keptImages?.length ? { imageBlocks: keptImages } : {}),
+                  ...(split.reply ? { reply: split.reply } : {}),
                 };
           this.#push(row);
           this.#turnStart = staged?.t0 ?? this.#now();

@@ -47,7 +47,7 @@ import { Icon } from "../ui/Icon";
 import { EASING } from "../ui/motion";
 import { FOCUS_RING, HOVER_REVEAL, PRESS } from "../ui/styles";
 import { tip } from "../ui/Tip";
-import { readingType, codeType } from "../ui/typography";
+import { readingType, readingLineHeight, readingLeading, codeType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
 import { openZoom } from "../ui/Zoom";
 import { MediaGallery, MediaStreamContext, mediaZoomOptions, openMediaZoom, type MediaStreamScope } from "./Media";
@@ -618,19 +618,20 @@ function VeiledListView(props: {
           const isTask = () => typeof item().checked === "boolean";
 
           return (
-            <View class="flex-row items-start gap-2.5">
+            <View class={`flex-row gap-2.5 ${isTask() ? "items-start" : "items-baseline"}`}>
               <If
                 when={isTask()}
                 else={
-                  <View class="shrink-0 items-end pt-[1px]" style={{ minWidth: markerWidth() }}>
-                    <Text class={`${readingType()} leading-relaxed tabular-nums text-subtle`}>{markerText()}</Text>
+                  <View class="shrink-0 items-end" style={{ minWidth: markerWidth() }}>
+                    <Text class={`${readingType()} ${readingLeading()} tabular-nums text-subtle`}>{markerText()}</Text>
                   </View>
                 }
               >
                 <View
-                  class={`mt-[4px] size-3.5 shrink-0 items-center justify-center rounded-xs corner-squircle border ${
+                  class={`size-3.5 shrink-0 items-center justify-center rounded-xs corner-squircle border ${
                     item().checked ? "border-brand bg-brand" : "border-hairline-focus bg-card"
                   }`}
+                  style={{ marginTop: Math.max(0, (readingLineHeight() - 14) / 2) }}
                 >
                   <If when={item().checked}>
                     <Icon name="check" size={10} tone="brand-foreground" />
@@ -645,7 +646,7 @@ function VeiledListView(props: {
                       <View>
                         <If when={child().type === "paragraph" ? (child() as Extract<TextViewBlock, { type: "paragraph" }>) : undefined}>
                           {(para) => (
-                            <Text class={`${readingType()} leading-relaxed`}>
+                            <Text class={`${readingType()} ${readingLeading()}`}>
                               {renderVeiledInlines(para().content, props.chunks().get(key()) ?? [], props.baseTone, props.inBubble)}
                             </Text>
                           )}
@@ -716,7 +717,7 @@ function VeiledTableView(props: {
                   <Each of={row()} key="index">
                     {(cell, c) => (
                       <View class="min-w-24 flex-1 px-3 py-1.5">
-                        <Text class={`${readingType("sm")} leading-relaxed ${alignClass(c())}`}>
+                        <Text class={`${readingType("sm")} ${readingLeading("sm")} ${alignClass(c())}`}>
                           {renderVeiledInlines(cell().content, props.chunks().get(`td:${props.blockIdx()}:${r()}:${c()}`) ?? [], "fg", props.inBubble)}
                         </Text>
                       </View>
@@ -1322,7 +1323,7 @@ export function ProseBlock(props: { row: ProseRow; inBubble?: boolean }) {
                                   <View>
                                     <If when={qChild().type === "paragraph" ? (qChild() as Extract<TextViewBlock, { type: "paragraph" }>) : undefined}>
                                       {(qp) => (
-                                        <Text class={`${readingType()} leading-relaxed italic`}>
+                                        <Text class={`${readingType()} ${readingLeading()} italic`}>
                                           {renderVeiledInlines(qp().content, chunksOf(`bq:${index()}:${k()}`), "muted", props.inBubble)}
                                         </Text>
                                       )}
@@ -1378,7 +1379,7 @@ export function ProseBlock(props: { row: ProseRow; inBubble?: boolean }) {
                 return (
                   <View class="gap-2">
                     <View selectable>
-                      <Text class={`${readingType()} leading-relaxed`}>{renderVeiledInlines(para().block.content, chunksOf(key()), "fg", props.inBubble)}</Text>
+                      <Text class={`${readingType()} ${readingLeading()}`}>{renderVeiledInlines(para().block.content, chunksOf(key()), "fg", props.inBubble)}</Text>
                     </View>
                     <If when={para().media.length > 0}>
                       <MediaGallery items={para().media} />

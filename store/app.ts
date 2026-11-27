@@ -13,7 +13,7 @@ import type {
 } from "../agents/types";
 import { basename, tildePath } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
-import { composeDocMessage, titleWords } from "../lib/doc-wire";
+import { composeDocMessage, composeReplyMessage, titleWords } from "../lib/doc-wire";
 import { classifyMediaKind, composeFileMessage, isMarkdownPath, mimeTypeForPath, type FileAttachment } from "../lib/media";
 import { formAnswerText } from "../lib/form-answers";
 import { answersTo, type ComposerCommand, parseSlashLine } from "../lib/slash";
@@ -67,6 +67,7 @@ import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
 import { backend, NoPickerError } from "./backend";
+import { clearPipReply, loadPipInteractions, pipReplyTarget, replyWirePart } from "./pip-interactions";
 import { startAppUpdateChecks, stopAppUpdateChecks } from "./update";
 import {
   addCustomAgentPref,
@@ -1838,39 +1839,55 @@ async function ensureDaemon(): Promise<DaemonClient | undefined> {
   return daemonStarting;
 }
 
+const personalAgentStarts = new Map<string, Promise<string | undefined>>();
+
 /** A persona's session id, starting it on its own preferred engine the first time it is asked for. */
 export async function ensurePersonalAgent(personaId = "default", options?: { name?: string; description?: string }): Promise<string | undefined> {
-  const held = personalAgents().find((persona) => (persona.personaId ?? "default") === personaId);
-  if (held) {
-    if (personaId === "default" && held.agentId && storedPersonaChoice("default")?.agentId !== held.agentId) {
-      rememberPersonaChoice("default", { agentId: held.agentId });
+  const heldNow = personalAgents().find((persona) => (persona.personaId ?? "default") === personaId);
+  if (heldNow) {
+    if (personaId === "default" && heldNow.agentId && storedPersonaChoice("default")?.agentId !== heldNow.agentId) {
+      rememberPersonaChoice("default", { agentId: heldNow.agentId });
     }
-    return held.id;
+    return heldNow.id;
   }
-  const daemon = await ensureDaemon();
-  if (!daemon) return undefined;
-  seedPersonaChoice(personaId);
-  const stored = storedPersonaChoice(personaId);
-  const agentId = stored?.agentId ?? preferredAgentId();
-  const choice = storedPersonaAgentChoice(personaId, agentId);
+  const alreadyStarting = personalAgentStarts.get(personaId);
+  if (alreadyStarting) return alreadyStarting;
+  const work = (async () => {
+    const daemon = await ensureDaemon();
+    if (!daemon) return undefined;
+    // Boot connects the daemon asynchronously: its registry can arrive while this
+    // first click was waiting. Re-read it rather than racing a duplicate persona.
+    const held = personalAgents().find((persona) => (persona.personaId ?? "default") === personaId);
+    if (held) return held.id;
+    seedPersonaChoice(personaId);
+    const stored = storedPersonaChoice(personaId);
+    const agentId = stored?.agentId ?? preferredAgentId();
+    const choice = storedPersonaAgentChoice(personaId, agentId);
+    try {
+      const session = await daemon.startSession({
+        persona: true,
+        personaId,
+        personaName: options?.name,
+        personaDescription: options?.description,
+        agentId,
+        model: choice?.model && `${choice.model.provider}/${choice.model.id}`,
+        thinking: choice?.thinkingLevel,
+        modelConfigs: choice?.modelConfigs,
+        runtimeMode: preferredRuntimeMode(),
+      });
+      upsertDaemonSession(session);
+      return session.id;
+    } catch (error) {
+      const label = options?.name?.trim() || (personaId === "default" ? "Pip" : tr("the personal agent", "个人智能体"));
+      toast("warning", `${tr(`${label} could not start`, `${label} 启动失败`)}: ${message(error)}`);
+      return undefined;
+    }
+  })();
+  personalAgentStarts.set(personaId, work);
   try {
-    const session = await daemon.startSession({
-      persona: true,
-      personaId,
-      personaName: options?.name,
-      personaDescription: options?.description,
-      agentId,
-      model: choice?.model && `${choice.model.provider}/${choice.model.id}`,
-      thinking: choice?.thinkingLevel,
-      modelConfigs: choice?.modelConfigs,
-      runtimeMode: preferredRuntimeMode(),
-    });
-    upsertDaemonSession(session);
-    return session.id;
-  } catch (error) {
-    const label = options?.name?.trim() || (personaId === "default" ? "Pip" : tr("the personal agent", "个人智能体"));
-    toast("warning", `${tr(`${label} could not start`, `${label} 启动失败`)}: ${message(error)}`);
-    return undefined;
+    return await work;
+  } finally {
+    if (personalAgentStarts.get(personaId) === work) personalAgentStarts.delete(personaId);
   }
 }
 
@@ -2068,6 +2085,7 @@ export async function boot() {
   unlistenWorkspaces = onWorkspacesChange(pushWorkspaces);
 
   await loadPrefs();
+  await loadPipInteractions();
   batch(() => {
     currentAgentId.set(preferredAgentId());
     currentRuntimeMode.set(preferredRuntimeMode());
@@ -3892,6 +3910,16 @@ export async function send(mode: "steer" | "followUp" = "steer") {
     // From here to the send nothing waits: the draft becomes the whole message and is cleared in the same turn,
     // so the field never shows a document's text.
     const withDocs = takeDocsIntoDraft();
+    const replySeed = isPersonaSession() ? pipReplyTarget() : undefined;
+    let replyUsed = false;
+    const encodeReply = (raw: string) => {
+      if (!replySeed || raw.startsWith("!") || parseSlashLine(raw)) return raw;
+      replyUsed = true;
+      return composeReplyMessage(replyWirePart(replySeed), raw);
+    };
+    const clearUsedReply = () => {
+      if (replyUsed) clearPipReply();
+    };
 
     // If `send` was triggered on an open session and the user switched away while `attachmentReads` finished,
     // deliver the message to the original session's held pipe rather than misrouting it to the new session.
@@ -3911,11 +3939,13 @@ export async function send(mode: "steer" | "followUp" = "steer") {
         await runAppCommand(text);
         return;
       }
-      const wirePrompt = pinnedHandoff ? prependHandoffToPrompt(pinnedHandoff.context, text) : text;
+      const outgoing = encodeReply(text);
+      const wirePrompt = pinnedHandoff ? prependHandoffToPrompt(pinnedHandoff.context, outgoing) : outgoing;
       batch(() => {
         draft.set("");
         attachments.set([]);
       });
+      clearUsedReply();
       if (!pinnedClient.closed) {
         void pinnedClient
           .request("prompt", {
@@ -3956,8 +3986,9 @@ export async function send(mode: "steer" | "followUp" = "steer") {
       // A destination already on screen — shown ahead of its attach, or kept
       // through its revival — takes the bubble now: the send reads as waiting
       // there rather than as nothing, and the landing carries it across.
+      const outgoing = encodeReply(text);
       const stageIn = ahead?.transcript === transcript || (revival && !heading()) ? transcript : undefined;
-      const preStagedId = stageIn?.stageUser(text, images);
+      const preStagedId = stageIn?.stageUser(outgoing, images);
       batch(() => {
         draft.set("");
         attachments.set([]);
@@ -3970,8 +4001,9 @@ export async function send(mode: "steer" | "followUp" = "steer") {
       const runDeferred = deferredSendTail.then(async () => {
         for (let wait = arrival; heading() && wait; wait = arrival === wait ? undefined : arrival) await wait;
         while (revival) await revival;
+        clearUsedReply();
         await dispatchPrompt(
-          text,
+          outgoing,
           images,
           mode,
           false,
@@ -3994,7 +4026,9 @@ export async function send(mode: "steer" | "followUp" = "steer") {
       await runAppCommand(text);
       return;
     }
-    await dispatchPrompt(text, images, mode, true);
+    const outgoing = encodeReply(text);
+    clearUsedReply();
+    await dispatchPrompt(outgoing, images, mode, true);
     // Not sent (no agent ready, no model): the words and the documents are on the composer as they were.
     if (withDocs && draft() === withDocs.message) {
       batch(() => {

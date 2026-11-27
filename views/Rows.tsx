@@ -4,7 +4,7 @@ import { Collapsible, TextView } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { clip } from "../lib/format";
 import { activeLanguage, tr } from "../lib/i18n";
-import { type DocPart, splitDocMessage } from "../lib/doc-wire";
+import { type DocPart, replyExcerpt, splitDocMessage } from "../lib/doc-wire";
 import { edgeFadeMask } from "../lib/scroll-mask";
 import {
   extractMarkdownMediaPaths,
@@ -16,6 +16,7 @@ import {
   type MediaItem,
 } from "../lib/media";
 import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
+import { userAnchor } from "../lib/pip-anchors";
 import type { ImageContent } from "../pi/protocol";
 import { type Row, type ToolRow, withoutPreamble, withoutImageNotes } from "../pi/transcript";
 import {
@@ -39,6 +40,8 @@ import {
   conversationKey,
   copyMessage,
   copyText,
+  activePersonaId,
+  currentDaemonSession,
   daemonSessionOfId,
   forkFrom,
   isPersonaSession,
@@ -53,6 +56,7 @@ import {
 import { backend } from "../store/backend";
 import { docTabTitle, titleLine } from "../store/docs";
 import { openDocIfThere } from "../store/tabs";
+import { openPipMessageMenu } from "../store/pip-interactions";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, isRowSeen, keepLast, Presence, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
@@ -62,6 +66,7 @@ import { tip } from "../ui/Tip";
 import { readingType, codeType, uiHeight, uiType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
 import { MediaGallery, MediaStreamContext, mediaZoomOptions, openMediaZoom } from "./Media";
+import { PipMessageAdornments, PipQuotePreview, pipMessageNode, registerPipMessageNode } from "./PipAdornments";
 import { BubbleTail, PipAvatarBadge, PipBubbleView, PipFooterView, PipSessionsView } from "./PipPresence";
 import { clearProseState, proseClasses, ProseBlock, proseVeilUntil, type PipBubbleRow, type ProseRow } from "./Prose";
 
@@ -687,7 +692,46 @@ function UserRow(props: { row: DisplayUserRow }) {
     return "rounded-[18px] rounded-r-[6px]";
   };
 
-  const contextMenu = (e: { pagePosition: { x: number; y: number } }) =>
+  const personaScope = () => `${activePersonaId() ?? "default"}:${currentDaemonSession()?.id ?? "unattached"}`;
+  const messageTarget = () => userAnchor(transcriptRows(), props.row.id) ?? props.row.id;
+  const messageSnapshot = () => ({
+    scope: personaScope(),
+    target: messageTarget(),
+    rowId: props.row.id,
+    displayId: props.row.id,
+    side: "right" as const,
+    author: "You",
+    excerpt: replyExcerpt(said() || parts().files.map((file) => file.name).join(" ")),
+    images: props.row.images,
+    text: said(),
+    copyText: props.row.text,
+    imageBlocks: props.row.imageBlocks,
+  });
+  const openPersonaMenu = (x: number, y: number) => openPipMessageMenu(messageSnapshot(), x, y);
+  const bubbleNode = signal<ViewRef | undefined>(undefined);
+  const mediaNode = signal<ViewRef | undefined>(undefined);
+  const clusterNode = signal<ViewRef | undefined>(undefined);
+  effect(() => {
+    const rowId = props.row.id;
+    const node = clusterNode() ?? bubbleNode() ?? (!hasBubble() && (hasImages() || fileMedia().length > 0) ? mediaNode() ?? hostNode() : undefined);
+    if (!node) return;
+    const unregister = registerPipMessageNode(rowId, node);
+    if (unregister) cleanup(unregister);
+  });
+  const openPersonaActions = () => {
+    const node = pipMessageNode(props.row.id) ?? clusterNode() ?? bubbleNode() ?? mediaNode() ?? hostNode();
+    if (!node) return;
+    void node.measure().then((m) => {
+      if (!m) return;
+      openPersonaMenu(m.pagePosition.x + m.bounds.size.width - 12, m.pagePosition.y + 6);
+    }).catch(() => undefined);
+  };
+
+  const contextMenu = (e: { pagePosition: { x: number; y: number } }) => {
+    if (isPersonaSession() && isSms()) {
+      openPersonaMenu(e.pagePosition.x, e.pagePosition.y);
+      return;
+    }
     Menu.popup(
       [
         ...(props.row.text ? [{ label: tr("Copy", "复制"), onSelect: () => void copyText(props.row.text) }] : []),
@@ -701,6 +745,7 @@ function UserRow(props: { row: DisplayUserRow }) {
       ],
       e.pagePosition,
     );
+  };
 
   return (
     <View ref={(node: ViewRef) => hostNode.set(node)} class="group items-end">
@@ -709,103 +754,131 @@ function UserRow(props: { row: DisplayUserRow }) {
         style={isSms() ? smsEntrance : undefined}
       >
         <View class="max-w-full items-end gap-1.5" style={{ opacity: bubbleOpacity }}>
-          <If when={hasImages()}>
-            <UserImages rowId={props.row.id} images={imageBlocks()} missing={missingImages()} onContextMenu={contextMenu} />
-          </If>
-          <If when={fileMedia().length > 0}>
-            <MediaGallery items={fileMedia()} compact align="end" />
-          </If>
-          <If when={hasBubble()}>
-            <View
-              testID="message-bubble"
-              class={
-                isSms()
-                  ? `relative max-w-full gap-1.5 ${smsBubbleRadius()} corner-squircle bg-brand px-3.5 py-2`
-                  : "max-w-full gap-1.5 rounded-2xl rounded-br-md corner-squircle border-[0.5px] border-hairline bg-secondary px-4 py-2.5"
-              }
-              selectable
-              onContextMenu={contextMenu}
-            >
-              <If when={sms()?.last}>
-                <BubbleTail side="right" tone="brand" />
-              </If>
-              <If when={said()}>
-                {/* While folded the whole message takes the press; while open it is plain selectable text again. */}
-                <View
-                  role={folded() ? "button" : undefined}
-                  onPress={folded() ? fold : undefined}
-                  accessibilityState={folded() ? { expanded: false } : undefined}
-                >
-                  <Text
-                    class={`${readingType()} ${isSms() ? "text-brand-foreground" : "text-secondary-foreground"} ${folded() ? "line-clamp-6" : ""}`}
-                    style={folded() ? { maskImage: "linear-gradient(to bottom, black 64%, transparent 94%)" } : undefined}
-                    onTextLayout={(e) => {
-                      const n = e.lines.length;
-                      // Fewer lines than the text's own breaks (or a zero-height headless stub box) is not a real layout pass.
-                      if (n < hardBreakLines(said()) || (n === 1 && (e.lines[0]?.bounds.size.height ?? 0) === 0)) return;
-                      if (folded() && n >= USER_FOLD_LINES) return;
-                      const key = measureKey();
-                      if (n !== userLineCounts()[key]) {
-                        userLineCounts.update((all) => {
-                          const keys = Object.keys(all);
-                          if (keys.length >= USER_LINE_COUNTS_LIMIT) {
-                            const trimmed: Record<string, number> = {};
-                            for (let i = keys.length - Math.floor(USER_LINE_COUNTS_LIMIT / 2); i < keys.length; i++) {
-                              trimmed[keys[i]] = all[keys[i]];
-                            }
-                            trimmed[key] = n;
-                            return trimmed;
-                          }
-                          return { ...all, [key]: n };
-                        });
-                      }
-                    }}
-                  >
-                    {said()}
-                  </Text>
+          {isPersonaSession() && props.row.reply ? <PipQuotePreview reply={props.row.reply} side="right" /> : null}
+          <View ref={(node: ViewRef | undefined) => clusterNode.set(node)} class="max-w-full items-end gap-1.5">
+            <If when={!hasBubble() && (hasImages() || fileMedia().length > 0)}>
+              <View ref={(node: ViewRef | undefined) => mediaNode.set(node)} class="relative max-w-full" onContextMenu={contextMenu}>
+                {isPersonaSession() && isSms() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="right" /> : null}
+                {isPersonaSession() && isSms() ? (
+                  <View class={`absolute -top-3 right-2 z-30 ${HOVER_REVEAL}`}>
+                    <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
+                  </View>
+                ) : null}
+                <View class="items-end gap-1.5">
+                  <If when={hasImages()}>
+                    <UserImages rowId={props.row.id} images={imageBlocks()} missing={missingImages()} onContextMenu={contextMenu} />
+                  </If>
+                  <If when={fileMedia().length > 0}>
+                    <MediaGallery items={fileMedia()} compact align="end" />
+                  </If>
                 </View>
-              </If>
-              {/* A document that rode on the message is named, not printed: its words are in the document, a press away. */}
-              <Each of={parts().docs} key="index">
-                {(doc) => (
+              </View>
+            </If>
+            <If when={hasBubble() && hasImages()}>
+              <UserImages rowId={props.row.id} images={imageBlocks()} missing={missingImages()} onContextMenu={contextMenu} />
+            </If>
+            <If when={hasBubble() && fileMedia().length > 0}>
+              <MediaGallery items={fileMedia()} compact align="end" />
+            </If>
+            <If when={hasBubble()}>
+              <View
+                testID="message-bubble"
+                ref={(node: ViewRef | undefined) => bubbleNode.set(node)}
+                class={
+                  isSms()
+                    ? `relative max-w-full gap-1.5 ${smsBubbleRadius()} corner-squircle bg-brand px-3.5 py-2`
+                    : "max-w-full gap-1.5 rounded-2xl rounded-br-md corner-squircle border-[0.5px] border-hairline bg-secondary px-4 py-2.5"
+                }
+                selectable
+                onContextMenu={contextMenu}
+              >
+                {isPersonaSession() && isSms() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="right" /> : null}
+                {isPersonaSession() && isSms() ? (
+                  <View class={`absolute -top-3 right-2 z-30 ${HOVER_REVEAL}`}>
+                    <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
+                  </View>
+                ) : null}
+                <If when={sms()?.last}>
+                  <BubbleTail side="right" tone="brand" />
+                </If>
+                <If when={said()}>
+                  {/* While folded the whole message takes the press; while open it is plain selectable text again. */}
                   <View
-                    testID="message-doc"
-                    role="button"
-                    onPress={() => void openDocIfThere(doc().path)}
-                    tooltip={tip(tr("Open the document", "打开文档"))}
-                    class={`group -mx-1 select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle px-1 py-0.5 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} ${
-                      isSms() ? "hover:bg-brand-foreground/15" : "hover:bg-accent"
-                    }`}
+                    role={folded() ? "button" : undefined}
+                    onPress={folded() ? fold : undefined}
+                    accessibilityState={folded() ? { expanded: false } : undefined}
                   >
-                    <Icon name="file" size={14} tone={isSms() ? "brand-foreground" : "muted-foreground"} />
                     <Text
-                      class={`shrink truncate ${uiType("xs")} transition-colors duration-100 ${
-                        isSms() ? "text-brand-foreground/85 group-hover:text-brand-foreground" : "text-muted-foreground group-hover:text-foreground"
-                      }`}
+                      class={`${readingType()} ${isSms() ? "text-brand-foreground" : "text-secondary-foreground"} ${folded() ? "line-clamp-6" : ""}`}
+                      style={folded() ? { maskImage: "linear-gradient(to bottom, black 64%, transparent 94%)" } : undefined}
+                      onTextLayout={(e) => {
+                        const n = e.lines.length;
+                        // Fewer lines than the text's own breaks (or a zero-height headless stub box) is not a real layout pass.
+                        if (n < hardBreakLines(said()) || (n === 1 && (e.lines[0]?.bounds.size.height ?? 0) === 0)) return;
+                        if (folded() && n >= USER_FOLD_LINES) return;
+                        const key = measureKey();
+                        if (n !== userLineCounts()[key]) {
+                          userLineCounts.update((all) => {
+                            const keys = Object.keys(all);
+                            if (keys.length >= USER_LINE_COUNTS_LIMIT) {
+                              const trimmed: Record<string, number> = {};
+                              for (let i = keys.length - Math.floor(USER_LINE_COUNTS_LIMIT / 2); i < keys.length; i++) {
+                                trimmed[keys[i]] = all[keys[i]];
+                              }
+                              trimmed[key] = n;
+                              return trimmed;
+                            }
+                            return { ...all, [key]: n };
+                          });
+                        }
+                      }}
                     >
-                      {(doc().excerpt ? "" : titleLine(doc().text, true)) || docTabTitle(doc().path)}
-                      {doc().excerpt ? tr(" · selection", " · 选中的内容") : ""}
+                      {said()}
                     </Text>
                   </View>
-                )}
-              </Each>
-              <If when={foldable()}>
-                <View
-                  role="button"
-                  onPress={fold}
-                  accessibilityState={{ expanded: open() }}
-                  accessibilityLabel={open() ? tr("Collapse message", "收起消息") : tr("Expand message", "展开消息")}
-                  class={`-mx-1 -mb-1 h-5 select-none items-center justify-center rounded-md corner-squircle ${PRESS} ${FOCUS_RING}`}
-                >
+                </If>
+                {/* A document that rode on the message is named, not printed: its words are in the document, a press away. */}
+                <Each of={parts().docs} key="index">
+                  {(doc) => (
+                    <View
+                      testID="message-doc"
+                      role="button"
+                      onPress={() => void openDocIfThere(doc().path)}
+                      tooltip={tip(tr("Open the document", "打开文档"))}
+                      class={`group -mx-1 select-none flex-row items-center gap-1.5 self-start rounded-md corner-squircle px-1 py-0.5 ${PRESS} ${PRESS_SCALE} ${FOCUS_RING} ${
+                        isSms() ? "hover:bg-brand-foreground/15" : "hover:bg-accent"
+                      }`}
+                    >
+                      <Icon name="file" size={14} tone={isSms() ? "brand-foreground" : "muted-foreground"} />
+                      <Text
+                        class={`shrink truncate ${uiType("xs")} transition-colors duration-100 ${
+                          isSms() ? "text-brand-foreground/85 group-hover:text-brand-foreground" : "text-muted-foreground group-hover:text-foreground"
+                        }`}
+                      >
+                        {(doc().excerpt ? "" : titleLine(doc().text, true)) || docTabTitle(doc().path)}
+                        {doc().excerpt ? tr(" · selection", " · 选中的内容") : ""}
+                      </Text>
+                    </View>
+                  )}
+                </Each>
+                <If when={foldable()}>
                   <View
-                    class={`transition-transform duration-200 ease-out-quint motion-reduce:transition-none ${open() ? "rotate-180" : ""}`}
+                    role="button"
+                    onPress={fold}
+                    accessibilityState={{ expanded: open() }}
+                    accessibilityLabel={open() ? tr("Collapse message", "收起消息") : tr("Expand message", "展开消息")}
+                    class={`-mx-1 -mb-1 h-5 select-none items-center justify-center rounded-md corner-squircle ${PRESS} ${FOCUS_RING}`}
                   >
-                    <Icon name="chevronDown" size={12} tone={isSms() ? "brand-foreground" : "muted-foreground"} />
+                    <View
+                      class={`transition-transform duration-200 ease-out-quint motion-reduce:transition-none ${open() ? "rotate-180" : ""}`}
+                    >
+                      <Icon name="chevronDown" size={12} tone={isSms() ? "brand-foreground" : "muted-foreground"} />
+                    </View>
                   </View>
-                </View>
-              </If>
-            </View>
-          </If>
+                </If>
+              </View>
+            </If>
+          </View>
         </View>
       </View>
       <If

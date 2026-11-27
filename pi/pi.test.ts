@@ -1882,6 +1882,22 @@ test("the personal agent's persona block never shows in the person's bubble, liv
   expect(reloaded.rows().map((r) => ("text" in r ? r.text : r.kind))).toEqual(["<pipi-persona> is what I typed"]);
 });
 
+test("a persona quote reply keeps its metadata but never shows its wire prefix, live or reloaded", () => {
+  const reply = { target: "a:1#b0", author: "Pip", excerpt: "Target answer.", side: "left" as const };
+  const wire = `<pipi-persona name="Pip">persona</pipi-persona>\n\n<pipi-reply target="a:1#b0" author="Pip" side="left">Target answer.</pipi-reply>\n\nvisible reply words`;
+
+  const live = new Transcript();
+  const id = live.stageUser(wire, 0);
+  live.apply({ type: "message_start", message: { role: "user", content: wire, timestamp: 1 } });
+  expect(live.rows()).toEqual([{ kind: "user", id, text: "visible reply words", images: 0, reply }]);
+
+  const reloaded = new Transcript();
+  reloaded.load([{ role: "user", content: wire, timestamp: 1 }] as never);
+  expect(reloaded.rows()).toHaveLength(1);
+  expect(reloaded.rows()[0]).toMatchObject({ kind: "user", text: "visible reply words", images: 0, reply });
+  expect(reloaded.rows().map((row) => ("text" in row ? row.text : "")).join("")).not.toContain("pipi-reply");
+});
+
 test("Antigravity ACP Run mcp_pipi_present_files and renamed pipiMedia results surface outside folded turns", () => {
   expect(classifyTool("Run mcp_pipi_present_files")).toEqual({ category: "present", icon: "image" });
   expect(classifyTool("Run mcp_pipi_workspaces_list")).toEqual({ category: "agent", icon: "folder" });

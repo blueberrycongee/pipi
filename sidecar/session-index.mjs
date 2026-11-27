@@ -81,6 +81,7 @@ const PIPI_MESSAGE_CLOSE = /\s*<\/pipi-message>\s*$/;
 const PIPI_MESSAGE_TRUNCATED = /^\s*<pipi-message\b[^>]*$/;
 const DOC_EDITOR_CONTEXT = /^<doc_editor_context\b[^>]*>[\s\S]*?<\/doc_editor_context>\s*/;
 const DOC_EDITOR_CONTEXT_TRAILING = /\s*<doc_editor_context\b[^>]*>[\s\S]*?<\/doc_editor_context>\s*$/;
+const PIPI_REPLY_WRAPPER = /^\s*<pipi-reply\b[^>]*>[\s\S]*?<\/pipi-reply>\s*/;
 
 function withoutProtocolShells(text) {
   let out = text;
@@ -88,6 +89,7 @@ function withoutProtocolShells(text) {
     const before = out;
     out = out.replace(PERSONA_WRAPPER, "");
     out = out.replace(HANDOFF_WRAPPER, "");
+    out = out.replace(PIPI_REPLY_WRAPPER, "");
     out = out.replace(PIPI_MESSAGE_WRAPPER, (_tag, body) => body.trim());
     // An old index or external header may already have clipped the envelope
     // before its closing tag: still drop the protocol head and keep what body

@@ -568,7 +568,7 @@ async function handle(msg) {
     case "initialize":
       reply(msg.id, {
         protocolVersion: Math.min(Number(msg.params?.protocolVersion) || 1, AGY ? 2 : 1),
-        agentCapabilities: { loadSession: AGY, sessionCapabilities: { resume: {}, list: {}, close: {}, ...(AGY ? { load: {} } : {}) } },
+        agentCapabilities: { loadSession: AGY, promptCapabilities: { image: true }, sessionCapabilities: { resume: {}, list: {}, close: {}, ...(AGY ? { load: {} } : {}) } },
         agentInfo: AGY ? { name: "Antigravity ACP Server", title: "Fake agy", version: process.env.FAKE_ACP_VERSION || "1.5.14" } : { name: "fake-dsh", title: "Fake DSH", version: "0.0.0" },
       });
       return;

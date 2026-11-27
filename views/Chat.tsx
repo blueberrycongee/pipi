@@ -62,7 +62,7 @@ import { uiHeight, uiMinHeight, uiType } from "../ui/typography";
 import { Composer } from "./Composer";
 import { hasFormTakeover, hasInlinePrompt } from "./ExtensionDialog";
 import { isKnownMissingPath, MediaStreamContext } from "./Media";
-import { PersonaHeader } from "./PersonaHeader";
+import { PersonaHeader, personaHeaderClearance } from "./PersonaHeader";
 import { PipWorkingFooter } from "./PipPresence";
 import { pipBubbleRows, proseRows } from "./Prose";
 import {
@@ -85,6 +85,9 @@ import {
 } from "./Rows";
 import { HEADER_BAND, HeaderBand, PaneVeil } from "./Wallpaper";
 import { buildDisplayRows, displayRowIds, stableDisplayRows } from "../pi/turns";
+import { resolveAnchor } from "../lib/pip-anchors";
+import { pipReplyLocate, resetPipInteractionChrome } from "../store/pip-interactions";
+import { PipMessageMenuLayer, PipReplyFocusLayer } from "./PipMessageLayers";
 import { FIGURE_REST, FOLLOW_THRESHOLD, footOf, HORIZON_GAP, INPUT_WINDOW_MS, RELEASE_SETTLE_MS, ScrollToBottomPill, type ScrollMode, UPWARD_GUARD_MS } from "./chat-scroll";
 
 /** Whether the displayed conversation is actively running. */
@@ -577,9 +580,9 @@ function maskRamp(from: number, to: number, start: number, end: number): string[
  *   it (`top` → `top + HEAD_FADE`), never crossing the title text.
  * - Below: rows fade out as they pass under the composer's top `edge`.
  */
-function transcriptMask(height: number, top: number, edge: number, overWallpaper: boolean): string {
-  const headStart = overWallpaper ? Math.max(0, top - 4) : Math.max(0, top - HEAD_FADE);
-  const headEnd = overWallpaper ? top + HEAD_FADE : top;
+function transcriptMask(height: number, top: number, edge: number, overWallpaper: boolean, persona: boolean): string {
+  const headStart = persona ? Math.max(0, top - HEAD_FADE) : overWallpaper ? Math.max(0, top - 4) : Math.max(0, top - HEAD_FADE);
+  const headEnd = persona ? top + personaHeaderClearance() : overWallpaper ? top + HEAD_FADE : top;
   const stops = maskRamp(0, 1, headStart, headEnd);
   if (height > headEnd + edge + 24) {
     const footStart = height - (edge + 20);
@@ -898,6 +901,21 @@ export function Chat() {
     inputAt = Date.now();
     list?.scrollToIndex({ index: target.index, viewPosition: 0, viewOffset: horizonInset(), animated: !untracked(reduceMotion) });
   };
+
+  // A quote preview's press brings the message it answers back into view, without following the tail again.
+  effect(() => {
+    const request = pipReplyLocate();
+    if (!request) return;
+    untracked(() => {
+      const resolved = resolveAnchor(transcriptRows(), request.target);
+      if (!resolved.displayId) return;
+      const index = displayRows().findIndex((row) => row.id === resolved.displayId);
+      if (index < 0) return;
+      disengageFollow(false);
+      inputAt = Date.now();
+      list?.scrollToIndex({ index, viewPosition: 0.35, animated: !untracked(reduceMotion) });
+    });
+  });
 
   const failure = () => {
     const phase = sidecarPhase();
@@ -1514,6 +1532,7 @@ export function Chat() {
       bottomRow.set(-1);
       viewSpan = -1;
       ensureEntered(key);
+      resetPipInteractionChrome();
       pokeRepaint();
     });
   });
@@ -1561,7 +1580,7 @@ export function Chat() {
             selectable
             onSelectionChange={onSelection}
             class="flex-1"
-            style={{ maskImage: transcriptMask(viewHeight(), topBarHeight(), foot().edge, Boolean(wallpaper()) && !HEADER_BAND) }}
+            style={{ maskImage: transcriptMask(viewHeight(), topBarHeight(), foot().edge, Boolean(wallpaper()) && !HEADER_BAND, isPersonaSession()) }}
           >
             <Each of={[conversationKey()]} key={(k) => k}>
               {(key) => {
@@ -1609,7 +1628,7 @@ export function Chat() {
                     class="flex-1"
                     contentStyle={{
                       paddingHorizontal: 24,
-                      paddingTop: topBarHeight() + (wallpaper() && !HEADER_BAND ? HEAD_FADE : 12),
+                      paddingTop: topBarHeight() + (isPersonaSession() ? personaHeaderClearance() : wallpaper() && !HEADER_BAND ? HEAD_FADE : 12),
                       paddingBottom: foot().end,
                     }}
                     accessibilityLabel={tr("Conversation", "对话")}
@@ -1660,7 +1679,10 @@ export function Chat() {
         </If>
       </View>
       <If when={isPersonaSession()}>
-        <PersonaHeader />
+        <PipReplyFocusLayer />
+      </If>
+      <If when={isPersonaSession()}>
+        <PersonaHeader reading={screen() === "transcript"} />
       </If>
       <Waiting show={isLeavingSession() && !hero()} />
       <HeaderBand show={screen() === "transcript"} height={topBarHeight()} />
@@ -1703,6 +1725,9 @@ export function Chat() {
           }}
         />
       </View>
+      <If when={isPersonaSession()}>
+        <PipMessageMenuLayer />
+      </If>
       <If when={repaint() % 2 === 0}>
         <View class="pointer-events-none absolute size-0" />
       </If>

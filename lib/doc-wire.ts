@@ -84,6 +84,70 @@ export function stripDocEditorContext(text: string): string {
   return text.replace(/\s*<doc_editor_context\b[^>]*>[\s\S]*?<\/doc_editor_context>\s*$/, "");
 }
 
+/** A message a quote-reply points back to. `target` is pipi's stable in-transcript anchor, not engine state. */
+export interface ReplyPart {
+  target: string;
+  author: string;
+  excerpt: string;
+  images?: number;
+  side?: "left" | "right";
+}
+
+const REPLY_EXCERPT_MAX = 240;
+const xmlText = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const xmlAttr = (value: string) => xmlText(value).replace(/"/g, "&quot;");
+const unxml = (value: string) =>
+  value.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+
+/** One compact line of quoted context; the wire carries an excerpt, never the whole message again. */
+export function replyExcerpt(text: string, max = REPLY_EXCERPT_MAX): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+/** The structured quote prefix every engine receives ahead of the person's own words. */
+export function composeReplyMessage(reply: ReplyPart, said: string): string {
+  const excerpt = replyExcerpt(reply.excerpt);
+  const attrs = [
+    `target="${xmlAttr(reply.target)}"`,
+    `author="${xmlAttr(reply.author)}"`,
+    ...(reply.images ? [`images="${reply.images}"`] : []),
+    ...(reply.side ? [`side="${reply.side}"`] : []),
+  ].join(" ");
+  const prefix = `<pipi-reply ${attrs}>${xmlText(excerpt)}</pipi-reply>`;
+  const words = said.trim();
+  return words ? `${prefix}\n\n${words}` : prefix;
+}
+
+const REPLY_OPEN = /^\s*<pipi-reply\b([^>]*)>([\s\S]*?)<\/pipi-reply>/;
+const REPLY_ATTR = /([\w-]+)="([^"]*)"/g;
+
+/** Reads a leading `<pipi-reply>` block; anything after it is the message the person wrote. */
+export function splitReplyMessage(text: string): { said: string; reply?: ReplyPart } {
+  const hit = REPLY_OPEN.exec(text);
+  if (!hit) return { said: text };
+  const attrs: Record<string, string> = {};
+  for (const match of hit[1].matchAll(REPLY_ATTR)) attrs[match[1]] = unxml(match[2]);
+  const said = text.slice(hit[0].length).replace(/^\n\n/, "");
+  if (!attrs.target && !attrs.author) return { said: text };
+  const images = Number(attrs.images ?? 0);
+  return {
+    said,
+    reply: {
+      target: attrs.target ?? "",
+      author: attrs.author ?? "",
+      excerpt: unxml(hit[2]),
+      ...(images > 0 ? { images } : {}),
+      ...(attrs.side === "left" || attrs.side === "right" ? { side: attrs.side } : {}),
+    },
+  };
+}
+
+/** The visible message without its quote-control prefix. */
+export function stripReplyMessage(text: string): string {
+  return splitReplyMessage(text).said;
+}
+
 /**
  * The message a send makes of what was typed and the documents attached.
  * Alone and unremarked, a document goes as its own text — unless that text
@@ -150,6 +214,7 @@ const PIPI_MESSAGE_OPEN = /^\s*<pipi-message\b[^>]*>\s*/;
 const PIPI_MESSAGE_CLOSE = /\s*<\/pipi-message>\s*$/;
 const PIPI_MESSAGE_TRUNCATED = /^\s*<pipi-message\b[^>]*$/;
 const DOC_EDITOR_CONTEXT_PREFIX = /^<doc_editor_context\b[^>]*>[\s\S]*?<\/doc_editor_context>\s*/;
+const REPLY_PREFIX = /^\s*<pipi-reply\b[^>]*>[\s\S]*?<\/pipi-reply>\s*/;
 
 /** Removes pipi's fixed protocol shells, keeping the task or words inside them. */
 function withoutProtocolShells(text: string): string {
@@ -158,6 +223,7 @@ function withoutProtocolShells(text: string): string {
     const before = out;
     out = out.replace(PERSONA_PREFIX, "");
     out = out.replace(HANDOFF_PREFIX, "");
+    out = out.replace(REPLY_PREFIX, "");
     out = out.replace(PIPI_MESSAGE, (_tag, body: string) => body.trim());
     // An old index or external header may already have clipped the envelope
     // before its closing tag: still drop the protocol head and keep what body

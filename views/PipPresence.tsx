@@ -3,6 +3,8 @@ import type { CanvasRenderingContext2D, CompositeAnimation, JSX, ScrollRef, View
 import { Button as BaseButton, Popover } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { activeLanguage, tr } from "../lib/i18n";
+import { replyExcerpt } from "../lib/doc-wire";
+import { pipAnchor } from "../lib/pip-anchors";
 import { derivePipLiveStatus, formatElapsedCompact, type PipChildStatus, type PipLiveStatus, type PipPhase } from "../lib/pip-status";
 import { Pip } from "../mascot/Pip";
 import {
@@ -14,6 +16,7 @@ import {
 } from "../pi/turns";
 import {
   activeAgent,
+  activePersonaId,
   copyMessage,
   currentActivity,
   currentChildSessions,
@@ -23,6 +26,7 @@ import {
   draftModel,
   headingDaemonSession,
   isLeavingSession,
+  isPersonaSession,
   isRunning,
   openDaemonSession,
   pendingDialog,
@@ -35,6 +39,8 @@ import {
   transcriptRows,
   waitingCount,
 } from "../store/app";
+import { openPipMessageMenu } from "../store/pip-interactions";
+import { IconButton } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import {
   EASING,
@@ -47,6 +53,7 @@ import {
 import { FOCUS_RING, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { uiHeight, uiType } from "../ui/typography";
 import { PersonaAvatar } from "./PersonaAvatar";
+import { PipMessageAdornments, pipMessageNode, registerPipMessageNode } from "./PipAdornments";
 import { PipBubbleBlocks, type PipBubbleRow } from "./Prose";
 
 const HOVER_OPEN_MS = 100;
@@ -707,7 +714,47 @@ export function PipBubbleView(props: {
     return "rounded-[18px] rounded-l-[6px]";
   };
 
+  const personaScope = () => `${activePersonaId() ?? "default"}:${currentDaemonSession()?.id ?? "unattached"}`;
+  const messageTarget = () => pipAnchor(transcriptRows(), props.row.rowId, props.row.bubbleIndex) ?? props.row.id;
+  const messageSnapshot = () => ({
+    scope: personaScope(),
+    target: messageTarget(),
+    rowId: props.row.rowId,
+    displayId: props.row.id,
+    side: "left" as const,
+    author: personaDisplayName(),
+    excerpt: replyExcerpt(props.row.copyText || props.row.fullText || ""),
+    images: 0,
+    text: props.row.copyText,
+    copyText: props.row.copyText,
+    fullText: props.row.fullText,
+    blocks: props.row.blocks,
+    wide: props.row.wide,
+    mediaOnly: props.row.mediaOnly,
+  });
+  const bubbleNode = signal<ViewRef | undefined>(undefined);
+  effect(() => {
+    const rowId = props.row.id;
+    const node = bubbleNode();
+    if (!node) return;
+    const unregister = registerPipMessageNode(rowId, node);
+    if (unregister) cleanup(unregister);
+  });
+  const openPersonaMenu = (x: number, y: number) => openPipMessageMenu(messageSnapshot(), x, y);
+  const openPersonaActions = () => {
+    const node = pipMessageNode(props.row.id) ?? bubbleNode();
+    if (!node) return;
+    void node.measure().then((m) => {
+      if (!m) return;
+      openPersonaMenu(m.pagePosition.x + m.bounds.size.width - 12, m.pagePosition.y + 6);
+    }).catch(() => undefined);
+  };
+
   const contextMenu = (e: { pagePosition: { x: number; y: number } }) => {
+    if (isPersonaSession()) {
+      openPersonaMenu(e.pagePosition.x, e.pagePosition.y);
+      return;
+    }
     const items = [
       ...(props.row.copyText
         ? [{ label: tr("Copy", "复制"), onSelect: () => void copyMessage(props.row.copyText) }]
@@ -722,7 +769,7 @@ export function PipBubbleView(props: {
   const bubblePad = () => (props.row.blocks.length > 1 || props.row.wide ? "px-4 py-3" : "px-3.5 py-2");
 
   return (
-    <View class="flex-row items-end gap-3">
+    <View class="group flex-row items-end gap-3">
       <View class="w-7 shrink-0 pb-0.5">
         <If when={props.row.pip.tail}>
           <PipAvatarBadge
@@ -739,11 +786,18 @@ export function PipBubbleView(props: {
           else={
             <View
               testID="pip-sms-bubble"
+              ref={(node: ViewRef | undefined) => bubbleNode.set(node)}
               selectable
               onContextMenu={contextMenu}
               style={entrance}
               class={`relative ${props.row.wide ? "max-w-[84%]" : "max-w-[74%]"} ${bubbleRadius()} corner-squircle bg-sms-incoming ${bubblePad()}`}
             >
+              {isPersonaSession() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="left" /> : null}
+              {isPersonaSession() ? (
+                <View class={`absolute -top-3 left-2 z-30 ${HOVER_REVEAL}`}>
+                  <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
+                </View>
+              ) : null}
               <If when={props.row.last}>
                 <BubbleTail side="left" tone="sms-incoming" />
               </If>
@@ -751,7 +805,13 @@ export function PipBubbleView(props: {
             </View>
           }
         >
-          <View testID="pip-sms-bubble" style={entrance} class="max-w-[74%]">
+          <View testID="pip-sms-bubble" ref={(node: ViewRef | undefined) => bubbleNode.set(node)} style={entrance} class="relative max-w-[74%]" onContextMenu={contextMenu}>
+            {isPersonaSession() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="left" /> : null}
+            {isPersonaSession() ? (
+              <View class={`absolute -top-3 left-2 z-30 ${HOVER_REVEAL}`}>
+                <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
+              </View>
+            ) : null}
             <PipBubbleBlocks row={props.row} />
           </View>
         </If>

@@ -1,6 +1,6 @@
 import { expect, test } from "nsh/test";
 import { FONT_SIZES, resetFontSizes, setFontSize } from "../store/prefs";
-import { uiHeight, uiIconSize, uiMinHeight, uiRowHeight, uiType } from "./typography";
+import { readingLeading, readingType, uiHeight, uiIconSize, uiMinHeight, uiRowHeight, uiType } from "./typography";
 
 test("default 13pt interface size emits original Tailwind tokens verbatim", () => {
   resetFontSizes();
@@ -39,6 +39,22 @@ test("interface scale preserves type ladder, row heights, and title bar ceiling 
     expect(uiRowHeight(24, { max: 28 })).toBe(28);
     expect(uiHeight(28, { max: 34 })).toBe("h-[34px]");
     expect(uiIconSize(14)).toBe(16);
+  } finally {
+    resetFontSizes();
+  }
+});
+
+test("reading body line height is explicit points and follows the reading scale", () => {
+  resetFontSizes();
+  expect(readingType()).toBe("text-md");
+  expect(readingLeading()).toBe("leading-[22.75px]");
+  expect(readingLeading("sm")).toBe("leading-[19.5px]");
+
+  try {
+    setFontSize("reading", 18);
+    expect(readingType()).toBe("text-[18px]/[1.57]");
+    expect(readingLeading()).toBe("leading-[29.25px]");
+    expect(readingLeading("sm")).toBe("leading-[24.375px]");
   } finally {
     resetFontSizes();
   }

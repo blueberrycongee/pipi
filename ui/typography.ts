@@ -84,6 +84,22 @@ export function readingType(token: FontToken = "md"): string {
   return `text-[${Math.round(points * ratio)}px]/[${leading}]`;
 }
 
+/**
+ * Relaxed reading line height as explicit points. A point value stays fixed in
+ * nested inline text (such as 0.9em inline code), where a unitless multiple
+ * would be recomputed at the smaller font size.
+ */
+export function readingLineHeight(token: FontToken = "md"): number {
+  const ratio = readingSize() / FONT_SIZES.reading.default;
+  const [points] = scale[token];
+  return Math.round(points * ratio) * 1.625;
+}
+
+/** `readingLineHeight` as a Tailwind class. */
+export function readingLeading(token: FontToken = "md"): string {
+  return `leading-[${readingLineHeight(token)}px]`;
+}
+
 export function codeType(): string {
   return codeSize() === FONT_SIZES.code.default ? "text-xs" : `text-[${codeSize()}px]/[${scale.xs[1]}]`;
 }

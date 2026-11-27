@@ -59,7 +59,7 @@ process.stdin.on("data", (chunk) => {
     const p = msg.params || {};
     log({ method: msg.method, params: p });
     if (msg.method === "initialize") {
-      reply(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: true, sessionCapabilities: { close: {} } }, agentInfo: { name: "affogato", title: "Devin Agent", version: "3000.14.30821" } });
+      reply(msg.id, { protocolVersion: 1, agentCapabilities: { loadSession: true, promptCapabilities: { image: true }, sessionCapabilities: { close: {} } }, agentInfo: { name: "affogato", title: "Devin Agent", version: "3000.14.30821" } });
     } else if (msg.method === "session/new") {
       const sessionId = `devin-fake-${++seq}`;
       sessions.set(sessionId, { model: process.env.FAKE_DEVIN_DEFAULT_MODEL || "swe-2-1-medium", effort: "medium", speed: "standard" });

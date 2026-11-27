@@ -18,10 +18,11 @@ const BRIDGE_SCRIPT = path.join(__dirname, "external-agent.mjs");
 const FAKE_ACP_SCRIPT = path.join(__dirname, "..", "dev", "fake-acp.mjs");
 
 /** Creates an isolated fake agent script speaking Pi's JSONL RPC protocol. */
-function writeMockAgent(dir) {
+function writeMockAgent(dir, options = {}) {
   const scriptPath = path.join(dir, "mock-pi.mjs");
   const sessionDir = path.join(dir, "sessions");
   fs.mkdirSync(sessionDir, { recursive: true });
+  const mockInput = JSON.stringify(options.input || ["text"]);
   const code = `#!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
@@ -42,6 +43,7 @@ if (process.argv[2] === "run" && process.argv[3] === "--format") {
 }
 
 const SESSION_DIR = ${JSON.stringify(sessionDir)};
+const MOCK_INPUT = ${mockInput};
 if (process.env.PIPI_MOCK_BOOTLOG) {
   try { fs.appendFileSync(process.env.PIPI_MOCK_BOOTLOG, String(process.pid) + "\\n"); } catch {}
 }
@@ -97,7 +99,15 @@ async function callMcp(name, args) {
   return res.json();
 }
 
-async function runSingleTurn(promptText) {
+function mcpPayload(res) {
+  try {
+    return JSON.parse(res?.result?.content?.[0]?.text || "{}");
+  } catch {
+    return {};
+  }
+}
+
+async function runSingleTurn(promptText, promptImages = []) {
   let aborted = false;
   let cancelWait = null;
   currentAbort = () => {
@@ -105,7 +115,11 @@ async function runSingleTurn(promptText) {
     if (cancelWait) cancelWait();
   };
 
-  const userMsg = { role: "user", content: promptText, timestamp: Date.now() };
+  const userMsg = {
+    role: "user",
+    content: promptImages.length ? [{ type: "text", text: promptText }, ...promptImages] : promptText,
+    timestamp: Date.now(),
+  };
   messages.push(userMsg);
   saveMessages();
 
@@ -239,6 +253,22 @@ async function runSingleTurn(promptText) {
     const [, title, ...rest] = promptText.split(":");
     const mcpRes = await callMcp("session_start", { agent: "pi", title, message: rest.join(":"), worktree: false });
     reply = mcpRes?.result?.content?.[0]?.text || JSON.stringify(mcpRes);
+  } else if (cmdText === "forward-latest-image") {
+    const read = mcpPayload(await callMcp("session_read", { session: process.env.PIPI_SESSION_ID, verbose: true }));
+    const row = [...(read.messages || [])].reverse().find((m) => m.role === "user" && (m.attachments || []).some((a) => a.kind === "image"));
+    const image = row?.attachments?.find((a) => a.kind === "image");
+    if (!image) {
+      reply = "no-image";
+    } else {
+      const spawned = mcpPayload(await callMcp("session_start", {
+        agent: "pi",
+        title: "forwarded original image",
+        message: "use the exact original image",
+        attachments: [image.path],
+        worktree: false,
+      }));
+      reply = JSON.stringify({ imagePath: image.path, childId: spawned.id, delivery: spawned.attachments?.[0]?.delivery, warnings: spawned.warnings });
+    }
   } else if (promptText.includes("<pipi-message ") && messages.some((m) => m.role === "user" && String(m.content).includes("pingpong-mode"))) {
     const fromMatch = /from="([^"]+)"/.exec(promptText);
     if (fromMatch && !promptText.includes('status="blocked"')) {
@@ -274,12 +304,12 @@ async function runSingleTurn(promptText) {
   return false;
 }
 
-async function runTurn(initialPrompt) {
+async function runTurn(initialPrompt, initialImages = []) {
   isStreaming = true;
   let lastAborted = false;
-  let next = initialPrompt;
+  let next = { text: initialPrompt, images: initialImages };
   while (next !== undefined) {
-    lastAborted = await runSingleTurn(next);
+    lastAborted = await runSingleTurn(next.text ?? next, next.images || []);
     if (lastAborted) {
       if (queued.steering.length || queued.followUp.length) {
         queued.steering.length = 0;
@@ -288,7 +318,8 @@ async function runTurn(initialPrompt) {
       }
       break;
     }
-    next = queued.steering.shift() ?? queued.followUp.shift();
+    const queuedNext = queued.steering.shift() ?? queued.followUp.shift();
+    next = queuedNext === undefined ? undefined : { text: queuedNext, images: [] };
     if (next !== undefined) {
       emit({ type: "queue_update", steering: [...queued.steering], followUp: [...queued.followUp] });
     }
@@ -339,7 +370,7 @@ process.stdin.on("data", (chunk) => {
           steeringMode: "one-at-a-time",
           followUpMode: "one-at-a-time",
           autoCompactionEnabled: true,
-          model: { id: "mock-1", name: "Mock 1", api: "mock", provider: "mock", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+          model: { id: "mock-1", name: "Mock 1", api: "mock", provider: "mock", reasoning: true, input: MOCK_INPUT, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
         },
       });
       continue;
@@ -395,7 +426,7 @@ process.stdin.on("data", (chunk) => {
         emit({ id: cmd.id, type: "response", command: cmd.type, success: true, data: { disposition: "queued" } });
       } else {
         emit({ id: cmd.id, type: "response", command: cmd.type, success: true, data: { disposition: "started" } });
-        void runTurn(msg);
+        void runTurn(msg, Array.isArray(cmd.images) ? cmd.images : []);
       }
       continue;
     }
@@ -498,7 +529,7 @@ async function configureMockAgents(ctrl, mockBin, extra = {}) {
         available: true,
         enabled: true,
         binaryPath: mockBin,
-        models: [{ id: "mock-1", name: "Mock 1", provider: "mock" }],
+        models: [{ id: "mock-1", name: "Mock 1", provider: "mock", input: ["text"] }],
         supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
         supportsWorktree: true,
       },
@@ -2428,4 +2459,364 @@ test("Pip switches engines as a singleton and launch choices reach Devin before 
   await ctrl.waitUntil(() => ctrl.sessions.get(bad.id)?.status === "failed");
   assert.match(ctrl.sessions.get(bad.id).error, /Model not found/);
   assert.equal((await ctrl.readMessages(bad.id)).lastAnswer, "");
+});
+
+test("session attachments push native images or degrade with warnings, and verbose reads expose original media", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-attachments-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const mockBin = writeMockAgent(tmp);
+  const ctrl = await openControl(homeDir, { HOME: tmp });
+  t.after(() => {
+    ctrl.client.close();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid, "SIGTERM");
+    } catch {}
+  });
+  await configureMockAgents(ctrl, mockBin);
+
+  const pngBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mP8z8BQz0AEwDiqAAAWBAQCAQIDAgAAAABJRU5ErkJggg==", "base64");
+  const pngPath = path.join(workDir, "shot.png");
+  const txtPath = path.join(workDir, "brief.txt");
+  fs.writeFileSync(pngPath, pngBytes);
+  fs.writeFileSync(txtPath, "original brief\n");
+
+  // Invalid paths are explicit tool errors — never a silently dropped attachment.
+  await assert.rejects(
+    ctrl.call("tool", {
+      name: "session_start",
+      args: { title: "bad attachment", agent: "pi", cwd: workDir, model: "mock/mock-1", message: "look", attachments: [path.join(workDir, "missing.png")] },
+    }),
+    /Invalid attachments: path does not exist or is not readable/,
+  );
+
+  // The mock model is text-only: the wire carries no image block, the exact
+  // path still reaches the child, and the caller receives an explicit warning.
+  const degraded = (
+    await ctrl.call("tool", {
+      name: "session_start",
+      args: { title: "text-only child", agent: "pi", cwd: workDir, model: "mock/mock-1", message: "inspect this", attachments: [pngPath, txtPath] },
+    })
+  ).result;
+  assert.equal(degraded.attachments.find((a) => a.kind === "image")?.delivery, "path-only");
+  assert.equal(degraded.attachments.find((a) => a.kind === "file")?.delivery, "path");
+  assert.ok(Array.isArray(degraded.warnings) && degraded.warnings[0].includes("path-only"));
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(degraded.id)).lastAnswer?.includes("echo:"));
+  const degradedFile = ctrl.sessions.get(degraded.id)?.file;
+  assert.ok(degradedFile);
+  const degradedUser = fs
+    .readFileSync(degradedFile, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((entry) => entry.message?.role === "user")?.message;
+  assert.equal(typeof degradedUser.content, "string");
+  assert.ok(!Array.isArray(degradedUser.content));
+  assert.match(degradedUser.content, /shot\.png/);
+  assert.match(degradedUser.content, /brief\.txt/);
+  assert.match(degradedUser.content, /path-only/);
+
+  // `session_send` uses the live model state too: a follow-up PNG to the same
+  // text-only session is not emitted as an image block and reports path-only.
+  const followUp = (
+    await ctrl.call("tool", {
+      name: "session_send",
+      args: { session: degraded.id, message: "check the same image again", attachments: [pngPath] },
+    })
+  ).result;
+  assert.equal(followUp.attachments.find((a) => a.kind === "image")?.delivery, "path-only");
+  assert.ok(Array.isArray(followUp.warnings) && followUp.warnings[0].includes("path-only"));
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(degraded.id)).lastAnswer?.includes("check the same image again"));
+  const degradedUsers = fs
+    .readFileSync(degradedFile, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((entry) => entry.message?.role === "user")
+    .map((entry) => entry.message);
+  assert.ok(degradedUsers.length >= 2);
+  assert.equal(typeof degradedUsers.at(-1).content, "string");
+  assert.match(degradedUsers.at(-1).content, /shot\.png/);
+
+  // A vision-capable catalog entry sends the same PNG as a native protocol
+  // image block while the text still carries exact paths as the fallback.
+  const visionBin = writeMockAgent(path.join(tmp, "vision-mock"), { input: ["text", "image"] });
+  await ctrl.call("config", {
+    agents: [
+      {
+        id: "pi",
+        name: "Pi",
+        driver: "pi",
+        available: true,
+        enabled: true,
+        binaryPath: visionBin,
+        models: [{ id: "mock-1", name: "Mock 1", provider: "mock", input: ["text", "image"] }],
+        supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
+      },
+    ],
+  });
+  const vision = (
+    await ctrl.call("tool", {
+      name: "session_start",
+      args: { title: "vision child", agent: "pi", cwd: workDir, model: "mock/mock-1", message: "inspect this", attachments: [pngPath] },
+    })
+  ).result;
+  assert.equal(vision.warnings, undefined);
+  assert.equal(vision.attachments[0]?.delivery, "image+path");
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(vision.id)).lastAnswer?.includes("echo:"));
+  const visionFile = ctrl.sessions.get(vision.id)?.file;
+  const visionUser = fs
+    .readFileSync(visionFile, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((entry) => entry.message?.role === "user")?.message;
+  assert.ok(Array.isArray(visionUser.content));
+  const imageBlock = visionUser.content.find((block) => block.type === "image");
+  assert.equal(imageBlock?.data, pngBytes.toString("base64"));
+  assert.equal(imageBlock?.mimeType, "image/png");
+  const visionText = visionUser.content.find((block) => block.type === "text")?.text || "";
+  assert.match(visionText, /shot\.png/);
+  assert.match(visionText, /<attachment path=/);
+
+  // Pull: a pasted inline base64 image is materialized once into the private
+  // content-addressed cache; attachment tags and presented_media keep their paths.
+  const inlineFile = path.join(tmp, "inline-session.jsonl");
+  const inlineMessage = {
+    role: "user",
+    content: [
+      { type: "text", text: `what does this show?\n\n<attachment path="${txtPath}" kind="file" mime="text/plain" size="${Buffer.byteLength("original brief\n")}" />` },
+      { type: "image", data: pngBytes.toString("base64"), mimeType: "image/png" },
+    ],
+    timestamp: Date.now(),
+  };
+  const presented = {
+    role: "assistant",
+    content: [{ type: "presented_media", items: [{ path: txtPath, kind: "document", title: "Brief", size: Buffer.byteLength("original brief\n") }] }],
+    timestamp: Date.now() + 1,
+  };
+  fs.writeFileSync(
+    inlineFile,
+    `${JSON.stringify({ type: "message", message: inlineMessage })}\n${JSON.stringify({ type: "message", message: presented })}\n`,
+  );
+  const attached = await ctrl.call("attach", { session: { cwd: workDir, agentId: "pi", driver: "pi", file: inlineFile } });
+  const page1 = await ctrl.readMessages(attached.session.id);
+  const userRow = page1.messages.find((message) => message.role === "user");
+  const cached = userRow?.attachments?.find((item) => item.kind === "image" && item.path.includes(`${path.sep}media-cache${path.sep}`));
+  assert.ok(cached, "inline image materialized into media-cache");
+  assert.deepEqual(fs.readFileSync(cached.path), pngBytes);
+  assert.equal(cached.bytes, pngBytes.length);
+  assert.equal(cached.width, 2);
+  assert.equal(cached.height, 2);
+  assert.ok(userRow.attachments.some((item) => item.kind === "file" && item.path === txtPath));
+  const assistantRow = page1.messages.find((message) => message.role === "assistant");
+  assert.ok(assistantRow?.attachments?.some((item) => item.path === txtPath && item.name === "Brief"));
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(cached.path).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.dirname(cached.path)).mode & 0o777, 0o700);
+  }
+  const firstStat = fs.statSync(cached.path);
+  const page2 = await ctrl.readMessages(attached.session.id);
+  const cachedAgain = page2.messages.find((message) => message.role === "user")?.attachments?.find((item) => item.kind === "image" && item.path === cached.path);
+  assert.ok(cachedAgain, "same content reuses the same cache path");
+  assert.equal(fs.statSync(cached.path).mtimeMs, firstStat.mtimeMs);
+});
+
+test("end-to-end parent materializes a pasted image and forwards the original to a vision child", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-attachment-e2e-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const visionBin = writeMockAgent(path.join(tmp, "vision-agent"), { input: ["text", "image"] });
+  const ctrl = await openControl(homeDir, { HOME: tmp });
+  t.after(() => {
+    ctrl.client.close();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid, "SIGTERM");
+    } catch {}
+  });
+  await ctrl.call("config", {
+    agents: [
+      {
+        id: "pi",
+        name: "Pi",
+        driver: "pi",
+        available: true,
+        enabled: true,
+        binaryPath: visionBin,
+        models: [{ id: "mock-1", name: "Mock 1", provider: "mock", input: ["text", "image"] }],
+        supportedRuntimeModes: ["approval-required", "auto-accept-edits", "full-access"],
+      },
+    ],
+    overrides: { pi: { binaryPath: visionBin } },
+    allowAgentTools: true,
+    sendScope: "all",
+    maxDepth: 3,
+    maxRunning: 8,
+    worktreeDefault: false,
+    linger: true,
+  });
+
+  const pngBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mP8z8BQz0AEwDiqAAAWBAQCAQIDAgAAAABJRU5ErkJggg==", "base64");
+  const { session: parent } = await ctrl.call("start_session", { input: { title: "Pip parent", agentId: "pi", cwd: workDir } });
+  await ctrl.call("attach", { session: { id: parent.id, cwd: workDir, agentId: "pi", driver: "pi" } });
+  ctrl.client.send({
+    type: "in",
+    sessionId: parent.id,
+    line: JSON.stringify({
+      id: "paste-image",
+      type: "prompt",
+      message: "forward-latest-image",
+      images: [{ type: "image", data: pngBytes.toString("base64"), mimeType: "image/png" }],
+    }),
+  });
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(parent.id)).messages?.some((message) => message.role === "assistant" && message.text.includes("childId")));
+  const parentPage = await ctrl.readMessages(parent.id);
+  const forwardReport = parentPage.messages.find((message) => message.role === "assistant" && message.text.includes("childId"))?.text;
+  const forwarded = JSON.parse(forwardReport);
+  assert.ok(forwarded.imagePath.includes(`${path.sep}media-cache${path.sep}`));
+  assert.equal(forwarded.delivery, "image+path");
+  assert.equal(forwarded.warnings, undefined);
+  assert.deepEqual(fs.readFileSync(forwarded.imagePath), pngBytes);
+
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(forwarded.childId)).lastAnswer?.includes("echo:"));
+  const childFile = ctrl.sessions.get(forwarded.childId)?.file;
+  assert.ok(childFile);
+  const childUser = fs
+    .readFileSync(childFile, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((entry) => entry.message?.role === "user")?.message;
+  assert.ok(Array.isArray(childUser.content));
+  assert.equal(childUser.content.find((block) => block.type === "image")?.data, pngBytes.toString("base64"));
+  const childPage = await ctrl.readMessages(forwarded.childId);
+  const childUserRow = childPage.messages.find((message) => message.role === "user");
+  assert.ok(childUserRow?.attachments?.some((item) => item.kind === "image" && item.path === forwarded.imagePath));
+  assert.match(childUserRow.text, /use the exact original image/);
+});
+
+test("ACP delegation receipts reflect negotiated model vision: Devin images inline, flash text-only path fallback", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-acp-attachments-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const ctrl = await openControl(homeDir, { HOME: tmp, FAKE_DEVIN_ACP_LOG: path.join(tmp, "devin-log.jsonl") });
+  t.after(() => {
+    ctrl.client.close();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid, "SIGTERM");
+    } catch {}
+  });
+  const fakeDevin = { id: "devin", name: "Devin", command: process.execPath, args: [path.join(__dirname, "..", "dev", "fake-devin-acp.mjs")] };
+  await ctrl.call("config", {
+    agents: [{ id: "devin", name: "Devin", driver: "acp", available: true, enabled: true, customAgent: fakeDevin, supportedRuntimeModes: ["full-access"] }],
+    allowAgentTools: true,
+    sendScope: "all",
+    worktreeDefault: false,
+    linger: true,
+  });
+  const pngBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mP8z8BQz0AEwDiqAAAWBAQCAQIDAgAAAABJRU5ErkJggg==", "base64");
+  const pngPath = path.join(workDir, "screen.png");
+  fs.writeFileSync(pngPath, pngBytes);
+
+  const vision = (
+    await ctrl.call("tool", {
+      name: "session_start",
+      args: { title: "Devin vision", agent: "devin", cwd: workDir, model: "devin/swe-2-1-medium", message: "inspect screen", attachments: [pngPath], detached: true },
+    })
+  ).result;
+  assert.equal(vision.warnings, undefined);
+  assert.equal(vision.attachments[0]?.delivery, "image+path");
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(vision.id)).lastAnswer?.includes('"prompt"'));
+  const visionAnswer = JSON.parse((await ctrl.readMessages(vision.id)).lastAnswer);
+  assert.ok(visionAnswer.prompt.some((block) => block.type === "image" && block.data === pngBytes.toString("base64")));
+  assert.match(visionAnswer.prompt.find((block) => block.type === "text")?.text || "", /screen\.png/);
+
+  const flash = (
+    await ctrl.call("tool", {
+      name: "session_start",
+      args: { title: "Devin flash", agent: "devin", cwd: workDir, model: "devin/swe-2-flash-medium", message: "inspect screen", attachments: [pngPath], detached: true },
+    })
+  ).result;
+  assert.equal(flash.attachments[0]?.delivery, "path-only");
+  assert.ok(flash.warnings?.[0]?.includes("path-only"));
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(flash.id)).lastAnswer?.includes('"prompt"'));
+  const flashAnswer = JSON.parse((await ctrl.readMessages(flash.id)).lastAnswer);
+  assert.ok(!flashAnswer.prompt.some((block) => block.type === "image"));
+  assert.match(flashAnswer.prompt.find((block) => block.type === "text")?.text || "", /screen\.png/);
+  assert.match(flashAnswer.prompt.find((block) => block.type === "text")?.text || "", /path-only/);
+});
+
+test("queued attachment deliveries keep bytes out of the registry and remain deliverable", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipi-daemon-attachment-queue-"));
+  const homeDir = path.join(tmp, "home");
+  const workDir = path.join(tmp, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const visionBin = writeMockAgent(path.join(tmp, "vision-agent"), { input: ["text", "image"] });
+  const ctrl = await openControl(homeDir, { HOME: tmp });
+  t.after(() => {
+    ctrl.client.close();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(homeDir, "daemon.json"), "utf8")).pid, "SIGTERM");
+    } catch {}
+  });
+  await ctrl.call("config", {
+    agents: [
+      {
+        id: "pi",
+        name: "Pi",
+        driver: "pi",
+        available: true,
+        enabled: true,
+        binaryPath: visionBin,
+        models: [{ id: "mock-1", name: "Mock 1", provider: "mock", input: ["text", "image"] }],
+        supportedRuntimeModes: ["full-access"],
+      },
+    ],
+    overrides: { pi: { binaryPath: visionBin } },
+    allowAgentTools: true,
+    sendScope: "all",
+    worktreeDefault: false,
+    linger: true,
+  });
+  const pngBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mP8z8BQz0AEwDiqAAAWBAQCAQIDAgAAAABJRU5ErkJggg==", "base64");
+  const pngPath = path.join(workDir, "queued.png");
+  fs.writeFileSync(pngPath, pngBytes);
+  const started = (
+    await ctrl.call("tool", {
+      name: "session_start",
+      args: { title: "slow vision", agent: "pi", cwd: workDir, model: "mock/mock-1", message: "slow:350:first", detached: true },
+    })
+  ).result;
+  await ctrl.waitUntil(() => ctrl.sessions.get(started.id)?.status === "working");
+  const sent = (
+    await ctrl.call("tool", {
+      name: "session_send",
+      args: { session: started.id, message: "queued image follow-up", attachments: [pngPath] },
+    })
+  ).result;
+  assert.equal(sent.queued, true);
+  assert.equal(sent.attachments[0]?.delivery, "image+path");
+  await ctrl.waitUntil(() => fs.readFileSync(path.join(homeDir, "sessions.jsonl"), "utf8").includes(`"to":"${started.id}"`));
+  const queueRecord = fs
+    .readFileSync(path.join(homeDir, "sessions.jsonl"), "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .reverse()
+    .find((record) => record.type === "queue" && record.to === started.id && record.items?.length);
+  assert.ok(queueRecord);
+  assert.equal(queueRecord.items[0].attachments.images[0].data, undefined);
+  assert.ok(queueRecord.items[0].attachments.images[0].cachePath.includes(`${path.sep}media-cache${path.sep}`));
+  await ctrl.waitUntil(async () => (await ctrl.readMessages(started.id)).lastAnswer?.includes("queued image follow-up"), 5000);
+  const users = fs
+    .readFileSync(ctrl.sessions.get(started.id).file, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((entry) => entry.message?.role === "user")
+    .map((entry) => entry.message);
+  assert.equal(users.at(-1).content.find((block) => block.type === "image")?.data, pngBytes.toString("base64"));
 });

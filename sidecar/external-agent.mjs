@@ -594,8 +594,9 @@ async function loadExternalSession(targetPath) {
 const EXTERNAL_ORCHESTRATION_PROMPT = `
 You are running inside pipi with session tools (via the \`pipi\` MCP server when available):
 - Call \`agents_list\` to see the coding agents you can start sessions with and whether they can drive sessions themselves, and \`workspaces_list\` for the person's project folders.
-- Call \`session_start\` to open a child session on a task — it runs on its own and its answer is delivered back to you when it finishes. Never wait on it.
+- Call \`session_start\` to open a child session on a task — it runs on its own and its answer is delivered back to you when it finishes. Never wait on the answer.
 - Call \`sessions_list\`, \`session_read\`, \`session_send\`, and \`session_stop\` to inspect, message, or stop sessions in your tree.
+- \`session_start\` and \`session_send\` accept \`attachments\` as local file paths for original screenshots/files. A \`<pipi-message from="...">\` names the session that wrote to you; use \`session_read\` with that id and \`verbose: true\` when you need exact original words or readable attachment/image paths.
 - When you create or want to show the user images, videos, audio, PDFs, or other deliverable files, call \`present_files\` (or link them with Markdown \`![alt](path)\` / \`[name](path)\`) so pipi renders native previews directly in the conversation.
 `.trim();
 
@@ -630,6 +631,51 @@ function imageBlocks(images) {
   return (Array.isArray(images) ? images : [])
     .filter((i) => i && i.type === "image" && typeof i.data === "string" && i.data)
     .map((i) => ({ type: "image", data: i.data, mimeType: String(i.mimeType || "image/png") }));
+}
+
+/** Effective outbound image input: transport capability ∩ the selected model's input list. */
+function outboundImageBlocks(images) {
+  const blocks = imageBlocks(images);
+  if (!blocks.length) return [];
+  if (!IMAGE_DRIVERS.has(driver)) return [];
+  if (driver === "acp" && acpPromptImage !== true) return [];
+  if (Array.isArray(currentModel?.input) && !currentModel.input.includes("image")) return [];
+  return blocks;
+}
+
+function imageInputForModel(modelSupportsImages) {
+  if (!modelSupportsImages) return ["text"];
+  if (!IMAGE_DRIVERS.has(driver)) return ["text"];
+  if (driver === "acp" && acpPromptImage !== true) return ["text"];
+  return ["text", "image"];
+}
+
+function reconcileImageInputs() {
+  let changed = false;
+  for (const model of availableModels) {
+    if (!Array.isArray(model?.input)) continue;
+    const hasImage = model.input.includes("image");
+    const shouldHaveImage = hasImage && (driver !== "acp" || acpPromptImage === true);
+    if (hasImage && !shouldHaveImage) {
+      model.input = model.input.filter((kind) => kind !== "image");
+      changed = true;
+    }
+  }
+  if (changed) {
+    emit({ type: "models_changed" });
+    emitCatalogSnapshot();
+  }
+}
+
+function acpPromptImageFromInitialize(init) {
+  if (init?.agentCapabilities) return init.agentCapabilities.promptCapabilities?.image === true;
+  const v2 = init?.capabilities?.session?.prompt?.image;
+  return v2 !== undefined && v2 !== false;
+}
+
+function isImageUnsupportedError(err) {
+  const text = String(err?.message || err || "").toLowerCase();
+  return /image|vision|multimodal/.test(text) && /unsupported|not supported|does not support|invalid|cannot/.test(text);
 }
 
 // Signals the agent's whole process group (spawned `detached`): a CLI's own
@@ -1552,7 +1598,7 @@ async function runClaudeTurn(bin, promptText, images = [], turnEpoch = sessionEp
   // image blocks reach the engine; a trailing CLI argument is text-only.
   const content = [
     ...(promptText ? [{ type: "text", text: promptText }] : []),
-    ...imageBlocks(images).map((i) => ({ type: "image", source: { type: "base64", media_type: i.mimeType, data: i.data } })),
+    ...outboundImageBlocks(images).map((i) => ({ type: "image", source: { type: "base64", media_type: i.mimeType, data: i.data } })),
   ];
   const stdinPayload = `${JSON.stringify({ type: "user", message: { role: "user", content } })}\n`;
 
@@ -1961,8 +2007,9 @@ let acpEffortConfig = undefined; // advertised `reasoning_effort`/`thought_level
 let acpModelConfigs = []; // advertised ACP `model_config` selectors (speed and siblings), sanitized for SessionState
 let acpThinkingWanted = undefined; // the user's abstract pick, kept even when a model clamps it (max → high)
 let acpUsage = undefined; // last `usage_update` {used, size}
-let acpAgentInfo = undefined; // initialize's agentInfo {name, title, version}
+let acpAgentInfo = undefined; // initialize's agentInfo/info {name, title, version}
 let acpAuthMethods = []; // initialize's authMethods — authenticate when required
+let acpPromptImage = undefined; // initialize promptCapabilities.image (false unless explicitly advertised)
 const acpRecentTools = new Map(); // toolCallId → {title, kind, rawInput} for permission enrichment
 // Last `session/update` the peer sent — the turn's own progress signal. Unlike
 // `acpLastOutAt` (every byte, probes included), only the session's traffic
@@ -2940,7 +2987,7 @@ function adoptModels(list, currentId) {
       api: "acp",
       provider: agentId,
       reasoning: false,
-      input: image === false ? ["text"] : ["text", "image"],
+      input: imageInputForModel(image !== false),
       // Only what the agent advertised; ACP's spec carries no window fields.
       ...(Number(m?.contextWindow) > 0 ? { contextWindow: Number(m.contextWindow) } : {}),
       ...(Number(m?.maxTokens) > 0 ? { maxTokens: Number(m.maxTokens) } : {}),
@@ -3095,7 +3142,7 @@ function adoptModelConfigOption(modelOpt) {
       api: "acp",
       provider,
       reasoning: false,
-      input: images ? ["text", "image"] : ["text"],
+      input: imageInputForModel(images),
       ...(devin && id.startsWith("fusion-") ? { group: "Fusion" } : {}),
       cost: zeroCost,
     });
@@ -3810,8 +3857,10 @@ function ensureAcpInitialized(bin) {
       }
       acpLoadSession = !!init?.agentCapabilities?.loadSession;
       acpSessionCaps = init?.agentCapabilities?.sessionCapabilities || undefined;
-      acpAgentInfo = init?.agentInfo || {};
+      acpAgentInfo = init?.agentInfo || init?.info || {};
       acpAuthMethods = Array.isArray(init?.authMethods) ? init.authMethods : [];
+      acpPromptImage = acpPromptImageFromInitialize(init);
+      reconcileImageInputs();
       acpModes = undefined;
       acpModelConfigId = undefined;
       acpModeConfigId = undefined;
@@ -4026,6 +4075,7 @@ async function acpPromptWatched(acpId, params, isSuperseded = () => false) {
 // the persistent session; peer lifetime managed by ensureAcp/spawnAcp above.
 async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch) {
   const acpId = await ensureAcp(bin);
+  let effectiveImages = outboundImageBlocks(images);
   // `session/cancel` only applies to a prompt already in flight — one sent
   // after the cancel starts fresh, so a turn aborted during negotiation must
   // never reach session/prompt.
@@ -4062,9 +4112,11 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
   try {
     let res;
     let activeSeq = ++deferred.promptSeq;
+    let currentPromptText = promptText;
+    let currentPromptImageCount = effectiveImages.length;
     let currentPrompt = acpPromptWatched(
       acpId,
-      { sessionId: acpId, prompt: [{ type: "text", text: promptText }, ...images] },
+      { sessionId: acpId, prompt: [{ type: "text", text: promptText }, ...effectiveImages] },
       () => deferred.promptSeq !== activeSeq,
     );
     let steerWake;
@@ -4122,14 +4174,32 @@ async function runAcpTurn(bin, promptText, images = [], turnEpoch = sessionEpoch
         deferred.swarmWaitToolId = undefined;
         deferred.swarmWaitDone = false;
         deferred.replyOpen = true;
+        const steerImages = outboundImageBlocks(nextSteer.images);
+        currentPromptText = nextSteer.text;
+        currentPromptImageCount = steerImages.length;
         currentPrompt = acpPromptWatched(
           acpId,
-          { sessionId: acpId, prompt: [{ type: "text", text: nextSteer.text }, ...nextSteer.images] },
+          { sessionId: acpId, prompt: [{ type: "text", text: nextSteer.text }, ...steerImages] },
           () => deferred.promptSeq !== activeSeq,
         );
         continue;
       }
-      if (step.kind === "err") throw step.err;
+      if (step.kind === "err") {
+        // Some engines only reveal a text-only model by rejecting the prompt.
+        // Retry the same user turn without image blocks; the daemon's message
+        // text already carries the authoritative local paths, so no context dies.
+        if (currentPromptImageCount > 0 && isImageUnsupportedError(step.err)) {
+          currentPromptImageCount = 0;
+          activeSeq = ++deferred.promptSeq;
+          currentPrompt = acpPromptWatched(
+            acpId,
+            { sessionId: acpId, prompt: [{ type: "text", text: currentPromptText }] },
+            () => deferred.promptSeq !== activeSeq,
+          );
+          continue;
+        }
+        throw step.err;
+      }
       res = step.result;
       break;
     }
@@ -4317,6 +4387,7 @@ async function handleCommand(cmd) {
         messageCount: messages.length,
         pendingMessageCount: queuedSteering.length + queuedFollowUp.length,
         modelConfigs: acpModelConfigs,
+        ...(driver === "acp" ? { promptCapabilities: { image: acpPromptImage === true } } : {}),
       };
     case "get_available_models":
       await discoverCatalog();

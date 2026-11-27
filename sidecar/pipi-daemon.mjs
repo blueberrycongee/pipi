@@ -28,6 +28,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -367,7 +368,16 @@ function persist(record) {
 
 /** Queued deliveries are registry state too: a restart hands them over, it does not lose them. */
 function persistDeliveries(session) {
-  persist({ type: "queue", to: session.id, items: session.deliverQueue.map((item) => ({ text: item.text, initiator: item.initiator })) });
+  persist({
+    type: "queue",
+    to: session.id,
+    items: session.deliverQueue.map((item) => ({
+      text: item.text,
+      initiator: item.initiator,
+      ...(item.attachments ? { attachments: serializeAttachmentPlan(item.attachments) } : {}),
+      ...(item.imageSupport ? { imageSupport: item.imageSupport } : {}),
+    })),
+  });
 }
 
 function pushSession(session) {
@@ -537,7 +547,8 @@ async function applyLaunchChoices(session, input) {
     if (input.model) {
       const slash = input.model.indexOf("/");
       if (slash <= 0 || slash === input.model.length - 1) throw new Error("model must be provider/modelId");
-      await daemonCommand(session, "set_model", { provider: input.model.slice(0, slash), modelId: input.model.slice(slash + 1) }, 60_000, true);
+      const model = await daemonCommand(session, "set_model", { provider: input.model.slice(0, slash), modelId: input.model.slice(slash + 1) }, 60_000, true);
+      if (model && typeof model === "object") session.model = model;
     }
     for (const [configId, value] of Object.entries(input.modelConfigs ?? {})) {
       await daemonCommand(session, "set_model_config", { configId, value }, 60_000, true);
@@ -793,6 +804,7 @@ function personaBlock(session) {
     `You are ${name}. PERSONA.md below says who you are; stay that character in every reply.`,
     `Your working directory holds PERSONA.md and MEMORY.md, and both outlast this conversation. MEMORY.md is yours: before you finish a turn in which you learned something worth keeping (a preference, a decision, a person, an open thread), write it there as one short line, and delete what has gone stale. Keep it under ${MEMORY_INDEX_BYTES / 1024} KB. Change PERSONA.md only when the person asks.`,
     "For coding work, start a session with a suitable agent (`agents_list`, `session_start`) and pass the project's directory as `cwd` (`workspaces_list` names the person's projects): your own directory holds only your notes.",
+    "When the person sends screenshots or files, pass the original local paths through `attachments` on `session_start`/`session_send` instead of re-describing them. Prefer vision-capable models for visual tasks; if the result warns that images were delivered path-only, add the key visual details in text or choose a vision-capable model.",
     "Between user messages, prefer `message_edit` to update your last summary when background reports arrive, rather than sending repeated updates; send a new message for a new topic or a decision the person must make. After editing, finish with no text or exactly `<no-reply/>` when no additional reply is needed.",
     "Do not mention this block.",
     "",
@@ -863,13 +875,21 @@ function blockMessageEdit(session, text) {
   persist({ type: "session_update", id: session.id, info: { editBlocked: true } });
 }
 
-function writePrompt(session, text, initiator) {
+function writePrompt(session, text, initiator, images = []) {
   if (initiator === "user" && !backgroundDelivery({ content: text }) && !session.editBlocked) blockMessageEdit(session, text);
   session.initiator = initiator;
   session.turnAnswer = "";
   session.lastPromptText = text;
   session.turnFailed = false;
-  const sent = writeLine(session, JSON.stringify({ id: `${INTERNAL_PREFIX}p${++internalSeq}`, type: "prompt", message: text }));
+  const sent = writeLine(
+    session,
+    JSON.stringify({
+      id: `${INTERNAL_PREFIX}p${++internalSeq}`,
+      type: "prompt",
+      message: text,
+      ...(Array.isArray(images) && images.length ? { images } : {}),
+    }),
+  );
   if (sent) setStatus(session, "working");
   return sent;
 }
@@ -1693,28 +1713,30 @@ function deliverToInitiator(from, text, status, explicitTarget) {
 }
 
 /** Puts a `<pipi-message>` into `target`: now if it can take it, queued otherwise. True when it queued. */
-function deliverMessage(target, text, initiator) {
+function deliverMessage(target, text, initiator, attachments, imageSupport) {
   if (initiator === "user" && !backgroundDelivery({ content: text })) blockMessageEdit(target, text);
+  const item = { text, initiator, ...(attachments ? { attachments, imageSupport } : {}) };
   if (target.status === "failed" || target.status === "interrupted") {
-    target.deliverQueue.push({ text, initiator });
+    target.deliverQueue.push(item);
     persistDeliveries(target);
     void revive(target);
     return true;
   }
   if (target.status === "working" || target.status === "blocked") {
-    target.deliverQueue.push({ text, initiator });
+    target.deliverQueue.push(item);
     persistDeliveries(target);
     return true;
   }
   if (!target.loaded) {
-    target.deliverQueue.push({ text, initiator });
+    target.deliverQueue.push(item);
     persistDeliveries(target);
     void revive(target);
     return true;
   }
-  if (!writePrompt(target, text, initiator)) {
+  const outgoing = composeMessageWithAttachments(text, attachments, imageSupport);
+  if (!writePrompt(target, outgoing.text, initiator, outgoing.images)) {
     // The pipe died between the check and the write — queue it for the revive.
-    target.deliverQueue.push({ text, initiator });
+    target.deliverQueue.push(item);
     persistDeliveries(target);
     void revive(target);
     return true;
@@ -1738,8 +1760,10 @@ function flushDeliveries(session) {
   const queue = session.deliverQueue.splice(0);
   const explicit = [...queue].reverse().find((item) => item.initiator && item.initiator !== "user");
   const initiator = explicit ? explicit.initiator : queue[queue.length - 1].initiator;
-  const text = queue.map((item) => item.text).join("\n\n");
-  if (!writePrompt(session, text, initiator)) {
+  const outgoingParts = queue.map((item) => composeMessageWithAttachments(item.text, item.attachments, item.imageSupport));
+  const text = outgoingParts.map((part) => part.text).join("\n\n");
+  const images = outgoingParts.flatMap((part) => part.images);
+  if (!writePrompt(session, text, initiator, images)) {
     // Restore — the exit's revive or a later delivery retries instead of losing it.
     session.deliverQueue.push(...queue);
   }
@@ -1794,12 +1818,16 @@ const SESSION_TOOLS = [
   },
   {
     name: "session_read",
-    description: "Read a session: its state, its last answer, and when it last worked. Worktree sessions include a diff stat; `verbose` returns recent messages, `cursor` pages back.",
+    description: "Read a session: its state, its last answer, and when it last worked. Worktree sessions include a diff stat; `verbose` returns recent messages with readable attachment paths (original pasted images included), `cursor` pages back.",
     inputSchema: {
       type: "object",
       properties: {
         session: { type: "string", description: "Session id." },
-        verbose: { type: "boolean", description: "Include the recent messages (user/assistant text), newest last." },
+        verbose: {
+          type: "boolean",
+          description:
+            "Include recent messages (user/assistant text), newest last. Messages with user files or pasted images also carry attachments[] with stable readable local paths; inline base64 images are materialized into pipi's private media cache. Use this when visual details or the user's exact original words matter.",
+        },
         cursor: { type: "number", description: "Page cursor from a previous read — returns messages older than it." },
       },
       required: ["session"],
@@ -1807,20 +1835,26 @@ const SESSION_TOOLS = [
   },
   {
     name: "session_send",
-    description: "Send a message to a session. A working session queues it; an idle one takes it as follow-up; a finished or interrupted one is revived and continues.",
+    description: "Send a message to a session. A working session queues it; an idle one takes it as follow-up; a finished or interrupted one is revived and continues. `attachments` forwards original local screenshots/files without re-describing them; the result warns when a text-only target receives images as paths only.",
     inputSchema: {
       type: "object",
       properties: {
         session: { type: "string" },
-        message: { type: "string" },
-        steer: { type: "boolean", description: "Deliver mid-run as steering instead of queuing for after the turn." },
+        message: { type: "string", description: "The follow-up to send; may be empty only when attachments are supplied." },
+        attachments: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional local file paths. png/jpg/jpeg/webp/gif images become native image input for vision-capable targets and are always also named by exact readable path; other files are clean path references. Relative paths resolve against the calling session's working directory.",
+        },
+        steer: { type: "boolean", description: "Deliver mid-run as steering instead of queueing for after the turn." },
       },
       required: ["session", "message"],
     },
   },
   {
     name: "session_start",
-    description: "Start a new session under yours with a first task. It runs on its own; its answer is delivered back to you when it finishes. Never wait on it.",
+    description: "Start a new session under yours with a first task. It runs on its own; its answer is delivered back to you when it finishes. Never wait on the answer. `attachments` forwards the user's original screenshots/files; image-capable models receive images inline, text-only models receive exact paths and the result warns you to add visual descriptions.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1830,7 +1864,13 @@ const SESSION_TOOLS = [
         model: { type: "string", description: "Model as provider/modelId (defaults to the agent's current)." },
         thinking: { type: "string", description: "Thinking level advertised by the engine: off, minimal, low, medium, high, xhigh, max." },
         modelConfigs: { type: "object", additionalProperties: { type: ["string", "boolean"] }, description: "Engine model settings by config id, e.g. Devin speed: standard or fast." },
-        message: { type: "string", description: "The first task, self-contained." },
+        message: { type: "string", description: "The first task, self-contained; may be empty only when attachments are supplied." },
+        attachments: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional local file paths. png/jpg/jpeg/webp/gif images become native image input for vision-capable targets and are always also named by exact readable path; other files are clean path references. Relative paths resolve against the calling session's working directory.",
+        },
         worktree: { type: "boolean", description: "Give it an isolated git worktree." },
         runtimeMode: { type: "string", enum: ["inherit", "approval-required", "auto-accept-edits", "full-access"] },
         detached: { type: "boolean", description: "Start it without a parent: it answers to the user, not to you." },
@@ -2009,6 +2049,334 @@ async function resolvePresentedFile(entry, baseCwd) {
   };
 }
 
+// ---- Delegation attachments -------------------------------------------------
+// `session_start`/`session_send` accept ordinary local paths. Images are read
+// once, copied into the daemon's content-addressed media cache (so queued or
+// restarted deliveries do not depend on the source file still being there),
+// and passed to image-capable harnesses as protocol-native `images` blocks.
+// Every attachment is also named by path in the prompt text: the path is the
+// zero-loss fallback when a model cannot receive inline images at all.
+const MEDIA_CACHE_DIR = path.join(home, "media-cache");
+const MAX_ATTACHMENTS = 16;
+const MAX_IMAGE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+const IMAGE_ATTACHMENT_MIME = new Map([
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".webp", "image/webp"],
+  [".gif", "image/gif"],
+]);
+const IMAGE_TRANSPORT_DRIVERS = new Set(["pi", "claude", "acp"]);
+
+function mediaExtensionForMime(mimeType) {
+  const mime = String(mimeType || "").toLowerCase();
+  if (mime === "image/jpeg") return "jpg";
+  if (mime === "image/png") return "png";
+  if (mime === "image/webp") return "webp";
+  if (mime === "image/gif") return "gif";
+  return "bin";
+}
+
+async function materializeMediaCache(data, mimeType) {
+  const raw = String(data || "");
+  const base64 = raw.startsWith("data:") ? raw.slice(raw.indexOf(",") + 1) : raw;
+  const bytes = Buffer.from(base64, "base64");
+  if (!bytes.length) throw new Error("attachment image is empty");
+  const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+  await fsp.mkdir(MEDIA_CACHE_DIR, { recursive: true, mode: 0o700 });
+  await fsp.chmod(MEDIA_CACHE_DIR, 0o700).catch(() => undefined);
+  const file = path.join(MEDIA_CACHE_DIR, `${sha256}.${mediaExtensionForMime(mimeType)}`);
+  try {
+    const st = await fsp.stat(file);
+    if (st.isFile() && st.size === bytes.length) return { path: file, bytes: bytes.length, sha256 };
+  } catch {}
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  await fsp.writeFile(tmp, bytes, { mode: 0o600 });
+  await fsp.chmod(tmp, 0o600).catch(() => undefined);
+  try {
+    await fsp.rename(tmp, file);
+  } catch {
+    // A concurrent reader may have materialized the same content first.
+    await fsp.unlink(tmp).catch(() => undefined);
+    try {
+      const st = await fsp.stat(file);
+      if (st.isFile() && st.size === bytes.length) return { path: file, bytes: bytes.length, sha256 };
+    } catch {}
+    throw new Error(`could not materialize media cache file: ${file}`);
+  }
+  await fsp.chmod(file, 0o600).catch(() => undefined);
+  return { path: file, bytes: bytes.length, sha256 };
+}
+
+function normalizeInputPath(raw, baseCwd) {
+  let input = String(raw || "").trim();
+  if (!input) return undefined;
+  if (/^file:\/\//i.test(input)) {
+    try {
+      input = decodeURIComponent(new URL(input).pathname);
+    } catch {}
+  } else if (input === "~" || input.startsWith("~/")) input = path.join(os.homedir(), input.slice(1));
+  return path.resolve(baseCwd || process.cwd(), input);
+}
+
+function attachmentError(message) {
+  return new Error(`Invalid attachments: ${message}`);
+}
+
+async function prepareAttachments(input, baseCwd) {
+  if (input === undefined) return undefined;
+  if (!Array.isArray(input)) throw attachmentError("attachments must be an array of local file paths");
+  if (!input.length) return { images: [], files: [] };
+  if (input.length > MAX_ATTACHMENTS) throw attachmentError(`at most ${MAX_ATTACHMENTS} attachments are accepted`);
+  const plan = { images: [], files: [] };
+  for (const raw of input) {
+    if (typeof raw !== "string" || !raw.trim()) throw attachmentError("every attachment must be a non-empty path string");
+    const file = normalizeInputPath(raw, baseCwd);
+    let st;
+    try {
+      st = await fsp.stat(file);
+      await fsp.access(file, fs.constants.R_OK);
+    } catch {
+      throw attachmentError(`path does not exist or is not readable: ${raw}`);
+    }
+    if (!st.isFile()) throw attachmentError(`path is not a regular file: ${raw}`);
+    if (st.size > MAX_ATTACHMENT_BYTES) throw attachmentError(`file is too large (${st.size} bytes, limit ${MAX_ATTACHMENT_BYTES}): ${raw}`);
+    const ext = path.extname(file).toLowerCase();
+    const mimeType = IMAGE_ATTACHMENT_MIME.get(ext);
+    if (!mimeType) {
+      plan.files.push({ kind: "file", path: file, name: path.basename(file), bytes: st.size, ...(MEDIA_MIME_BY_EXT[ext] ? { mimeType: MEDIA_MIME_BY_EXT[ext] } : {}) });
+      continue;
+    }
+    if (!st.size) throw attachmentError(`image is empty: ${raw}`);
+    if (st.size > MAX_IMAGE_ATTACHMENT_BYTES) {
+      throw attachmentError(`image is too large (${st.size} bytes, limit ${MAX_IMAGE_ATTACHMENT_BYTES}): ${raw}`);
+    }
+    const data = await fsp.readFile(file);
+    const dimensions = sniffImageDimensions(data) || {};
+    const cache = await materializeMediaCache(data.toString("base64"), mimeType);
+    plan.images.push({
+      kind: "image",
+      type: "image",
+      data: data.toString("base64"),
+      mimeType,
+      path: file,
+      cachePath: cache.path,
+      sha256: cache.sha256,
+      name: path.basename(file),
+      bytes: st.size,
+      ...(dimensions.width ? { width: dimensions.width, height: dimensions.height } : {}),
+    });
+  }
+  return plan;
+}
+
+function inputListSupportsImage(input) {
+  return Array.isArray(input) ? input.includes("image") : undefined;
+}
+
+function modelSupportsImages(model) {
+  return inputListSupportsImage(model?.input);
+}
+
+function parseModelRef(model) {
+  if (model && typeof model === "object" && typeof model.id === "string") return { provider: model.provider, id: model.id };
+  const text = String(model || "").trim();
+  if (!text) return undefined;
+  const slash = text.indexOf("/");
+  if (slash <= 0) return { id: text };
+  return { provider: text.slice(0, slash), id: text.slice(slash + 1) };
+}
+
+function findModelInCatalogs(agentId, modelRef) {
+  const ref = parseModelRef(modelRef);
+  if (!ref) return undefined;
+  const pools = [];
+  const agent = config.agents?.find((entry) => entry?.id === agentId);
+  if (Array.isArray(agent?.models)) pools.push(agent.models);
+  const cached = catalogCache.get(agentId);
+  if (Array.isArray(cached?.models)) pools.push(cached.models);
+  for (const models of pools) {
+    const found = models.find((m) => m?.id === ref.id && (!ref.provider || m.provider === ref.provider))
+      || models.find((m) => m?.id === ref.id);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function externalHeaderModel(file) {
+  try {
+    const fd = fs.openSync(file, "r");
+    try {
+      const buf = Buffer.alloc(64 * 1024);
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      const line = buf.subarray(0, n).toString("utf8").split("\n", 1)[0];
+      const rec = JSON.parse(line);
+      if (rec?.type === "external_session" && rec.model && typeof rec.model === "object") return rec.model;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {}
+  return undefined;
+}
+
+function transportSupportsImages(session) {
+  if (session.driver === "pi") return true;
+  return IMAGE_TRANSPORT_DRIVERS.has(String(session.driver || ""));
+}
+
+// Best-effort, metadata-driven image capability resolution. A loaded harness
+// is authoritative (`get_state` returns the live model's input list); for a
+// not-yet-started or queued target we use the requested model, catalog cache,
+// and external session header. Unknown Pi/Claude targets stay optimistic
+// because both harnesses strip unsupported images before their upstream APIs;
+// unknown ACP targets stay conservative because unsupported image content is
+// a protocol-level rejection there.
+async function resolveImageSupport(session, requestedModel) {
+  if (!transportSupportsImages(session)) {
+    return { supported: false, reason: `the ${session.driver} transport does not accept image input`, confidence: "transport" };
+  }
+  const consider = (model, source) => {
+    const support = modelSupportsImages(model);
+    if (support === undefined) return undefined;
+    return {
+      supported: support,
+      source,
+      confidence: "model",
+      modelLabel: model?.id ? `${model.provider || "default"}/${model.id}` : undefined,
+      reason: support ? undefined : `model ${model?.name || model?.id || "selected"} accepts text input only`,
+    };
+  };
+  if (session.loaded && session.proc && !session.killed) {
+    try {
+      // ACP image support is negotiated in initialize/session-new; a live but
+      // not-yet-negotiated bridge otherwise only knows its optimistic placeholder.
+      if (session.driver === "acp") await daemonCommand(session, "prewarm", { mode: "full" }, 25_000);
+      const state = await daemonCommand(session, "get_state", {}, 5000);
+      if (state?.model && typeof state.model === "object") session.model = state.model;
+      if (session.driver === "acp" && state?.promptCapabilities?.image !== true) {
+        return { supported: false, reason: "the ACP agent did not advertise image prompt capability", confidence: "transport" };
+      }
+      const live = consider(state?.model, "live model");
+      if (live) return live;
+    } catch {}
+  }
+  const rememberedChoice = config.sessionChoices?.[session.agentId]?.model;
+  const requested =
+    findModelInCatalogs(session.agentId, requestedModel) ||
+    findModelInCatalogs(session.agentId, session.initialChoice?.model) ||
+    findModelInCatalogs(session.agentId, rememberedChoice);
+  const requestedResult = consider(requested, "requested model");
+  if (requestedResult) return requestedResult;
+  const remembered = consider(session.model, "session state") || consider(externalHeaderModel(session.file), "session file");
+  if (remembered) return remembered;
+  if (session.driver === "acp") {
+    return { supported: false, reason: "image capability has not been advertised by this ACP agent yet", confidence: "unknown" };
+  }
+  return { supported: true, confidence: "unknown" };
+}
+
+function serializeAttachmentPlan(plan) {
+  if (!plan) return undefined;
+  return {
+    images: (plan.images || []).map(({ data, ...img }) => ({ ...img })),
+    files: (plan.files || []).map((file) => ({ ...file })),
+  };
+}
+
+function imageDataSync(img) {
+  if (typeof img?.data === "string" && img.data) return img.data;
+  for (const file of [img?.cachePath, img?.path]) {
+    if (!file) continue;
+    try {
+      return fs.readFileSync(file).toString("base64");
+    } catch {}
+  }
+  return undefined;
+}
+
+function attachmentWireImages(plan) {
+  if (!plan?.images?.length) return [];
+  return plan.images
+    .map((img) => {
+      const data = imageDataSync(img);
+      return data ? { type: "image", data, mimeType: img.mimeType } : undefined;
+    })
+    .filter(Boolean);
+}
+
+function formatAttachmentLine(item, inline) {
+  const details = [
+    item.mimeType,
+    item.width && item.height ? `${item.width}x${item.height}` : undefined,
+    typeof item.bytes === "number" ? `${item.bytes} bytes` : undefined,
+  ].filter(Boolean).join(", ");
+  if (item.kind === "image") {
+    return `- image: ${JSON.stringify(item.path)}${details ? ` (${details})` : ""} — ${inline ? "also attached inline as image input" : "path-only; this target cannot receive inline images"}`;
+  }
+  return `- file: ${JSON.stringify(item.path)}${details ? ` (${details})` : ""}`;
+}
+
+function attachmentWireTag(item) {
+  const parts = [`path="${escapeAttr(item.path)}"`, `kind="${escapeAttr(item.kind === "image" ? "image" : "file")}"`];
+  if (item.mimeType) parts.push(`mime="${escapeAttr(item.mimeType)}"`);
+  if (typeof item.bytes === "number") parts.push(`size="${Math.max(0, Math.round(item.bytes))}"`);
+  return `<attachment ${parts.join(" ")} />`;
+}
+
+function composeMessageWithAttachments(text, plan, support) {
+  if (!plan || (!plan.images?.length && !plan.files?.length)) return { text, images: [] };
+  const inline = !!support?.supported;
+  const lines = [
+    "Attachments supplied with this message. These exact local paths are authoritative; read them directly when visual or file details matter.",
+    ...(plan.images || []).map((img) => formatAttachmentLine(img, inline)),
+    ...(plan.files || []).map((file) => formatAttachmentLine(file, false)),
+  ];
+  if ((plan.images || []).length && !inline) {
+    lines.push(`Inline image input was not sent: ${support?.reason || "the target cannot receive images"}.`);
+  }
+  const tags = [...(plan.images || []), ...(plan.files || [])].map((item) => attachmentWireTag(item));
+  return {
+    text: `${text}${text.endsWith("\n") ? "" : "\n"}\n${lines.join("\n")}\n\n${tags.join("\n")}`,
+    images: inline ? attachmentWireImages(plan) : [],
+  };
+}
+
+function attachmentReceipt(plan, support) {
+  if (!plan || (!plan.images?.length && !plan.files?.length)) return {};
+  const attachments = [
+    ...(plan.images || []).map((img) => ({
+      kind: "image",
+      path: img.path,
+      cachePath: img.cachePath,
+      name: img.name,
+      mimeType: img.mimeType,
+      bytes: img.bytes,
+      ...(img.width ? { width: img.width, height: img.height } : {}),
+      delivery: support?.supported ? "image+path" : "path-only",
+      ...(support?.supported ? {} : { reason: support?.reason || "target cannot receive image input" }),
+    })),
+    ...(plan.files || []).map((file) => ({
+      kind: "file",
+      path: file.path,
+      name: file.name,
+      bytes: file.bytes,
+      delivery: "path",
+    })),
+  ];
+  const degraded = (plan.images || []).length && !support?.supported;
+  return {
+    attachments,
+    ...(degraded
+      ? {
+          warnings: [
+            `${plan.images.length} image attachment${plan.images.length === 1 ? "" : "s"} delivered as path-only because ${support?.reason || "the target cannot receive image input"}. Add key visual details in text or choose a vision-capable model.`,
+          ],
+        }
+      : {}),
+  };
+}
+
 const supportsTools = (driver) => driver !== "opencode" && driver !== "cursor";
 
 function findSession(ref) {
@@ -2164,7 +2532,7 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
         if (diff) extra.diff = diff;
       }
       if (args.verbose || args.cursor !== undefined) {
-        const page = await readSessionFile(target.file, { limit: 20, before: args.cursor }).catch(() => undefined);
+        const page = await readSessionFile(target.file, { limit: 20, before: args.cursor }, target.cwd).catch(() => undefined);
         if (page) {
           const budgeted = budgetMessages(page.messages, READ_BYTE_BUDGET);
           extra.messages = budgeted.messages;
@@ -2193,7 +2561,10 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
       const target = findSession(args.session);
       const scoped = checkScope(caller, target);
       if (scoped) throw new Error(scoped);
-      if (!args.message?.trim()) throw new Error("message is empty");
+      const attachments = await prepareAttachments(args.attachments, caller?.cwd || target.cwd);
+      const hasAttachments = !!(attachments?.images?.length || attachments?.files?.length);
+      if (!args.message?.trim() && !hasAttachments) throw new Error("message is empty");
+      const imageSupport = hasAttachments ? await resolveImageSupport(target) : undefined;
       if (caller) {
         const key = `${caller.id}->${target.id}`;
         const depth = (pairCounts.get(key) ?? 0) + 1;
@@ -2207,19 +2578,27 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
       }
       const sender = caller?.id ?? "user";
       target.upstreamInitiator = sender;
-      const text = envelope(caller ?? { id: "user", title: "you", agentName: "you" }, args.message, caller?.status ?? "idle");
+      const text = envelope(caller ?? { id: "user", title: "you", agentName: "you" }, args.message || "", caller?.status ?? "idle");
+      const receipt = attachmentReceipt(attachments, imageSupport);
       if (args.steer && (target.status === "working" || target.status === "blocked")) {
+        const outgoing = composeMessageWithAttachments(text, attachments, imageSupport);
         const sent = writeLine(
           target,
-          JSON.stringify({ id: `${INTERNAL_PREFIX}p${++internalSeq}`, type: "prompt", message: text, streamingBehavior: "steer" }),
+          JSON.stringify({
+            id: `${INTERNAL_PREFIX}p${++internalSeq}`,
+            type: "prompt",
+            message: outgoing.text,
+            streamingBehavior: "steer",
+            ...(outgoing.images.length ? { images: outgoing.images } : {}),
+          }),
         );
         if (!sent) throw new Error(`${target.title} is not loaded`);
         // The steered turn answers to whoever steered it.
         target.initiator = sender;
-        return { id: target.id, steered: true };
+        return { id: target.id, steered: true, ...receipt };
       }
-      const queued = deliverMessage(target, text, sender);
-      return { id: target.id, queued };
+      const queued = deliverMessage(target, text, sender, attachments, imageSupport);
+      return { id: target.id, queued, ...receipt };
     }
     case "session_start": {
       const agent = config.agents.find((a) => a.id === args.agent) ?? config.agents.find((a) => a.name === args.agent);
@@ -2242,6 +2621,9 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
           : clampMode("full-access", args.runtimeMode);
       const mode = fitAgentModes(rawMode, agent.supportedRuntimeModes);
       const cwd = args.cwd || caller?.cwd || process.cwd();
+      const attachments = await prepareAttachments(args.attachments, caller?.cwd || cwd);
+      const hasAttachments = !!(attachments?.images?.length || attachments?.files?.length);
+      if (!String(args.message || "").trim() && !hasAttachments) throw new Error("message is empty");
       const wantWorktree = args.worktree === true || (args.worktree === undefined && config.worktreeDefault === true);
       const session = createSession({
         title: args.title,
@@ -2257,10 +2639,23 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
         extraArgs: agent.extraArgs ?? config.overrides?.[agent.id]?.extraArgs,
         customAgent: agent.customAgent ?? config.customAgents?.find((c) => c.id === agent.id),
       });
-      if (args.message) setStatus(session, "working");
-      // The id answers at once; spawning, model picks and the first prompt run in the
-      // background — a failed start lands on the session (and its initiator), not here.
-      void (async () => {
+      if (args.message || hasAttachments) setStatus(session, "working");
+      // Attachment-bearing starts wait only until the first prompt is dispatched
+      // (never for the answer): the receipt's image/path-only verdict must be the
+      // negotiated model's real capability, not a guess made before the engine spoke.
+      let deliveryReadyResolve;
+      const deliveryReady = hasAttachments
+        ? new Promise((resolve) => {
+            deliveryReadyResolve = resolve;
+          })
+        : undefined;
+      const finishDelivery = (support) => {
+        if (!deliveryReadyResolve) return;
+        const resolve = deliveryReadyResolve;
+        deliveryReadyResolve = undefined;
+        resolve(attachmentReceipt(attachments, support));
+      };
+      const launchFlow = (async () => {
         if (wantWorktree) {
           try {
             const worktree = await createWorktree(cwd, args.title);
@@ -2269,16 +2664,34 @@ async function callSessionTool(caller, name, args = {}, options = {}) {
             pushSession(session);
           } catch (error) {
             failSession(session, `could not create a worktree: ${error.message}`);
+            finishDelivery({ supported: false, reason: `could not create a worktree: ${error.message}` });
             return;
           }
         }
         const ok = await startProcess(session);
-        if (!ok) return;
-        if (session.status !== "working" && args.message) return;
-        if (!(await applyLaunchChoices(session, args))) return;
-        const text = envelope(caller ?? { id: "user", title: "you", agentName: "you" }, args.message, "idle");
-        writePrompt(session, text, caller?.id ?? "user");
+        if (!ok) {
+          finishDelivery({ supported: false, reason: session.lastError || "the agent process could not start" });
+          return;
+        }
+        if (session.status !== "working" && (args.message || hasAttachments)) {
+          finishDelivery({ supported: false, reason: "the session stopped before the first prompt" });
+          return;
+        }
+        if (!(await applyLaunchChoices(session, args))) {
+          finishDelivery({ supported: false, reason: session.lastError || "could not apply session choices" });
+          return;
+        }
+        const imageSupport = hasAttachments ? await resolveImageSupport(session, args.model) : undefined;
+        const text = envelope(caller ?? { id: "user", title: "you", agentName: "you" }, args.message || "", "idle");
+        const outgoing = composeMessageWithAttachments(text, attachments, imageSupport);
+        const sent = writePrompt(session, outgoing.text, caller?.id ?? "user", outgoing.images);
+        finishDelivery(sent ? imageSupport : { supported: false, reason: "the agent process closed before the first prompt" });
       })();
+      if (hasAttachments) {
+        launchFlow.catch((error) => finishDelivery({ supported: false, reason: error?.message || String(error) }));
+        return { id: session.id, ...(await deliveryReady) };
+      }
+      void launchFlow;
       return { id: session.id };
     }
     case "session_stop": {
@@ -2386,7 +2799,129 @@ async function stopTree(session) {
 
 // ── Session-file reading (for `session_read` on unloaded sessions) ───────────
 
-async function readSessionFile(file, page) {
+const ATTACHMENT_TAG = /<attachment\s+([^>\n]*?)\s*\/>/g;
+const ATTR_PAIR = /([a-zA-Z]+)="([^"\n]*)"/g;
+const unescapeAttachmentAttr = (value) => String(value || "").replace(/&lt;/g, "<").replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+
+function attachmentTagsInText(text) {
+  const out = [];
+  if (typeof text !== "string" || !text.includes("<attachment")) return out;
+  for (const match of text.matchAll(ATTACHMENT_TAG)) {
+    const attrs = {};
+    for (const pair of match[1].matchAll(ATTR_PAIR)) attrs[pair[1]] = unescapeAttachmentAttr(pair[2]);
+    if (!attrs.path) continue;
+    out.push({
+      path: attrs.path,
+      kind: attrs.kind,
+      mimeType: attrs.mime,
+      bytes: attrs.size !== undefined && Number.isFinite(Number(attrs.size)) ? Number(attrs.size) : undefined,
+    });
+  }
+  return out;
+}
+
+async function localAttachmentEntry(raw, fallbackKind, baseCwd) {
+  const rawFile = typeof raw?.path === "string" ? raw.path : typeof raw === "string" ? raw : undefined;
+  const file = rawFile && !/^https?:\/\//i.test(rawFile) && !path.isAbsolute(rawFile) ? path.resolve(baseCwd || process.cwd(), rawFile) : rawFile;
+  if (!file || /^https?:\/\//i.test(file)) return undefined;
+  let st;
+  try {
+    st = await fsp.stat(file);
+  } catch {}
+  const kind = raw?.kind || fallbackKind || classifyPresentedKind(file);
+  const ext = path.extname(file).slice(1).toLowerCase();
+  let sha256;
+  if (st?.isFile() && kind === "image") {
+    try {
+      sha256 = crypto.createHash("sha256").update(await fsp.readFile(file)).digest("hex");
+    } catch {}
+  }
+  return {
+    kind: kind === "image" ? "image" : "file",
+    path: file,
+    ...(raw?.mimeType || MEDIA_MIME_BY_EXT[ext] ? { mimeType: raw?.mimeType || MEDIA_MIME_BY_EXT[ext] } : {}),
+    name: raw?.name || raw?.title || path.basename(file),
+    bytes: st?.isFile() ? st.size : raw?.bytes ?? raw?.size,
+    ...(sha256 ? { sha256 } : {}),
+    ...(st?.isFile() ? {} : { exists: false }),
+  };
+}
+
+async function inlineImageAttachment(block) {
+  const data = block?.data ?? block?.source?.data;
+  const mimeType = block?.mimeType || block?.mime_type || block?.source?.media_type || "image/png";
+  if (typeof data !== "string" || !data.trim()) return undefined;
+  try {
+    const cache = await materializeMediaCache(data, mimeType);
+    let dims;
+    try {
+      dims = sniffImageDimensions(await fsp.readFile(cache.path));
+    } catch {}
+    return {
+      kind: "image",
+      path: cache.path,
+      mimeType: mimeType.startsWith("image/") ? mimeType : "image/png",
+      name: path.basename(cache.path),
+      bytes: cache.bytes,
+      sha256: cache.sha256,
+      ...(dims?.width ? { width: dims.width, height: dims.height } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function pushUniqueAttachment(out, item) {
+  if (!item?.path) return;
+  if (out.some((existing) => existing.path === item.path && existing.kind === item.kind)) return;
+  if (item.kind === "image" && item.sha256 && out.some((existing) => existing.kind === "image" && existing.sha256 === item.sha256)) return;
+  out.push(item);
+}
+
+/** Extracts readable local media/files from one persisted protocol message. */
+async function messageAttachments(message, baseCwd) {
+  const out = [];
+  const content = message?.content;
+  const blocks = Array.isArray(content) ? content : typeof content === "string" ? [{ type: "text", text: content }] : [];
+  for (const block of blocks) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text") {
+      for (const tagged of attachmentTagsInText(block.text)) {
+        pushUniqueAttachment(out, await localAttachmentEntry({ ...tagged, name: path.basename(tagged.path) }, tagged.kind, baseCwd));
+      }
+      continue;
+    }
+    if (block.type === "image") {
+      const rawReference = typeof block.path === "string" ? block.path : typeof block.uri === "string" ? block.uri : undefined;
+      const referenced = rawReference && (/^file:\/\//i.test(rawReference) || path.isAbsolute(rawReference)) ? normalizeInputPath(rawReference, "/") : undefined;
+      if (referenced) pushUniqueAttachment(out, await localAttachmentEntry({ ...block, path: referenced }, "image", baseCwd));
+      else pushUniqueAttachment(out, await inlineImageAttachment(block));
+      continue;
+    }
+    if (block.type === "resource" || block.type === "resource_link") {
+      const uri = block.uri || block.resource?.uri;
+      if (typeof uri === "string" && (/^file:\/\//i.test(uri) || path.isAbsolute(uri))) {
+        pushUniqueAttachment(out, await localAttachmentEntry({ path: normalizeInputPath(uri, "/"), mimeType: block.mimeType || block.resource?.mimeType, name: block.name }, "file", baseCwd));
+      }
+      continue;
+    }
+    if (block.type === "presented_media" && Array.isArray(block.items)) {
+      for (const item of block.items) {
+        pushUniqueAttachment(out, await localAttachmentEntry({ ...item, bytes: item.size, name: item.title }, item.kind, baseCwd));
+      }
+    }
+  }
+  return out;
+}
+
+function userMessageText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const parts = content.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text);
+  return parts.length ? parts.join("\n") : undefined;
+}
+
+async function readSessionFile(file, page, baseCwd) {
   const raw = await fsp.readFile(file ?? "", "utf8").catch(() => "");
   const lines = raw.split("\n").filter(Boolean);
   let answer;
@@ -2407,7 +2942,7 @@ async function readSessionFile(file, page) {
     if (entry.message?.role === "user") previousUser = entry.message;
     const message = editSnapshot([previousUser, entry.message], edits)[1];
     if (message?.role === "user" && !firstUser) {
-      const text = typeof message.content === "string" ? message.content : message.content?.find?.((b) => b?.type === "text")?.text;
+      const text = userMessageText(message.content);
       const cleaned = typeof text === "string" ? titleWords(text) : text;
       if (typeof cleaned === "string" && cleaned.trim()) firstUser = cleaned;
     }
@@ -2416,14 +2951,20 @@ async function readSessionFile(file, page) {
         .filter((b) => b?.type === "text" && typeof b.text === "string")
         .map((b) => b.text)
         .join("\n");
-      if (text.trim()) {
-        answer = text;
-        messages.push({ role: "assistant", text: clip(text, 4000) });
+      const attachments = page ? await messageAttachments(message, baseCwd) : [];
+      if (text.trim() || attachments.length) {
+        if (text.trim()) answer = text;
+        messages.push({ role: "assistant", text: clip(text, 4000), ...(attachments.length ? { attachments } : {}) });
       }
     } else if (page && message?.role === "user") {
-      const text = typeof message.content === "string" ? message.content : message.content?.find?.((b) => b?.type === "text")?.text;
-      if (typeof text === "string" && text.trim() && !text.startsWith("<pipi-message")) {
-        messages.push({ role: "user", text: clip(text, 1000) });
+      const text = userMessageText(message.content);
+      const attachments = await messageAttachments(message, baseCwd);
+      if ((typeof text === "string" && text.trim() && !text.startsWith("<pipi-message")) || attachments.length) {
+        messages.push({
+          role: "user",
+          text: clip(typeof text === "string" ? text : "", 1000),
+          ...(attachments.length ? { attachments } : {}),
+        });
       }
     }
   }
@@ -2868,7 +3409,7 @@ async function controlOp(conn, msg) {
       }
       const info = sessionInfo(session);
       if (!session.loaded && session.file) {
-        const last = await readSessionFile(session.file).catch(() => undefined);
+        const last = await readSessionFile(session.file, undefined, session.cwd).catch(() => undefined);
         const answer = truncateUtf8(session.lastAnswer || last?.answer || "", READ_BYTE_BUDGET);
         respond(conn, id, "read", { session: { ...info, lastAnswer: answer.text, summary: last?.summary } });
       } else {
@@ -3350,7 +3891,12 @@ async function loadRegistry() {
       // The latest queue record is the session's pending deliveries.
       const session = sessions.get(record.to);
       if (session && Array.isArray(record.items)) {
-        session.deliverQueue = record.items.map((item) => ({ text: String(item.text ?? ""), initiator: item.initiator }));
+        session.deliverQueue = record.items.map((item) => ({
+          text: String(item.text ?? ""),
+          initiator: item.initiator,
+          ...(item.attachments && typeof item.attachments === "object" ? { attachments: item.attachments } : {}),
+          ...(item.imageSupport && typeof item.imageSupport === "object" ? { imageSupport: item.imageSupport } : {}),
+        }));
       }
     }
   }

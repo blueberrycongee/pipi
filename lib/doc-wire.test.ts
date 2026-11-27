@@ -1,5 +1,5 @@
 import { expect, test } from "nsh/test";
-import { composeDocMessage, plainMarkdown, splitDocMessage, titleWords } from "./doc-wire";
+import { composeDocMessage, composeReplyMessage, plainMarkdown, splitDocMessage, splitReplyMessage, stripReplyMessage, titleWords } from "./doc-wire";
 
 // A document riding on a message: what goes to the agent, and what the bubble reads back.
 //
@@ -128,6 +128,37 @@ test("titles strip handoff and editor protocol prefixes inside an envelope", () 
 
 test("a clipped pipi-message envelope still loses its protocol head", () => {
   expect(titleWords('<pipi-message from="s_pip" title="Pip" agent="Pi" status="idle">\nReadable words survived…')).toBe("Readable words survived…");
+});
+
+test("a quote reply round-trips escaped metadata and never becomes the visible words", () => {
+  const wire = composeReplyMessage(
+    { target: "a:2#b1", author: 'Pip "ghost" & friends', excerpt: "A <sharp> answer\nwith lines", images: 2, side: "left" },
+    "I mean the second paragraph",
+  );
+  expect(wire.startsWith('<pipi-reply target="a:2#b1" author="Pip &quot;ghost&quot; &amp; friends" images="2" side="left">')).toBe(true);
+  expect(wire).toContain("A &lt;sharp&gt; answer with lines");
+  expect(splitReplyMessage(wire)).toEqual({
+    said: "I mean the second paragraph",
+    reply: { target: "a:2#b1", author: 'Pip "ghost" & friends', excerpt: "A <sharp> answer with lines", images: 2, side: "left" },
+  });
+  expect(stripReplyMessage(wire)).toBe("I mean the second paragraph");
+  expect(titleWords(wire)).toBe("I mean the second paragraph");
+  expect(titleWords(`<pipi-persona name="Pip">persona</pipi-persona>\n\n${wire}`)).toBe("I mean the second paragraph");
+});
+
+test("a quote excerpt is capped to one compact line", () => {
+  const long = `  first\n${"x".repeat(300)}  `;
+  const wire = composeReplyMessage({ target: "u:1", author: "You", excerpt: long }, "ok");
+  const reply = splitReplyMessage(wire).reply;
+  expect(reply?.excerpt.length).toBe(240);
+  expect(reply?.excerpt.endsWith("…")).toBe(true);
+  expect(reply?.excerpt.includes("\n")).toBe(false);
+});
+
+test("text merely mentioning pipi-reply later in the message is left intact", () => {
+  const plain = 'Please explain what <pipi-reply target="u:1"> means';
+  expect(splitReplyMessage(plain)).toEqual({ said: plain });
+  expect(titleWords(plain)).toBe(plain);
 });
 
 test("ordinary title words are unchanged", () => {
