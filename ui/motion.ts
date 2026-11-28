@@ -43,6 +43,10 @@ export const EASING = {
   signature: [0.16, 1, 0.3, 1] as [number, number, number, number],
   /** Crisp entrance: confident start with quick settle. */
   entrance: [0.2, 0.92, 0.36, 1] as [number, number, number, number],
+  /** Weighted settle: half the peak velocity of `signature`, motion spread across
+      the whole duration — for objects carrying meaning (a sent message) that
+      lift off and glide into their seat rather than darting into place. */
+  settle: [0.25, 0.7, 0.35, 1] as [number, number, number, number],
   /** Graceful exit: smooth acceleration into fade. */
   exit: [0.4, 0, 0.6, 1] as [number, number, number, number],
   /** Expressive transform: playful overshoot for major transitions. */
@@ -231,20 +235,36 @@ const SMS_OUTGOING_SPEC: LeanSpec<"opacity" | "translateX" | "translateY" | "sca
       { offset: 1, value: 1 },
     ],
     translateX: [
-      { offset: 0, value: 10 },
+      { offset: 0, value: 6 },
       { offset: 1, value: 0 },
     ],
     translateY: [
-      { offset: 0, value: 18 },
+      { offset: 0, value: 12 },
       { offset: 1, value: 0 },
     ],
     scale: [
-      { offset: 0, value: 0.94 },
+      { offset: 0, value: 0.965 },
       { offset: 1, value: 1 },
     ],
   },
-  duration: 240,
-  easing: EASING.signature,
+  duration: 340,
+  easing: EASING.settle,
+};
+
+/** A queued outgoing bubble pops in already wearing its queue dim, so the
+ * entrance moves it through transform only: the row keeps its own opacity
+ * channel for the dim, and two opacity animations multiplied would read as
+ * two entrances (the second landing when the queue lets go). */
+const SMS_OUTGOING_MUTED_SPEC: LeanSpec<"opacity" | "translateX" | "translateY" | "scale"> = {
+  tracks: {
+    ...SMS_OUTGOING_SPEC.tracks,
+    opacity: [
+      { offset: 0, value: 1 },
+      { offset: 1, value: 1 },
+    ],
+  },
+  duration: SMS_OUTGOING_SPEC.duration,
+  easing: SMS_OUTGOING_SPEC.easing,
 };
 
 /** iMessage-style incoming SMS bubble pop-in blooming from the bottom-left corner. */
@@ -345,7 +365,7 @@ export function useRowEntrance(id: () => string, streaming?: () => boolean, skip
 export function useSmsBubbleEntrance(
   id: () => string,
   side: () => "left" | "right",
-  options?: { enabled?: () => boolean; skip?: () => boolean; stagger?: () => number },
+  options?: { enabled?: () => boolean; skip?: () => boolean; stagger?: () => number; muted?: () => boolean },
 ): ViewStyle {
   const item = leanMotion(["opacity", "translateX", "translateY", "scale"] as const);
   let lastId = "";
@@ -367,7 +387,7 @@ export function useSmsBubbleEntrance(
       }
       seenRowIds.add(currentId);
       const isLeft = side() === "left";
-      const spec = isLeft ? SMS_INCOMING_SPEC : SMS_OUTGOING_SPEC;
+      const spec = isLeft ? SMS_INCOMING_SPEC : options?.muted?.() ? SMS_OUTGOING_MUTED_SPEC : SMS_OUTGOING_SPEC;
       const delay = isLeft ? Math.min(Math.max(0, options?.stagger?.() ?? 0), 4) * 85 : 0;
       if (reduceMotion()) {
         item.reset();

@@ -1024,7 +1024,7 @@ function SplitChatView(props: { chat: SplitChatController }) {
       if (promptTop < frame.pagePosition.y + 4) {
         const promptId = untracked(activePromptId);
         const promptIndex = promptId ? untracked(listRows).findIndex((row) => row.id === promptId) : -1;
-        if (promptIndex >= 0) targetList.scrollToIndex({ index: promptIndex, viewPosition: 0, viewOffset: HORIZON_GAP, animated: false });
+        if (promptIndex >= 0) targetList.scrollToIndex({ index: promptIndex, viewPosition: 0, viewOffset: HORIZON_GAP, animated: !untracked(reduceMotion) });
       }
       measureEnd();
     });
@@ -1140,6 +1140,37 @@ function SplitChatView(props: { chat: SplitChatController }) {
     });
   };
 
+  /**
+   * The send's return to the end as one motion, like the primary chat's: the
+   * measure waits out this turn's layout — the just-staged bubble included —
+   * then an animated scroll covers the remaining gap, so the list's return
+   * and the bubble's rise read as a single move rather than a teleport plus
+   * an entrance.
+   */
+  const scheduleEndGlide = () => {
+    const epoch = ++endSettleEpoch;
+    const targetList = list;
+    if (!targetList) return;
+    void Promise.all([targetList.measure(), ending?.measure()]).then(([frame, end]) => {
+      if (epoch !== endSettleEpoch) return;
+      if (!untracked(bottomFollowing) || isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
+      if (!frame || list !== targetList) return;
+      const pad = untracked(foot).end;
+      if (end && frame.bounds.size.height > 0) {
+        const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
+        if (Math.abs(gap) <= 1 || (gap < 0 && (lastY === undefined || lastY <= 0.5))) {
+          distanceFromEnd.set(0);
+          return;
+        }
+        if (lastY !== undefined) {
+          targetList.scrollTo({ y: Math.max(0, lastY + gap), animated: true });
+          return;
+        }
+      }
+      targetList.scrollToEnd({ animated: true });
+    });
+  };
+
   const follow = (animated: boolean) => {
     inputAt = 0;
     lastUpwardInputAt = 0;
@@ -1166,7 +1197,8 @@ function SplitChatView(props: { chat: SplitChatController }) {
       lastUpwardInputAt = 0;
       isDragging = false;
       scrollMode.set(hasHistoryAbove ? "horizon" : "tail");
-      scheduleEndSettle(2);
+      if (reduceMotion()) scheduleEndSettle(2);
+      else scheduleEndGlide();
     });
   });
 

@@ -446,6 +446,7 @@ composer's glass, not underlined words: words do not stand on a picture.
 | Disclosure & flow row in / out | ~265ms spring + 150–240ms fade/glide | `Reveal` (`Collapsible reveal`, scoped) |
 | Inline indicator in / out | 150–180ms | `Presence` (opacity + 78% scale) |
 | Toast entrance | 220ms | fade up |
+| Sent message bubble in | 340ms | `settle` — lifts 12px, 96.5% scale, glides into its seat |
 | Session change: the chat left / landing | 120ms out / 200ms in | opacity only, the pane as one |
 | Wallpaper veil: composer in the middle ↔ docked ↔ conversation | 200ms | opacity only, under the pane |
 | Composer: the middle of the pane ↔ its dock | ~480ms | a spring with no bounce (`DOCK_SPRING`), played as keyframes; the stage it leaves fades where it stood in 140ms |
@@ -456,6 +457,13 @@ composer's glass, not underlined words: words do not stand on a picture.
 
 Motion explains a change; nothing loops except Pip, a spinner, the shared
 breath of the live labels, the input caret, and the update track's drift.
+Tempo follows what moves. A control answering input — a hover, a press, a
+popup — is agile on purpose: speed there is respect, and the crisp easings
+(`signature`, `entrance`) front-load the journey so the answer feels instant.
+An object carrying meaning — a sent message, a card, a document — never
+darts: it lifts off and settles on `settle`, whose peak velocity is half of
+`signature`'s, spread across the whole duration. A bubble that jumps into
+place reads as a control; a message should read as something that arrived.
 The breath is one clock (`ui/motion.ts`): every label still working binds the
 same value, so a header and the step under it inhale together, the cue hands
 from row to row mid-breath, and the last one settling eases the words home —

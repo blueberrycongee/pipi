@@ -295,7 +295,17 @@ export function classifyTool(rawName: string): { category: ToolCategory; subkind
     return { category: "present", icon: "image" };
   }
   const bareAsk = lower.replace(/^(?:running|run|use|call)_/, "").replace(/\?+$/, "");
-  if (bareAsk === "ask_question" || bareAsk === "ask_user" || bareAsk === "ask_user_question" || bareAsk === "askuserquestion") {
+  if (
+    bareAsk === "ask_question" ||
+    bareAsk === "ask_user" ||
+    bareAsk === "ask_user_question" ||
+    bareAsk === "askuserquestion" ||
+    // Devin titles the call in past-tense English with the question inside
+    // ("Asked user Which color?"): rows persisted before the real tool name
+    // rode the wire still classify by that prefix.
+    lower.startsWith("asked_user") ||
+    lower.startsWith("asking_user")
+  ) {
     return { category: "ask", icon: "message" };
   }
   return { category: "other", icon: "wrench" };
@@ -608,7 +618,10 @@ export function describeToolCall(row: ToolRow, lang: Lang): ToolPresentation {
     case "ask": {
       const questions = Array.isArray(args.questions) ? args.questions : [];
       const firstQ = questions[0] && typeof questions[0] === "object" ? pickStr(questions[0] as Record<string, unknown>, "question", "title", "prompt") : "";
-      const target = firstQ || pickStr(args, "question", "prompt", "message", "title");
+      // A title-named row ("Asked user Which color?") carries the question in
+      // its name when the arguments do not.
+      const titled = /^(?:asked|asking)\s+user\s+/i.exec(row.name.trim());
+      const target = firstQ || pickStr(args, "question", "prompt", "message", "title") || (titled ? row.name.trim().slice(titled[0].length).trim() : "");
       const verb = active ? (zh ? "正在提问" : "Asking") : failed ? (zh ? "提问已跳过" : "Skipped question") : zh ? "已提问" : "Asked";
       return {
         category,

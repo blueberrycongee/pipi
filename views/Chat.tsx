@@ -1051,7 +1051,11 @@ export function Chat() {
           const promptId = untracked(activePromptId);
           const promptIdx = promptId ? untracked(displayRows).findIndex((r) => r.id === promptId) : -1;
           if (promptIdx >= 0) {
-            targetList.scrollToIndex({ index: promptIdx, viewPosition: 0, viewOffset: horizonInset(), animated: false });
+            // The ride overshot the line — a mount pushed the prompt past the
+            // horizon before this measure landed. Glide it back onto the line:
+            // an un-animated correction here is a hard jump in the middle of
+            // the bubble's own rise.
+            targetList.scrollToIndex({ index: promptIdx, viewPosition: 0, viewOffset: horizonInset(), animated: !untracked(reduceMotion) });
           }
         }
         measureEnd();
@@ -1325,6 +1329,40 @@ export function Chat() {
     });
   };
 
+  /**
+   * The send's return to the end as one motion: where `scheduleEndSettle`
+   * snaps, a send glides. The measure still waits out this turn's layout — the
+   * just-staged bubble included — then an animated scroll covers the exact
+   * remaining gap, so the list's return and the bubble's rise read as a single
+   * continuous move rather than a teleport plus an entrance. No settle passes:
+   * an animated correction must not be snapped short by its own scroll events,
+   * and the bottom pin picks up whatever streamed in past the glide's target.
+   */
+  const scheduleEndGlide = () => {
+    const epoch = ++endSettleEpoch;
+    const expectedKey = untracked(conversationKey);
+    const targetList = list;
+    if (!targetList || listKey !== expectedKey || !listReady) return;
+    void Promise.all([targetList.measure(), ending?.measure()]).then(([frame, end]) => {
+      if (epoch !== endSettleEpoch) return;
+      if (!untracked(bottomFollowing) || isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
+      if (!frame || list !== targetList || listKey !== expectedKey || !listReady) return;
+      const pad = untracked(foot).end;
+      if (end && frame.bounds.size.height > 0) {
+        const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
+        if (Math.abs(gap) <= 1 || (gap < 0 && (lastY === undefined || lastY <= 0.5))) {
+          distanceFromEnd.set(0);
+          return;
+        }
+        if (lastY !== undefined) {
+          targetList.scrollTo({ y: Math.max(0, lastY + gap), animated: true });
+          return;
+        }
+      }
+      targetList.scrollToEnd({ animated: true });
+    });
+  };
+
   const follow = (animated: boolean) => {
     inputAt = 0;
     lastUpwardInputAt = 0;
@@ -1361,7 +1399,10 @@ export function Chat() {
       isDragging = false;
       scrollMode.set(hasHistoryAbove ? "horizon" : "tail");
       if (list && listKey === conversationKey() && listReady && untracked(distanceFromEnd) > FOLLOW_THRESHOLD) {
-        scheduleEndSettle(2);
+        // The reader was off the end when they sent: come back to it as one
+        // motion, never a position snapshot under the bubble's own entrance.
+        if (untracked(reduceMotion)) scheduleEndSettle(2);
+        else scheduleEndGlide();
       }
     });
   });
@@ -1382,7 +1423,8 @@ export function Chat() {
       // `initialScrollAtEnd` (before its first frame, following while rows measure); calling
       // `scrollTo` during that synchronous swap would hit the outgoing list or cancel the pass.
       if (list && listKey === conversationKey() && listReady) {
-        scheduleEndSettle(3);
+        if (untracked(reduceMotion)) scheduleEndSettle(3);
+        else scheduleEndGlide();
       }
     });
   });

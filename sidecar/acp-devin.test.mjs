@@ -29,6 +29,7 @@ function startBridge(t, extraEnv = {}) {
   const child = spawn(process.execPath, [BRIDGE, JSON.stringify(config)], { cwd: home, env, stdio: ["pipe", "pipe", "ignore"] });
   t.after(() => child.kill());
   const waits = new Map();
+  const records = [];
   let seq = 0;
   let buffer = "";
   child.stdout.on("data", (chunk) => {
@@ -41,6 +42,8 @@ function startBridge(t, extraEnv = {}) {
       if (record.type === "response" && waits.has(record.id)) {
         waits.get(record.id)(record);
         waits.delete(record.id);
+      } else {
+        records.push(record);
       }
     }
   });
@@ -58,7 +61,8 @@ function startBridge(t, extraEnv = {}) {
     assert.equal(res.success, true, res.error);
     return res.data;
   };
-  return { ok, send };
+  const write = (record) => child.stdin.write(`${JSON.stringify(record)}\n`);
+  return { ok, send, write, records };
 }
 
 test("Devin's model catalog is shown as model families, with image reach and fusion grouping honest", async (t) => {
@@ -139,4 +143,47 @@ test("set_model negotiates before the first catalog read, resolves Devin's max a
   assert.match(failure.error, /Model not found/);
   state = await bridge.ok({ type: "get_state" });
   assert.equal(state.model.id, "swe-2-1-medium");
+});
+
+test("Devin's past-tense titles yield to the real tool names riding in _meta", async (t) => {
+  const bridge = startBridge(t);
+  const waitFor = (pred, ms = 8000, label = "condition") =>
+    new Promise((resolve, reject) => {
+      const at = Date.now();
+      const poll = () => {
+        if (pred()) return resolve();
+        if (Date.now() - at > ms) return reject(new Error(`waited ${ms}ms for ${label}`));
+        setTimeout(poll, 20);
+      };
+      poll();
+    });
+
+  await bridge.send({ type: "prompt", message: "please run a command for me" });
+  await waitFor(
+    () => bridge.records.some((r) => r.type === "agent_settled"),
+    8000,
+    "exec turn settle",
+  );
+  const execStart = bridge.records.find((r) => r.type === "tool_execution_start");
+  assert.equal(execStart?.toolName, "exec", "the row is the tool, not the English title");
+  assert.notEqual(execStart?.toolName, "Ran echo");
+
+  await bridge.send({ type: "prompt", message: "please ask a question" });
+  await waitFor(
+    () => bridge.records.some((r) => r.type === "tool_execution_start" && r.toolName?.includes("ask")),
+    8000,
+    "ask tool start",
+  );
+  const askStart = bridge.records.find((r) => r.type === "tool_execution_start" && r.toolName?.includes("ask"));
+  assert.equal(askStart?.toolName, "ask_user_question");
+  assert.ok(Array.isArray(askStart?.args?.questions), "the questions ride in the row's arguments");
+
+  const dialog = bridge.records.find((r) => r.type === "extension_ui_request" && r.method === "form");
+  assert.ok(dialog, "the elicitation still surfaces as a form dialog");
+  bridge.write({ type: "extension_ui_response", id: dialog.id, answers: { q0: "Red" } });
+  await waitFor(
+    () => bridge.records.filter((r) => r.type === "agent_settled").length >= 2,
+    8000,
+    "ask turn settle",
+  );
 });

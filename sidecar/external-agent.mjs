@@ -2912,6 +2912,21 @@ function acpToolArgs(u) {
   return rawArgs;
 }
 
+/**
+ * The tool the model actually invoked, when the harness says so apart from the
+ * display title. Devin titles every call in past-tense English ("Ran echo",
+ * "Asked user Which color?") and carries the real name in a namespaced `_meta`
+ * key — without it the transcript can neither classify the call nor read its
+ * target, and a row reads "Running Asked user …". Generic wrappers that name
+ * no tool of their own (`mcp_call_tool`) are no better than the title.
+ */
+function acpInferenceToolName(u) {
+  const value = u?._meta?.["cognition.ai/inferenceToolName"];
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const name = value.trim();
+  return name === "mcp_call_tool" ? undefined : name;
+}
+
 /** The pipi session tools, attached to every session this bridge opens or loads. */
 function acpMcpServers() {
   return !isSubagent && orchestratorUrl && orchestratorToken && fs.existsSync(mcpStdioScript)
@@ -3523,7 +3538,7 @@ function handleAcpUpdate(u, params = undefined) {
       rawInput: u.rawInput,
     });
     if (!replaying) {
-      const toolLabel = canonicalPipiToolName(u.name) || canonicalPipiToolName(u.title) || u.title || u.kind || "tool";
+      const toolLabel = canonicalPipiToolName(u.name) || canonicalPipiToolName(u.title) || acpInferenceToolName(u) || u.title || u.kind || "tool";
       acpStream?.toolStart(id, toolLabel, acpToolArgs(u), {
         kind: u.kind,
         title: u.title,

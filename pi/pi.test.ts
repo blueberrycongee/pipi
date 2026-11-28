@@ -423,6 +423,34 @@ test("groups interleaved reasoning and tool calls between commentary boundaries 
   expect(classifyTool("Edit-file").category).toBe("edit");
 });
 
+test("Devin's past-tense ask titles classify as questions and yield the question inside", () => {
+  expect(classifyTool("ask_user_question").category).toBe("ask");
+  expect(classifyTool("Asked user Which color do you prefer?").category).toBe("ask");
+  expect(classifyTool("Asking user 要删除哪些旧的 pipi 内容？（可多选）").category).toBe("ask");
+
+  const titled = describeToolCall(
+    { kind: "tool", id: "ask1", name: "Asked user 要删除哪些旧的 pipi 内容？（可多选）", status: "done", args: {}, output: "", images: 0 },
+    "zh",
+  );
+  expect(titled.verb).toBe("已提问");
+  expect(titled.target).toBe("要删除哪些旧的 pipi 内容？（可多选）");
+
+  const argued = describeToolCall(
+    {
+      kind: "tool",
+      id: "ask2",
+      name: "ask_user_question",
+      status: "running",
+      args: { questions: [{ question: "Which color do you prefer?", header: "Color", options: [{ label: "Red" }] }] },
+      output: "",
+      images: 0,
+    },
+    "zh",
+  );
+  expect(argued.verb).toBe("正在提问");
+  expect(argued.target).toBe("Which color do you prefer?");
+});
+
 /** A message that works on: prose, then a call (its result follows). */
 const working = (id: string, text: string, at = 2) =>
   ({ role: "assistant", content: [{ type: "text", text }, { type: "toolCall", id, name: "read", arguments: {} }], stopReason: "toolUse", timestamp: at }) as never;

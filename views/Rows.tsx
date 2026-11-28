@@ -59,7 +59,7 @@ import { openDocIfThere } from "../store/tabs";
 import { openPipMessageMenu } from "../store/pip-interactions";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
-import { EASING, isRowSeen, keepLast, Presence, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
+import { DURATION, EASING, isRowSeen, keepLast, Presence, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
@@ -655,7 +655,9 @@ function UserRow(props: { row: DisplayUserRow }) {
       if (reduced) {
         bubbleOpacity.set(isQueued ? 0.6 : 1);
       } else {
-        void bubbleOpacity.timing(isQueued ? 0.6 : 1, { duration: 180, easing: EASING.entrance });
+        // Delivery is a state flip, not an entrance: a quick symmetric fade
+        // reads as "sent", a long entrance-eased one as a second pop-in.
+        void bubbleOpacity.timing(isQueued ? 0.6 : 1, { duration: DURATION.instant, easing: EASING.inOut });
       }
     });
   });
@@ -664,7 +666,7 @@ function UserRow(props: { row: DisplayUserRow }) {
   const smsEntrance = useSmsBubbleEntrance(
     () => props.row.id,
     () => "right",
-    { enabled: isSms },
+    { enabled: isSms, muted: queued },
   );
 
   const hostNode = signal<ViewRef | undefined>(undefined);
@@ -723,7 +725,7 @@ function UserRow(props: { row: DisplayUserRow }) {
     if (!node) return;
     void node.measure().then((m) => {
       if (!m) return;
-      openPersonaMenu(m.pagePosition.x + m.bounds.size.width - 12, m.pagePosition.y + 6);
+      openPersonaMenu(m.pagePosition.x - 4 - 248, m.pagePosition.y + m.bounds.size.height / 2 - 12);
     }).catch(() => undefined);
   };
 
@@ -760,7 +762,7 @@ function UserRow(props: { row: DisplayUserRow }) {
               <View ref={(node: ViewRef | undefined) => mediaNode.set(node)} class="relative max-w-full" onContextMenu={contextMenu}>
                 {isPersonaSession() && isSms() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="right" /> : null}
                 {isPersonaSession() && isSms() ? (
-                  <View class={`absolute -top-3 right-2 z-30 ${HOVER_REVEAL}`}>
+                  <View class={`absolute -left-8 top-1/2 -translate-y-1/2 z-30 ${HOVER_REVEAL}`}>
                     <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
                   </View>
                 ) : null}
@@ -794,7 +796,7 @@ function UserRow(props: { row: DisplayUserRow }) {
               >
                 {isPersonaSession() && isSms() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="right" /> : null}
                 {isPersonaSession() && isSms() ? (
-                  <View class={`absolute -top-3 right-2 z-30 ${HOVER_REVEAL}`}>
+                  <View class={`absolute -left-8 top-1/2 -translate-y-1/2 z-30 ${HOVER_REVEAL}`}>
                     <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
                   </View>
                 ) : null}
@@ -924,38 +926,42 @@ function UserRow(props: { row: DisplayUserRow }) {
           </View>
         }
       >
-        <If when={queued()}>
+        {/* The queued label and the receipt share one seat, so a message the
+         * queue lets go of trades marks without moving the bubble above. */}
+        <If when={queued() || Boolean(sms()?.receipt)}>
           <View class="h-6 select-none flex-row items-center gap-1.5 pt-0.5">
-            <View
-              class="flex-row items-center gap-1 pr-1"
-              accessibilityLabel={followsUp() ? tr("Follow-up", "追问") : tr("Steering", "引导")}
-              tooltip={tip(followsUp() ? tr("Follow-up: sent when the run is done", "追问：本轮结束后发送") : tr("Steering: sent at the run's next step", "引导：在本轮的下一步发送"))}
-            >
-              <Icon name={followsUp() ? "queue" : "steer"} size={12} tone="subtle" />
-              <Text class={`${uiType("2xs")} text-subtle`}>{tr("Queued", "排队中")}</Text>
-            </View>
-            <IconButton
-              icon="pencil"
-              tone="subtle"
-              size="sm"
-              tipPlacement="bottom"
-              label={tr("Edit queued message", "编辑排队消息")}
-              onPress={() => recallQueuedRow(props.row, true)}
-            />
-            <IconButton
-              icon="x"
-              tone="subtle"
-              size="sm"
-              tipPlacement="bottom"
-              label={tr("Remove from queue", "从队列中移除")}
-              onPress={() => recallQueuedRow(props.row, false)}
-            />
+            <If when={queued()}>
+              <View
+                class="flex-row items-center gap-1 pr-1"
+                accessibilityLabel={followsUp() ? tr("Follow-up", "追问") : tr("Steering", "引导")}
+                tooltip={tip(followsUp() ? tr("Follow-up: sent when the run is done", "追问：本轮结束后发送") : tr("Steering: sent at the run's next step", "引导：在本轮的下一步发送"))}
+              >
+                <Icon name={followsUp() ? "queue" : "steer"} size={12} tone="subtle" />
+                <Text class={`${uiType("2xs")} text-subtle`}>{tr("Queued", "排队中")}</Text>
+              </View>
+              <IconButton
+                icon="pencil"
+                tone="subtle"
+                size="sm"
+                tipPlacement="bottom"
+                label={tr("Edit queued message", "编辑排队消息")}
+                onPress={() => recallQueuedRow(props.row, true)}
+              />
+              <IconButton
+                icon="x"
+                tone="subtle"
+                size="sm"
+                tipPlacement="bottom"
+                label={tr("Remove from queue", "从队列中移除")}
+                onPress={() => recallQueuedRow(props.row, false)}
+              />
+            </If>
+            <If when={!queued() && sms()?.receipt}>
+              <Text testID="sms-receipt" class={`pr-1 ${uiType("2xs")} font-medium text-subtle`}>
+                {sms()?.receipt === "read" ? tr("Read", "已读") : tr("Delivered", "已送达")}
+              </Text>
+            </If>
           </View>
-        </If>
-        <If when={!queued() && sms()?.receipt}>
-          <Text testID="sms-receipt" class={`select-none pr-1 pt-0.5 ${uiType("2xs")} font-medium text-subtle`}>
-            {sms()?.receipt === "read" ? tr("Read", "已读") : tr("Delivered", "已送达")}
-          </Text>
         </If>
       </If>
     </View>

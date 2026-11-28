@@ -23,6 +23,8 @@ const MODELS = [
 ];
 const byValue = new Map(MODELS.map((m) => [m.value, m]));
 const sessions = new Map();
+/** The fake's own outbound requests (elicitation/create): id → resume callback. */
+const outbound = new Map();
 let seq = 0;
 
 function configOptions(s) {
@@ -56,6 +58,15 @@ process.stdin.on("data", (chunk) => {
     if (!line.trim()) continue;
     const msg = JSON.parse(line);
     if (msg.id === undefined) continue;
+    if (msg.method === undefined) {
+      // A client's answer to the fake's own outbound request: resume the prompt.
+      const resume = outbound.get(msg.id);
+      if (resume) {
+        outbound.delete(msg.id);
+        resume(msg.result);
+      }
+      continue;
+    }
     const p = msg.params || {};
     log({ method: msg.method, params: p });
     if (msg.method === "initialize") {
@@ -92,8 +103,52 @@ process.stdin.on("data", (chunk) => {
       } else replyErr(msg.id, -32602, "unknown config");
     } else if (msg.method === "session/prompt") {
       const s = sessions.get(p.sessionId);
-      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: p.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify({ ...s, prompt: p.prompt }) } } } });
-      reply(msg.id, { stopReason: "end_turn" });
+      const text = (Array.isArray(p.prompt) ? p.prompt : []).map((c) => (typeof c === "string" ? c : c?.text || "")).join("\n");
+      const update = (u) => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: p.sessionId, update: u } });
+      if (/run a command/i.test(text)) {
+        // Devin's exec dialect: the title is past-tense English, the real tool
+        // name rides in the namespaced `_meta` key.
+        const toolCallId = `exec:0#f${String(++seq).padStart(31, "0")}`;
+        update({ sessionUpdate: "tool_call", toolCallId, title: "Ran echo", kind: "execute", status: "in_progress", rawInput: { command: "echo hi" }, _meta: { "cognition.ai/inferenceToolName": "exec", "cognition.ai/commandNames": ["echo"] } });
+        update({ sessionUpdate: "tool_call_update", toolCallId, status: "completed", _meta: { "cognition.ai/inferenceToolName": "exec" } });
+        update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Ran it." } });
+        reply(msg.id, { stopReason: "end_turn" });
+      } else if (/ask a question/i.test(text)) {
+        const toolCallId = `ask_user_question:0#f${String(++seq).padStart(31, "0")}`;
+        const question = "Which color do you prefer?";
+        update({
+          sessionUpdate: "tool_call",
+          toolCallId,
+          title: `Asked user ${question}`,
+          status: "in_progress",
+          rawInput: { questions: [{ question, header: "Color", options: [{ label: "Red" }, { label: "Blue" }] }] },
+          _meta: { "cognition.ai/inferenceToolName": "ask_user_question", "cognition.ai/eventType": "ask_user_question" },
+        });
+        const elicitId = `elicit-${++seq}`;
+        outbound.set(elicitId, () => {
+          update({ sessionUpdate: "tool_call_update", toolCallId, status: "completed", _meta: { "cognition.ai/inferenceToolName": "ask_user_question" } });
+          update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Thanks." } });
+          reply(msg.id, { stopReason: "end_turn" });
+        });
+        send({
+          jsonrpc: "2.0",
+          id: elicitId,
+          method: "elicitation/create",
+          params: {
+            mode: "form",
+            sessionId: p.sessionId,
+            message: question,
+            requestedSchema: {
+              type: "object",
+              properties: { q0: { type: "string", title: "Color", description: question, oneOf: [{ const: "Red", title: "Red" }, { const: "Blue", title: "Blue" }] } },
+              required: ["q0"],
+            },
+          },
+        });
+      } else {
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: p.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify({ ...s, prompt: p.prompt }) } } } });
+        reply(msg.id, { stopReason: "end_turn" });
+      }
     } else if (msg.method === "session/close" || msg.method === "session/delete") {
       reply(msg.id, {});
     } else {

@@ -746,7 +746,7 @@ export function PipBubbleView(props: {
     if (!node) return;
     void node.measure().then((m) => {
       if (!m) return;
-      openPersonaMenu(m.pagePosition.x + m.bounds.size.width - 12, m.pagePosition.y + 6);
+      openPersonaMenu(m.pagePosition.x + m.bounds.size.width + 4, m.pagePosition.y + m.bounds.size.height / 2 - 12);
     }).catch(() => undefined);
   };
 
@@ -794,11 +794,11 @@ export function PipBubbleView(props: {
             >
               {isPersonaSession() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="left" /> : null}
               {isPersonaSession() ? (
-                <View class={`absolute -top-3 left-2 z-30 ${HOVER_REVEAL}`}>
+                <View class={`absolute -right-8 top-1/2 -translate-y-1/2 z-30 ${HOVER_REVEAL}`}>
                   <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
                 </View>
               ) : null}
-              <If when={props.row.last}>
+              <If when={props.row.pip.tail}>
                 <BubbleTail side="left" tone="sms-incoming" />
               </If>
               <PipBubbleBlocks row={props.row} />
@@ -808,7 +808,7 @@ export function PipBubbleView(props: {
           <View testID="pip-sms-bubble" ref={(node: ViewRef | undefined) => bubbleNode.set(node)} style={entrance} class="relative max-w-[74%]" onContextMenu={contextMenu}>
             {isPersonaSession() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="left" /> : null}
             {isPersonaSession() ? (
-              <View class={`absolute -top-3 left-2 z-30 ${HOVER_REVEAL}`}>
+              <View class={`absolute -right-8 top-1/2 -translate-y-1/2 z-30 ${HOVER_REVEAL}`}>
                 <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
               </View>
             ) : null}
