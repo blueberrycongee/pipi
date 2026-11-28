@@ -53,6 +53,7 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
   let sawThinkingLabelDuringRun = false;
   let sawWorkingLabelDuringRun = false;
   let sawTypingBubbleDuringRun = false;
+  let sawTypingBubbleHitGeometry = false;
   let sawReadReceiptDuringRun = false;
   let sawToolWallDuringRun = false;
   let sawCommentaryDuringRun = false;
@@ -61,7 +62,12 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
   for (let elapsed = 0; elapsed < 60_000; elapsed += 16) {
     const stillRunning = !app.shows("label:Send");
     if (stillRunning) {
-      if (app.shows("id:pip-typing-bubble")) sawTypingBubbleDuringRun = true;
+      if (app.shows("id:pip-typing-bubble")) {
+        sawTypingBubbleDuringRun = true;
+        const bubbleBox = app.layout("id:pip-typing-bubble");
+        const labelBox = app.layout("id:pip-working-label");
+        if (bubbleBox?.width === 56 && labelBox?.width === 56) sawTypingBubbleHitGeometry = true;
+      }
       if (app.count("id:pip-working-label >> text:Thinking") > 0) sawThinkingLabelDuringRun = true;
       if (app.count("id:pip-working-label >> text:Working") > 0) sawWorkingLabelDuringRun = true;
       if (app.shows("id:sms-receipt")) sawReadReceiptDuringRun = true;
@@ -95,6 +101,7 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
   expect(sawThinkingLabelDuringRun).toBe(true);
   expect(sawWorkingLabelDuringRun).toBe(true);
   expect(sawTypingBubbleDuringRun).toBe(true);
+  expect(sawTypingBubbleHitGeometry).toBe(true);
   expect(sawReadReceiptDuringRun).toBe(true);
   expect(sawWorkingHeaderDuringRun).toBe(false);
   expect(sawToolWallDuringRun).toBe(false);
@@ -115,6 +122,9 @@ test("Pip delivers completed IM messages without streaming jitter, while avatar 
   expect(app.shows("id:pip-typing-bubble")).toBe(false);
   expect(app.count("id:pip-sms-bubble")).toBeGreaterThanOrEqual(1);
   expect(app.count("id:pip-message-avatar")).toBeGreaterThanOrEqual(1);
+  const messageAvatarBox = app.layout("id:pip-message-avatar");
+  expect(messageAvatarBox?.width).toBe(28);
+  expect(messageAvatarBox?.height).toBe(28);
   expect(app.count("id:pip-process-toggle")).toBe(0);
   expect(showsInChat(app, "The list follows by hand. Let me check the tests before changing it.")).toBe(true);
 
@@ -188,7 +198,10 @@ test("Pip hover card surfaces active child sessions and error notices never vani
   expect(app.shows("id:pip-typing-bubble")).toBe(false);
   expect(app.count("id:pip-working-label >> text:Waiting on 1 session")).toBeGreaterThan(0);
   await app.wait(200);
-  const waitingLayout = app.layout("id:pip-working-label");
+  const waitingLayout = app.layout("id:pip-working-label")!;
+  const workingRowLayout = app.layout("id:pip-working-row")!;
+  expect(waitingLayout.width).toBeLessThan(workingRowLayout.width / 2);
+  expect(waitingLayout.x + waitingLayout.width).toBeLessThan(workingRowLayout.x + workingRowLayout.width - 32);
   for (let elapsed = 0; elapsed < 2000; elapsed += 16) {
     await app.wait(16);
     expect(app.layout("id:pip-working-label")).toEqual(waitingLayout);

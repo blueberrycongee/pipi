@@ -1270,23 +1270,18 @@ export function buildDisplayRows(
   }
   // In Pip SMS mode, tag consecutive user bubbles with cluster boundaries and
   // show a quiet delivery/read receipt under the trailing user message before Pip replies.
+  // Pip shows no queue: a message the engine holds is as sent as any, so the
+  // receipt is the last bubble's whatever the queue does, and moves only when
+  // a new bubble arrives under it — in the commit its room opens in.
   if (persona) {
-    let lastNonQueuedUserIdx = -1;
-    for (let k = out.length - 1; k >= 0; k--) {
-      const r = out[k];
-      if (r.kind === "user") {
-        if (!r.queued && lastNonQueuedUserIdx < 0) lastNonQueuedUserIdx = k;
-        continue;
-      }
-      break;
-    }
+    const lastUserIdx = out.length > 0 && out[out.length - 1].kind === "user" ? out.length - 1 : -1;
     for (let k = 0; k < out.length; k++) {
       const r = out[k];
       if (r.kind !== "user") continue;
       const prevIsUser = k > 0 && out[k - 1].kind === "user";
       const nextIsUser = k + 1 < out.length && out[k + 1].kind === "user";
       const receipt: UserSmsSlot["receipt"] =
-        k === lastNonQueuedUserIdx ? (sessionRunning ? "read" : "delivered") : undefined;
+        k === lastUserIdx ? (sessionRunning ? "read" : "delivered") : undefined;
       out[k] = {
         ...r,
         sms: {

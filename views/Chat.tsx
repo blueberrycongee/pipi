@@ -54,7 +54,9 @@ import { recentWorkspaces } from "../store/prefs";
 import { openNewChatTab } from "../store/tabs";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
-import { DURATION, EASING, enterStagger, isRowSeen, keepLast, markRowsSeen, popupHiddenStyle, popupLeavingStyle, popupStyle, PATIENCE_MS, Presence, SPRING } from "../ui/motion";
+import { DURATION, EASING, enterStagger, forgetArrival, isRowSeen, keepLast, markRowsSeen, popupHiddenStyle, popupLeavingStyle, popupStyle, PATIENCE_MS, Presence, SPRING } from "../ui/motion";
+import { motionTraceOn, traceMotion } from "../ui/motion-trace";
+import { ARRIVAL_SETTLE_MS, arrivalEpoch, arrivalHeld, arrivingRow, latestArrival, provideArrivalTail, pushWave, settleArrivals } from "../ui/bubble-lag";
 import { RollingText } from "../ui/RollingText";
 import { tip } from "../ui/Tip";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
@@ -1351,7 +1353,7 @@ export function Chat() {
    * an animated correction must not be snapped short by its own scroll events,
    * and the bottom pin picks up whatever streamed in past the glide's target.
    */
-  const scheduleEndGlide = () => {
+  const scheduleEndGlide = (arrival?: string) => {
     const epoch = ++endSettleEpoch;
     const expectedKey = untracked(conversationKey);
     const targetList = list;
@@ -1368,13 +1370,66 @@ export function Chat() {
           return;
         }
         if (lastY !== undefined) {
-          targetList.scrollTo({ y: Math.max(0, lastY + gap), animated: true });
+          const to = Math.max(0, lastY + gap);
+          targetList.scrollTo({ y: to, animated: true });
+          if (arrival) {
+            // The rows above the arrival, nearest first, trail the glide (`ui/bubble-lag.ts`).
+            const rows = untracked(displayRows);
+            const at = rows.findIndex((row) => row.id === arrival);
+            if (at > 0) pushWave(rows.slice(Math.max(0, at - 24), at).map((row) => row.id).reverse(), to - lastY);
+          }
           return;
         }
       }
       targetList.scrollToEnd({ animated: true });
     });
   };
+
+  // An arrival in a persona conversation opens its room under a list that
+  // holds its offset (`arrivalHeld`): the column glides up to it as one move,
+  // where the list's own follow would snap a frame after the room appeared.
+  // The hold starts in the commit the arriving row is staged in (closed, a
+  // frame before its room opens): the receipt it takes from the bubble above
+  // leaves in that commit, and a list following on its own would jump for it.
+  // Only the end arrives so: a row landing above others (a wake turn ahead of
+  // the staged bubble, a reply above messages the engine still holds) appears
+  // in place, and the list keeps what is under the reader's eyes where it is.
+  const arrivalTail = computed<ReadonlySet<string>>(() => {
+    const rows = displayRows();
+    arrivalEpoch();
+    const tail = new Set<string>();
+    if (!isPersonaSession() || reduceMotion()) return tail;
+    for (let k = rows.length - 1; k >= Math.max(0, rows.length - 6) && arrivingRow(rows[k]); k--) tail.add(rows[k].id);
+    return tail;
+  });
+  provideArrivalTail(arrivalTail);
+  const followHeld = computed(() => arrivalHeld(() => arrivalTail().size > 0));
+  effect(() => {
+    if (!followHeld()) return;
+    // A row the list never mounted never opens: it does not hold the end for long.
+    const timer = setTimeout(() => {
+      for (const id of untracked(arrivalTail)) forgetArrival(id);
+      settleArrivals();
+    }, 1200);
+    cleanup(() => clearTimeout(timer));
+  });
+  let arrivalTimer: ReturnType<typeof setTimeout> | undefined;
+  // An arrival from before this view mounted is not one to glide to.
+  let arrivalSeen = untracked(latestArrival)?.seq ?? 0;
+  effect(() => {
+    const arrival = latestArrival();
+    untracked(() => {
+      if (!arrival || arrival.seq === arrivalSeen) return;
+      arrivalSeen = arrival.seq;
+      clearTimeout(arrivalTimer);
+      if (bottomFollowing() && list && listKey === conversationKey() && listReady) scheduleEndGlide(arrival.id);
+      arrivalTimer = setTimeout(() => {
+        settleArrivals();
+        if (untracked(bottomFollowing) && list && listKey === untracked(conversationKey) && listReady) scheduleEndGlide();
+      }, ARRIVAL_SETTLE_MS);
+    });
+  });
+  cleanup(() => clearTimeout(arrivalTimer));
 
   const follow = (animated: boolean) => {
     inputAt = 0;
@@ -1405,7 +1460,9 @@ export function Chat() {
       if (!cue) return;
       const rows = untracked(transcriptRows);
       const promptPos = rows.findIndex((row) => row.id === cue.rowId);
-      const hasHistoryAbove = promptPos > 0 || (promptPos < 0 && rows.length > 0);
+      // A persona conversation follows its end as Messages does: its replies are
+      // bubbles that land whole, never a long reply to hold at the horizon.
+      const hasHistoryAbove = !isPersonaSession() && (promptPos > 0 || (promptPos < 0 && rows.length > 0));
       activePromptId.set(hasHistoryAbove ? cue.rowId : undefined);
       inputAt = 0;
       lastUpwardInputAt = 0;
@@ -1586,6 +1643,11 @@ export function Chat() {
       topRow.set(-1);
       bottomRow.set(-1);
       viewSpan = -1;
+      // An arrival in flight belongs to the conversation it landed in: its hold
+      // and its settling glide must not reach the one coming in.
+      clearTimeout(arrivalTimer);
+      arrivalTimer = undefined;
+      settleArrivals();
       ensureEntered(key);
       resetPipInteractionChrome();
       resetEditHistories();
@@ -1643,6 +1705,8 @@ export function Chat() {
                 const currentKey = untracked(key);
                 let mountedList: ListRef | undefined;
                 let mountedEnding: ViewRef | undefined;
+                const traceScroll = motionTraceOn() ? createAnimatedValue(0) : undefined;
+                if (traceScroll) traceMotion(() => "list", { scroll: traceScroll });
                 listKey = currentKey;
                 listReady = false;
                 queueMicrotask(() => {
@@ -1665,6 +1729,7 @@ export function Chat() {
                     estimatedItemSize={44}
                     keyExtractor={(row) => row.id}
                     onScroll={onScroll}
+                    scrollValue={traceScroll}
                     scrollEventThrottle={16}
                     onScrollDragStart={onDragStart}
                     onScrollDragEnd={onDragEnd}
@@ -1680,7 +1745,7 @@ export function Chat() {
                       bottomRow.set(last);
                       if (first >= 0 && last >= first) viewSpan = last - first;
                     }}
-                    maintainVisibleContentPosition={bottomFollowing() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
+                    maintainVisibleContentPosition={bottomFollowing() && !followHeld() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
                     class="flex-1"
                     contentStyle={{
                       paddingHorizontal: 24,

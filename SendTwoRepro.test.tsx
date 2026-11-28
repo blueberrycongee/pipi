@@ -1,19 +1,17 @@
 import { open, test, type App } from "nsh/test";
 import { decodeLumGridAsync, lum, type Grid } from "./dev/frames";
 
-// A film of a queued send's bubble life, asserted on what survives coarse
-// sampling: the second message goes in with ⌘↵ (follow-up), so it is born
-// already dim in the queue's 0.6 coat — its entrance moves transform only —
-// and it stays dim until the queue lets it go, when it brightens in one quick
-// flip while its label's seat becomes the receipt's without moving the bubble.
+// A film of a follow-up sent to Pip while Pip is still answering: the second
+// message goes in with ⌘↵, so the engine holds it until the run ends. Pip's
+// conversation shows no queue (`views/Rows.tsx`, `pi/turns.ts`): the held
+// bubble is born and stays at full ink, wears no "Queued" seat, and the run
+// ending — the engine letting it go — changes nothing on screen.
 //
-// What used to go wrong: the queued bubble's entrance faded toward 1 while the
-// queue held it at 0.6 (a literal two-stage fade), the label row collapsing at
-// dequeue yanked the transcript, and the send's return to the reader was an
-// un-animated position snapshot mid-entrance. The first two are visible in
-// these frames; the third is guaranteed by there being no un-animated scroll
-// call left on the send path — at ~1.4s a frame a snap and a glide land inside
-// the same interval, so smoothness itself is not what this test can judge.
+// What used to go wrong: the held bubble was dimmed to 0.6 under a "Queued"
+// label and brightened when the queue let go (a second entrance), and the
+// label row's swap for the receipt could yank the transcript. At ~1.4s a
+// frame this film judges ink and seats, not smoothness (`PipBurst.test.tsx`
+// reads every display frame for that).
 //
 //   nsh test SendTwoRepro.test.tsx --target macos
 
@@ -93,14 +91,19 @@ function deltas(t: Track[]): number[] {
   return dys;
 }
 
-/** No interval may move the bubble a teleport's distance; the reply streaming
- * under it steps it a few grid px at a time. */
+/** Spread (max - min) of `cy` across frames that found the bubble. */
+function spread(t: Track[]): number {
+  const ys = t.filter((s) => s.found).map((s) => s.cy);
+  return ys.length ? Math.max(...ys) - Math.min(...ys) : 0;
+}
+
+/** No interval may move the bubble a teleport's distance while it is held. */
 function noTeleport(name: string, t: Track[]) {
   const top = deltas(t).sort((a, b) => b - a)[0] ?? 0;
   if (top >= 30) fail(`[${name}] teleport: one interval moved the bubble ${top.toFixed(1)} grid px`);
 }
 
-test("a queued bubble is born dim, brightens in one flip, and is never yanked", async () => {
+test("a message Pip's engine holds reads as sent: full ink, no queue seat, and the queue letting go moves nothing", async () => {
   const app = await open("./Harness.tsx", {
     width: 760,
     height: 560,
@@ -118,53 +121,65 @@ test("a queued bubble is born dim, brightens in one flip, and is never yanked", 
   await app.submit("label:Message");
   await app.wait(11000);
 
-  // ⌘↵ sends a follow-up: the bubble stages queued for the rest of the run.
+  // ⌘↵ sends a follow-up: the engine holds it for the rest of the run.
   await app.type("label:Message", "and make it shorter");
   await app.keyboard.press("mod+enter");
-  await app.waitFor("text:Queued");
+  await app.waitFor("text:and make it shorter");
+  const noQueueSeat = (when: string) => {
+    if (app.shows("text:Queued") || app.shows("label:Remove from queue")) fail(`[${when}] a queue seat showed in Pip's conversation`);
+  };
+  noQueueSeat("sent");
 
-  const queued = await film(app, "queued", 10);
-  say("queued", queued);
-
-  // Born dim and dim the whole queue: the muted entrance moves transform only,
-  // so no frame may catch it fading down from full — or brightening early. The
-  // first eight frames land well before the run ends, while the queue holds.
-  const found = queued.filter((s) => s.found);
-  if (found.length < 5) fail(`[queued] bubble tracked in only ${found.length} frames`);
-  for (const s of found.slice(0, 8)) {
-    if (s.fill < 125) fail(`[queued] bubble bright while queued: fill=${s.fill.toFixed(1)} @${s.at}ms`);
-    if (s.fill > 195) fail(`[queued] bubble fading down while queued: fill=${s.fill.toFixed(1)} @${s.at}ms`);
-  }
-  // Seated and still: once the entrance settles, the held bubble does not drift.
-  const seat = found.slice(-6);
-  const spread = Math.max(...seat.map((s) => s.cy)) - Math.min(...seat.map((s) => s.cy));
-  if (spread > 10) fail(`[queued] held bubble drifting: cy spread ${spread.toFixed(1)}px over ${seat.length} frames`);
-  noTeleport("queued", queued);
-
-  // The queue lets go when the run ends: the label's seat becomes the
-  // receipt's — the same height, so the swap must leave the bubble be — and
-  // the dim flips to full in ~120ms, a delivery, not a second entrance.
-  await app.waitUntil(() => !app.shows("text:Queued"), { timeout: 90000 });
+  // ~10 frames while the engine holds it, ~12 more across the run's end
+  // (~28s after the first send): one film of the bubble's whole life.
+  const held = await film(app, "held", 10);
+  say("held", held);
+  noQueueSeat("held");
   const drained = await film(app, "drained", 12);
   say("drained", drained);
+  noQueueSeat("drained");
 
-  const post = drained.filter((s) => s.found);
-  if (post.length < 3) fail(`[drained] bubble tracked in only ${post.length} frames`);
-  // Bright, and bright for good — the flip, not a ramp that could dip back.
-  const bright = post.findIndex((s) => s.fill < 135);
-  if (bright < 0) fail(`[drained] bubble never brightened (last fill=${post[post.length - 1].fill.toFixed(1)})`);
-  if (bright > 3) fail(`[drained] brighten took ${bright + 1} frames to land — a second fade, not a flip`);
-  const redim = post.slice(bright).find((s) => s.fill > 150);
-  if (redim) fail(`[drained] bubble dimmed again after brightening: fill=${redim.fill.toFixed(1)} @${redim.at}ms`);
-  // Once the follow-up's reply lands, the bubble sits: a live tail, not jitter.
-  const postSeat = post.slice(-4);
-  const postSpread = Math.max(...postSeat.map((s) => s.cy)) - Math.min(...postSeat.map((s) => s.cy));
-  if (postSpread > 8) fail(`[drained] bubble still jittering after the reply: cy spread ${postSpread.toFixed(1)}px`);
-  // Its own reply grows below it: the bubble only rises, never drops — a drop
-  // is the signature of the label row collapsing under an end-pinned view.
-  for (let i = 1; i < drained.length; i++) {
-    if (drained[i].found && drained[i - 1].found && drained[i].cy - drained[i - 1].cy > 8) {
-      fail(`[drained] bubble dropped ${(drained[i].cy - drained[i - 1].cy).toFixed(1)}px — content below it shrank`);
+  const all = [...held, ...drained];
+  const found = all.filter((s) => s.found);
+  if (found.length < 8) fail(`bubble tracked in only ${found.length} frames`);
+  if (!app.shows("text:Here is the plan.")) fail("follow-up reply never landed during the film");
+
+  // Full ink from its entrance on: no queue dim, no second brightening.
+  const bright = found.findIndex((s) => s.fill < 135);
+  if (bright < 0) fail(`bubble never at full ink (last fill=${found[found.length - 1].fill.toFixed(1)})`);
+  if (bright > 2) fail(`bubble took ${bright + 1} frames to reach full ink — dimmed, not sent`);
+  const dim = found.slice(bright).find((s) => s.fill > 150);
+  if (dim) fail(`bubble dimmed after its entrance: fill=${dim.fill.toFixed(1)} @${dim.at}ms`);
+
+  // In an empty Pip chat the two user bubbles sit near the top while turn 1
+  // runs; Pip's non-streaming 24-part reply lands whole above the follow-up and
+  // fills the viewport (one downward shift to the tail), and turn 2's settled
+  // SMS bubble later lands whole below it (one upward shift). Within each
+  // phase the bubble must hold steady, and once turn 1's reply has filled the
+  // viewport the bubble may never drop again (no seat collapse or rebound).
+  const turn1At = found.findIndex((s, i) => i > 0 && s.cy - found[i - 1].cy > 8);
+  const heldPhase = turn1At > 0 ? found.slice(0, turn1At) : found;
+  if (heldPhase.length < 5) fail(`[held] bubble stayed held for only ${heldPhase.length} frames`);
+  noTeleport("held", heldPhase);
+  const heldSeat = heldPhase.slice(1);
+  const heldSpread = spread(heldSeat);
+  if (heldSpread > 10) fail(`[held] held bubble drifting: cy spread ${heldSpread.toFixed(1)}px over ${heldSeat.length} frames`);
+
+  const afterTurn1 = turn1At > 0 ? found.slice(turn1At) : found;
+  for (let i = 1; i < afterTurn1.length; i++) {
+    if (afterTurn1[i].cy - afterTurn1[i - 1].cy > 8) {
+      fail(`[drained] bubble dropped ${(afterTurn1[i].cy - afterTurn1[i - 1].cy).toFixed(1)}px @${afterTurn1[i].at}ms — content below it shrank or rebounded`);
     }
   }
+  const turn2At = afterTurn1.findIndex((s, i) => i > 0 && afterTurn1[i - 1].cy - s.cy > 8);
+  if (turn2At > 0) {
+    // Between turn 1's reply landing and turn 2's reply landing, the engine
+    // releases the follow-up and runs it: nothing on screen may shift or jitter.
+    const draining = afterTurn1.slice(0, turn2At);
+    const drainSpread = spread(draining);
+    if (drainSpread > 8) fail(`[drained] bubble moved while queue drained: cy spread ${drainSpread.toFixed(1)}px`);
+  }
+  const postSeat = (turn2At > 0 ? afterTurn1.slice(turn2At) : afterTurn1).slice(-4);
+  const postSpread = spread(postSeat);
+  if (postSpread > 8) fail(`[drained] bubble still jittering after the reply: cy spread ${postSpread.toFixed(1)}px`);
 }, 240000);

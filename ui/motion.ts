@@ -23,6 +23,7 @@ import {
   untracked,
   type ViewStyle,
 } from "nsh";
+import { traceMotion } from "./motion-trace";
 
 /** Shared duration tokens (ms). */
 export const DURATION = {
@@ -139,9 +140,9 @@ interface LeanSpec<C extends LeanChannel> {
   easing: Easing;
 }
 
-function leanMotion<C extends LeanChannel>(channels: readonly C[]) {
+function leanMotion<C extends LeanChannel>(channels: readonly C[], born?: LeanSpec<C>) {
   const values = {} as Record<C, AnimatedValue>;
-  for (const c of channels) values[c] = createAnimatedValue(REST[c]);
+  for (const c of channels) values[c] = createAnimatedValue(born ? born.tracks[c][0].value : REST[c]);
   let running: CompositeAnimation | null = null;
   const stop = () => {
     running?.stop();
@@ -251,22 +252,6 @@ const SMS_OUTGOING_SPEC: LeanSpec<"opacity" | "translateX" | "translateY" | "sca
   easing: EASING.settle,
 };
 
-/** A queued outgoing bubble pops in already wearing its queue dim, so the
- * entrance moves it through transform only: the row keeps its own opacity
- * channel for the dim, and two opacity animations multiplied would read as
- * two entrances (the second landing when the queue lets go). */
-const SMS_OUTGOING_MUTED_SPEC: LeanSpec<"opacity" | "translateX" | "translateY" | "scale"> = {
-  tracks: {
-    ...SMS_OUTGOING_SPEC.tracks,
-    opacity: [
-      { offset: 0, value: 1 },
-      { offset: 1, value: 1 },
-    ],
-  },
-  duration: SMS_OUTGOING_SPEC.duration,
-  easing: SMS_OUTGOING_SPEC.easing,
-};
-
 /** iMessage-style incoming SMS bubble pop-in blooming from the bottom-left corner.
  * Pip's replies land as whole thoughts rather than streamed ink, so they take the
  * heavier settle curve: less sideways dart than the outgoing send, a shorter rise,
@@ -340,6 +325,19 @@ export function isRowSeen(id: string): boolean {
   return seenRowIds.has(id);
 }
 
+/** Whether a row would arrive live: entrances are on and it has not been on screen. */
+export function isLiveArrival(id: string): boolean {
+  return liveEntranceEnabled && !seenRowIds.has(id);
+}
+
+/** A row that never came on screen to arrive (a list that did not mount it) arrives no more. */
+export function forgetArrival(id: string) {
+  seenRowIds.add(id);
+}
+
+/** The spring an arriving SMS row opens its room on. */
+export const ARRIVAL_SPRING = { stiffness: 260, damping: 30, mass: 1 } as const;
+
 /** Enables live entrance animations (e.g. right before sending a prompt in an
  * empty session). */
 export function enableLiveRowEntrance() {
@@ -394,9 +392,18 @@ export function useRowEntrance(id: () => string, streaming?: () => boolean, skip
 export function useSmsBubbleEntrance(
   id: () => string,
   side: () => "left" | "right",
-  options?: { enabled?: () => boolean; skip?: () => boolean; stagger?: () => number; muted?: () => boolean },
+  options?: { enabled?: () => boolean; skip?: () => boolean; stagger?: () => number },
 ): ViewStyle {
-  const item = leanMotion(["opacity", "translateX", "translateY", "scale"] as const);
+  const specOf = () => (side() === "left" ? SMS_INCOMING_SPEC : SMS_OUTGOING_SPEC);
+  // A bubble that will enter is born where its entrance starts: values made at
+  // rest and moved there by the effect (which runs after rendering) could reach
+  // the screen for a frame fully drawn, then vanish into the pop-in.
+  const born = untracked(() => {
+    const currentId = id();
+    const live = (options?.enabled ? options.enabled() : true) && currentId && !options?.skip?.() && liveEntranceEnabled && !seenRowIds.has(currentId);
+    return live && !reduceMotion() ? specOf() : undefined;
+  });
+  const item = leanMotion(["opacity", "translateX", "translateY", "scale"] as const, born);
   let lastId = "";
   effect(() => {
     const currentId = id();
@@ -416,7 +423,7 @@ export function useSmsBubbleEntrance(
       }
       seenRowIds.add(currentId);
       const isLeft = side() === "left";
-      const spec = isLeft ? SMS_INCOMING_SPEC : options?.muted?.() ? SMS_OUTGOING_MUTED_SPEC : SMS_OUTGOING_SPEC;
+      const spec = specOf();
       const delay = isLeft ? smsIncomingDelay(options?.stagger?.()) : 0;
       if (reduceMotion()) {
         item.reset();
@@ -429,6 +436,7 @@ export function useSmsBubbleEntrance(
     });
   });
   cleanup(() => item.stop());
+  traceMotion(() => untracked(id), { eo: item.values.opacity, ex: item.values.translateX, ey: item.values.translateY, es: item.values.scale });
   return {
     transformOrigin: side() === "left" ? "left bottom" : "right bottom",
     opacity: item.values.opacity,

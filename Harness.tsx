@@ -24,6 +24,8 @@
 // `harness.pickedImage` / `harness.pickedFolder` / `harness.pickedFile` answer the app's file pickers, for wallpaper and document flows.
 // `harness.dataDir` names the app's data folder (notes are files in its `docs/`): a real one, for the tests that save.
 // `harness.files` (JSON `{path: content}`) puts real files on disk before boot: documents and notes a test names.
+// `harness.trace` (`"<ms>:<duration>"`) records the transcript's motion once a display frame from that long
+// after boot (`ui/motion-trace.ts`) and leaves the samples, as JSON, in storage at `harness.traceOut`.
 // `harness.update` (JSON of FakeOptions.update) has the update checker find a new version: the card, its
 // track and its sparkles. `package: true` also offers it as a signed code package — the small
 // download the check prefers over the archive.
@@ -38,6 +40,7 @@ import { startSplitDrag, workspaceBounds } from "./store/split";
 import { beginMeasuredPipReply } from "./views/PipMessageLayers";
 import { Shell } from "./views/Shell";
 import { clearPipReply, pipMessageMenu } from "./store/pip-interactions";
+import { enableMotionTrace, recordMotion } from "./ui/motion-trace";
 
 const now = Date.now();
 const sessions = [
@@ -58,6 +61,8 @@ const workspaceSessions = {
 };
 
 Storage.getItem("harness.scenario").then(async (scenario) => {
+  const trace = await Storage.getItem("harness.trace");
+  if (trace) enableMotionTrace();
   const startDelay = Number((await Storage.getItem("harness.startDelay")) ?? 0);
   const reply = (await Storage.getItem("harness.reply")) || undefined;
   const distinctHistories = Boolean(await Storage.getItem("harness.distinct"));
@@ -150,6 +155,10 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
     }),
   );
   void boot();
+  if (trace) {
+    const [at, ms] = trace.split(":").map(Number);
+    setTimeout(() => void recordMotion(ms).then((samples) => Storage.setItem("harness.traceOut", JSON.stringify(samples))), at);
+  }
   for (const step of ((await Storage.getItem("harness.then")) ?? "").split(";").filter(Boolean)) {
     const at = step.indexOf(":");
     const target = step.slice(at + 1);

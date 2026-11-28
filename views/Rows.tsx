@@ -1,4 +1,4 @@
-import { cleanup, createAnimatedValue, effect, Image, openUrl, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
+import { Animated, cleanup, createAnimatedValue, effect, Image, openUrl, reduceMotion, Scroll, signal, Text, untracked, View } from "nsh";
 import type { JSX, ScrollEvent, ViewRef } from "nsh";
 import { Collapsible, TextView } from "nsh/base";
 import { Menu } from "nsh/desktop";
@@ -59,7 +59,9 @@ import { openDocIfThere } from "../store/tabs";
 import { messageInteraction, openPipMessageMenu, pipReplyCoveredId } from "../store/pip-interactions";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
-import { DURATION, EASING, isRowSeen, keepLast, Presence, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
+import { ARRIVAL_SPRING, DURATION, EASING, isRowSeen, keepLast, Presence, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
+import { traceMotion } from "../ui/motion-trace";
+import { arrivingRow, isArrivalTail, noteArrival, useBubbleLag } from "../ui/bubble-lag";
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
@@ -634,12 +636,14 @@ function UserRow(props: { row: DisplayUserRow }) {
     const q = messageQueue();
     return q.followUp.some((wire) => said(wire) === props.row.text) && !q.steering.some((wire) => said(wire) === props.row.text);
   };
-  const bubbleOpacity = createAnimatedValue(untracked(queued) ? 0.6 : 1);
+  /** The queue's dim: a coding transcript's waiting bubble. An SMS bubble is sent the moment it is sent, queue or not. */
+  const dimmed = () => queued() && !isSms();
+  const bubbleOpacity = createAnimatedValue(untracked(dimmed) ? 0.6 : 1);
   let trackedBubbleId = untracked(() => props.row.id);
-  let wasQueued = untracked(queued);
+  let wasQueued = untracked(dimmed);
   effect(() => {
     const id = props.row.id;
-    const isQueued = queued();
+    const isQueued = dimmed();
     const reduced = reduceMotion();
     untracked(() => {
       if (id !== trackedBubbleId) {
@@ -666,7 +670,7 @@ function UserRow(props: { row: DisplayUserRow }) {
   const smsEntrance = useSmsBubbleEntrance(
     () => props.row.id,
     () => "right",
-    { enabled: isSms, muted: queued },
+    { enabled: isSms },
   );
 
   const hostNode = signal<ViewRef | undefined>(undefined);
@@ -716,6 +720,8 @@ function UserRow(props: { row: DisplayUserRow }) {
   const bubbleNode = signal<ViewRef | undefined>(undefined);
   const mediaNode = signal<ViewRef | undefined>(undefined);
   const clusterNode = signal<ViewRef | undefined>(undefined);
+  traceMotion(() => props.row.id, { dim: bubbleOpacity }, () => untracked(bubbleNode));
+  traceMotion(() => `${props.row.id}#row`, {}, () => untracked(hostNode));
   effect(() => {
     const rowId = props.row.id;
     const node = clusterNode() ?? bubbleNode() ?? (!hasBubble() && (hasImages() || fileMedia().length > 0) ? mediaNode() ?? hostNode() : undefined);
@@ -925,41 +931,14 @@ function UserRow(props: { row: DisplayUserRow }) {
           </View>
         }
       >
-        {/* The queued label and the receipt share one seat, so a message the
-         * queue lets go of trades marks without moving the bubble above. */}
-        <If when={queued() || Boolean(sms()?.receipt)}>
+        {/* A conversation with Pip has no queue to show: a message the engine
+         * holds reads as sent, and only the last of the run wears the receipt
+         * (`pi/turns.ts`), so the queue letting go changes nothing on screen. */}
+        <If when={sms()?.receipt}>
           <View class="h-6 select-none flex-row items-center gap-1.5 pt-0.5">
-            <If when={queued()}>
-              <View
-                class="flex-row items-center gap-1 pr-1"
-                accessibilityLabel={followsUp() ? tr("Follow-up", "追问") : tr("Steering", "引导")}
-                tooltip={tip(followsUp() ? tr("Follow-up: sent when the run is done", "追问：本轮结束后发送") : tr("Steering: sent at the run's next step", "引导：在本轮的下一步发送"))}
-              >
-                <Icon name={followsUp() ? "queue" : "steer"} size={12} tone="subtle" />
-                <Text class={`${uiType("2xs")} text-subtle`}>{tr("Queued", "排队中")}</Text>
-              </View>
-              <IconButton
-                icon="pencil"
-                tone="subtle"
-                size="sm"
-                tipPlacement="bottom"
-                label={tr("Edit queued message", "编辑排队消息")}
-                onPress={() => recallQueuedRow(props.row, true)}
-              />
-              <IconButton
-                icon="x"
-                tone="subtle"
-                size="sm"
-                tipPlacement="bottom"
-                label={tr("Remove from queue", "从队列中移除")}
-                onPress={() => recallQueuedRow(props.row, false)}
-              />
-            </If>
-            <If when={!queued() && sms()?.receipt}>
-              <Text testID="sms-receipt" class={`pr-1 ${uiType("2xs")} font-medium text-subtle`}>
-                {sms()?.receipt === "read" ? tr("Read", "已读") : tr("Delivered", "已送达")}
-              </Text>
-            </If>
+            <Text testID="sms-receipt" class={`pr-1 ${uiType("2xs")} font-medium text-subtle`}>
+              {sms()?.receipt === "read" ? tr("Read", "已读") : tr("Delivered", "已送达")}
+            </Text>
           </View>
         </If>
       </If>
@@ -1859,12 +1838,32 @@ export function TranscriptRow(props: { row: ChatRow; activityMaxHeight: number }
   const needsOuterPipAvatar = () => props.row.kind !== "pip-bubble" && Boolean(pipSlot()?.tail);
   const needsOuterPipIndent = () => props.row.kind !== "pip-bubble" && Boolean(pipSlot()?.indent);
 
+  // A bubble arriving live at the end of a persona conversation opens its own
+  // room: the cell mounts closed, then springs open a frame later
+  // (`ARRIVAL_SPRING`), so what is under it moves down with the room rather
+  // than in one frame, and the conversation glides to the new end
+  // (`noteArrival`, `views/Chat.tsx`).
+  const arrivedId = signal("");
+  const arriving = () => isArrivalTail(props.row.id) && arrivingRow(props.row) && untracked(arrivedId) !== props.row.id;
+  effect(() => {
+    const id = props.row.id;
+    if (!untracked(arriving)) return;
+
+    const frame = requestAnimationFrame(() => noteArrival(id, () => arrivedId.set(id)));
+    cleanup(() => cancelAnimationFrame(frame));
+  });
+  const lag = useBubbleLag(() => props.row.id);
+  let cellNode: ViewRef | undefined;
+  traceMotion(() => `${props.row.kind}:${props.row.id}`, { lag }, () => cellNode);
+  const rowStyle = { opacity: entrance.opacity, transform: [{ translateY: Animated.add(entrance.transform[0].translateY, lag) }] };
+
   return (
     <Collapsible
-      open={fold.open()}
+      open={fold.open() && (arrivedId() === props.row.id || !arriving())}
       reveal={fold.reveal()}
+      revealSpring={arrivedId() === props.row.id ? ARRIVAL_SPRING : undefined}
       content={
-        <View class={`w-full max-w-180 self-center ${spacing()}${fold.open() ? "" : " pointer-events-none"}`} style={entrance}>
+        <View ref={(node: ViewRef) => (cellNode = node)} class={`w-full max-w-180 self-center ${spacing()}${fold.open() ? "" : " pointer-events-none"}`} style={rowStyle}>
           <View style={fold.style} class={!isPipProcess() && indentedProcess() ? "pl-7" : undefined}>
             <If
               when={needsOuterPipAvatar()}

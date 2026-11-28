@@ -54,6 +54,7 @@ import {
   useSmsBubbleEntrance,
   useSmsCompanionEntrance,
 } from "../ui/motion";
+import { traceMotion } from "../ui/motion-trace";
 import { FOCUS_RING, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { uiHeight, uiType } from "../ui/typography";
 import { PersonaAvatar } from "./PersonaAvatar";
@@ -716,7 +717,7 @@ function TypingDots() {
   );
 }
 
-function TypingBubbleHandoff(props: { show: () => boolean }) {
+function TypingBubbleHandoff(props: { show: () => boolean; onMountedChange?: (mounted: boolean) => void }) {
   const initiallyShown = untracked(props.show);
   const mounted = signal(initiallyShown);
   const opacity = createAnimatedValue(initiallyShown ? 1 : 0);
@@ -775,6 +776,10 @@ function TypingBubbleHandoff(props: { show: () => boolean }) {
     stopAll();
   });
 
+  effect(() => {
+    props.onMountedChange?.(mounted());
+  });
+
   return (
     <If when={mounted()}>
       <View
@@ -813,6 +818,7 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
     return live.textLanded && !composing() && (live.phase === "writing" || live.phase === "thinking" || live.phase === "idle");
   };
   const typing = signal(untracked(() => isChatActive() && composing()));
+  const typingBubbleMounted = signal(untracked(() => isChatActive() && composing()));
   let exitTimer: ReturnType<typeof setTimeout> | undefined;
   let openTimer: ReturnType<typeof setTimeout> | undefined;
   let closeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -879,6 +885,9 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
     void opacity.stop();
   });
 
+  let footNode: ViewRef | undefined;
+  traceMotion(() => "footer", { fo: opacity }, () => footNode);
+
   const status = pipLiveStatus;
   effect(() => {
     if (isChatActive() && !isLeavingSession()) {
@@ -888,7 +897,7 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
   });
 
   return (
-    <View ref={(node: ViewRef) => props.anchor?.(node)} class="h-12 w-full max-w-180 select-none justify-end self-center pb-1">
+    <View ref={(node: ViewRef) => { footNode = node; props.anchor?.(node); }} class="h-12 w-full max-w-180 select-none justify-end self-center pb-1">
       <If when={shown()}>
         <View testID="pip-working-row" class="h-7 w-full flex-row items-center gap-3.5" style={{ opacity }}>
           <PipAvatarBadge
@@ -906,10 +915,11 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
             onMouseEnter={() => handleHover(true)}
             onMouseLeave={() => handleHover(false)}
             onPress={handleToggle}
-            class={`relative h-7 min-w-0 flex-1 justify-center items-start rounded-sm ${FOCUS_RING}`}
+            class={`relative h-7 min-w-0 max-w-full justify-center items-start rounded-sm ${FOCUS_RING}`}
+            style={{ minWidth: typingBubbleMounted() ? 56 : 0 }}
           >
             <View class="absolute bottom-0 left-0">
-              <TypingBubbleHandoff show={typing} />
+              <TypingBubbleHandoff show={typing} onMountedChange={(mounted) => typingBubbleMounted.set(mounted)} />
             </View>
             <If when={!typing() && !handoffQuiet()}>
               <Text testID="pip-waiting-label" class={`truncate ${uiType("xs")} text-muted-foreground`}>{label()}</Text>
@@ -1016,6 +1026,7 @@ export function PipBubbleView(props: {
     ...(props.row.footnotes?.length ? { footnotes: props.row.footnotes } : {}),
   });
   const bubbleNode = signal<ViewRef | undefined>(undefined);
+  traceMotion(() => props.row.id, {}, () => untracked(bubbleNode));
   effect(() => {
     const rowId = props.row.id;
     const node = bubbleNode();
