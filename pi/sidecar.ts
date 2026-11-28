@@ -1,8 +1,10 @@
+import crypto from "crypto";
 import fs from "fs/promises";
 import os from "os";
 import process from "process";
 import type { ChildProcess, CommandOutput } from "process";
 import { fileURLToPath } from "url";
+import { runningPackage } from "nsh/updater";
 import type { StartAgentOptions } from "../agents/types";
 import { env } from "../lib/env";
 import { tr } from "../lib/i18n";
@@ -19,6 +21,7 @@ import envPathsAsset from "../sidecar/env-paths.mjs?url";
 import externalAgentAsset from "../sidecar/external-agent.mjs?url";
 import launchPiAsset from "../sidecar/launch-pi.mjs?url";
 import listSessionsAsset from "../sidecar/list-sessions.mjs?url";
+import messageEditsAsset from "../sidecar/message-edits.mjs?url";
 import pipiCliAsset from "../sidecar/pipi-cli.mjs?url";
 import pipiDaemonAsset from "../sidecar/pipi-daemon.mjs?url";
 import pipiMcpStdioAsset from "../sidecar/pipi-mcp-stdio.mjs?url";
@@ -28,24 +31,28 @@ import sessionIndexAsset from "../sidecar/session-index.mjs?url";
 import usageStatsAsset from "../sidecar/usage-stats.mjs?url";
 import worktreeAsset from "../sidecar/worktree.mjs?url";
 
-void [
-  acpFormAsset,
-  agentUsageAsset,
-  daemonClientAsset,
-  daemonLinkAsset,
-  envPathsAsset,
-  externalAgentAsset,
-  launchPiAsset,
-  listSessionsAsset,
-  pipiCliAsset,
-  pipiDaemonAsset,
-  pipiMcpStdioAsset,
-  pipiOrchestratorExtensionAsset,
-  probeAgentsAsset,
-  sessionIndexAsset,
-  usageStatsAsset,
-  worktreeAsset,
-];
+/** Every helper a sidecar tree needs, by file name, as the running bundle's `asset:/` URL. */
+export const SIDECAR_ASSETS: Record<string, string> = {
+  "acp-form.mjs": acpFormAsset,
+  "agent-usage.mjs": agentUsageAsset,
+  "daemon-client.mjs": daemonClientAsset,
+  "daemon-link.mjs": daemonLinkAsset,
+  "env-paths.mjs": envPathsAsset,
+  "external-agent.mjs": externalAgentAsset,
+  "launch-pi.mjs": launchPiAsset,
+  "list-sessions.mjs": listSessionsAsset,
+  "message-edits.mjs": messageEditsAsset,
+  "pipi-cli.mjs": pipiCliAsset,
+  "pipi-daemon.mjs": pipiDaemonAsset,
+  "pipi-mcp-stdio.mjs": pipiMcpStdioAsset,
+  "pipi-orchestrator-extension.mjs": pipiOrchestratorExtensionAsset,
+  "probe-agents.mjs": probeAgentsAsset,
+  "session-index.mjs": sessionIndexAsset,
+  "usage-stats.mjs": usageStatsAsset,
+  "worktree.mjs": worktreeAsset,
+};
+
+const SIDECAR_NAMES = Object.keys(SIDECAR_ASSETS);
 
 /**
  * The Pi & external agent sidecars:
@@ -75,27 +82,203 @@ export function appDir(): string | undefined {
 }
 
 const SIDECAR_DIR_KEY = "__pipiSidecarDir";
+const SIDECAR_DIR_PROMISE_KEY = "__pipiSidecarDirPromise";
 const NODE_LAUNCHER_KEY = "__pipiNodeLauncher";
+
+const trimSlashes = (dir: string) => dir.replace(/[\\/]+$/, "");
+const joinPath = (dir: string, name: string) => `${trimSlashes(dir)}/${name}`;
+const pathExists = (path: string) => fs.exists(path).catch(() => false);
+
+function appDataDir(): string | undefined {
+  try {
+    const dir = (globalThis as { process?: { dataDir?: string | null } }).process?.dataDir;
+    return dir ? trimSlashes(dir) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function hasFiles(dir: string, names: string[]): Promise<boolean> {
+  for (const name of names) {
+    if (!(await pathExists(joinPath(dir, name)))) return false;
+  }
+  return true;
+}
+
+export interface SidecarFile {
+  name: string;
+  bytes: Uint8Array;
+}
+
+/** A content key for one materialized sidecar tree. */
+export function sidecarMaterialKey(version: string, build: number, files: SidecarFile[]): string {
+  const hash = crypto.createHash("sha256");
+  hash.update(`${version}\0${build}\0`);
+  for (const file of [...files].sort((a, b) => a.name.localeCompare(b.name))) {
+    hash.update(file.name);
+    hash.update("\0");
+    hash.update(file.bytes);
+    hash.update("\0");
+  }
+  return hash.digest("hex").slice(0, 16);
+}
+
+async function materializedSidecarValid(dir: string, files: SidecarFile[]): Promise<boolean> {
+  return (await pathExists(joinPath(dir, ".complete"))) && (await hasFiles(dir, files.map((f) => f.name)));
+}
+
+async function removeFlatDir(dir: string) {
+  let names: string[] = [];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) await fs.unlink(joinPath(dir, name)).catch(() => undefined);
+  await fs.rmdir(dir).catch(() => undefined);
+}
+
+const samePath = (a: string, b: string) => a.replace(/\\/g, "/").replace(/\/+$/, "") === b.replace(/\\/g, "/").replace(/\/+$/, "");
+
+async function liveDaemonSidecarDir(dataDir: string): Promise<string | undefined> {
+  try {
+    const info: unknown = JSON.parse(await fs.readFile(joinPath(joinPath(dataDir, "daemon"), "daemon.json"), "utf8"));
+    const dir = (info as { sidecarDir?: unknown }).sidecarDir;
+    return typeof dir === "string" && dir ? dir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Keeps cache growth bounded without deleting the tree daemon.json says is live, nor recently written trees. */
+async function cleanupMaterializedSidecars(root: string, keep: string, dataDir: string) {
+  let names: string[] = [];
+  try {
+    names = await fs.readdir(root);
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  const live = await liveDaemonSidecarDir(dataDir);
+  const trees: Array<{ name: string; mtimeMs: number }> = [];
+  for (const name of names) {
+    if (name === keep) continue;
+    const dir = joinPath(root, name);
+    if (name.startsWith(".ota-")) {
+      const stat = await fs.stat(dir).catch(() => undefined);
+      if (stat && now - stat.mtimeMs > 3_600_000) await removeFlatDir(dir);
+      continue;
+    }
+    if (!name.startsWith("ota-") || (live && samePath(dir, live))) continue;
+    const stat = await fs.stat(dir).catch(() => undefined);
+    if (stat) trees.push({ name, mtimeMs: stat.mtimeMs });
+  }
+  trees.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const [index, tree] of trees.entries()) {
+    if (index >= 8 || now - tree.mtimeMs > 30 * 86_400_000) await removeFlatDir(joinPath(root, tree.name));
+  }
+}
+
+/**
+ * Writes one complete sidecar tree beside the app's data, atomically: files go
+ * to a unique temporary sibling first and the versioned directory appears in
+ * one rename, so no concurrent reader can see half a tree.
+ */
+export async function materializeSidecarFiles(dataDir: string, key: string, files: SidecarFile[]): Promise<string> {
+  const root = joinPath(dataDir, "sidecar");
+  const leaf = `ota-${key}`;
+  const finalDir = joinPath(root, leaf);
+  if (await materializedSidecarValid(finalDir, files)) return finalDir;
+  await fs.mkdir(root, { recursive: true });
+  const temp = joinPath(root, `.${leaf}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`);
+  await fs.mkdir(temp, { recursive: true });
+  try {
+    for (const file of files) await fs.writeFile(joinPath(temp, file.name), file.bytes);
+    await fs.writeFile(joinPath(temp, ".complete"), `${key}\n`);
+    try {
+      await fs.rename(temp, finalDir);
+    } catch (error) {
+      if (!(await materializedSidecarValid(finalDir, files))) throw error;
+      await removeFlatDir(temp);
+    }
+  } catch (error) {
+    await removeFlatDir(temp);
+    throw error;
+  }
+  await cleanupMaterializedSidecars(root, leaf, dataDir).catch(() => undefined);
+  return finalDir;
+}
+
+async function assetBytes(url: string): Promise<Uint8Array> {
+  if (url.startsWith("file:")) return new Uint8Array(await fs.readFile(fileURLToPath(url)));
+  if (!url.startsWith("asset:")) return new Uint8Array(await fs.readFile(url));
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+/**
+ * The stable sidecar tree belonging to the running `.nshpkg`, never the
+ * shell's old resources. nsh's package extraction directory is deliberately
+ * not the execution directory: the next OTA launch removes non-running
+ * package trees while a deferred daemon may still need sibling helpers, so
+ * the current package's `asset:/sidecar/*.mjs` bytes are materialized under
+ * the app's own data directory.
+ */
+async function packagedSidecarDir(): Promise<string | undefined> {
+  let pkg: ReturnType<typeof runningPackage>;
+  try {
+    pkg = runningPackage();
+  } catch {
+    return undefined;
+  }
+  if (!pkg) return undefined;
+  const dataDir = appDataDir();
+  if (!dataDir) return undefined;
+  const files = await Promise.all(
+    SIDECAR_NAMES.map(async (name) => ({ name, bytes: await assetBytes(SIDECAR_ASSETS[name]) })),
+  );
+  return materializeSidecarFiles(dataDir, sidecarMaterialKey(pkg.version, pkg.build, files), files);
+}
 
 /**
  * Resolves the directory containing `sidecar/*.mjs`:
+ * - `.nshpkg` run: the running package's own assets, materialized stably
  * - `nsh dev` / checkout: `<appDir>/sidecar`
  * - `nsh package` `.app`: `<appDir>/assets/sidecar`
  */
-async function sidecarDir(): Promise<string | undefined> {
+async function resolveSidecarDir(): Promise<string | undefined> {
+  const g = globalThis as Record<string, unknown>;
+  const packaged = await packagedSidecarDir();
+  if (packaged) {
+    g[SIDECAR_DIR_KEY] = packaged;
+    return packaged;
+  }
   const dir = appDir();
   if (!dir) return undefined;
-  const g = globalThis as Record<string, unknown>;
-  const cached = g[SIDECAR_DIR_KEY] as string | undefined;
-  if (cached) return cached;
   const candidates = [`${dir}/sidecar`, `${dir}/assets/sidecar`];
   for (const candidate of candidates) {
-    if (await fs.exists(`${candidate}/env-paths.mjs`)) {
+    if (await pathExists(`${candidate}/env-paths.mjs`)) {
       g[SIDECAR_DIR_KEY] = candidate;
       return candidate;
     }
   }
   return `${dir}/sidecar`;
+}
+
+async function sidecarDir(): Promise<string | undefined> {
+  const g = globalThis as Record<string, unknown>;
+  const cached = g[SIDECAR_DIR_KEY] as string | undefined;
+  if (cached) return cached;
+  const inFlight = g[SIDECAR_DIR_PROMISE_KEY] as Promise<string | undefined> | undefined;
+  if (inFlight) return inFlight;
+  const resolving = resolveSidecarDir();
+  g[SIDECAR_DIR_PROMISE_KEY] = resolving;
+  try {
+    return await resolving;
+  } finally {
+    if (g[SIDECAR_DIR_PROMISE_KEY] === resolving) delete g[SIDECAR_DIR_PROMISE_KEY];
+  }
 }
 
 const isWindows = process.platform === "windows";

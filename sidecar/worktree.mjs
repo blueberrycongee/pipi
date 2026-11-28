@@ -96,7 +96,7 @@ try {
       }),
     );
   } else if (action === "create") {
-    const label = (process.argv[4] || "agent").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
+    const label = (process.argv[4] || "agent").toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/\.{2,}/g, "-").replace(/^[-.]+|[-.]+$/g, "") || "agent";
     const root = await git(cwd, ["rev-parse", "--show-toplevel"]);
     // In a linked worktree `--show-toplevel` is that checkout, while
     // `--git-common-dir` points back at the primary repository's `.git`.

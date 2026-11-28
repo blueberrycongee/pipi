@@ -618,7 +618,11 @@ function VeiledListView(props: {
           const isTask = () => typeof item().checked === "boolean";
 
           return (
-            <View class={`flex-row gap-2.5 ${isTask() ? "items-start" : "items-baseline"}`}>
+            // Markers and first paragraphs share one explicit point line height, so
+            // top alignment is also first-baseline alignment. `items-baseline` is not
+            // safe here: a composite content column has no reliable first baseline in
+            // nsh, and the fallback is its bottom edge (with worse nested measurement).
+            <View class="flex-row items-start gap-2.5">
               <If
                 when={isTask()}
                 else={
