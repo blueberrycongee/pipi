@@ -1384,6 +1384,58 @@ test("DaemonClient.attach delivers queue_update and blocked dialogs arriving in 
   client.close();
 });
 
+test("DaemonClient.startSession resolves on the session-shaped response, which stays a push too", async () => {
+  const written: string[] = [];
+  let pushStdout: (chunk: string) => void = () => undefined;
+  const link: Transport = {
+    write: (text) => void written.push(text),
+    onStdout: (handler) => void (pushStdout = handler),
+    onStderr: () => undefined,
+    onExit: () => undefined,
+    end: () => undefined,
+    kill: () => undefined,
+  };
+
+  const pushed: string[] = [];
+  const connectPromise = DaemonClient.connect(link, { onSession: (session) => pushed.push(session.id) });
+  pushStdout(`${JSON.stringify({ type: "hello", pid: 42, sessions: [] })}\n`);
+  const daemon = await connectPromise;
+
+  const startPromise = daemon.startSession({ persona: true, agentId: "pi" });
+  const startReq = JSON.parse(written.at(-1)!);
+  const session = {
+    id: "s_pip",
+    title: "Pip",
+    cwd: "/Users/pip/.pipi/persona",
+    agentId: "pi",
+    agentName: "Pi",
+    driver: "pi",
+    persona: true,
+    personaId: "default",
+    runtimeMode: "full-access" as const,
+    status: "idle" as const,
+    unread: false,
+    loaded: false,
+    depth: 0,
+    createdAt: 1,
+    lastActive: 2,
+  };
+
+  // The daemon pushes the new session to every client, then answers the call
+  // with the same session record — that frame is a push and the response alike.
+  pushStdout(
+    [
+      JSON.stringify({ type: "session", session }),
+      JSON.stringify({ id: startReq.id, type: "session", session }),
+      "",
+    ].join("\n"),
+  );
+
+  expect((await startPromise).id).toBe("s_pip");
+  expect(pushed).toEqual(["s_pip", "s_pip"]);
+  expect(daemon.session("s_pip")?.personaId).toBe("default");
+});
+
 test("stageUser shows the user bubble immediately, preserves its row and id on echo, strips handoff context, and keeps pre-echo wake turns ahead of it", () => {
   const t = new Transcript();
   const stagedId = t.stageUser("你好，先显示气泡", 0);

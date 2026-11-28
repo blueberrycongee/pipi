@@ -26,6 +26,10 @@ const launch = (storage: Record<string, string> = {}) =>
   });
 
 const showsInChat = (app: App, text: string) => app.count(`label:Conversation >> text:${text}`) > 0;
+const textVisible = (app: App, text: string) => {
+  const box = app.layout(`text:${text}`);
+  return Boolean(box && !box.hidden && !box.clipped);
+};
 
 test("Pip delivers completed IM messages without streaming jitter, while avatar hover reveals live status", async () => {
   const app = await launch();
@@ -236,28 +240,141 @@ test("Pip SMS bubbles display malformed strong emphasis edge whitespace as bold 
   expect(showsInChat(app, "final 验收")).toBe(true);
 });
 
-test("edited Pip messages show only the latest SMS bubbles, with bounded scrollable version history", async () => {
-  const versions = Array.from({ length: 9 }, (_, i) => ({ content: `Progress version ${i}\n${"Earlier details. ".repeat(15)}`, at: 1000 + i * 1000 }));
+test("edited Pip messages expand older versions inline above the latest bubble without moving Edited", async () => {
+  const versions = [
+    { content: "## Version one\n\nFirst progress version with enough words to wrap into a compact bubble.", at: 1000 },
+    { content: "## Version two\n\nSecond progress version, now closer to the latest answer.", at: 2000 },
+    { content: "Latest answer.", at: 3000 },
+  ];
+  const history = [
+    ...Array.from({ length: 14 }, (_, i) => [
+      { role: "user", content: `Question ${i} with a little more text`, timestamp: i * 10 + 1 },
+      { role: "assistant", content: [{ type: "text", text: `Answer ${i}` }], provider: "test", model: "test", timestamp: i * 10 + 2, stopReason: "stop" },
+    ]).flat(),
+    { role: "user", content: "Coordinate these tasks", timestamp: 200 },
+    { role: "assistant", content: [{ type: "text", text: "Latest answer." }], provider: "test", model: "test", timestamp: 201, stopReason: "stop", editKey: "summary", versions },
+  ];
+  const app = await launch({ "harness.scenario": "history", "harness.history": JSON.stringify(history) });
+  await app.press("id:sidebar-pip");
+  await app.waitFor("id:pip-message-edited");
+  await app.wait(200);
+  const region = "id:pip-edit-history-region";
+  const edited = "id:pip-message-edited";
+  const above = "text:Question 13 with a little more text";
+  const closedHeight = () => app.layout(region)?.height ?? 0;
+  const waitClosed = () => app.waitUntil(() => closedHeight() <= 0.6, { timeout: 3000 });
+
+  expect(closedHeight()).toBeLessThanOrEqual(0.6);
+  await app.hover("text:Latest answer.");
+  await app.wait(260);
+  expect(closedHeight()).toBeLessThanOrEqual(0.6);
+  const editedBefore = app.layout(edited)!;
+  const aboveBefore = app.layout(above)!;
+
+  await app.hover(edited);
+  await app.waitFor(region);
+  await app.wait(320);
+  const editedOpen = app.layout(edited)!;
+  const aboveOpen = app.layout(above)!;
+  const first = app.layout("id:pip-edit-history-version >> nth=0")!;
+  const second = app.layout("id:pip-edit-history-version >> nth=1")!;
+  const bubble = app.layout("text:Latest answer.")!;
+  expect(Math.abs(editedOpen.y - editedBefore.y)).toBeLessThanOrEqual(1);
+  expect(aboveOpen.y).toBeLessThan(aboveBefore.y - 30);
+  expect(first.y).toBeLessThan(second.y);
+  expect(second.y + second.height).toBeLessThanOrEqual(bubble.y + 1);
+  expect(app.viewStyle("id:pip-edit-history-version >> nth=0")?.opacity).toBeLessThan(0.6);
+  expect(app.viewStyle("id:pip-edit-history-version >> nth=0")?.opacity).toBeGreaterThan(0.4);
+  expect(app.viewStyle("text:Latest answer.")?.effectiveOpacity ?? 1).toBe(1);
+
+  await app.hover("text:Latest answer.");
+  await app.wait(260);
+  expect(app.layout(region)?.height ?? 0).toBeGreaterThan(40);
+  await app.hover(region);
+  await app.wait(360);
+  expect(app.layout(region)?.height ?? 0).toBeGreaterThan(40);
+  await app.hover("id:sidebar-pip");
+  await waitClosed();
+  expect(Math.abs((app.layout(edited)?.y ?? 0) - editedBefore.y)).toBeLessThanOrEqual(0.75);
+  expect(Math.abs((app.layout(above)?.y ?? 0) - aboveBefore.y)).toBeLessThanOrEqual(1);
+
+  await app.press(edited);
+  await app.waitFor(region);
+  await app.wait(320);
+  await app.hover("id:sidebar-pip");
+  await app.wait(360);
+  expect(app.layout(region)?.height ?? 0).toBeGreaterThan(40);
+  await app.press(edited);
+  await waitClosed();
+
+});
+
+test("long edited history is bounded, starts at the previous version, and scrolls to the oldest", async () => {
+  const versions = Array.from({ length: 9 }, (_, i) => ({
+    content: `## Progress version ${i}\n\n${"Earlier details in a bounded version bubble. ".repeat(10)}`,
+    at: 1000 + i * 1000,
+  }));
   const latest = "All tasks finished.\n\nReady for review.";
   versions[8].content = latest;
   const app = await launch({ "harness.scenario": "history", "harness.history": JSON.stringify([
     { role: "user", content: "Coordinate these tasks", timestamp: 1 },
     { role: "assistant", content: [{ type: "text", text: latest }], provider: "test", model: "test", timestamp: 2, stopReason: "stop", editKey: "summary", versions },
   ]) });
-  await app.waitFor("id:sidebar-pip");
   await app.press("id:sidebar-pip");
   await app.waitFor("id:pip-message-edited");
   expect(app.count("id:pip-sms-bubble")).toBe(2);
-  expect(app.shows(`text:${versions[0].content}`)).toBe(false);
-  expect(app.shows("id:pip-edit-history")).toBe(false);
+  expect(textVisible(app, "Progress version 0")).toBe(false);
+
   await app.press("id:pip-message-edited");
-  await app.waitFor("id:pip-edit-history");
+  await app.waitFor("id:pip-edit-history-region");
+  await app.wait(320);
   expect(app.count("id:pip-sms-bubble")).toBe(2);
-  expect(app.count(`id:pip-edit-history >> text:${versions[7].content}`)).toBeGreaterThan(0);
+  expect(app.layout("id:pip-edit-history-region")!.height).toBeLessThanOrEqual(296);
+  expect(textVisible(app, "Progress version 7")).toBe(true);
+  expect(textVisible(app, "Progress version 0")).toBe(false);
   await app.scroll("id:pip-edit-history", -4000);
-  expect(app.count(`id:pip-edit-history >> text:${versions[0].content}`)).toBeGreaterThan(0);
-  await app.keyboard.press("escape");
+  await app.waitUntil(() => textVisible(app, "Progress version 0"), { timeout: 3000 });
   expect(app.count("id:pip-sms-bubble")).toBe(2);
+  await app.press("id:pip-message-edited");
+  await app.waitUntil(() => (app.layout("id:pip-edit-history-region")?.height ?? 0) <= 0.6, { timeout: 3000 });
+});
+
+test("edit history expansion stays keyed to its own row across recycled list cells", async () => {
+  const editVersions = (label: string, latest: string) => [
+    { content: `## ${label} older\n\n${label} first text.`, at: 1000 },
+    { content: latest, at: 2000 },
+  ];
+  const firstLatest = "First edited latest.";
+  const secondLatest = "Second edited latest.";
+  const history = [
+    { role: "user", content: "first edited question", timestamp: 1 },
+    { role: "assistant", content: [{ type: "text", text: firstLatest }], provider: "test", model: "test", timestamp: 2, stopReason: "stop", editKey: "first", versions: editVersions("First", firstLatest) },
+    ...Array.from({ length: 18 }, (_, i) => [
+      { role: "user", content: `middle question ${i}`, timestamp: 10 + i * 10 + 1 },
+      { role: "assistant", content: [{ type: "text", text: `middle answer ${i}` }], provider: "test", model: "test", timestamp: 10 + i * 10 + 2, stopReason: "stop" },
+    ]).flat(),
+    { role: "user", content: "second edited question", timestamp: 300 },
+    { role: "assistant", content: [{ type: "text", text: secondLatest }], provider: "test", model: "test", timestamp: 301, stopReason: "stop", editKey: "second", versions: editVersions("Second", secondLatest) },
+  ];
+  const app = await launch({ "harness.scenario": "history", "harness.history": JSON.stringify(history) });
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:second edited question");
+  await app.waitFor("id:pip-message-edited");
+  await app.press("id:pip-message-edited");
+  await app.waitFor("text:Second first text.");
+  await app.wait(320);
+
+  for (let i = 0; i < 5; i++) await app.scroll("label:Conversation", -1200).catch(() => undefined);
+  await app.waitFor("text:first edited question", { timeout: 5000 });
+  expect(textVisible(app, "First first text.")).toBe(false);
+  await app.press("id:pip-message-edited");
+  await app.waitUntil(() => textVisible(app, "First first text."), { timeout: 3000 });
+  expect(textVisible(app, "Second first text.")).toBe(false);
+
+  for (let i = 0; i < 5; i++) await app.scroll("label:Conversation", 1200).catch(() => undefined);
+  await app.waitFor("text:second edited question", { timeout: 5000 });
+  expect(textVisible(app, "Second first text.")).toBe(true);
+  await app.press("id:pip-message-edited");
 });
 
 test("Pip restores independent engine/model/thinking preferences and keeps them across /new and engine handoff", async () => {

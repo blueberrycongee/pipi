@@ -26,6 +26,8 @@ export interface FakeOptions {
   workspaceSessions?: Record<string, SessionSummary[]>;
   /** Initial daemon session records to seed before connect (e.g. failed or interrupted background sessions). */
   daemonSessions?: DaemonSession[];
+  /** Daemon sessions the registry holds but never pushes at connect: the UI's mirror must catch up by other means. */
+  unannouncedDaemonSessions?: DaemonSession[];
   /** Folder path returned when `pickFolder` is called. */
   pickedFolder?: string;
   /** Image path returned when `pickImage` is called. */
@@ -1147,15 +1149,20 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     custom?: CustomAgentConfig;
     pendingQueue?: { steering: string[]; followUp: string[] };
     pendingDialogs?: Map<string, Record<string, unknown>>;
+    /** Held in the registry but never pushed at connect: `list`/`startSession` still see it. */
+    unannounced?: boolean;
   }
 
   const daemonSessions = new Map<string, FakeDaemonSession>(
-    (options.daemonSessions ?? []).map((seed) => [seed.id, { ...seed }]),
+    [
+      ...(options.daemonSessions ?? []),
+      ...(options.unannouncedDaemonSessions ?? []).map((seed) => ({ ...seed, unannounced: true })),
+    ].map((seed) => [seed.id, { ...seed }]),
   );
   let daemonCallbacks: DaemonCallbacks | undefined;
 
   const daemonInfo = (s: FakeDaemonSession): DaemonSession => {
-    const { inner: _inner, viewers: _viewers, custom: _custom, pendingQueue: _pendingQueue, pendingDialogs: _pendingDialogs, ...rest } = s;
+    const { inner: _inner, viewers: _viewers, custom: _custom, pendingQueue: _pendingQueue, pendingDialogs: _pendingDialogs, unannounced: _unannounced, ...rest } = s;
     return { ...rest };
   };
 
@@ -1621,7 +1628,9 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         },
         close() {},
       };
-      for (const s of daemonSessions.values()) pushDaemon(s);
+      for (const s of daemonSessions.values()) {
+        if (!s.unannounced) pushDaemon(s);
+      }
       return client as unknown as DaemonClient;
     },
     listSessions: async (cwd) => byWorkspace[cwd] ?? sessions,

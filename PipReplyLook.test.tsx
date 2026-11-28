@@ -57,4 +57,39 @@ for (const colorScheme of ["light", "dark"] as const) {
 
     await app.screenshot(`.nsh/shots/pip-reply-thread-${colorScheme}.png`);
   }, 60000);
+
+  test(`a tapback keeps its corner room in a consecutive bubble cluster ${colorScheme}`, async () => {
+    const history = JSON.stringify([
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "First bubble.\n\nSecond bubble.\n\nThird bubble." }],
+        provider: "test",
+        model: "test",
+        timestamp: 1,
+        stopReason: "stop",
+      },
+    ]);
+    const app = await open("./Harness.tsx", {
+      width: 1180,
+      height: 780,
+      platform: "macos",
+      locale: "en-US",
+      colorScheme,
+      clock: {},
+      storage: {
+        "harness.scenario": "history",
+        "harness.history": history,
+      },
+    });
+    await app.press("id:sidebar-pip");
+    await app.waitFor("text:Third bubble.");
+    await app.press("id:pip-message-actions >> nth=1");
+    await app.waitFor("id:pip-message-menu");
+    await app.press("id:pip-tapback-❤️");
+    await app.waitFor("id:pip-message-tapback");
+    await app.waitUntil(() => !app.shows("id:pip-message-menu"));
+    await app.wait(250);
+    expect(app.count("id:pip-sms-bubble")).toBe(3);
+    await app.screenshot(`.nsh/shots/pip-tapback-cluster-${colorScheme}.png`);
+  }, 60000);
 }

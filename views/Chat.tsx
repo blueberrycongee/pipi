@@ -88,6 +88,7 @@ import { buildDisplayRows, displayRowIds, stableDisplayRows } from "../pi/turns"
 import { resolveAnchor } from "../lib/pip-anchors";
 import { pipReplyLocate, resetPipInteractionChrome } from "../store/pip-interactions";
 import { PipMessageMenuLayer, PipReplyFocusLayer } from "./PipMessageLayers";
+import { resetEditHistories } from "./pip-edit-history";
 import { FIGURE_REST, FOLLOW_THRESHOLD, footOf, HORIZON_GAP, INPUT_WINDOW_MS, RELEASE_SETTLE_MS, ScrollToBottomPill, type ScrollMode, UPWARD_GUARD_MS } from "./chat-scroll";
 
 /** Whether the displayed conversation is actively running. */
@@ -1575,6 +1576,7 @@ export function Chat() {
       viewSpan = -1;
       ensureEntered(key);
       resetPipInteractionChrome();
+      resetEditHistories();
       pokeRepaint();
     });
   });

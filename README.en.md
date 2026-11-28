@@ -15,11 +15,23 @@ pipi is a cross-platform native desktop app (no Electron) that gathers the codin
 
 ## Highlights
 
+- A personal agent, **Pip**, pinned in the sidebar — iMessage-style bubbles, answers it can edit itself (version history kept), any engine and model you pick
 - Built-in support for **18 coding agents**, plus any ACP-compatible command
 - Parallel sessions: switching conversations never interrupts a running task
 - Delegate sub-tasks by role to any installed agent to work in parallel
+- Markdown documents are first-class: inline rewrites from the DocOrb, one-click undo, @-mention into sessions
 - Command palette (`⌘K` / `Ctrl+K`), slash commands, image paste, session archiving, usage stats, custom wallpapers
 - pipi the mascot is cute, with 7 cat and 7 dog coats in Settings
+
+## Pip, your personal agent
+
+Pinned atop the sidebar lives Pip — a personal agent running on whichever engine and model you choose (Pi, Claude Code, Codex — your call, thinking level included). It talks in iMessage-style bubbles: an answer lands as a cluster, a bad one quietly edits itself with every version kept, and when a job gets big it delegates sub-tasks to the other agents on your machine — live status chips you can click through to supervise.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/promo/pip-dark.png">
+  <img alt="A Pip conversation: iMessage-style bubbles, an edited marker, an inline chart, and two delegated-session chips" src="assets/promo/pip.png">
+</picture>
+
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/promo/chat-dark.png">

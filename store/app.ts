@@ -1878,6 +1878,18 @@ export async function ensurePersonalAgent(personaId = "default", options?: { nam
       upsertDaemonSession(session);
       return session.id;
     } catch (error) {
+      // The daemon's registry is the truth: a persona it still holds is this one's,
+      // whatever the local mirror missed (a retired id an older daemon pushes back,
+      // a push filtered or lost before it landed). Adopt it rather than report a failure.
+      const heldRemotely = await daemon
+        .list()
+        .then((all) => all.find((s) => s.persona && (s.personaId ?? "default") === personaId))
+        .catch(() => undefined);
+      if (heldRemotely) {
+        dismissedDaemonIds.delete(heldRemotely.id);
+        upsertDaemonSession(heldRemotely);
+        return heldRemotely.id;
+      }
       const label = options?.name?.trim() || (personaId === "default" ? "Pip" : tr("the personal agent", "个人智能体"));
       toast("warning", `${tr(`${label} could not start`, `${label} 启动失败`)}: ${message(error)}`);
       return undefined;

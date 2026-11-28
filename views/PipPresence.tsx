@@ -1,9 +1,10 @@
-import { Animated, Canvas, cleanup, computed, createAnimatedValue, effect, Path2D, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
+import { Animated, Canvas, cleanup, computed, createAnimatedValue, effect, keymap, Path2D, reduceMotion, Scroll, signal, Text, token, untracked, View } from "nsh";
 import type { CanvasRenderingContext2D, CompositeAnimation, JSX, ScrollRef, ViewRef } from "nsh";
-import { Button as BaseButton, Popover } from "nsh/base";
+import { Button as BaseButton, Popover, TextView } from "nsh/base";
 import { Menu } from "nsh/desktop";
 import { activeLanguage, tr } from "../lib/i18n";
 import { replyExcerpt } from "../lib/doc-wire";
+import { mendSettledStrongEmphasis } from "../lib/mend";
 import { pipAnchor } from "../lib/pip-anchors";
 import { derivePipLiveStatus, formatElapsedCompact, type PipChildStatus, type PipLiveStatus, type PipPhase } from "../lib/pip-status";
 import { Pip } from "../mascot/Pip";
@@ -14,6 +15,7 @@ import {
   type PipTurnMeta,
   spokenDuration,
 } from "../pi/turns";
+import type { MessageVersion } from "../pi/protocol";
 import {
   activeAgent,
   activePersonaId,
@@ -21,6 +23,7 @@ import {
   currentActivity,
   currentChildSessions,
   currentDaemonSession,
+  conversationKey,
   daemonSessionOfId,
   daemonSessionTitle,
   draftModel,
@@ -55,9 +58,161 @@ import { uiHeight, uiType } from "../ui/typography";
 import { PersonaAvatar } from "./PersonaAvatar";
 import { PipMessageAdornments, pipMessageNode, registerPipMessageNode } from "./PipAdornments";
 import { PipBubbleBlocks, type PipBubbleRow } from "./Prose";
+import { closeEditHistory, editHistoryEscapeBlocked, editHistoryState, enterEditHistory, enterEditHistoryBridge, leaveEditHistory, toggleEditHistoryPin } from "./pip-edit-history";
 
 const HOVER_OPEN_MS = 100;
 const HOVER_CLOSE_MS = 160;
+const EDIT_HISTORY_SPRING_STIFFNESS = 170;
+const EDIT_HISTORY_SPRING_DAMPING = 26;
+
+function useEditHistoryReveal(rowId: () => string, open: () => boolean) {
+  const height = signal(0);
+  const opacity = createAnimatedValue(0);
+  const translateY = createAnimatedValue(3);
+  let trackedId = "";
+  let currentOpen = false;
+  let measured = 0;
+  let position = 0;
+  let velocity = 0;
+  let target = 0;
+  let frame: number | undefined;
+  let lastAt = 0;
+  let measureSnap = true;
+
+  const stopFrame = () => {
+    if (frame !== undefined) cancelAnimationFrame(frame);
+    frame = undefined;
+  };
+
+  const settle = (value: number) => {
+    stopFrame();
+    position = target = value;
+    velocity = 0;
+    height.set(Math.max(0, Math.round(value * 100) / 100));
+  };
+
+  const step = () => {
+    const now = Date.now();
+    const dt = Math.min(0.032, Math.max(0.004, (now - lastAt) / 1000));
+    lastAt = now;
+    const force = -EDIT_HISTORY_SPRING_STIFFNESS * (position - target) - EDIT_HISTORY_SPRING_DAMPING * velocity;
+    velocity += force * dt;
+    position += velocity * dt;
+    if (position < 0) {
+      position = 0;
+      if (velocity < 0) velocity = 0;
+    }
+    if ((target === 0 && position < 0.6) || (Math.abs(position - target) < 0.5 && Math.abs(velocity) < 8)) {
+      settle(target);
+      return;
+    }
+    height.set(Math.max(0, Math.round(position * 100) / 100));
+    frame = requestAnimationFrame(step);
+  };
+
+  const startFrame = () => {
+    if (frame !== undefined) return;
+    lastAt = Date.now();
+    frame = requestAnimationFrame(step);
+  };
+
+  const animateOpen = (nextOpen: boolean) => {
+    target = nextOpen ? measured : 0;
+    void opacity.stop();
+    void translateY.stop();
+    if (untracked(reduceMotion)) {
+      opacity.set(nextOpen ? 1 : 0);
+      translateY.set(0);
+      settle(target);
+      return;
+    }
+    if (nextOpen) {
+      void opacity.timing(1, { duration: 180, easing: EASING.entrance });
+      void translateY.timing(0, { duration: 220, easing: EASING.signature });
+    } else {
+      void opacity.timing(0, { duration: 145, easing: EASING.exit });
+      void translateY.timing(3, { duration: 165, easing: EASING.exit });
+    }
+    startFrame();
+  };
+
+  const snapOpen = (nextOpen: boolean) => {
+    void opacity.stop();
+    void translateY.stop();
+    opacity.set(nextOpen ? 1 : 0);
+    translateY.set(nextOpen ? 0 : 3);
+    settle(nextOpen ? measured : 0);
+  };
+
+  effect(() => {
+    const id = rowId();
+    const nextOpen = open();
+    untracked(() => {
+      if (id !== trackedId) {
+        trackedId = id;
+        currentOpen = nextOpen;
+        measured = 0;
+        measureSnap = true;
+        snapOpen(nextOpen);
+        return;
+      }
+      if (nextOpen === currentOpen) return;
+      currentOpen = nextOpen;
+      animateOpen(nextOpen);
+    });
+  });
+
+  cleanup(() => {
+    stopFrame();
+    void opacity.stop();
+    void translateY.stop();
+  });
+
+  return {
+    height,
+    style: { opacity, transform: [{ translateY }] },
+    measure(contentHeight: number) {
+      if (contentHeight <= 0) return;
+      measured = contentHeight;
+      if (!currentOpen) {
+        measureSnap = false;
+        return;
+      }
+      target = contentHeight;
+      if (measureSnap) {
+        measureSnap = false;
+        settle(contentHeight);
+        return;
+      }
+      if (Math.abs(position - contentHeight) > 0.5) startFrame();
+    },
+  };
+}
+
+function PipEditHistoryVersion(props: { row: PipBubbleRow; version: MessageVersion; index: number }) {
+  const doc = computed(() => TextView.parse(mendSettledStrongEmphasis(props.version.content), { streaming: false }));
+  const historyRow = computed<PipBubbleRow>(() => ({
+    ...props.row,
+    id: `${props.row.id}#edit-${props.index}`,
+    blocks: doc().blocks,
+    ...(doc().footnotes?.length ? { footnotes: doc().footnotes } : { footnotes: undefined }),
+    copyText: props.version.content,
+    versions: undefined,
+    edited: false,
+    mediaOnly: false,
+  }));
+  const pad = () => (doc().blocks.length > 1 || props.row.wide ? "px-4 py-3" : "px-3.5 py-2");
+  return (
+    <View
+      testID="pip-edit-history-version"
+      selectable
+      class={`self-start ${props.row.wide ? "max-w-[84%]" : "max-w-[74%]"} rounded-[18px] corner-squircle bg-sms-incoming ${pad()}`}
+      style={{ opacity: 0.52 }}
+    >
+      <PipBubbleBlocks row={historyRow()} />
+    </View>
+  );
+}
 
 /** Crisp curved macOS iMessage tail drawn on a 11x15 Retina canvas. */
 const TAIL_PATH = new Path2D(
@@ -696,8 +851,42 @@ export function PipBubbleView(props: {
   processOpen?: () => boolean;
   onToggleProcess?: () => void;
 }) {
-  const historyOpen = signal(false);
+  const historyKey = () => `${conversationKey()}:${props.row.id}`;
+  const historyOpen = () => editHistoryState(historyKey()).open;
+  const historyReveal = useEditHistoryReveal(historyKey, historyOpen);
   let historyScroll: ScrollRef | null = null;
+  let historyScrolledKey = "";
+  let historyScrollTimer: ReturnType<typeof setTimeout> | undefined;
+  let historyContentHeight = 0;
+  let historyViewHeight = 0;
+  let historyOffset = 0;
+  const historyScrollable = signal(false);
+  effect(() => {
+    historyKey();
+    untracked(() => {
+      clearTimeout(historyScrollTimer);
+      historyContentHeight = 0;
+      historyViewHeight = 0;
+      historyOffset = 0;
+      historyScrollable.set(false);
+      historyScrolledKey = "";
+    });
+  });
+  cleanup(() => clearTimeout(historyScrollTimer));
+  effect(() => {
+    if (!historyOpen() || editHistoryEscapeBlocked()) return;
+    const key = historyKey();
+    cleanup(keymap.bind("escape", () => closeEditHistory(key), { when: "always" }));
+  });
+  const syncHistoryScrollable = () => historyScrollable.set(historyContentHeight > historyViewHeight + 1);
+  const historyMaxOffset = () => Math.max(0, historyContentHeight - historyViewHeight);
+  const scrollHistoryTo = (y: number) => {
+    historyOffset = Math.max(0, Math.min(historyMaxOffset(), y));
+    historyScroll?.scrollTo({ y: historyOffset, animated: false });
+  };
+  const historyWheel = (e: { delta: { y: number }; deltaMode: "points" | "lines" }) => {
+    scrollHistoryTo(historyOffset + e.delta.y * (e.deltaMode === "lines" ? 32 : 1));
+  };
   const entrance = useSmsBubbleEntrance(
     () => props.row.id,
     () => "left",
@@ -781,6 +970,50 @@ export function PipBubbleView(props: {
         </If>
       </View>
       <View class="min-w-0 flex-1 items-start">
+        <If when={(props.row.versions?.length ?? 0) > 1}>
+          <View
+            testID="pip-edit-history-region"
+            selectable
+            onMouseEnter={() => enterEditHistory(historyKey(), "history")}
+            onMouseLeave={() => leaveEditHistory(historyKey(), "history")}
+            class={`w-full overflow-hidden ${historyOpen() ? "" : "pointer-events-none"}`}
+            style={{ height: historyReveal.height() }}
+          >
+            <View
+              class="pb-1.5"
+              onLayout={(e) => {
+                historyReveal.measure(e.bounds.size.height);
+                const scrollKey = `${props.row.id}:${props.row.versions?.length ?? 0}:${e.bounds.size.height}`;
+                if (historyScroll && historyScrolledKey !== scrollKey) {
+                  historyScrolledKey = scrollKey;
+                  clearTimeout(historyScrollTimer);
+                  historyScrollTimer = setTimeout(() => scrollHistoryTo(Number.POSITIVE_INFINITY), 0);
+                }
+              }}
+              style={historyReveal.style}
+            >
+              <Scroll
+                ref={(ref) => { historyScroll = ref; }}
+                testID="pip-edit-history"
+                class="w-full"
+                style={{ maxHeight: 288 }}
+                scrollEventThrottle={16}
+                onLayout={(e) => { historyViewHeight = e.bounds.size.height; syncHistoryScrollable(); }}
+                onScroll={(e) => { historyOffset = e.offset.y; }}
+              >
+                <View
+                  class="w-full items-start gap-1.5 py-0.5"
+                  onLayout={(e) => { historyContentHeight = e.bounds.size.height; syncHistoryScrollable(); }}
+                  onWheel={historyScrollable() ? historyWheel : undefined}
+                >
+                  <Each of={props.row.versions?.slice(0, -1) ?? []} key={(version, index) => `${props.row.id}:${index}:${version.at}:${version.content.length}`}>
+                    {(version, index) => <PipEditHistoryVersion row={props.row} version={version()} index={index()} />}
+                  </Each>
+                </View>
+              </Scroll>
+            </View>
+          </View>
+        </If>
         <If
           when={props.row.mediaOnly}
           else={
@@ -788,6 +1021,8 @@ export function PipBubbleView(props: {
               testID="pip-sms-bubble"
               ref={(node: ViewRef | undefined) => bubbleNode.set(node)}
               selectable
+              onMouseEnter={() => { if ((props.row.versions?.length ?? 0) > 1) enterEditHistoryBridge(historyKey()); }}
+              onMouseLeave={() => { if ((props.row.versions?.length ?? 0) > 1) leaveEditHistory(historyKey(), "bridge"); }}
               onContextMenu={contextMenu}
               style={entrance}
               class={`relative ${props.row.wide ? "max-w-[84%]" : "max-w-[74%]"} ${bubbleRadius()} corner-squircle bg-sms-incoming ${bubblePad()}`}
@@ -805,7 +1040,7 @@ export function PipBubbleView(props: {
             </View>
           }
         >
-          <View testID="pip-sms-bubble" ref={(node: ViewRef | undefined) => bubbleNode.set(node)} style={entrance} class="relative max-w-[74%]" onContextMenu={contextMenu}>
+          <View testID="pip-sms-bubble" ref={(node: ViewRef | undefined) => bubbleNode.set(node)} style={entrance} class="relative max-w-[74%]" onMouseEnter={() => { if ((props.row.versions?.length ?? 0) > 1) enterEditHistoryBridge(historyKey()); }} onMouseLeave={() => { if ((props.row.versions?.length ?? 0) > 1) leaveEditHistory(historyKey(), "bridge"); }} onContextMenu={contextMenu}>
             {isPersonaSession() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="left" /> : null}
             {isPersonaSession() ? (
               <View class={`absolute -right-8 top-1/2 -translate-y-1/2 z-30 ${HOVER_REVEAL}`}>
@@ -816,24 +1051,19 @@ export function PipBubbleView(props: {
           </View>
         </If>
         <If when={(props.row.versions?.length ?? 0) > 1}>
-          <Popover
-            open={historyOpen()}
-            onOpenChange={(event) => historyOpen.set(event.open)}
-            placement="top"
-            align="start"
-            closeOnEscape
-            closeOnPressOutside
-            popupClass={POPUP}
-            trigger={<View testID="pip-message-edited" role="button" accessibilityLabel={tr("Edited", "已编辑")} onPress={() => historyOpen.set(!historyOpen())} class="px-1 py-1 hover:opacity-80"><Text class={`${uiType("2xs")} text-subtle`}>{tr("Edited", "已编辑")}</Text></View>}
+          <View
+            testID="pip-message-edited"
+            role="button"
+            accessibilityLabel={tr("Edited", "已编辑")}
+            accessibilityState={{ expanded: historyOpen() }}
+            onMouseEnter={() => enterEditHistory(historyKey(), "trigger")}
+            onMouseLeave={() => leaveEditHistory(historyKey(), "trigger")}
+            onPress={() => toggleEditHistoryPin(historyKey())}
+            onKeyDown={(e) => { if ((e.key === "Escape" || e.key === "escape") && !editHistoryEscapeBlocked()) closeEditHistory(historyKey()); }}
+            class={`self-start px-1 py-1 hover:opacity-80 ${FOCUS_RING}`}
           >
-            <Scroll ref={(ref) => { historyScroll = ref; }} testID="pip-edit-history" class="h-[280px] w-[360px]" contentClass="p-4">
-              <View selectable class="gap-3" onLayout={() => historyScroll?.scrollToEnd({ animated: false })}>
-              <Each of={props.row.versions?.slice(0, -1) ?? []} key={(_, index) => String(index)}>
-                {(version) => <View class="gap-1 border-b border-hairline pb-3"><Text class={`${uiType("2xs")} text-subtle`}>{new Date(version().at).toLocaleString()}</Text><Text class={`${uiType("sm")} text-muted-foreground`}>{version().content}</Text></View>}
-              </Each>
-              </View>
-            </Scroll>
-          </Popover>
+            <Text class={`${uiType("2xs")} text-subtle`}>{tr("Edited", "已编辑")}</Text>
+          </View>
         </If>
       </View>
     </View>

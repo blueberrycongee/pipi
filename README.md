@@ -15,11 +15,23 @@ pipi 是一款跨平台原生桌面应用（不用 Electron），把电脑上已
 
 ## 特性
 
+- 侧边栏常驻私人助理 **Pip**：iMessage 式气泡、能自己修改的回答（版本历史都在）、引擎和模型随换
 - 内置支持 **18 种主流编码智能体**，也可添加任何 ACP 兼容命令
 - 多会话并行：切换会话不打断运行中的任务，后台进度一目了然
 - 可以把子任务按角色委派给本机任意智能体并行完成
+- Markdown 文档是第一类公民：DocOrb 就地改写、一键撤回，文档可以 @ 进会话
 - 命令面板（`⌘K` / `Ctrl+K`）、斜杠命令、图片粘贴、会话归档、用量统计、自定义壁纸
 - 吉祥物 pipi 很可爱，设置里还能给它换 7 款猫咪和 7 款小狗皮肤
+
+## 私人助理 Pip
+
+侧边栏顶端钉着一只 Pip——你的私人助理，跑在你挑的智能体和模型上，引擎、思考强度随时换。聊天是 iMessage 式气泡：一段回答收成一簇，答得不好它自己会改，每个版本都留底；活太大，它把子任务委派给本机其他智能体并行干，会话卡片实时报状态，点一下就能进去督战。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/promo/pip-zh-dark.png">
+  <img alt="Pip 对话：iMessage 式气泡、已编辑标记、内联图表和两张委派会话卡片" src="assets/promo/pip-zh.png">
+</picture>
+
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/promo/chat-zh-dark.png">

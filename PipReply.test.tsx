@@ -4,6 +4,8 @@ import { expect, open, test } from "nsh/test";
 //
 //   nsh test PipReply.test.tsx
 
+const PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
 const launch = (storage: Record<string, string> = {}) =>
   open("./Harness.tsx", {
     width: 1180,
@@ -23,6 +25,23 @@ const openPipWithReply = async (app: Awaited<ReturnType<typeof launch>>) => {
   await app.submit("label:Message");
   await app.waitFor("text:Target answer.");
   await app.waitUntil(() => !app.shows("id:pip-typing-bubble"));
+};
+
+const reactAndExpectRoom = async (app: Awaited<ReturnType<typeof launch>>, first: string, second: string) => {
+  const before = app.layout(second);
+  expect(before).toBeTruthy();
+  await app.rightClick(second);
+  await app.waitFor("id:pip-message-menu");
+  await app.press("id:pip-tapback-❤️");
+  await app.waitFor("id:pip-message-tapback");
+  await app.waitUntil(() => {
+    const box = app.layout(second);
+    return Boolean(before && box && box.y - before.y > 8);
+  });
+  const firstBox = app.layout(first)!;
+  const tapback = app.layout("id:pip-message-tapback")!;
+  expect(tapback.y).toBeGreaterThanOrEqual(firstBox.y + firstBox.height);
+  return before!;
 };
 
 test("reply enters blur-focus, Escape and backdrop cancel, and sending restores a clean quote card", async () => {
@@ -142,7 +161,7 @@ test("tapbacks toggle locally and Pip, emoji, and custom image stickers attach a
 
 
 test("pure image user messages expose persona actions and focus without an empty text bubble", async () => {
-  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const png = PNG_1X1;
   const history = JSON.stringify([
     { role: "user", content: [{ type: "image", data: png, mimeType: "image/png" }], timestamp: 1 },
   ]);
@@ -205,6 +224,81 @@ test("stored tapbacks and stickers are restored when a persona conversation is o
   await app.waitFor("text:Target answer.");
   await app.waitFor("id:pip-message-tapback");
   expect(app.shows("id:pip-message-sticker")).toBe(true);
+});
+
+test("a tapback opening on a clustered bubble makes enough vertical room and removing it restores the cluster", async () => {
+  const history = JSON.stringify([
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "First bubble.\n\nSecond bubble.\n\nThird bubble." }],
+      provider: "test",
+      model: "test",
+      timestamp: 1,
+      stopReason: "stop",
+    },
+  ]);
+  const app = await launch({ "harness.scenario": "history", "harness.history": history });
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:Third bubble.");
+  const first = "id:pip-sms-bubble >> nth=0";
+  const second = "id:pip-sms-bubble >> nth=1";
+  const before = await reactAndExpectRoom(app, first, second);
+
+  await app.rightClick(second);
+  await app.waitFor("id:pip-message-menu");
+  await app.press("id:pip-tapback-❤️");
+  await app.waitUntil(() => !app.shows("id:pip-message-tapback"));
+  await app.waitUntil(() => {
+    const box = app.layout(second);
+    return Boolean(before && box && Math.abs(box.y - before.y) < 1);
+  });
+});
+
+test("a tapback opening on a consecutive outgoing bubble makes enough vertical room", async () => {
+  const history = JSON.stringify([
+    { role: "user", content: "First outgoing.", timestamp: 1 },
+    { role: "user", content: "Second outgoing.", timestamp: 2 },
+  ]);
+  const app = await launch({ "harness.scenario": "history", "harness.history": history });
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:Second outgoing.");
+  const second = "id:message-bubble >> nth=1";
+  await reactAndExpectRoom(app, "id:message-bubble >> nth=0", second);
+});
+
+test("a tapback opening on a consecutive media bubble makes enough vertical room", async () => {
+  const png = PNG_1X1;
+  const image = (alt: string) => `![${alt}](data:image/png;base64,${png})`;
+  const history = JSON.stringify([
+    {
+      role: "assistant",
+      content: [{ type: "text", text: `${image("one")}\n\n${image("two")}` }],
+      provider: "test",
+      model: "test",
+      timestamp: 1,
+      stopReason: "stop",
+    },
+  ]);
+  const app = await launch({ "harness.scenario": "history", "harness.history": history });
+  await app.press("id:sidebar-pip");
+  await app.waitUntil(() => app.count("id:pip-sms-bubble") >= 2);
+  const first = "id:pip-sms-bubble >> nth=0";
+  const second = "id:pip-sms-bubble >> nth=1";
+  await reactAndExpectRoom(app, first, second);
+});
+
+test("a tapback opening on a consecutive outgoing media bubble makes enough vertical room", async () => {
+  const image = { type: "image", data: PNG_1X1, mimeType: "image/png" };
+  const history = JSON.stringify([
+    { role: "user", content: [image], timestamp: 1 },
+    { role: "user", content: [image], timestamp: 2 },
+  ]);
+  const app = await launch({ "harness.scenario": "history", "harness.history": history });
+  await app.press("id:sidebar-pip");
+  await app.waitUntil(() => app.count("id:message-image") >= 2);
+  const first = "id:message-image >> nth=0";
+  const second = "id:message-image >> nth=1";
+  await reactAndExpectRoom(app, first, second);
 });
 
 test("clicking a quote preview scrolls the anchored original message back into view", async () => {

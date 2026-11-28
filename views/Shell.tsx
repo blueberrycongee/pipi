@@ -49,6 +49,7 @@ import {
   waitingCount,
   wallpaper,
 } from "../store/app";
+import { pipMessageMenu, pipReplyTarget } from "../store/pip-interactions";
 import {
   runInBackground,
   setRunInBackground,
@@ -84,6 +85,7 @@ import { DocDeck, notifyDocPointerUp } from "./DocEditor";
 import { ExtensionDialog, hasInlinePrompt } from "./ExtensionDialog";
 import { PersonaCreateDialog } from "./PersonaCreateDialog";
 import { Palette } from "./Palette";
+import { closeAnyEditHistory, setEditHistoryEscapeBlocker } from "./pip-edit-history";
 import { Settings } from "./Settings";
 import { notifySidebarPointerMove, notifySidebarPointerUp, Sidebar } from "./Sidebar";
 import {
@@ -135,6 +137,10 @@ const effectiveSidebarMinWidth = () =>
 const toggleSidebar = () => setSidebarOpen(!sidebarOpen());
 const toggleSettings = () => (currentView().name === "settings" ? leaveSettings() : showSettings());
 
+setEditHistoryEscapeBlocker(() => Boolean(
+  splitDrag() || isPaletteOpen() || isCompareOpen() || isZoomOpen() || isWallpaperAdjustOpen() || pendingDialog() || isRenaming() || currentView().name === "settings" || pipMessageMenu() || pipReplyTarget(),
+));
+
 /** Escape leaves what is on top: a dialog or inline prompt closes itself; then settings or sub-agent inspection; then the run stops. */
 function escape() {
   if (splitDrag()) return cancelSplitDrag();
@@ -145,6 +151,8 @@ function escape() {
   }
   if (isRenaming()) return cancelRenaming();
   if (currentView().name === "settings") return leaveSettings();
+  if (pipMessageMenu() || pipReplyTarget()) return;
+  if (closeAnyEditHistory()) return;
   if (currentView().name === "chat" && (isRunning() || isBashRunning() || waitingCount() > 0)) void stop();
 }
 

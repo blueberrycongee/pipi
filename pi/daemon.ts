@@ -177,6 +177,14 @@ export class DaemonClient {
         const session = msg.session as DaemonSession;
         this.sessions.set(session.id, session);
         this.callbacks.onSession(session);
+        // `start_session`/`set_session_choices` answer with the session record itself:
+        // the same frame is a push and the pending call's response.
+        if (typeof msg.id === "string" && this.pending.has(msg.id)) {
+          const w = this.pending.get(msg.id)!;
+          this.pending.delete(msg.id);
+          this.pendingAttaches.delete(msg.id);
+          w.resolve(msg);
+        }
         return;
       }
       case "session_removed": {

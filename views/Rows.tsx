@@ -16,7 +16,7 @@ import {
   type MediaItem,
 } from "../lib/media";
 import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
-import { userAnchor } from "../lib/pip-anchors";
+import { pipAnchor, userAnchor } from "../lib/pip-anchors";
 import type { ImageContent } from "../pi/protocol";
 import { type Row, type ToolRow, withoutPreamble, withoutImageNotes } from "../pi/transcript";
 import {
@@ -56,7 +56,7 @@ import {
 import { backend } from "../store/backend";
 import { docTabTitle, titleLine } from "../store/docs";
 import { openDocIfThere } from "../store/tabs";
-import { openPipMessageMenu } from "../store/pip-interactions";
+import { messageInteraction, openPipMessageMenu } from "../store/pip-interactions";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { DURATION, EASING, isRowSeen, keepLast, Presence, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
@@ -1790,12 +1790,27 @@ export function TranscriptRow(props: { row: ChatRow; activityMaxHeight: number }
     () => props.row.kind === "user" || Boolean(pipSlot()),
   );
   const of = <K extends ChatRow["kind"]>(kind: K) => (props.row.kind === kind ? (props.row as Extract<ChatRow, { kind: K }>) : undefined);
-  const spacing = () => {
+  const hasTapback = () => {
+    if (!isPersonaSession()) return false;
+    const scope = `${activePersonaId() ?? "default"}:${currentDaemonSession()?.id ?? "unattached"}`;
     if (props.row.kind === "user" && props.row.sms) {
-      return props.row.sms.first ? "pt-3.5 pb-[1.5px]" : "py-[1.5px]";
+      const target = userAnchor(transcriptRows(), props.row.id) ?? props.row.id;
+      return Boolean(messageInteraction(scope, target)?.tapback);
     }
     if (props.row.kind === "pip-bubble") {
-      return props.row.pip.lead ? "pt-3.5 pb-[1.5px]" : "py-[1.5px]";
+      const target = pipAnchor(transcriptRows(), props.row.rowId, props.row.bubbleIndex) ?? props.row.id;
+      return Boolean(messageInteraction(scope, target)?.tapback);
+    }
+    return false;
+  };
+  const spacing = () => {
+    if (props.row.kind === "user" && props.row.sms) {
+      if (props.row.sms.first) return "pt-3.5 pb-[1.5px]";
+      return hasTapback() ? "pt-3 pb-[1.5px]" : "py-[1.5px]";
+    }
+    if (props.row.kind === "pip-bubble") {
+      if (props.row.pip.lead) return "pt-3.5 pb-[1.5px]";
+      return hasTapback() ? "pt-3 pb-[1.5px]" : "py-[1.5px]";
     }
     if (pipSlot()?.lead) return "pt-3.5 pb-0.5";
     return SPACING[props.row.kind];

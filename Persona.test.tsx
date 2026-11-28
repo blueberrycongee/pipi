@@ -302,3 +302,53 @@ test("delete is protected on the default persona and removes a confirmed custom 
   expect(app.count("id:sidebar-pip >> text:Pip")).toBe(1);
   expect(app.count("id:persona-header")).toBe(0);
 });
+
+test("a persona the daemon already holds is adopted instead of started again", async () => {
+  const now = Date.now();
+  const personaSeed = (id: string, personaId: string, title: string, cwd: string) => ({
+    id,
+    title,
+    titleLocked: true,
+    persona: true,
+    personaId,
+    cwd,
+    agentId: "pi",
+    agentName: "Pi",
+    driver: "pi",
+    runtimeMode: "full-access",
+    status: "idle",
+    unread: false,
+    loaded: true,
+    depth: 0,
+    createdAt: now - 80_000,
+    lastActive: now - 10_000,
+  });
+  // The daemon's registry holds both personas but never pushed them to this
+  // window — the mirror the sidebar reads knows nothing of them (the shape a
+  // push filtered or lost across a restart leaves).
+  const app = await launch({
+    "harness.unannouncedDaemonSessions": JSON.stringify([
+      personaSeed("s_pip", "default", "Pip", "/Users/pip/.pipi/persona"),
+      personaSeed("s_nova", "nova", "Nova", "/Users/pip/.pipi/personas/nova"),
+    ]),
+  });
+  await app.waitFor("text:What are we building?");
+
+  // Pressing Pip's pinned row must adopt the held session, not start a duplicate.
+  await app.press("id:sidebar-pip");
+  await app.waitFor("id:persona-header");
+  await app.waitUntil(() => app.count("id:persona-header >> text:Pip") > 0);
+  expect(app.texts().filter((t) => t.includes("already runs as") || t.includes("启动失败"))).toEqual([]);
+
+  // Creating a persona whose id the daemon already holds adopts it too —
+  // the toast this used to raise was "Nova 启动失败: the personal agent already runs as s_nova".
+  await app.press("id:sidebar-persona-add");
+  await app.waitFor("id:persona-create-form");
+  await app.type("id:persona-name-input", "Nova");
+  await app.press("id:persona-create-submit");
+  await app.waitUntil(() => app.count("id:persona-create-form") === 0);
+  await app.waitUntil(() => app.count("id:sidebar-persona-nova") === 1);
+  await app.waitUntil(() => app.count("id:persona-header >> text:Nova") > 0);
+  expect(app.texts().filter((t) => t.includes("already runs as") || t.includes("启动失败"))).toEqual([]);
+  expect(app.count("id:sidebar-pip >> text:Pip")).toBe(1);
+});
