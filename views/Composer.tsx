@@ -57,6 +57,7 @@ import { attachDocToCurrentComposer, draftToDoc, mentionableDocs, openDocTab } f
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { EASING, enter, keepLast, popupHiddenStyle, popupLeavingStyle, popupStyle, Presence, Reveal, SPRING } from "../ui/motion";
+import { isSmsThrowLaunching, notifyThrowComposerLayout, registerThrowComposerInput } from "../ui/pip-throw";
 import { COMPOSER_SURFACE, FOCUS_RING, GLASS_REGULAR, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
 import { readingType, uiHeight, uiMinHeight, uiType } from "../ui/typography";
@@ -957,7 +958,9 @@ export function Composer(props?: { store?: ComposerStore }) {
   const canSend = () => s.canSend();
   const working = () => s.working();
   const hasText = () => s.draft().trim().length > 0 || s.attachments().length > 0 || s.docs().length > 0 || s.files().length > 0;
-  const showPlaceholder = computed(() => s.draft().length === 0 && !composing());
+  const showPlaceholder = computed(
+    () => s.draft().length === 0 && !composing() && !(s === primaryComposerStore && isSmsThrowLaunching()),
+  );
   const statusLine = () => Object.values(s.extensionStatuses?.() ?? {}).join("  ·  ");
   const shownStatus = keepLast(() => statusLine() || undefined, "");
   const showStop = () => working() && !hasText();
@@ -1013,13 +1016,6 @@ export function Composer(props?: { store?: ComposerStore }) {
   });
 
   const replyTarget = () => s.replyTarget?.();
-  const replyLabel = (target: PipReplyTarget) =>
-    target.author === "You" ? tr("Replying to yourself", "回复自己") : tr(`Replying to ${target.author}`, `回复 ${target.author}`);
-  const replySummary = (target: PipReplyTarget) => {
-    if (target.excerpt.trim()) return target.excerpt;
-    const images = target.images ?? 0;
-    return images > 0 ? (images === 1 ? tr("[Image]", "[图片]") : tr(`[${images} images]`, `[${images} 张图片]`)) : "";
-  };
 
   // Entering reply focus is a composer focus request; Escape is the quiet way back out.
   effect(() => {
@@ -1202,13 +1198,30 @@ export function Composer(props?: { store?: ComposerStore }) {
     return tr(`Ask ${name}…`, `问问 ${name}…`);
   };
 
+  const isPrimary = s === primaryComposerStore;
+  effect(() => {
+    if (!isPrimary) return;
+    height();
+    replyTarget();
+    s.attachments().length;
+    s.docs().length;
+    s.files().length;
+    untracked(notifyThrowComposerLayout);
+  });
+  cleanup(() => {
+    if (isPrimary) registerThrowComposerInput(undefined);
+  });
+
   return (
     <View class="px-6 pb-5 pt-3">
       <View
         ref={(node) => {
           if (node) column.set(node);
         }}
-        onLayout={(e) => columnWidth.set(e.bounds.size.width)}
+        onLayout={(e) => {
+          columnWidth.set(e.bounds.size.width);
+          if (isPrimary) notifyThrowComposerLayout();
+        }}
         class="pointer-events-auto relative w-full max-w-180 self-center"
       >
         {s.renderExtensionPrompt ? s.renderExtensionPrompt() : <ExtensionPrompt />}
@@ -1245,29 +1258,17 @@ export function Composer(props?: { store?: ComposerStore }) {
             when={showFormTakeover() ? formDialog() : undefined}
             else={
               <View>
-                {replyTarget() ? (
-                  <View testID="composer-reply-strip" class="mx-2 mt-2 flex-row items-center gap-2 rounded-xl corner-squircle border-[0.5px] border-hairline bg-sms-incoming/75 px-2.5 py-1.5">
-                    <Icon name="quote" size={13} tone="muted-foreground" />
-                    <View class="min-w-0 flex-1">
-                      <Text class={`${uiType("2xs")} font-medium text-muted-foreground`}>{replyLabel(replyTarget()!)}</Text>
-                      <Text class={`truncate ${uiType("xs")} text-muted-foreground/85`}>{replySummary(replyTarget()!)}</Text>
-                    </View>
-                    <IconButton
-                      testID="composer-reply-cancel"
-                      icon="x"
-                      size="sm"
-                      tone="subtle"
-                      label={tr("Cancel reply", "取消回复")}
-                      tipPlacement="top"
-                      onPress={() => s.clearReplyTarget?.()}
-                    />
-                  </View>
-                ) : null}
                 <ExtensionLines store={s} below={false} />
                 <View class="relative">
                 <Input
                   testID={s.inputTestID}
-                  ref={input}
+                  ref={(node) => {
+                    input = node;
+                    if (isPrimary) registerThrowComposerInput(node);
+                  }}
+                  onLayout={() => {
+                    if (isPrimary) notifyThrowComposerLayout();
+                  }}
                   multiline
                   autoFocus={s.autoFocus ?? true}
                   scrollbar={false}

@@ -13,6 +13,7 @@ import {
   resetPersonalAgentAvatar,
   setPersonalAgentAvatar,
   toast,
+  wallpaper,
 } from "../store/app";
 import { backend } from "../store/backend";
 import { Icon } from "../ui/Icon";
@@ -32,25 +33,65 @@ export function personaHeaderClearance() {
   return HEADER_TOP + AVATAR_SIZE - NAMEPLATE_OVERLAP + uiRowHeight(28) + HEADER_BOTTOM_GAP;
 }
 
-const SCRIM_STEPS = 8;
+/** Local cushion padding around the centered avatar + nameplate silhouette. */
+const HALO_PAD_X = 36;
+const HALO_PAD_TOP = 20;
+const HALO_PAD_BOTTOM = 28;
+const HALO_DEFAULT_WIDTH = 88;
+const HALO_STEPS = 12;
+/**
+ * `radial-gradient` maps 100% to the box's farthest corner, so the nearest
+ * straight edge sits at 1/sqrt(2) (~70.7%). Reaching exact alpha 0 by 66%
+ * guarantees zero rectangular clipping on every edge and corner.
+ */
+const HALO_EDGE = 0.66;
+/** `maskImage` (which also feathers `backdropFilter` without system tint) is supported on macOS. */
+const SUPPORTS_RADIAL_BLUR_MASK = platform.os === "macos";
+
 const smoothstep = (t: number) => t * t * (3 - 2 * t);
 const alphaHex = (alpha: number) =>
   Math.round(Math.max(0, Math.min(1, alpha)) * 255)
     .toString(16)
     .padStart(2, "0");
 
-/** The page-colored scrim rows recede into, eased at both ends so no fade line shows. */
-function personaScrim(height: number): string {
-  const base = String(token("background")).slice(0, 7);
-  const fade = 52;
-  const start = Math.max(0, height - fade);
-  const stops = [`${base}ff 0px`, `${base}ff ${start}px`];
-  for (let i = 1; i <= SCRIM_STEPS; i++) {
-    const t = i / SCRIM_STEPS;
-    const at = Math.round((start + fade * t) * 10) / 10;
-    stops.push(`${base}${alphaHex(1 - smoothstep(t))} ${at}px`);
+/**
+ * Eased radial falloff from `peak` inside `core` down to exact 0 at `edge`
+ * (strictly inside `1/sqrt(2)` so the cushion dissolves before any box edge).
+ */
+function radialStops(baseHex: string, peak: number, core: number, edge: number): string {
+  const stops = [`${baseHex}${alphaHex(peak)} 0%`, `${baseHex}${alphaHex(peak)} ${Math.round(core * 1000) / 10}%`];
+  for (let i = 1; i <= HALO_STEPS; i++) {
+    const t = i / HALO_STEPS;
+    const pos = Math.round((core + (edge - core) * t) * 1000) / 10;
+    const falloff = 1 - smoothstep(t);
+    const alpha = peak * falloff * Math.pow(falloff, 0.5);
+    stops.push(`${baseHex}${alphaHex(alpha)} ${pos}%`);
   }
-  return `linear-gradient(to bottom, ${stops.join(", ")})`;
+  stops.push(`${baseHex}00 100%`);
+  return stops.join(", ");
+}
+
+/** Gentle inner page-colored mist tucked behind the avatar + nameplate core. */
+function personaHaloWash(overWallpaper: boolean, badgeWidth: number): string {
+  const base = String(token("background")).slice(0, 7);
+  const haloWidth = badgeWidth + HALO_PAD_X * 2;
+  const edge = SUPPORTS_RADIAL_BLUR_MASK ? 0.58 : HALO_EDGE;
+  const core = Math.min(edge - 0.2, Math.max(0.16, ((badgeWidth - 28) / haloWidth) * Math.SQRT1_2));
+  const peak = overWallpaper
+    ? SUPPORTS_RADIAL_BLUR_MASK
+      ? 0.24
+      : 0.52
+    : SUPPORTS_RADIAL_BLUR_MASK
+      ? 0.4
+      : 0.88;
+  return `radial-gradient(ellipse at 50% 52%, ${radialStops(base, peak, core, edge)})`;
+}
+
+/** Radial alpha mask feathering the localized backdrop blur smoothly to zero inside its bounds. */
+function personaHaloBlurMask(badgeWidth: number): string {
+  const haloWidth = badgeWidth + HALO_PAD_X * 2;
+  const core = Math.min(0.44, Math.max(0.22, ((badgeWidth - 16) / haloWidth) * Math.SQRT1_2));
+  return `radial-gradient(ellipse at 50% 52%, ${radialStops("#000000", 1, core, HALO_EDGE)})`;
 }
 
 function capsuleSurface(active: boolean) {
@@ -84,6 +125,7 @@ export function PersonaHeader(props: { reading?: boolean }) {
   const editing = signal(false);
   const name = signal("");
   const nameWidth = signal(0);
+  const badgeWidth = signal(HALO_DEFAULT_WIDTH);
   const inputRef = signal<InputRef | undefined>(undefined);
   const hovered = signal(false);
   const menuOpen = signal(false);
@@ -182,16 +224,40 @@ export function PersonaHeader(props: { reading?: boolean }) {
   const playful = () => hovered() && mascot();
   const avatarLift = hoverAmount.interpolate({ inputRange: [0, 1], outputRange: [0, -1.5] });
   const avatarScale = hoverAmount.interpolate({ inputRange: [0, 1], outputRange: [1, 1.045] });
-  const scrimHeight = () => topBarHeight() + personaHeaderClearance() + 30;
+  const badgeHeight = () => AVATAR_SIZE - NAMEPLATE_OVERLAP + uiRowHeight(28);
+  const haloWidth = () => Math.max(HALO_DEFAULT_WIDTH, badgeWidth()) + HALO_PAD_X * 2;
+  const haloHeight = () => badgeHeight() + HALO_PAD_TOP + HALO_PAD_BOTTOM;
+  const overWallpaper = () => Boolean(wallpaper());
 
   return (
     <>
       <If when={Boolean(persona()) && props.reading}>
         <View
-          testID="persona-header-scrim"
-          class="pointer-events-none absolute inset-x-0 top-0 z-10"
-          style={{ height: scrimHeight(), backgroundImage: personaScrim(scrimHeight()) }}
-        />
+          class="pointer-events-none absolute inset-x-0 z-10 items-center"
+          style={{ top: Math.max(0, topBarHeight() + HEADER_TOP - HALO_PAD_TOP) }}
+        >
+          <View
+            testID="persona-header-scrim"
+            class="pointer-events-none relative"
+            style={{ width: haloWidth(), height: haloHeight() }}
+          >
+            <If when={SUPPORTS_RADIAL_BLUR_MASK}>
+              <View
+                class="pointer-events-none absolute inset-0"
+                style={{
+                  backdropFilter: "blur(16px) saturate(130%)",
+                  maskImage: personaHaloBlurMask(Math.max(HALO_DEFAULT_WIDTH, badgeWidth())),
+                }}
+              />
+            </If>
+            <View
+              class="pointer-events-none absolute inset-0"
+              style={{
+                backgroundImage: personaHaloWash(overWallpaper(), Math.max(HALO_DEFAULT_WIDTH, badgeWidth())),
+              }}
+            />
+          </View>
+        </View>
       </If>
       <If when={Boolean(persona())}>
         <View
@@ -202,6 +268,10 @@ export function PersonaHeader(props: { reading?: boolean }) {
           <View
             testID="persona-header-hitarea"
             class="group pointer-events-auto items-center"
+            onLayout={(e) => {
+              const width = Math.ceil(e.bounds.size.width);
+              if (width > 0 && width !== badgeWidth()) badgeWidth.set(width);
+            }}
             onMouseEnter={() => driveHover(true)}
             onMouseLeave={() => driveHover(false)}
           >

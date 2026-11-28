@@ -59,9 +59,10 @@ import { openDocIfThere } from "../store/tabs";
 import { messageInteraction, openPipMessageMenu, pipReplyCoveredId } from "../store/pip-interactions";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
-import { ARRIVAL_SPRING, DURATION, EASING, isRowSeen, keepLast, Presence, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
+import { DURATION, EASING, isRowSeen, keepLast, Presence, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
 import { traceMotion } from "../ui/motion-trace";
-import { arrivingRow, isArrivalTail, noteArrival, useBubbleLag } from "../ui/bubble-lag";
+import { useBubbleLag } from "../ui/bubble-lag";
+import { isSmsBubbleFlying, registerThrowBubbleNode, wasSmsBubbleThrown } from "../ui/pip-throw";
 import { RollingText } from "../ui/RollingText";
 import { FOCUS_RING, HOVER_REVEAL, PRESS, PRESS_SCALE } from "../ui/styles";
 import { tip } from "../ui/Tip";
@@ -670,7 +671,11 @@ function UserRow(props: { row: DisplayUserRow }) {
   const smsEntrance = useSmsBubbleEntrance(
     () => props.row.id,
     () => "right",
-    { enabled: isSms },
+    {
+      enabled: isSms,
+      skip: () => isSms() && wasSmsBubbleThrown(props.row.id),
+      traceHidden: () => isSms() && isSmsBubbleFlying(props.row.id),
+    },
   );
 
   const hostNode = signal<ViewRef | undefined>(undefined);
@@ -729,6 +734,14 @@ function UserRow(props: { row: DisplayUserRow }) {
     const unregister = registerPipMessageNode(rowId, node);
     if (unregister) cleanup(unregister);
   });
+  effect(() => {
+    const rowId = props.row.id;
+    const node = bubbleNode();
+    if (!isSms() || !node) return;
+    const unregister = registerThrowBubbleNode(rowId, node);
+    if (unregister) cleanup(unregister);
+  });
+  const flying = () => isSms() && isSmsBubbleFlying(props.row.id);
   const openPersonaActions = () => {
     const node = pipMessageNode(props.row.id) ?? clusterNode() ?? bubbleNode() ?? mediaNode() ?? hostNode();
     if (!node) return;
@@ -800,6 +813,7 @@ function UserRow(props: { row: DisplayUserRow }) {
                     ? `relative max-w-full gap-1.5 ${smsBubbleRadius()} corner-squircle bg-brand px-3.5 py-2`
                     : "max-w-full gap-1.5 rounded-2xl rounded-br-md corner-squircle border-[0.5px] border-hairline bg-secondary px-4 py-2.5"
                 }
+                style={isSms() ? { opacity: flying() ? 0 : 1 } : undefined}
                 selectable
                 onContextMenu={contextMenu}
               >
@@ -935,7 +949,7 @@ function UserRow(props: { row: DisplayUserRow }) {
          * holds reads as sent, and only the last of the run wears the receipt
          * (`pi/turns.ts`), so the queue letting go changes nothing on screen. */}
         <If when={sms()?.receipt}>
-          <View class="h-6 select-none flex-row items-center gap-1.5 pt-0.5">
+          <View class="h-6 select-none flex-row items-center gap-1.5 pt-0.5" style={{ opacity: flying() ? 0 : 1 }}>
             <Text testID="sms-receipt" class={`pr-1 ${uiType("2xs")} font-medium text-subtle`}>
               {sms()?.receipt === "read" ? tr("Read", "已读") : tr("Delivered", "已送达")}
             </Text>
@@ -1838,71 +1852,63 @@ export function TranscriptRow(props: { row: ChatRow; activityMaxHeight: number }
   const needsOuterPipAvatar = () => props.row.kind !== "pip-bubble" && Boolean(pipSlot()?.tail);
   const needsOuterPipIndent = () => props.row.kind !== "pip-bubble" && Boolean(pipSlot()?.indent);
 
-  // A bubble arriving live at the end of a persona conversation opens its own
-  // room: the cell mounts closed, then springs open a frame later
-  // (`ARRIVAL_SPRING`), so what is under it moves down with the room rather
-  // than in one frame, and the conversation glides to the new end
-  // (`noteArrival`, `views/Chat.tsx`).
-  const arrivedId = signal("");
-  const arriving = () => isArrivalTail(props.row.id) && arrivingRow(props.row) && untracked(arrivedId) !== props.row.id;
-  effect(() => {
-    const id = props.row.id;
-    if (!untracked(arriving)) return;
-
-    const frame = requestAnimationFrame(() => noteArrival(id, () => arrivedId.set(id)));
-    cleanup(() => cancelAnimationFrame(frame));
-  });
   const lag = useBubbleLag(() => props.row.id);
   let cellNode: ViewRef | undefined;
   traceMotion(() => `${props.row.kind}:${props.row.id}`, { lag }, () => cellNode);
   const rowStyle = { opacity: entrance.opacity, transform: [{ translateY: Animated.add(entrance.transform[0].translateY, lag) }] };
 
-  return (
-    <Collapsible
-      open={fold.open() && (arrivedId() === props.row.id || !arriving())}
-      reveal={fold.reveal()}
-      revealSpring={arrivedId() === props.row.id ? ARRIVAL_SPRING : undefined}
-      content={
-        <View ref={(node: ViewRef) => (cellNode = node)} class={`w-full max-w-180 self-center ${spacing()}${fold.open() ? "" : " pointer-events-none"}`} style={rowStyle}>
-          <View style={fold.style} class={!isPipProcess() && indentedProcess() ? "pl-7" : undefined}>
+  // Only process-fold rows and non-SMS recalled queued bubbles use Collapsible;
+  // sent/incoming chat bubbles render directly at full height with zero clipping.
+  const canFold = () =>
+    processTurns.has(props.row.id) ||
+    Boolean(recallingUsers()[props.row.id]) ||
+    (props.row.kind === "user" && !props.row.sms && props.row.queued === true);
+
+  const rowContent = () => (
+    <View ref={(node: ViewRef) => (cellNode = node)} class={`w-full max-w-180 self-center ${spacing()}${fold.open() ? "" : " pointer-events-none"}`} style={rowStyle}>
+      <View style={fold.style} class={!isPipProcess() && indentedProcess() ? "pl-7" : undefined}>
+        <If
+          when={needsOuterPipAvatar()}
+          else={
             <If
-              when={needsOuterPipAvatar()}
+              when={needsOuterPipIndent()}
               else={
-                <If
-                  when={needsOuterPipIndent()}
-                  else={
-                    <If when={isPipProcess()} else={renderBody()}>
-                      <View class="pl-10">
-                        <View class="border-l border-hairline pl-3">{renderBody()}</View>
-                      </View>
-                    </If>
-                  }
-                >
-                  <View class="pl-10">{renderBody()}</View>
+                <If when={isPipProcess()} else={renderBody()}>
+                  <View class="pl-10">
+                    <View class="border-l border-hairline pl-3">{renderBody()}</View>
+                  </View>
                 </If>
               }
             >
-              <View class="flex-row items-end gap-3">
-                <View class="w-7 shrink-0 pb-0.5">
-                  <PipAvatarBadge
-                    rowId={() => props.row.id}
-                    turnMeta={() => pipSlot()?.meta}
-                    processOpen={() => {
-                      const turnId = pipSlot()?.meta?.turnId;
-                      return turnId ? (chosen(turnId) ?? false) : false;
-                    }}
-                    onToggleProcess={() => {
-                      const turnId = pipSlot()?.meta?.turnId;
-                      if (turnId) toggleTurn(turnId, chosen(turnId) ?? false, false);
-                    }}
-                  />
-                </View>
-                <View class="min-w-0 flex-1">{renderBody()}</View>
-              </View>
+              <View class="pl-10">{renderBody()}</View>
             </If>
+          }
+        >
+          <View class="flex-row items-end gap-3">
+            <View class="w-7 shrink-0 pb-0.5">
+              <PipAvatarBadge
+                rowId={() => props.row.id}
+                turnMeta={() => pipSlot()?.meta}
+                processOpen={() => {
+                  const turnId = pipSlot()?.meta?.turnId;
+                  return turnId ? (chosen(turnId) ?? false) : false;
+                }}
+                onToggleProcess={() => {
+                  const turnId = pipSlot()?.meta?.turnId;
+                  if (turnId) toggleTurn(turnId, chosen(turnId) ?? false, false);
+                }}
+              />
+            </View>
+            <View class="min-w-0 flex-1">{renderBody()}</View>
           </View>
-        </View>
-      }
-    />
+        </If>
+      </View>
+    </View>
+  );
+
+  return (
+    <If when={canFold()} else={rowContent()}>
+      <Collapsible open={fold.open()} reveal={fold.reveal()} content={rowContent()} />
+    </If>
   );
 }

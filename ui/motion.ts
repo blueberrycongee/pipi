@@ -325,19 +325,6 @@ export function isRowSeen(id: string): boolean {
   return seenRowIds.has(id);
 }
 
-/** Whether a row would arrive live: entrances are on and it has not been on screen. */
-export function isLiveArrival(id: string): boolean {
-  return liveEntranceEnabled && !seenRowIds.has(id);
-}
-
-/** A row that never came on screen to arrive (a list that did not mount it) arrives no more. */
-export function forgetArrival(id: string) {
-  seenRowIds.add(id);
-}
-
-/** The spring an arriving SMS row opens its room on. */
-export const ARRIVAL_SPRING = { stiffness: 260, damping: 30, mass: 1 } as const;
-
 /** Enables live entrance animations (e.g. right before sending a prompt in an
  * empty session). */
 export function enableLiveRowEntrance() {
@@ -392,7 +379,7 @@ export function useRowEntrance(id: () => string, streaming?: () => boolean, skip
 export function useSmsBubbleEntrance(
   id: () => string,
   side: () => "left" | "right",
-  options?: { enabled?: () => boolean; skip?: () => boolean; stagger?: () => number },
+  options?: { enabled?: () => boolean; skip?: () => boolean; stagger?: () => number; traceHidden?: () => boolean },
 ): ViewStyle {
   const specOf = () => (side() === "left" ? SMS_INCOMING_SPEC : SMS_OUTGOING_SPEC);
   // A bubble that will enter is born where its entrance starts: values made at
@@ -436,7 +423,13 @@ export function useSmsBubbleEntrance(
     });
   });
   cleanup(() => item.stop());
-  traceMotion(() => untracked(id), { eo: item.values.opacity, ex: item.values.translateX, ey: item.values.translateY, es: item.values.scale });
+  traceMotion(
+    () => {
+      const currentId = untracked(id);
+      return currentId && options?.traceHidden?.() ? "" : currentId;
+    },
+    { eo: item.values.opacity, ex: item.values.translateX, ey: item.values.translateY, es: item.values.scale },
+  );
   return {
     transformOrigin: side() === "left" ? "left bottom" : "right bottom",
     opacity: item.values.opacity,

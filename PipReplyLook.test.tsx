@@ -47,7 +47,7 @@ for (const colorScheme of ["light", "dark"] as const) {
     await app.waitFor("id:pip-reply-focus-layer");
     await app.wait(480);
     await app.screenshot(`.nsh/shots/pip-reply-focus-${colorScheme}.png`);
-    expect(app.shows("id:composer-reply-strip")).toBe(true);
+    expect(app.shows("id:composer-reply-strip")).toBe(false);
 
     await app.type("label:Message", "plain answer back");
     await app.submit("label:Message");

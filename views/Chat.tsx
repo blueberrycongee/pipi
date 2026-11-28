@@ -54,9 +54,10 @@ import { recentWorkspaces } from "../store/prefs";
 import { openNewChatTab } from "../store/tabs";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
-import { DURATION, EASING, enterStagger, forgetArrival, isRowSeen, keepLast, markRowsSeen, popupHiddenStyle, popupLeavingStyle, popupStyle, PATIENCE_MS, Presence, SPRING } from "../ui/motion";
+import { DURATION, EASING, enterStagger, keepLast, markRowsSeen, popupHiddenStyle, popupLeavingStyle, popupStyle, PATIENCE_MS, Presence, SPRING } from "../ui/motion";
 import { motionTraceOn, traceMotion } from "../ui/motion-trace";
-import { ARRIVAL_SETTLE_MS, arrivalEpoch, arrivalHeld, arrivingRow, latestArrival, provideArrivalTail, pushWave, settleArrivals } from "../ui/bubble-lag";
+import { pushWave } from "../ui/bubble-lag";
+import { notifyThrowComposerLayout, resetSmsThrows, setThrowPaneSize } from "../ui/pip-throw";
 import { RollingText } from "../ui/RollingText";
 import { tip } from "../ui/Tip";
 import { FOCUS_RING, GLASS_REGULAR, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
@@ -66,6 +67,7 @@ import { hasFormTakeover, hasInlinePrompt } from "./ExtensionDialog";
 import { isKnownMissingPath, MediaStreamContext } from "./Media";
 import { PersonaHeader, personaHeaderClearance } from "./PersonaHeader";
 import { PipWorkingFooter } from "./PipPresence";
+import { PipThrowLayer } from "./PipThrowLayer";
 import { pipBubbleRows, proseRows } from "./Prose";
 import {
   type ChatRow,
@@ -583,9 +585,9 @@ function maskRamp(from: number, to: number, start: number, end: number): string[
  *   it (`top` → `top + HEAD_FADE`), never crossing the title text.
  * - Below: rows fade out as they pass under the composer's top `edge`.
  */
-function transcriptMask(height: number, top: number, edge: number, overWallpaper: boolean, persona: boolean): string {
-  const headStart = persona ? Math.max(0, top - HEAD_FADE) : overWallpaper ? Math.max(0, top - 4) : Math.max(0, top - HEAD_FADE);
-  const headEnd = persona ? top + personaHeaderClearance() : overWallpaper ? top + HEAD_FADE : top;
+function transcriptMask(height: number, top: number, edge: number, overWallpaper: boolean): string {
+  const headStart = overWallpaper ? Math.max(0, top - 4) : Math.max(0, top - HEAD_FADE);
+  const headEnd = overWallpaper ? top + HEAD_FADE : top;
   const stops = maskRamp(0, 1, headStart, headEnd);
   if (height > headEnd + edge + 24) {
     const footStart = height - (edge + 20);
@@ -673,6 +675,11 @@ function PromptJumpPill(props: {
       </Presence>
     </View>
   );
+}
+
+/** Structural config helper compatible with nsh stage-1 `animated?: boolean` and older types alike. */
+function followEndConfig(animated: boolean) {
+  return { autoscrollToBottomThreshold: FOLLOW_THRESHOLD, animated };
 }
 
 /** The main pane: the conversation, or what stands in for it, over the composer. */
@@ -998,8 +1005,10 @@ export function Chat() {
       travel = undefined;
       // Up: the stage is where it will be, and the composer comes to it. Down: it stays where it was.
       stand.set(middle ? 0 : -(way + shrink));
-      if (instant) slide.set(0);
-      else {
+      if (instant) {
+        slide.set(0);
+        queueMicrotask(notifyThrowComposerLayout);
+      } else {
         const mine = (travel = { from, at: Date.now() });
         // Set first: the layout changes in this turn, and so must where the composer is drawn.
         slide.set(from);
@@ -1011,6 +1020,7 @@ export function Chat() {
           )
           .then(() => {
             if (travel === mine) travel = undefined;
+            notifyThrowComposerLayout();
           });
       }
       if (middle) return;
@@ -1135,7 +1145,7 @@ export function Chat() {
         releasedAt = now;
         if (y < lastY - 0.5) lastUpwardInputAt = now;
         scrollMode.set("free");
-      } else if (!untracked(bottomFollowing) && lastY !== undefined && y > lastY + 0.5) {
+      } else if (!untracked(bottomFollowing) && lastY !== undefined && (y > lastY + 0.5 || (wheelDirection > 0 && distance <= 2))) {
         const reattachThreshold = isChatActive() ? 24 : 40;
         if (
           distance <= reattachThreshold &&
@@ -1344,97 +1354,44 @@ export function Chat() {
     });
   };
 
-  /**
-   * The send's return to the end as one motion: where `scheduleEndSettle`
-   * snaps, a send glides. The measure still waits out this turn's layout — the
-   * just-staged bubble included — then an animated scroll covers the exact
-   * remaining gap, so the list's return and the bubble's rise read as a single
-   * continuous move rather than a teleport plus an entrance. No settle passes:
-   * an animated correction must not be snapped short by its own scroll events,
-   * and the bottom pin picks up whatever streamed in past the glide's target.
-   */
-  const scheduleEndGlide = (arrival?: string) => {
-    const epoch = ++endSettleEpoch;
-    const expectedKey = untracked(conversationKey);
-    const targetList = list;
-    if (!targetList || listKey !== expectedKey || !listReady) return;
-    void Promise.all([targetList.measure(), ending?.measure()]).then(([frame, end]) => {
-      if (epoch !== endSettleEpoch) return;
-      if (!untracked(bottomFollowing) || isDragging || Date.now() - inputAt <= INPUT_WINDOW_MS) return;
-      if (!frame || list !== targetList || listKey !== expectedKey || !listReady) return;
-      const pad = untracked(foot).end;
-      if (end && frame.bounds.size.height > 0) {
-        const gap = end.pagePosition.y + end.bounds.size.height + pad - (frame.pagePosition.y + frame.bounds.size.height);
-        if (Math.abs(gap) <= 1 || (gap < 0 && (lastY === undefined || lastY <= 0.5))) {
-          distanceFromEnd.set(0);
-          return;
-        }
-        if (lastY !== undefined) {
-          const to = Math.max(0, lastY + gap);
-          targetList.scrollTo({ y: to, animated: true });
-          if (arrival) {
-            // The rows above the arrival, nearest first, trail the glide (`ui/bubble-lag.ts`).
-            const rows = untracked(displayRows);
-            const at = rows.findIndex((row) => row.id === arrival);
-            if (at > 0) pushWave(rows.slice(Math.max(0, at - 24), at).map((row) => row.id).reverse(), to - lastY);
-          }
-          return;
-        }
-      }
-      targetList.scrollToEnd({ animated: true });
-    });
-  };
-
-  // An arrival in a persona conversation opens its room under a list that
-  // holds its offset (`arrivalHeld`): the column glides up to it as one move,
-  // where the list's own follow would snap a frame after the room appeared.
-  // The hold starts in the commit the arriving row is staged in (closed, a
-  // frame before its room opens): the receipt it takes from the bubble above
-  // leaves in that commit, and a list following on its own would jump for it.
-  // Only the end arrives so: a row landing above others (a wake turn ahead of
-  // the staged bubble, a reply above messages the engine still holds) appears
-  // in place, and the list keeps what is under the reader's eyes where it is.
-  const arrivalTail = computed<ReadonlySet<string>>(() => {
+  // Subtle iMessage elastic lag wave for settled bubbles above a newly appended
+  // persona tail message when the conversation is scrollable and following the end.
+  let lagTrackedKey = -1;
+  let lagSeenIds = new Set<string>();
+  effect(() => {
+    const key = conversationKey();
     const rows = displayRows();
-    arrivalEpoch();
-    const tail = new Set<string>();
-    if (!isPersonaSession() || reduceMotion()) return tail;
-    for (let k = rows.length - 1; k >= Math.max(0, rows.length - 6) && arrivingRow(rows[k]); k--) tail.add(rows[k].id);
-    return tail;
-  });
-  provideArrivalTail(arrivalTail);
-  const followHeld = computed(() => arrivalHeld(() => arrivalTail().size > 0));
-  effect(() => {
-    if (!followHeld()) return;
-    // A row the list never mounted never opens: it does not hold the end for long.
-    const timer = setTimeout(() => {
-      for (const id of untracked(arrivalTail)) forgetArrival(id);
-      settleArrivals();
-    }, 1200);
-    cleanup(() => clearTimeout(timer));
-  });
-  let arrivalTimer: ReturnType<typeof setTimeout> | undefined;
-  // An arrival from before this view mounted is not one to glide to.
-  let arrivalSeen = untracked(latestArrival)?.seq ?? 0;
-  effect(() => {
-    const arrival = latestArrival();
     untracked(() => {
-      if (!arrival || arrival.seq === arrivalSeen) return;
-      arrivalSeen = arrival.seq;
-      clearTimeout(arrivalTimer);
-      if (bottomFollowing() && list && listKey === conversationKey() && listReady) scheduleEndGlide(arrival.id);
-      arrivalTimer = setTimeout(() => {
-        settleArrivals();
-        if (untracked(bottomFollowing) && list && listKey === untracked(conversationKey) && listReady) scheduleEndGlide();
-      }, ARRIVAL_SETTLE_MS);
+      if (key !== lagTrackedKey) {
+        lagTrackedKey = key;
+        lagSeenIds = new Set(rows.map((r) => r.id));
+        return;
+      }
+      if (!isPersonaSession() || reduceMotion() || !bottomFollowing() || lastMax <= 4) {
+        for (const r of rows) lagSeenIds.add(r.id);
+        return;
+      }
+      const last = rows[rows.length - 1];
+      const isNewSmsTail =
+        last &&
+        !lagSeenIds.has(last.id) &&
+        ((last.kind === "user" && Boolean(last.sms)) || (last.kind === "pip-bubble" && !last.edited));
+      for (const r of rows) lagSeenIds.add(r.id);
+      if (isNewSmsTail && rows.length > 1) {
+        const above = rows
+          .slice(Math.max(0, rows.length - 25), rows.length - 1)
+          .map((row) => row.id)
+          .reverse();
+        pushWave(above, last.kind === "user" ? 56 : 64);
+      }
     });
   });
-  cleanup(() => clearTimeout(arrivalTimer));
 
   const follow = (animated: boolean) => {
     inputAt = 0;
     lastUpwardInputAt = 0;
     isDragging = false;
+    wheelDirection = 0;
     scrollMode.set("tail");
     if (animated) list?.scrollToEnd({ animated: true });
     else scheduleEndSettle(2);
@@ -1458,21 +1415,27 @@ export function Chat() {
     const cue = sendAnchorTick();
     untracked(() => {
       if (!cue) return;
-      const rows = untracked(transcriptRows);
+      const wasFollowing = scrollMode() === "tail" || scrollMode() === "horizon";
+      const wasAway = distanceFromEnd() > FOLLOW_THRESHOLD;
+      const rows = transcriptRows();
       const promptPos = rows.findIndex((row) => row.id === cue.rowId);
       // A persona conversation follows its end as Messages does: its replies are
       // bubbles that land whole, never a long reply to hold at the horizon.
-      const hasHistoryAbove = !isPersonaSession() && (promptPos > 0 || (promptPos < 0 && rows.length > 0));
-      activePromptId.set(hasHistoryAbove ? cue.rowId : undefined);
+      const hasHistoryAbove = !cue.queued && !isPersonaSession() && (promptPos > 0 || (promptPos < 0 && rows.length > 0));
+      if (!cue.queued) activePromptId.set(hasHistoryAbove ? cue.rowId : undefined);
+      // Explicit user send supersedes any recent scroll gesture (`INPUT_WINDOW_MS`).
       inputAt = 0;
       lastUpwardInputAt = 0;
       isDragging = false;
-      scrollMode.set(hasHistoryAbove ? "horizon" : "tail");
-      if (list && listKey === conversationKey() && listReady && untracked(distanceFromEnd) > FOLLOW_THRESHOLD) {
-        // The reader was off the end when they sent: come back to it as one
-        // motion, never a position snapshot under the bubble's own entrance.
-        if (untracked(reduceMotion)) scheduleEndSettle(2);
-        else scheduleEndGlide();
+      wheelDirection = 0;
+      if (hasHistoryAbove) scrollMode.set("horizon");
+      else if (isPersonaSession() || !wasFollowing || scrollMode() !== "horizon") scrollMode.set("tail");
+      // When already following at the bottom, `maintainVisibleContentPosition` with
+      // `animated: !reduceMotion()` handles the discrete tail append natively with
+      // velocity-preserving critically damped spring scrolling. Only call imperative
+      // `scrollToEnd` when returning from off-bottom.
+      if (list && listKey === conversationKey() && listReady && (!wasFollowing || wasAway)) {
+        list.scrollToEnd({ animated: !reduceMotion() });
       }
     });
   });
@@ -1493,8 +1456,7 @@ export function Chat() {
       // `initialScrollAtEnd` (before its first frame, following while rows measure); calling
       // `scrollTo` during that synchronous swap would hit the outgoing list or cancel the pass.
       if (list && listKey === conversationKey() && listReady) {
-        if (untracked(reduceMotion)) scheduleEndSettle(3);
-        else scheduleEndGlide();
+        scheduleEndSettle(3);
       }
     });
   });
@@ -1643,17 +1605,22 @@ export function Chat() {
       topRow.set(-1);
       bottomRow.set(-1);
       viewSpan = -1;
-      // An arrival in flight belongs to the conversation it landed in: its hold
-      // and its settling glide must not reach the one coming in.
-      clearTimeout(arrivalTimer);
-      arrivalTimer = undefined;
-      settleArrivals();
+      resetSmsThrows();
       ensureEntered(key);
       resetPipInteractionChrome();
       resetEditHistories();
       pokeRepaint();
     });
   });
+
+  const smsSlotOf = (rowId: string) => {
+    const rows = displayRows();
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      if (row.kind === "user" && row.id === rowId) return row.sms;
+    }
+    return undefined;
+  };
 
   const onDroppedFiles = (uris: readonly string[]) => {
     for (const raw of uris) {
@@ -1698,7 +1665,7 @@ export function Chat() {
             selectable
             onSelectionChange={onSelection}
             class="flex-1"
-            style={{ maskImage: transcriptMask(viewHeight(), topBarHeight(), foot().edge, Boolean(wallpaper()) && !HEADER_BAND, isPersonaSession()) }}
+            style={{ maskImage: transcriptMask(viewHeight(), topBarHeight(), foot().edge, Boolean(wallpaper()) && !HEADER_BAND) }}
           >
             <Each of={[conversationKey()]} key={(k) => k}>
               {(key) => {
@@ -1745,7 +1712,7 @@ export function Chat() {
                       bottomRow.set(last);
                       if (first >= 0 && last >= first) viewSpan = last - first;
                     }}
-                    maintainVisibleContentPosition={bottomFollowing() && !followHeld() ? { autoscrollToBottomThreshold: FOLLOW_THRESHOLD } : undefined}
+                    maintainVisibleContentPosition={bottomFollowing() ? followEndConfig(!reduceMotion()) : undefined}
                     class="flex-1"
                     contentStyle={{
                       paddingHorizontal: 24,
@@ -1813,6 +1780,7 @@ export function Chat() {
         onLayout={(e) => {
           paneHeight = e.bounds.size.height;
           viewHeight.set(Math.round(e.bounds.size.height));
+          setThrowPaneSize(e.bounds.size.width, e.bounds.size.height);
           bumpReplyFocusTrack();
         }}
       >
@@ -1825,6 +1793,7 @@ export function Chat() {
             const h = Math.round(e.bounds.size.height);
             figure.set(h);
             if (untracked(hero)) heroFigure = h;
+            notifyThrowComposerLayout();
           }}
         >
           <View class="absolute inset-0" style={{ transform: [{ translateY: Animated.subtract(stand, slide) }] }}>
@@ -1847,6 +1816,9 @@ export function Chat() {
           }}
         />
       </View>
+      <If when={isPersonaSession()}>
+        <PipThrowLayer smsSlotOf={smsSlotOf} />
+      </If>
       <If when={isPersonaSession()}>
         <PipMessageMenuLayer />
       </If>

@@ -82,6 +82,8 @@ const reactAndExpectRoom = async (app: Awaited<ReturnType<typeof launch>>, first
 test("reply enters blur-focus, Escape and backdrop cancel, and sending restores a clean quote card", async () => {
   const app = await launch();
   await openPipWithReply(app);
+  const composerBefore = app.layout("id:composer-docked")!;
+  expect(composerBefore).toBeTruthy();
 
   await app.rightClick("id:pip-sms-bubble");
   await app.waitFor("id:pip-message-menu");
@@ -89,8 +91,10 @@ test("reply enters blur-focus, Escape and backdrop cancel, and sending restores 
   await app.press("id:pip-menu-reply");
   await app.waitFor("id:pip-reply-focus-layer");
   expect(app.shows("id:pip-reply-focus-bubble")).toBe(true);
-  expect(app.shows("id:composer-reply-strip")).toBe(true);
+  expect(app.shows("id:composer-reply-strip")).toBe(false);
   expect(app.shows("text:Reply…")).toBe(true);
+  const composerFocused = app.layout("id:composer-docked")!;
+  expect(Math.abs(composerFocused.height - composerBefore.height)).toBeLessThanOrEqual(1);
 
   await app.keyboard.press("escape");
   await app.waitUntil(() => !app.shows("id:pip-reply-focus-layer"));
@@ -100,13 +104,14 @@ test("reply enters blur-focus, Escape and backdrop cancel, and sending restores 
   await app.waitFor("id:pip-message-menu");
   await app.press("id:pip-menu-reply");
   await app.waitFor("id:pip-reply-focus-layer");
-  await app.press("id:composer-reply-cancel");
+  await app.press("id:pip-reply-focus-backdrop");
   await app.waitUntil(() => !app.shows("id:pip-reply-focus-layer"));
 
   await app.rightClick("id:pip-sms-bubble");
   await app.waitFor("id:pip-message-menu");
   await app.press("id:pip-menu-reply");
   await app.waitFor("id:pip-reply-focus-layer");
+  expect(app.shows("id:composer-reply-strip")).toBe(false);
   await app.type("label:Message", "plain answer back");
   await app.submit("label:Message");
 
@@ -122,6 +127,26 @@ test("reply enters blur-focus, Escape and backdrop cancel, and sending restores 
   await app.waitFor("id:pip-message-menu");
   await app.keyboard.press("escape");
   await app.waitUntil(() => !app.shows("id:pip-message-menu"));
+});
+
+test("leaving and returning to the persona conversation drops reply focus", async () => {
+  const app = await launch();
+  await openPipWithReply(app);
+
+  await app.rightClick("id:pip-sms-bubble");
+  await app.waitFor("id:pip-message-menu");
+  await app.press("id:pip-menu-reply");
+  await app.waitFor("id:pip-reply-focus-layer");
+  expect(app.shows("id:composer-reply-strip")).toBe(false);
+
+  await app.press("id:sidebar-new-session");
+  await app.waitFor("text:What are we building?");
+  expect(app.shows("id:pip-reply-focus-layer")).toBe(false);
+
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:Target answer.");
+  expect(app.shows("id:pip-reply-focus-layer")).toBe(false);
+  expect(app.shows("id:composer-reply-strip")).toBe(false);
 });
 
 test("hover message actions form a continuous strip beside incoming and outgoing bubbles", async () => {
@@ -251,7 +276,7 @@ test("file-only user messages never quote or focus their attachment wire markup"
   await app.waitFor("id:pip-message-menu");
   await app.press("id:pip-menu-reply");
   await app.waitFor("id:pip-reply-focus-layer");
-  expect(app.shows("id:composer-reply-strip")).toBe(true);
+  expect(app.shows("id:composer-reply-strip")).toBe(false);
   expect(app.count("text:<attachment")).toBe(0);
   expect(app.shows("id:pip-reply-focus-text-bubble")).toBe(false);
   await app.keyboard.press("escape");
@@ -472,7 +497,7 @@ test("reduced motion focuses and restores instantly with the same continuity sta
   await app.press("id:pip-menu-reply");
   await app.waitFor("id:pip-reply-focus-layer");
   expect(app.count("id:pip-sms-bubble")).toBe(0);
-  expect(app.shows("id:composer-reply-strip")).toBe(true);
+  expect(app.shows("id:composer-reply-strip")).toBe(false);
   await app.keyboard.press("escape");
   await app.waitUntil(() => !app.shows("id:pip-reply-focus-layer"));
   expect(app.count("id:pip-sms-bubble")).toBe(1);

@@ -660,3 +660,30 @@ test("parseAcpForm accepts multi-select array items combining type string with a
   ]);
   assert.equal(fields[0].other?.id, "q1_other");
 });
+
+test("Antigravity session/new sends run_workflow disabledTools _meta only on 1.4.2–1.4.5 and omits _meta on >= 1.4.6", async (t) => {
+  const readSessionNew = (acpLog) =>
+    fs
+      .readFileSync(acpLog, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .find((entry) => entry.method === "session/new");
+
+  for (const version of ["1.4.2", "1.4.5"]) {
+    const bridge = startBridge(t, { FAKE_ACP_VERSION: version });
+    await bridge.send({ type: "get_available_models" });
+    const req = readSessionNew(bridge.acpLog);
+    assert.ok(req, `expected session/new for ${version}`);
+    assert.deepEqual(req.params._meta, { antigravity: { disabledTools: ["run_workflow"] } });
+  }
+
+  for (const version of ["1.4.6", "1.5.14"]) {
+    const bridge = startBridge(t, { FAKE_ACP_VERSION: version });
+    await bridge.send({ type: "get_available_models" });
+    const req = readSessionNew(bridge.acpLog);
+    assert.ok(req, `expected session/new for ${version}`);
+    assert.equal("_meta" in req.params, false, `expected no _meta on Antigravity ${version}`);
+  }
+});

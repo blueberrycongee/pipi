@@ -58,6 +58,7 @@ export function recordMotion(ms: number): Promise<MotionSample[]> {
               const sample = out.get(key) ?? { t, id, v: {} };
               names.forEach((n, i) => (sample.v[n] = Math.round(vals[i] * 1000) / 1000));
               if (frame) {
+                sample.v.x = Math.round(frame.pagePosition.x * 10) / 10;
                 sample.v.y = Math.round(frame.pagePosition.y * 10) / 10;
                 sample.v.h = Math.round(frame.bounds.size.height * 10) / 10;
               }

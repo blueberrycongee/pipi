@@ -3937,10 +3937,10 @@ async function negotiateAcpRound(bin, epoch) {
       let begun = false;
       if (!sess && !stale()) {
         const newParams = { cwd, mcpServers };
-        // Antigravity's session `_meta`: 1.4.2–1.4.5 scatter a run-workflow skill
-        // file into the workspace unless the tool is disabled up front.
-        if (/antigravity/i.test(String(acpAgentInfo?.name || ""))) {
-          newParams._meta = { antigravity: { disabledTools: agyWritesRunWorkflowSkill(acpAgentInfo?.version) ? ["run_workflow"] : [] } };
+        // Antigravity 1.4.2–1.4.5 scatter a run-workflow skill file into the
+        // workspace unless the tool is disabled up front.
+        if (/antigravity/i.test(String(acpAgentInfo?.name || "")) && agyWritesRunWorkflowSkill(acpAgentInfo?.version)) {
+          newParams._meta = { antigravity: { disabledTools: ["run_workflow"] } };
         }
         sess = await acpRequest("session/new", newParams, 30_000).catch(async (err) => {
           // AUTH_REQUIRED (-32000) or a text match: authenticate once, then retry.

@@ -18,6 +18,7 @@ import { classifyMediaKind, composeFileMessage, isMarkdownPath, mimeTypeForPath,
 import { formAnswerText } from "../lib/form-answers";
 import { answersTo, type ComposerCommand, parseSlashLine } from "../lib/slash";
 import { markPacersSeeded } from "../lib/stream-pacer";
+import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
 import { markVeilsSeeded, reseedVeils } from "../lib/veil";
 import { pipiWorktreeBaseCwd, projectListPath } from "../lib/worktree-path";
 import {
@@ -66,6 +67,7 @@ import { type Row, sameVisualRows, Transcript, withoutPreamble, withoutImageNote
 import { displayRowIds } from "../pi/turns";
 import type { IconName } from "../ui/Icon";
 import { enableLiveRowEntrance, markRowsSeen } from "../ui/motion";
+import { launchSmsThrow } from "../ui/pip-throw";
 import { backend, NoPickerError } from "./backend";
 import { clearPipReply, loadPipInteractions, pipReplyTarget, replyWirePart } from "./pip-interactions";
 import { startAppUpdateChecks, stopAppUpdateChecks } from "./update";
@@ -81,6 +83,7 @@ import {
   clearArchivedSessionPref,
   markArchivedSessionGone,
   ensureWorkspaceListed,
+  FONT_SIZES,
   forgetWorkspace,
   isSessionArchived,
   isWorkspaceCollapsed,
@@ -92,6 +95,7 @@ import {
   preferredPersonalAgentId,
   setPreferredPersonalAgentId,
   preferredRuntimeMode,
+  readingSize,
   recentWorkspaces,
   rememberAutoRetry,
   rememberPersonaAgentChoice,
@@ -232,8 +236,8 @@ const composerFocus = signal(0, { equals: false });
 /** Ticks when something outside the model chip (`/model`) asks for its list. */
 const modelPickerAsk = signal(0, { equals: false });
 const scrollToEnd = signal(0, { equals: false });
-/** The staged row of a send that begins a fresh run: the chat's cue to track its prompt to the reading horizon. */
-const sendAnchor = signal<{ rowId: string } | undefined>(undefined, { equals: false });
+/** The staged row of any prompt send: the chat's cue to track bottom-follow or the reading horizon. */
+const sendAnchor = signal<{ rowId: string; queued?: boolean } | undefined>(undefined, { equals: false });
 const landed = signal(0);
 const paletteOpen = signal(false);
 const compareOpen = signal(false);
@@ -4021,6 +4025,7 @@ export async function send(mode: "steer" | "followUp" = "steer") {
       // through its revival — takes the bubble now: the send reads as waiting
       // there rather than as nothing, and the landing carries it across.
       const outgoing = encodeReply(text);
+      const throwText = !withDocs && !images.length && !text.startsWith("!") && !parseSlashLine(text) ? text : undefined;
       const stageIn = ahead?.transcript === transcript || (revival && !heading()) ? transcript : undefined;
       const preStagedId = stageIn?.stageUser(outgoing, images);
       batch(() => {
@@ -4028,8 +4033,13 @@ export async function send(mode: "steer" | "followUp" = "steer") {
         attachments.set([]);
         if (preStagedId) {
           enableLiveRowEntrance();
+          if (isPersonaSession() && throwText && stageIn === transcript) {
+            const scale = readingSize() / FONT_SIZES.reading.default;
+            const folded = hardBreakLines(throwText) > USER_FOLD_LINES || roughUserLines(throwText, undefined, scale) >= USER_PREFOLD_LINES;
+            launchSmsThrow(preStagedId, throwText, { folded });
+          }
           flush();
-          scrollToEnd.set(0);
+          sendAnchor.set({ rowId: preStagedId, queued: true });
         }
       });
       const runDeferred = deferredSendTail.then(async () => {
@@ -4061,8 +4071,9 @@ export async function send(mode: "steer" | "followUp" = "steer") {
       return;
     }
     const outgoing = encodeReply(text);
+    const throwText = !withDocs && !images.length && !text.startsWith("!") && !parseSlashLine(text) ? text : undefined;
     clearUsedReply();
-    await dispatchPrompt(outgoing, images, mode, true);
+    await dispatchPrompt(outgoing, images, mode, true, [], undefined, throwText);
     // Not sent (no agent ready, no model): the words and the documents are on the composer as they were.
     if (withDocs && draft() === withDocs.message) {
       batch(() => {
@@ -4084,6 +4095,7 @@ async function dispatchPrompt(
   clearComposer: boolean,
   unsentAttachments: Attachment[] = [],
   preStaged?: { transcript: Transcript; id: string },
+  throwText?: string,
 ) {
   const restoreUnsent = () => {
     if (clearComposer) return;
@@ -4170,15 +4182,19 @@ async function dispatchPrompt(
       stagedId = runTranscript.stageUser(text, images, queued);
     }
     if (stagedId) queuedSends.set(stagedId, { held: runTranscript, wire: wirePrompt, images, mode, ...(handoff ? { handoff } : {}) });
+    if (stagedId && isPersonaSession() && runTranscript === transcript && throwText && !preStaged) {
+      const scale = readingSize() / FONT_SIZES.reading.default;
+      const folded = hardBreakLines(throwText) > USER_FOLD_LINES || roughUserLines(throwText, undefined, scale) >= USER_PREFOLD_LINES;
+      launchSmsThrow(stagedId, throwText, { folded });
+    }
     if (runTranscript === transcript) flush();
     if (!queued) {
       running.set(true);
       runStartedAt.set(Date.now());
       activity.set({ kind: "thinking" });
-      // A fresh run starts in horizon mode: the prompt rises naturally until it reaches the reading horizon.
-      if (stagedId) sendAnchor.set({ rowId: stagedId });
     }
-    scrollToEnd.set(0);
+    if (stagedId) sendAnchor.set({ rowId: stagedId, queued });
+    else scrollToEnd.set(0);
   });
   try {
     const { disposition } = await activeClient.request("prompt", {
