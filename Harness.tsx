@@ -35,7 +35,9 @@ import { boot, newSession, openSession, send, setDraft, showSettings, type Setti
 import { useBackend } from "./store/backend";
 import { closeTab, openTabs, selectTab, tabId } from "./store/tabs";
 import { startSplitDrag, workspaceBounds } from "./store/split";
+import { beginMeasuredPipReply } from "./views/PipMessageLayers";
 import { Shell } from "./views/Shell";
+import { clearPipReply, pipMessageMenu } from "./store/pip-interactions";
 
 const now = Date.now();
 const sessions = [
@@ -134,8 +136,9 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       pickedFile: (await Storage.getItem("harness.pickedFile")) ?? undefined,
       pickedSaveFile: (await Storage.getItem("harness.pickedSaveFile")) ?? undefined,
       dataDir: (await Storage.getItem("harness.dataDir")) ?? undefined,
-      pace: scenario === "slow" ? 400 : scenario === "stream" || scenario === "multi-slow" ? 150 : 0,
+      pace: Number((await Storage.getItem("harness.pace")) ?? (scenario === "slow" ? 400 : scenario === "stream" || scenario === "multi-slow" ? 150 : 0)),
       startDelay,
+      runDelay: Number((await Storage.getItem("harness.runDelay")) ?? 0) || undefined,
       distinctHistories,
       longHistories,
       cutHistories,
@@ -157,6 +160,26 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       else if (target.startsWith("send:")) {
         if (target.length > 5) setDraft(target.slice(5).replace(/\\n/g, "\n"));
         void send();
+      } else if (target === "replyfocus") {
+        // Reply-focus with no test-driver action in flight: fires the moment the persona
+        // menu is open, so a film of the lift catches its native frames (a press hides them).
+        let openSince = 0;
+        const tryFocus = () => {
+          const menu = pipMessageMenu();
+          if (!menu) {
+            openSince = 0;
+            setTimeout(tryFocus, 20);
+            return;
+          }
+          if (!openSince) openSince = Date.now();
+          // One steady second with the menu open: every driver step that opened it has
+          // long resolved, so the lift's frames belong to the animation alone.
+          if (Date.now() - openSince >= 1000) {
+            void beginMeasuredPipReply(menu);
+            setTimeout(() => clearPipReply(), 1400);
+          } else setTimeout(tryFocus, 20);
+        };
+        tryFocus();
       } else if (target.startsWith("splitdrag:")) {
         const side = target.slice(10) === "left" ? "left" : "right";
         const rect = workspaceBounds() ?? { left: 264, top: 7, width: 949, height: 766 };

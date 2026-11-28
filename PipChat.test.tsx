@@ -471,6 +471,19 @@ test("a live multi-bubble Pip reply lands whole at once, in order, without a per
   const order = orderOf(app, ["Alpha one.", "Beta two.", "Gamma three."]);
   expect(order[0]).toBeLessThan(order[1]);
   expect(order[1]).toBeLessThan(order[2]);
+
+  // The typing bubble hands off to the landed reply: a short crossfade, never a
+  // long coexistence, and no redundant generic status flashing underneath the words.
+  let overlapMs = 0;
+  let sawWaitingLabel = false;
+  for (let elapsed = 0; elapsed < 1100; elapsed += 16) {
+    if (app.shows("id:pip-typing-bubble") && app.count("id:pip-sms-bubble") === 3) overlapMs += 16;
+    if (app.shows("id:pip-waiting-label")) sawWaitingLabel = true;
+    await app.wait(16);
+  }
+  expect(overlapMs).toBeGreaterThan(0);
+  expect(overlapMs).toBeLessThan(180);
+  expect(sawWaitingLabel).toBe(false);
   await app.waitFor("label:Copy reply");
   await app.waitUntil(() => !app.shows("id:pip-typing-bubble"));
 });
@@ -545,5 +558,40 @@ test("leaving Pip and returning shows every bubble statically", async () => {
   expect(showsInChat(app, "Beta two.")).toBe(true);
   expect(showsInChat(app, "Gamma three.")).toBe(true);
   expect(app.shows("id:pip-typing-bubble")).toBe(false);
+});
+
+test("a pre-echo wake burst ends in one sent bubble — the echo confirms it in place, never twins it", async () => {
+  const app = await launch();
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:Hey, what's up?");
+
+  // "wake" makes the scripted run breathe a Devin-style wake turn first: its
+  // second assistant message carries no `turnStart`, so it lands between the
+  // staged bubble and its echo — the ordering that used to commit the bubble
+  // early and mint a twin on echo (the two-stage entrance).
+  await app.type("label:Message", "wake the bear");
+  await app.submit("label:Message");
+  await app.waitFor("text:wake the bear");
+
+  // Through the whole burst and echo: one outgoing bubble, mounted once.
+  let appeared = false,
+    dipped = false,
+    maxBubbles = 0;
+  for (let elapsed = 0; elapsed < 6_000; elapsed += 16) {
+    const n = app.count("id:message-bubble");
+    if (n > 0) appeared = true;
+    if (appeared && n === 0) dipped = true;
+    if (n > maxBubbles) maxBubbles = n;
+    await app.wait(16);
+  }
+  expect(appeared).toBe(true);
+  expect(dipped).toBe(false);
+  expect(maxBubbles).toBe(1);
+
+  await app.waitUntil(() => showsInChat(app, "Background check done."), { timeout: 10_000 });
+  await app.waitUntil(() => app.shows("label:Send"), { timeout: 15_000 });
+  await app.wait(300);
+  expect(app.count("id:message-bubble")).toBe(1);
+  expect(app.count("label:Conversation >> text:wake the bear")).toBe(1);
 });
 

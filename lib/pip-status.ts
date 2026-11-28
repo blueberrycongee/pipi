@@ -37,6 +37,10 @@ export interface PipLiveStatus {
   recentSteps: string[];
   /** Start timestamp (ms epoch) of the active run/turn for the live elapsed timer. */
   startedAt?: number;
+  /** A prose row in the trailing run is still streaming. */
+  textStreaming: boolean;
+  /** A complete prose row in the trailing run has already landed on screen. */
+  textLanded: boolean;
   /** Descendant sessions currently working or waiting for user confirmation. */
   activeChildren: PipChildStatus[];
   /** Engine/model label shown quietly when idle. */
@@ -101,6 +105,27 @@ function activeTurnRows(rows: readonly Row[]): Array<Extract<Row, { kind: "think
   return slice;
 }
 
+function trailingTextState(rows: readonly Row[]): { streaming: boolean; landed: boolean } {
+  let end = rows.length - 1;
+  while (end >= 0) {
+    const row = rows[end];
+    if (row.kind !== "user" || !row.queued) break;
+    end--;
+  }
+  let streaming = false;
+  let landed = false;
+  for (let i = end; i >= 0; i--) {
+    const row = rows[i];
+    if (!isTurnRow(row)) break;
+    if (row.kind === "text") {
+      if (row.streaming) streaming = true;
+      else landed = true;
+    }
+    if (row.turnStart) break;
+  }
+  return { streaming, landed };
+}
+
 function toChildStatus(session: DaemonSession): PipChildStatus {
   const title = session.title && session.title !== "New session" ? session.title : session.agentName || session.agentId;
   return {
@@ -125,7 +150,9 @@ export function derivePipLiveStatus(input: PipStatusInput): PipLiveStatus {
   const turnRows = input.running ? activeTurnRows(input.rows) : [];
   const turnSteps = turnRows.filter((r): r is ProcessStep => r.kind === "thinking" || r.kind === "tool");
   const activeStep = selectActiveStep(turnSteps);
-  const streamingText = turnRows.some((r) => r.kind === "text" && r.streaming);
+  const trailingText = trailingTextState(input.rows);
+  const streamingText = trailingText.streaming;
+  const landedText = trailingText.landed;
   const startedAt = turnRows[0]?.t0 ?? (input.running ? input.runStartedAt : undefined);
 
   // Recent completed tool steps in the active turn (last 3 unique descriptions), giving clear momentum.
@@ -142,6 +169,8 @@ export function derivePipLiveStatus(input: PipStatusInput): PipLiveStatus {
   const base = {
     name: input.name || "Pip",
     recentSteps: tailSteps,
+    textStreaming: streamingText,
+    textLanded: landedText,
     activeChildren,
     ...(input.engineLabel ? { engineLabel: input.engineLabel } : {}),
   };

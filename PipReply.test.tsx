@@ -328,6 +328,102 @@ test("clicking a quote preview scrolls the anchored original message back into v
   });
 });
 
+test("focus veils the original, coincides with it exactly, and restores it on exit", async () => {
+  const app = await launch();
+  await openPipWithReply(app);
+  expect(app.count("id:pip-sms-bubble")).toBe(1);
+  const before = app.layout("id:pip-sms-bubble")!;
+  expect(before.hidden).toBe(false);
+
+  await app.rightClick("id:pip-sms-bubble");
+  await app.waitFor("id:pip-message-menu");
+  await app.press("id:pip-menu-reply");
+  await app.waitFor("id:pip-reply-focus-layer");
+
+  // One object: the transcript original is veiled while its replica carries the focus —
+  // the bubble's test id leaves the tree entirely, and the replica sits exactly where it sat.
+  expect(app.count("id:pip-sms-bubble")).toBe(0);
+  const copy = app.layout("id:pip-reply-focus-bubble")!;
+  expect(copy).toBeTruthy();
+  expect(Math.abs(copy.x - before.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(copy.y - before.y)).toBeLessThanOrEqual(1);
+  expect(Math.abs(copy.width - before.width)).toBeLessThanOrEqual(1);
+  expect(app.shows("id:pip-reply-focus-text-bubble")).toBe(true);
+
+  await app.keyboard.press("escape");
+  await app.waitUntil(() => !app.shows("id:pip-reply-focus-layer"));
+  expect(app.count("id:pip-sms-bubble")).toBe(1);
+  const restored = app.layout("id:pip-sms-bubble")!;
+  expect(Math.abs(restored.y - before.y)).toBeLessThanOrEqual(1);
+});
+
+test("the focus replica tracks the conversation when it scrolls", async () => {
+  const messages: unknown[] = [
+    { role: "assistant", content: [{ type: "text", text: "The very first answer." }], provider: "test", model: "test", timestamp: 1, stopReason: "stop" },
+  ];
+  for (let i = 0; i < 20; i++) {
+    messages.push(
+      { role: "user", content: `filler question ${i}`, timestamp: 10 + i * 3 },
+      { role: "assistant", content: [{ type: "text", text: `filler answer ${i}\n\n${"Enough words to fill the conversation. ".repeat(4)}` }], provider: "test", model: "test", timestamp: 11 + i * 3, stopReason: "stop" },
+    );
+  }
+  const app = await launch({ "harness.scenario": "history", "harness.history": JSON.stringify(messages) });
+  await app.press("id:sidebar-pip");
+  await app.waitFor("text:filler answer 19");
+  const count = app.count("id:pip-sms-bubble");
+  expect(count).toBeGreaterThan(10);
+  const target = `id:pip-sms-bubble >> nth=${count - 1}`;
+
+  await app.rightClick(target);
+  await app.waitFor("id:pip-message-menu");
+  await app.press("id:pip-menu-reply");
+  await app.waitFor("id:pip-reply-focus-layer");
+  expect(app.count("id:pip-sms-bubble")).toBe(count - 1);
+
+  // The replica moves with the scrolled conversation by the same delta as a sibling row.
+  const copyBefore = app.layout("id:pip-reply-focus-bubble")!;
+  const refBefore = (app.layout("text:filler answer 15") ?? app.layout("text:filler question 15"))!;
+  expect(refBefore).toBeTruthy();
+  await app.scroll("label:Conversation", -160);
+  await app.waitUntil(() => {
+    const moved = app.layout("text:filler answer 15") ?? app.layout("text:filler question 15");
+    return Boolean(moved && refBefore && Math.abs(moved.y - refBefore.y) > 40);
+  });
+  const copyAfter = app.layout("id:pip-reply-focus-bubble")!;
+  const refAfter = (app.layout("text:filler answer 15") ?? app.layout("text:filler question 15"))!;
+  const copyDelta = copyAfter.y - copyBefore.y;
+  const refDelta = refAfter.y - refBefore.y;
+  expect(Math.abs(copyDelta)).toBeGreaterThan(40);
+  expect(Math.abs(copyDelta - refDelta)).toBeLessThanOrEqual(2);
+
+  const veiledCount = app.count("id:pip-sms-bubble");
+  await app.keyboard.press("escape");
+  await app.waitUntil(() => !app.shows("id:pip-reply-focus-layer"));
+  expect(app.count("id:pip-sms-bubble")).toBe(veiledCount + 1);
+});
+
+test("reduced motion focuses and restores instantly with the same continuity state", async () => {
+  const app = await open("./Harness.tsx", {
+    width: 1180,
+    height: 1100,
+    platform: "macos",
+    locale: "en-US",
+    clock: {},
+    reducedMotion: true,
+    storage: { "harness.scenario": "stream", "harness.reply": "Target answer." },
+  });
+  await openPipWithReply(app);
+  await app.rightClick("id:pip-sms-bubble");
+  await app.waitFor("id:pip-message-menu");
+  await app.press("id:pip-menu-reply");
+  await app.waitFor("id:pip-reply-focus-layer");
+  expect(app.count("id:pip-sms-bubble")).toBe(0);
+  expect(app.shows("id:composer-reply-strip")).toBe(true);
+  await app.keyboard.press("escape");
+  await app.waitUntil(() => !app.shows("id:pip-reply-focus-layer"));
+  expect(app.count("id:pip-sms-bubble")).toBe(1);
+});
+
 test("ordinary coding sessions keep their native menu and no persona interaction chrome", async () => {
   const app = await launch();
   await app.waitFor("text:What are we building?");

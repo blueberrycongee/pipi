@@ -184,9 +184,11 @@ test("buildDisplayRows in persona mode hides in-flight streaming/tools and deliv
     { kind: "text", id: "m2", text: "Halfway through typing...", streaming: true },
   ];
 
-  // While running in Pip persona mode: only the user's bubble is shown; no streaming text or tool log wall.
+  // While running in Pip persona mode: completed commentary lands whole, while streaming text and the tool log wall stay hidden.
   const pipRunning = buildDisplayRows(liveRows, true, {}, undefined, { persona: true, lang: "en" });
-  expect(pipRunning.map((r) => r.kind)).toEqual(["user"]);
+  expect(pipRunning.map((r) => r.kind)).toEqual(["user", "text"]);
+  expect(pipRunning.some((r) => r.kind === "text" && r.text === "Checking package.json first.")).toBe(true);
+  expect(pipRunning.some((r) => r.kind === "text" && r.text === "Halfway through typing...")).toBe(false);
 
   // In normal coding mode (persona omitted/false): turn header, process, and streaming text show as usual.
   const codingRunning = buildDisplayRows(liveRows, true, {}, undefined, { persona: false, lang: "en" });
@@ -211,15 +213,18 @@ test("buildDisplayRows in persona mode hides in-flight streaming/tools and deliv
   ];
 
   const pipSettled = buildDisplayRows(settledRows, false, {}, undefined, { persona: true, lang: "en" });
-  expect(pipSettled.map((r) => r.kind)).toEqual(["user", "text", "pip-sessions", "pip-footer"]);
+  expect(pipSettled.map((r) => r.kind)).toEqual(["user", "text", "text", "pip-sessions", "pip-footer"]);
   const reply = pipSettled[1];
   expect(reply.kind === "text" && reply.pip?.lead).toBe(true);
-  const sessionsRow = pipSettled[2];
+  const finalReply = pipSettled[2];
+  expect(finalReply.kind === "text" && finalReply.pip?.lead).toBe(false);
+  expect(finalReply.kind === "text" && finalReply.pip?.tail).toBe(true);
+  const sessionsRow = pipSettled[3];
   expect(sessionsRow.kind === "pip-sessions" && sessionsRow.sessions[0].sessionId).toBe("s_child_9");
   expect(sessionsRow.kind === "pip-sessions" && sessionsRow.pip?.lead).toBe(false);
   expect(sessionsRow.kind === "pip-sessions" && sessionsRow.pip?.indent).toBe(true);
-  const footer = pipSettled[3];
-  expect(footer.kind === "pip-footer" && footer.text).toBe("All set! I started a session to fix the login tests.");
+  const footer = pipSettled[4];
+  expect(footer.kind === "pip-footer" && footer.text).toBe("Checking package.json first.\n\nAll set! I started a session to fix the login tests.");
   // The turn's metadata rides on the avatar's slot: the status card reads it, the stream carries no pill of it.
   expect(footer.kind === "pip-footer" && footer.pip?.meta?.hasDetails).toBe(true);
   expect(footer.kind === "pip-footer" && footer.pip?.meta?.durationMs).toBe(4200);

@@ -690,6 +690,11 @@ export function Chat() {
   const scrollMode = signal<ScrollMode>("tail");
   const bottomFollowing = computed(() => scrollMode() === "tail" || scrollMode() === "horizon");
   const distanceFromEnd = signal(0);
+  // Bumped on scroll, row growth, and resize: the reply-focus replica re-measures off this.
+  const replyFocusTrack = signal(0);
+  const bumpReplyFocusTrack = () => {
+    replyFocusTrack.update((n) => n + 1);
+  };
   const topRow = signal(-1);
   const bottomRow = signal(-1);
   let viewSpan = -1;
@@ -851,6 +856,12 @@ export function Chat() {
    * Before the run's first row the last thing said is still the reader's own message.
    */
   const hasRunningTurn = computed(() => displayRows().some((row) => row.kind === "turn" && row.running));
+
+  // Streaming growth, folds, and version edits resize rows without firing scroll events.
+  effect(() => {
+    displayRows();
+    untracked(bumpReplyFocusTrack);
+  });
 
   const liveRowShown = computed(() => {
     const rows = displayRows();
@@ -1137,6 +1148,7 @@ export function Chat() {
     lastDistance = distance;
     lastMax = max;
     distanceFromEnd.set(distance);
+    bumpReplyFocusTrack();
 
     if (untracked(scrollMode) === "horizon") checkHorizon();
 
@@ -1723,7 +1735,7 @@ export function Chat() {
         </If>
       </View>
       <If when={isPersonaSession()}>
-        <PipReplyFocusLayer />
+        <PipReplyFocusLayer track={replyFocusTrack} />
       </If>
       <If when={isPersonaSession()}>
         <PersonaHeader reading={screen() === "transcript"} />
@@ -1736,6 +1748,7 @@ export function Chat() {
         onLayout={(e) => {
           paneHeight = e.bounds.size.height;
           viewHeight.set(Math.round(e.bounds.size.height));
+          bumpReplyFocusTrack();
         }}
       >
         <View style={{ flexGrow: hero() ? HERO.rise : 1, flexShrink: 1, flexBasis: hero() ? HERO.head : 0 }} />

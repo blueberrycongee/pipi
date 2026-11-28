@@ -350,6 +350,12 @@ interface StagedUserEntry {
   dropAt?: number;
 }
 
+/** A staged row `#commitStaged` promoted early; its echo is still owed. */
+interface CommittedEcho {
+  row: Extract<Row, { kind: "user" }>;
+  t0: number;
+}
+
 /**
  * Strips the context pipi prepends to a prompt — the personal agent's persona,
  * a Portable Context Handoff — so the user bubble shows only what the person wrote.
@@ -480,6 +486,13 @@ export class Transcript {
    * withdraws it when none does.
    */
   #staged: StagedUserEntry[] = [];
+  /**
+   * Staged rows an assistant `message_start` promoted before their echo: already
+   * inside `#rows`, but the wire still owes them `message_start(user)`. The echo
+   * must confirm this row — appending it would twin the bubble and replay its
+   * entrance under a fresh id.
+   */
+  #committedEchoes: CommittedEcho[] = [];
   /** The assistant message being streamed: its key, and what its tool calls have of their arguments. */
   #live: { key: string; rowIds: Map<number, string>; toolIds: Map<number, string>; toolJson: Map<number, string>; thinkingSince: Map<number, number>; argsAt: Map<number, number> } | undefined;
   /** Start timestamps for running tool executions so external engines without `durationMs` still measure elapsed time. */
@@ -550,6 +563,7 @@ export class Transcript {
     this.#editText.clear();
     this.#rows = [];
     this.#staged = [];
+    this.#committedEchoes = [];
     this.#index.clear();
     this.#live = undefined;
     this.#toolSince.clear();
@@ -1223,6 +1237,12 @@ export class Transcript {
       const echoed = next.rows().some((row) => row.kind === "user" && row.text === item.row.text && (row.images ?? 0) === item.row.images);
       if (!echoed) next.#staged.push({ ...item, dropAt: item.dropAt ?? now + QUEUE_ECHO_GRACE_MS });
     }
+    // A promoted row the file has not echoed re-waits staged; one it has was
+    // confirmed by the load itself, and its echo can never arrive twice.
+    for (const item of this.#committedEchoes) {
+      const echoed = next.rows().some((row) => row.id === item.row.id || (row.kind === "user" && row.text === item.row.text && (row.images ?? 0) === item.row.images));
+      if (!echoed) next.#staged.push({ row: item.row, t0: item.t0, dropAt: now + QUEUE_ECHO_GRACE_MS });
+    }
   }
 
   #commitStaged() {
@@ -1236,6 +1256,7 @@ export class Transcript {
       this.#reportFailure();
       this.#flushResults();
       this.#push(row);
+      this.#committedEchoes.push({ row, t0 });
       this.#turnStart = t0;
     }
   }
@@ -1265,12 +1286,23 @@ export class Transcript {
     return at >= 0 ? this.#staged.splice(at, 1)[0] : undefined;
   }
 
+  /**
+   * The early-promoted row an echo confirms. Exact only — unlike `#takeStaged`
+   * no fallback may guess here: the committed row already sits in `#rows`, so a
+   * wrong match would swallow a different message's echo whole.
+   */
+  #takeCommitted(text: string, images: number) {
+    const at = this.#committedEchoes.findIndex((item) => item.row.text === text && item.row.images === images);
+    return at >= 0 ? this.#committedEchoes.splice(at, 1)[0] : undefined;
+  }
+
   /** Prepends historical rows (for example, keeping visible conversation rows across a harness switch). */
   seedRows(previous: readonly Row[]) {
     this.#editing = false;
     this.#editText.clear();
     this.#rows = [];
     this.#staged = [];
+    this.#committedEchoes = [];
     this.#index.clear();
     this.#callCounts.clear();
     this.#callRows.clear();
@@ -1797,27 +1829,35 @@ export class Transcript {
           this.#turnStart = this.#now();
         } else if (text || images) {
           const staged = this.#clock === undefined ? this.#takeStaged(text, images) : undefined;
-          const keptImages = imageBlocks.length ? imageBlocks : staged?.row.imageBlocks;
-          const sameStagedImages = (staged?.row.imageBlocks?.length ?? 0) === (keptImages?.length ?? 0);
-          const keepsStaged = staged && staged.row.text === text && staged.row.images === images && sameStagedImages && !staged.row.queued;
-          const stagedRow =
-            staged && keepsStaged
-              ? split.reply && !sameJsonValue(staged.row.reply, split.reply)
-                ? { ...staged.row, reply: split.reply }
-                : staged.row
-              : undefined;
-          const row: Row =
-            stagedRow
-              ?? {
-                  kind: "user",
-                  id: staged ? staged.row.id : this.#id("u"),
-                  text,
-                  images,
-                  ...(keptImages?.length ? { imageBlocks: keptImages } : {}),
-                  ...(split.reply ? { reply: split.reply } : {}),
-                };
-          this.#push(row);
-          this.#turnStart = staged?.t0 ?? this.#now();
+          const committed = !staged && this.#clock === undefined ? this.#takeCommitted(text, images) : undefined;
+          if (committed) {
+            // Its row already sits in `#rows` — the echo only confirms it, in
+            // place. Appending here would show the same bubble twice.
+            const row = this.#get(committed.row.id);
+            if (row?.kind === "user" && split.reply && !sameJsonValue(row.reply, split.reply)) this.#set({ ...row, reply: split.reply });
+          } else {
+            const keptImages = imageBlocks.length ? imageBlocks : staged?.row.imageBlocks;
+            const sameStagedImages = (staged?.row.imageBlocks?.length ?? 0) === (keptImages?.length ?? 0);
+            const keepsStaged = staged && staged.row.text === text && staged.row.images === images && sameStagedImages && !staged.row.queued;
+            const stagedRow =
+              staged && keepsStaged
+                ? split.reply && !sameJsonValue(staged.row.reply, split.reply)
+                  ? { ...staged.row, reply: split.reply }
+                  : staged.row
+                : undefined;
+            const row: Row =
+              stagedRow
+                ?? {
+                    kind: "user",
+                    id: staged ? staged.row.id : this.#id("u"),
+                    text,
+                    images,
+                    ...(keptImages?.length ? { imageBlocks: keptImages } : {}),
+                    ...(split.reply ? { reply: split.reply } : {}),
+                  };
+            this.#push(row);
+            this.#turnStart = staged?.t0 ?? this.#now();
+          }
         } else {
           this.#turnStart = this.#now();
         }

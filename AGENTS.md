@@ -271,6 +271,15 @@ multi-agent orchestration, and settings.
   only the inner `useSmsBubbleEntrance` claims it. Ordinary skipped rows still
   mark seen. Pip's one-shot corner glide is intentionally distinct from the
   coding transcript's opacity-only entrances.
+- `nsh test PipReply.test.tsx` — persona reply-focus, tapbacks and stickers: the
+  focus replica coincides with the original it veils (`visibility`, never a
+  second copy), tracks the transcript's scroll by the same delta as a sibling
+  row, restores the original on exit, and is instant under Reduced Motion.
+  `nsh test ReplyFilm.test.tsx --target macos` films one enter+hold+exit reel
+  with the trigger inside the app (`harness.then`'s `replyfocus` — a driver
+  step's quiet-wait serializes the captures and hides the frames): the fill
+  stays solid in every frame (no crossfade, no gap), the silhouette and the
+  shadow ring grow and settle back monotonically.
 - `nsh test UserFold.test.tsx` — a sent message laid out past six lines folds
   to a fading preview; the chevron at the bubble's foot opens and closes it
   (`--target macos` films `.nsh/shots/userfold-*.png`)

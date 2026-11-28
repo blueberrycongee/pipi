@@ -1500,6 +1500,63 @@ test("stageUser shows the user bubble immediately, preserves its row and id on e
   expect(reloaded.rows()).toEqual([{ kind: "user", id: reloaded.rows()[0].id, text: "你好，先显示气泡", images: 0 }]);
 });
 
+test("a mid-turn assistant message_start between send and echo commits the bubble once — the echo confirms it in place", () => {
+  const t = new Transcript();
+  const stagedId = t.stageUser("say hi", 0);
+  const stagedRow = t.rows()[0];
+  expect(stagedRow).toEqual({ kind: "user", id: stagedId, text: "say hi", images: 0 });
+
+  // A second message inside a wake turn carries no `turnStart` — ACP's ordering
+  // when the daemon breathes between send and echo. It promotes the staged row
+  // into the rows on the spot.
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+  t.apply({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } } as never);
+  t.apply({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "wake" } } as never);
+  t.apply({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "wake" }], stopReason: "stop", timestamp: 10 } as never });
+  expect(t.hasStagedUser()).toBe(false);
+  expect(t.rows().map((r) => ({ kind: r.kind, id: r.id }))).toEqual([
+    { kind: "user", id: stagedId },
+    { kind: "text", id: t.rows()[1].id },
+  ]);
+
+  // The echo confirms the already-placed row: same object, same id, no twin —
+  // a second row would mount a second bubble and replay the send's entrance.
+  t.apply({ type: "message_start", message: { role: "user", content: "say hi", timestamp: 20 } as never });
+  const userRows = t.rows().filter((r) => r.kind === "user");
+  expect(userRows).toHaveLength(1);
+  expect(userRows[0]).toBe(stagedRow);
+});
+
+test("a committed echo survives a transcript swap as staged, then confirms by id", () => {
+  const t = new Transcript();
+  const stagedId = t.stageUser("say hi", 0);
+  const stagedRow = t.rows()[0];
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+
+  // The transcript is replaced (attach/landing) before the echo: the promoted
+  // row is not in the new rows, so it re-waits staged with its id.
+  const next = new Transcript();
+  next.load([]);
+  t.carryStagedTo(next);
+  expect(next.rows()).toEqual([stagedRow]);
+  expect(next.hasStagedId(stagedId)).toBe(true);
+
+  next.apply({ type: "message_start", message: { role: "user", content: "say hi", timestamp: 20 } as never });
+  expect(next.rows().filter((r) => r.kind === "user")).toHaveLength(1);
+  expect(next.rows()[0].id).toBe(stagedId);
+});
+
+test("a promoted bubble the replacement already echoes is not carried twice", () => {
+  const t = new Transcript();
+  t.stageUser("say hi", 0);
+  t.apply({ type: "message_start", message: { role: "assistant", content: [] } as never });
+
+  const next = new Transcript();
+  next.load([{ role: "user", content: "say hi", timestamp: 20 } as never]);
+  t.carryStagedTo(next);
+  expect(next.rows().filter((r) => r.kind === "user")).toHaveLength(1);
+});
+
 test("a queued staged bubble reconciles with the agent's queue: delivered echoes keep it, recalls withdraw it", () => {
   const t = new Transcript();
   const first = t.stageUser("steer this", 0);

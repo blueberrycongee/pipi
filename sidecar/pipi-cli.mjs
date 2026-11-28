@@ -23,7 +23,7 @@ const home = daemonHome(homeAt >= 0 ? argv[homeAt + 1] : undefined);
 const USAGE = `usage:
   pipi agents
   pipi sessions
-  pipi start --agent <id> --title <title> [--cwd <dir>] [--worktree] [--mode <mode>] <task>
+  pipi start --agent <id> --title <title> [--cwd <dir>] [--worktree] [--mode <mode>] [--model <m>] [--thinking <t>] <task>
   pipi send <session> <message>
   pipi read <session>
   pipi pip [--agent <id>] [<message>]
@@ -122,6 +122,8 @@ async function main() {
           message: task,
           worktree: f.worktree === true,
           ...(f.mode ? { runtimeMode: f.mode } : {}),
+          ...(f.model ? { model: f.model } : {}),
+          ...(f.thinking ? { thinking: f.thinking } : {}),
         },
       });
       print(res.session.id);

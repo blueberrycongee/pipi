@@ -267,30 +267,59 @@ const SMS_OUTGOING_MUTED_SPEC: LeanSpec<"opacity" | "translateX" | "translateY" 
   easing: SMS_OUTGOING_SPEC.easing,
 };
 
-/** iMessage-style incoming SMS bubble pop-in blooming from the bottom-left corner. */
+/** iMessage-style incoming SMS bubble pop-in blooming from the bottom-left corner.
+ * Pip's replies land as whole thoughts rather than streamed ink, so they take the
+ * heavier settle curve: less sideways dart than the outgoing send, a shorter rise,
+ * and most of the opacity arriving early enough for the shape to read immediately. */
 const SMS_INCOMING_SPEC: LeanSpec<"opacity" | "translateX" | "translateY" | "scale"> = {
   tracks: {
     opacity: [
       { offset: 0, value: 0 },
-      { offset: 0.38, value: 0.94 },
+      { offset: 0.32, value: 0.92 },
       { offset: 1, value: 1 },
     ],
     translateX: [
-      { offset: 0, value: -8 },
+      { offset: 0, value: -5 },
       { offset: 1, value: 0 },
     ],
     translateY: [
-      { offset: 0, value: 12 },
+      { offset: 0, value: 9 },
       { offset: 1, value: 0 },
     ],
     scale: [
-      { offset: 0, value: 0.96 },
+      { offset: 0, value: 0.975 },
       { offset: 1, value: 1 },
     ],
   },
-  duration: 240,
-  easing: EASING.signature,
+  duration: 300,
+  easing: EASING.settle,
 };
+
+/** The trailing avatar is part of the last bubble's arrival, not a piece of
+ * chrome that can appear early and wait for it. It keeps the same clock but a
+ * smaller travel, so the bubble remains the moving mass. */
+const SMS_COMPANION_SPEC: LeanSpec<"opacity" | "translateY" | "scale"> = {
+  tracks: {
+    opacity: [
+      { offset: 0, value: 0 },
+      { offset: 0.42, value: 0.9 },
+      { offset: 1, value: 1 },
+    ],
+    translateY: [
+      { offset: 0, value: 4 },
+      { offset: 1, value: 0 },
+    ],
+    scale: [
+      { offset: 0, value: 0.94 },
+      { offset: 1, value: 1 },
+    ],
+  },
+  duration: SMS_INCOMING_SPEC.duration,
+  easing: SMS_INCOMING_SPEC.easing,
+};
+
+const SMS_INCOMING_STAGGER_MS = 58;
+const smsIncomingDelay = (stagger: number | undefined) => Math.min(Math.max(0, stagger ?? 0), 4) * SMS_INCOMING_STAGGER_MS;
 
 /** Tracks which transcript row IDs have already animated in during the current
  * session so recycled `List` cells and history loads stay still while newly
@@ -388,7 +417,7 @@ export function useSmsBubbleEntrance(
       seenRowIds.add(currentId);
       const isLeft = side() === "left";
       const spec = isLeft ? SMS_INCOMING_SPEC : options?.muted?.() ? SMS_OUTGOING_MUTED_SPEC : SMS_OUTGOING_SPEC;
-      const delay = isLeft ? Math.min(Math.max(0, options?.stagger?.() ?? 0), 4) * 85 : 0;
+      const delay = isLeft ? smsIncomingDelay(options?.stagger?.()) : 0;
       if (reduceMotion()) {
         item.reset();
         return;
@@ -408,6 +437,51 @@ export function useSmsBubbleEntrance(
       { translateY: item.values.translateY },
       { scale: item.values.scale },
     ],
+  };
+}
+
+/** Companion entrance for the avatar sitting beside an incoming bubble's tail.
+ * It uses its own seen key so it can share the bubble's stagger clock without
+ * the bubble hook treating it as already played. */
+export function useSmsCompanionEntrance(
+  id: () => string,
+  options?: { enabled?: () => boolean; skip?: () => boolean; stagger?: () => number },
+): ViewStyle {
+  const item = leanMotion(["opacity", "translateY", "scale"] as const);
+  let lastId = "";
+  effect(() => {
+    const bubbleId = id();
+    const currentId = bubbleId ? `${bubbleId}#companion` : "";
+    const enabled = options?.enabled ? options.enabled() : true;
+    untracked(() => {
+      if (currentId === lastId && enabled) return;
+      lastId = currentId;
+      if (!enabled || !currentId || options?.skip?.()) {
+        if (currentId) seenRowIds.add(currentId);
+        item.reset();
+        return;
+      }
+      if (!liveEntranceEnabled || seenRowIds.has(currentId)) {
+        seenRowIds.add(currentId);
+        item.reset();
+        return;
+      }
+      seenRowIds.add(currentId);
+      if (reduceMotion()) {
+        item.reset();
+        return;
+      }
+      for (const channel of ["opacity", "translateY", "scale"] as const) {
+        item.values[channel].set(SMS_COMPANION_SPEC.tracks[channel][0].value);
+      }
+      item.play(SMS_COMPANION_SPEC, smsIncomingDelay(options?.stagger?.()));
+    });
+  });
+  cleanup(() => item.stop());
+  return {
+    transformOrigin: "center bottom",
+    opacity: item.values.opacity,
+    transform: [{ translateY: item.values.translateY }, { scale: item.values.scale }],
   };
 }
 

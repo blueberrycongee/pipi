@@ -42,7 +42,7 @@ import {
   transcriptRows,
   waitingCount,
 } from "../store/app";
-import { openPipMessageMenu } from "../store/pip-interactions";
+import { openPipMessageMenu, pipReplyCoveredId } from "../store/pip-interactions";
 import { IconButton } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import {
@@ -52,6 +52,7 @@ import {
   popupLeavingStyle,
   popupStyle,
   useSmsBubbleEntrance,
+  useSmsCompanionEntrance,
 } from "../ui/motion";
 import { FOCUS_RING, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { uiHeight, uiType } from "../ui/typography";
@@ -715,6 +716,82 @@ function TypingDots() {
   );
 }
 
+function TypingBubbleHandoff(props: { show: () => boolean }) {
+  const initiallyShown = untracked(props.show);
+  const mounted = signal(initiallyShown);
+  const opacity = createAnimatedValue(initiallyShown ? 1 : 0);
+  const scale = createAnimatedValue(initiallyShown ? 1 : 0.9);
+  const translateX = createAnimatedValue(initiallyShown ? 0 : -8);
+  const translateY = createAnimatedValue(initiallyShown ? 0 : 2);
+  let handoffTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const settle = () => {
+    opacity.set(1);
+    scale.set(1);
+    translateX.set(0);
+    translateY.set(0);
+  };
+  const stopAll = () => {
+    void opacity.stop();
+    void scale.stop();
+    void translateX.stop();
+    void translateY.stop();
+  };
+
+  effect(() => {
+    const show = props.show();
+    const reduced = reduceMotion();
+    untracked(() => {
+      clearTimeout(handoffTimer);
+      handoffTimer = undefined;
+      stopAll();
+      if (show) {
+        mounted.set(true);
+        if (reduced) {
+          settle();
+          return;
+        }
+        void opacity.timing(1, { duration: 150, easing: EASING.entrance });
+        void scale.timing(1, { duration: 180, easing: EASING.settle });
+        void translateX.timing(0, { duration: 180, easing: EASING.settle });
+        void translateY.timing(0, { duration: 180, easing: EASING.settle });
+      } else if (mounted()) {
+        if (reduced) {
+          opacity.set(0);
+          mounted.set(false);
+          return;
+        }
+        void opacity.timing(0, { duration: 140, easing: EASING.exit });
+        void scale.timing(0.88, { duration: 140, easing: EASING.exit });
+        void translateX.timing(-9, { duration: 140, easing: EASING.exit });
+        void translateY.timing(2, { duration: 140, easing: EASING.exit });
+        handoffTimer = setTimeout(() => mounted.set(false), 140);
+      }
+    });
+  });
+
+  cleanup(() => {
+    clearTimeout(handoffTimer);
+    stopAll();
+  });
+
+  return (
+    <If when={mounted()}>
+      <View
+        testID="pip-typing-bubble"
+        class="h-7 w-14 flex-row items-center justify-center gap-[5px] rounded-full bg-sms-incoming"
+        style={{
+          transformOrigin: "left bottom",
+          opacity,
+          transform: [{ translateX }, { translateY }, { scale }],
+        }}
+      >
+        <TypingDots />
+      </View>
+    </If>
+  );
+}
+
 /**
  * Quiet working row for Pip conversations; the avatar and label share a live status card.
  * Reserves a constant 48pt (`h-12`) slot so starting and settling a run never
@@ -727,7 +804,14 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
   const cardOpen = signal(false);
   const opacity = createAnimatedValue(alreadyWorking ? 1 : 0);
   const label = signal("");
-  const composing = () => pipLiveStatus().phase === "writing";
+  const composing = () => {
+    const live = pipLiveStatus();
+    return live.textStreaming || (live.phase === "writing" && !live.textLanded);
+  };
+  const handoffQuiet = () => {
+    const live = pipLiveStatus();
+    return live.textLanded && !composing() && (live.phase === "writing" || live.phase === "thinking" || live.phase === "idle");
+  };
   const typing = signal(untracked(() => isChatActive() && composing()));
   let exitTimer: ReturnType<typeof setTimeout> | undefined;
   let openTimer: ReturnType<typeof setTimeout> | undefined;
@@ -822,15 +906,13 @@ export function PipWorkingFooter(props: { anchor?: (node: ViewRef | undefined) =
             onMouseEnter={() => handleHover(true)}
             onMouseLeave={() => handleHover(false)}
             onPress={handleToggle}
-            class={`h-7 min-w-0 flex-1 justify-center items-start rounded-sm ${FOCUS_RING}`}
+            class={`relative h-7 min-w-0 flex-1 justify-center items-start rounded-sm ${FOCUS_RING}`}
           >
-            <If
-              when={typing()}
-              else={<Text testID="pip-waiting-label" class={`truncate ${uiType("xs")} text-muted-foreground`}>{label()}</Text>}
-            >
-              <View testID="pip-typing-bubble" class="h-7 w-14 flex-row items-center justify-center gap-[5px] rounded-full bg-sms-incoming">
-                <TypingDots />
-              </View>
+            <View class="absolute bottom-0 left-0">
+              <TypingBubbleHandoff show={typing} />
+            </View>
+            <If when={!typing() && !handoffQuiet()}>
+              <Text testID="pip-waiting-label" class={`truncate ${uiType("xs")} text-muted-foreground`}>{label()}</Text>
             </If>
           </View>
         </View>
@@ -895,6 +977,14 @@ export function PipBubbleView(props: {
       stagger: () => props.row.bubbleIndex,
     },
   );
+  const avatarEntrance = useSmsCompanionEntrance(
+    () => props.row.id,
+    {
+      enabled: () => props.row.pip.tail === true,
+      skip: () => Boolean(props.row.edited) || isRowSeen(props.row.rowId),
+      stagger: () => props.row.bubbleIndex,
+    },
+  );
 
   const bubbleRadius = () => {
     if (props.row.first && props.row.last) return "rounded-[18px] rounded-bl-[5px]";
@@ -920,6 +1010,10 @@ export function PipBubbleView(props: {
     blocks: props.row.blocks,
     wide: props.row.wide,
     mediaOnly: props.row.mediaOnly,
+    first: props.row.first,
+    last: props.row.last,
+    tail: props.row.pip.tail,
+    ...(props.row.footnotes?.length ? { footnotes: props.row.footnotes } : {}),
   });
   const bubbleNode = signal<ViewRef | undefined>(undefined);
   effect(() => {
@@ -959,7 +1053,7 @@ export function PipBubbleView(props: {
 
   return (
     <View class="group flex-row items-end gap-3">
-      <View class="w-7 shrink-0 pb-0.5">
+      <View class="w-7 shrink-0 pb-0.5" style={avatarEntrance}>
         <If when={props.row.pip.tail}>
           <PipAvatarBadge
             rowId={() => props.row.id}
@@ -1024,7 +1118,7 @@ export function PipBubbleView(props: {
               onMouseEnter={() => { if ((props.row.versions?.length ?? 0) > 1) enterEditHistoryBridge(historyKey()); }}
               onMouseLeave={() => { if ((props.row.versions?.length ?? 0) > 1) leaveEditHistory(historyKey(), "bridge"); }}
               onContextMenu={contextMenu}
-              style={entrance}
+              style={{ ...entrance, visibility: pipReplyCoveredId() === props.row.id ? "hidden" : "visible" }}
               class={`relative ${props.row.wide ? "max-w-[84%]" : "max-w-[74%]"} ${bubbleRadius()} corner-squircle bg-sms-incoming ${bubblePad()}`}
             >
               {isPersonaSession() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="left" /> : null}
@@ -1040,7 +1134,7 @@ export function PipBubbleView(props: {
             </View>
           }
         >
-          <View testID="pip-sms-bubble" ref={(node: ViewRef | undefined) => bubbleNode.set(node)} style={entrance} class="relative max-w-[74%]" onMouseEnter={() => { if ((props.row.versions?.length ?? 0) > 1) enterEditHistoryBridge(historyKey()); }} onMouseLeave={() => { if ((props.row.versions?.length ?? 0) > 1) leaveEditHistory(historyKey(), "bridge"); }} onContextMenu={contextMenu}>
+          <View testID="pip-sms-bubble" ref={(node: ViewRef | undefined) => bubbleNode.set(node)} style={{ ...entrance, visibility: pipReplyCoveredId() === props.row.id ? "hidden" : "visible" }} class="relative max-w-[74%]" onMouseEnter={() => { if ((props.row.versions?.length ?? 0) > 1) enterEditHistoryBridge(historyKey()); }} onMouseLeave={() => { if ((props.row.versions?.length ?? 0) > 1) leaveEditHistory(historyKey(), "bridge"); }} onContextMenu={contextMenu}>
             {isPersonaSession() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="left" /> : null}
             {isPersonaSession() ? (
               <View class={`absolute -right-8 top-1/2 -translate-y-1/2 z-30 ${HOVER_REVEAL}`}>

@@ -56,7 +56,7 @@ import {
 import { backend } from "../store/backend";
 import { docTabTitle, titleLine } from "../store/docs";
 import { openDocIfThere } from "../store/tabs";
-import { messageInteraction, openPipMessageMenu } from "../store/pip-interactions";
+import { messageInteraction, openPipMessageMenu, pipReplyCoveredId } from "../store/pip-interactions";
 import { IconButton } from "../ui/Button";
 import { Icon, type IconName } from "../ui/Icon";
 import { DURATION, EASING, isRowSeen, keepLast, Presence, useRowEntrance, useSmsBubbleEntrance } from "../ui/motion";
@@ -708,6 +708,9 @@ function UserRow(props: { row: DisplayUserRow }) {
     text: said(),
     copyText: props.row.text,
     imageBlocks: props.row.imageBlocks,
+    first: sms()?.first ?? true,
+    last: sms()?.last ?? true,
+    tail: sms()?.last ?? true,
   });
   const openPersonaMenu = (x: number, y: number) => openPipMessageMenu(messageSnapshot(), x, y);
   const bubbleNode = signal<ViewRef | undefined>(undefined);
@@ -757,7 +760,11 @@ function UserRow(props: { row: DisplayUserRow }) {
       >
         <View class="max-w-full items-end gap-1.5" style={{ opacity: bubbleOpacity }}>
           {isPersonaSession() && props.row.reply ? <PipQuotePreview reply={props.row.reply} side="right" /> : null}
-          <View ref={(node: ViewRef | undefined) => clusterNode.set(node)} class="max-w-full items-end gap-1.5">
+          <View
+            ref={(node: ViewRef | undefined) => clusterNode.set(node)}
+            class="max-w-full items-end gap-1.5"
+            style={{ visibility: pipReplyCoveredId() === props.row.id ? "hidden" : "visible" }}
+          >
             <If when={!hasBubble() && (hasImages() || fileMedia().length > 0)}>
               <View ref={(node: ViewRef | undefined) => mediaNode.set(node)} class="relative max-w-full" onContextMenu={contextMenu}>
                 {isPersonaSession() && isSms() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="right" /> : null}

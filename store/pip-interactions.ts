@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { signal, Storage } from "nsh";
-import type { TextViewBlock } from "nsh/base";
+import type { TextViewBlock, TextViewDocument } from "nsh/base";
 import type { ReplyPart } from "../lib/doc-wire";
 import { tr } from "../lib/i18n";
 import type { Mood } from "../mascot/geometry";
@@ -213,6 +213,13 @@ export interface PipMessageSnapshot {
   wide?: boolean;
   mediaOnly?: boolean;
   imageBlocks?: ImageContent[];
+  /** Where this bubble sits in its cluster: corner shape and tail are part of its silhouette. */
+  first?: boolean;
+  last?: boolean;
+  /** The curved tail flag exactly as the row renders it (`pip.tail` left, cluster `last` right). */
+  tail?: boolean;
+  /** Footnotes rendered inside the bubble, so a focus replica keeps its exact height. */
+  footnotes?: TextViewDocument["footnotes"];
 }
 
 export interface PipMessageMenuState extends PipMessageSnapshot {
@@ -229,15 +236,35 @@ export function closePipMessageMenu() {
   menu.set(undefined);
 }
 
-export interface PipReplyTarget extends PipMessageSnapshot {}
+export interface PipReplyFocusFrame {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PipReplyTarget extends PipMessageSnapshot {
+  /** Where the original was measured before the focus layer's first frame, in that layer's coordinates. */
+  initialFrame?: PipReplyFocusFrame;
+}
 
 const reply = signal<PipReplyTarget | undefined>(undefined);
 export const pipReplyTarget = () => reply();
 
+/** The transcript original temporarily veiled by its exact focus replica. */
+const covered = signal<string | undefined>(undefined);
+export const pipReplyCoveredId = () => covered();
+export function coverPipReplyOriginal(displayId: string) {
+  covered.set(displayId);
+}
+export function uncoverPipReplyOriginal(displayId?: string) {
+  if (!displayId || covered() === displayId) covered.set(undefined);
+}
+
 /** Enters the reply-focus state for one message. No wire is written until the person actually sends. */
-export function beginPipReply(message: PipMessageSnapshot) {
+export function beginPipReply(message: PipMessageSnapshot, options?: { initialFrame?: PipReplyFocusFrame }) {
   menu.set(undefined);
-  reply.set({ ...message });
+  reply.set({ ...message, ...(options?.initialFrame ? { initialFrame: options.initialFrame } : {}) });
 }
 
 export function clearPipReply() {
@@ -255,6 +282,7 @@ export function locatePipReply(target: string) {
 export function resetPipInteractionChrome() {
   menu.set(undefined);
   reply.set(undefined);
+  covered.set(undefined);
   locate.set(undefined);
 }
 

@@ -42,6 +42,8 @@ export interface FakeOptions {
   pace?: number;
   /** Milliseconds an agent takes to start and to load a saved session, as real CLIs do (0: at once). */
   startDelay?: number;
+  /** Milliseconds between a prompt and its run's first events (the wire latency a cloud agent adds before the echo). */
+  runDelay?: number;
   /** Each saved session opens on a history of its own (its title asked, then answered) instead of the shared sample. */
   distinctHistories?: boolean;
   /** Each saved session's history ends on a reply longer than the window (`LONG_REPLY`): where a conversation lands shows. */
@@ -825,6 +827,35 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         sessionMessages.set(sessionFile, messages);
         await later(60);
         return die({ code: 1 });
+      }
+      // `runDelay`: the wire latency a cloud agent (ACP/Devin) puts between the
+      // prompt and its echo — the staged bubble sits alone for that long.
+      if (options.runDelay) await later(options.runDelay);
+      // "wake": the cloud agent's own burst lands before this prompt's turn — a
+      // wake turn whose second assistant message carries no `turnStart`, the
+      // ordering ACP emits when the daemon breathes between send and echo. That
+      // message commits the staged bubble early; the echo must confirm it, not
+      // twin it.
+      if (prompt.includes("wake")) {
+        const wakeMsg: AgentMessage = { role: "assistant", turnStart: true, content: [{ type: "text", text: "Background check done." }], provider: "anthropic", model: "claude-sonnet-4-5", usage, stopReason: "stop", timestamp: Date.now() };
+        const wakeSecond: AgentMessage = { role: "assistant", content: [{ type: "text", text: "All clear." }], provider: "anthropic", model: "claude-sonnet-4-5", usage, stopReason: "stop", timestamp: Date.now() };
+        await step({ type: "agent_start" });
+        await step({ type: "turn_start" });
+        await step({ type: "message_start", message: { ...wakeMsg, content: [], stopReason: "pending" } });
+        await update({ type: "text_start", contentIndex: 0 });
+        await update({ type: "text_delta", contentIndex: 0, delta: "Background check done." });
+        await update({ type: "text_end", contentIndex: 0, content: "Background check done." });
+        await step({ type: "message_end", message: wakeMsg });
+        await step({ type: "message_start", message: { ...wakeSecond, content: [], stopReason: "pending" } });
+        await update({ type: "text_start", contentIndex: 0 });
+        await update({ type: "text_delta", contentIndex: 0, delta: "All clear." });
+        await update({ type: "text_end", contentIndex: 0, content: "All clear." });
+        await step({ type: "message_end", message: wakeSecond });
+        await step({ type: "turn_end" });
+        await step({ type: "agent_end", willRetry: false });
+        await step({ type: "agent_settled", aborted: false });
+        messages = [...messages, wakeMsg, wakeSecond];
+        if (sessionFile) sessionMessages.set(sessionFile, messages);
       }
       await step({ type: "agent_start" });
       await step({ type: "turn_start" });
