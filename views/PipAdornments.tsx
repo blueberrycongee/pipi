@@ -3,7 +3,9 @@ import type { ViewRef } from "nsh";
 import type { ReplyPart } from "../lib/doc-wire";
 import { tr } from "../lib/i18n";
 import { Pip } from "../mascot/Pip";
+import { IconButton } from "../ui/Button";
 import { locatePipReply, messageInteraction, removeSticker, type MessageSticker } from "../store/pip-interactions";
+import { HOVER_REVEAL } from "../ui/styles";
 import { uiType } from "../ui/typography";
 
 /** Bubble nodes by display-row id, for measuring the crisp foreground bubble of reply focus. */
@@ -45,6 +47,29 @@ function StickerView(props: { scope: string; target: string; sticker: MessageSti
         <Image src={props.sticker.path} class="size-10 rounded-xl corner-squircle border-[0.5px] border-hairline shadow-sm" style={{ objectFit: "cover" }} />
       )}
     </View>
+  );
+}
+
+/**
+ * The hover affordance parked beside a persona message. The transparent seat is
+ * the whole 32pt strip from the bubble's edge through the button, for the full
+ * height of the bubble, so a pointer crossing from the message never passes
+ * through unhovered space. It stays below tapbacks and stickers; the visible
+ * button keeps the outer 24pt of the strip and their original z-order.
+ */
+export function PipMessageHoverActions(props: { side: "left" | "right"; onPress: () => void }) {
+  const outgoing = props.side === "right";
+  const outward = outgoing ? "-left-8" : "-right-8";
+  return (
+    <>
+      <View testID="pip-message-actions-bridge" class={`absolute top-0 bottom-0 z-10 w-8 ${outward}`} />
+      <View
+        class={`absolute top-0 bottom-0 z-30 w-8 flex-row items-center ${outward} ${outgoing ? "justify-start" : "justify-end"} ${HOVER_REVEAL}`}
+        style={{ pointerEvents: "box-none" }}
+      >
+        <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={props.onPress} />
+      </View>
+    </>
   );
 }
 

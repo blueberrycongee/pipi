@@ -1821,7 +1821,7 @@ async function ensureDaemon(): Promise<DaemonClient | undefined> {
             }
           },
           onExit: () => {
-            daemonClient = undefined;
+            if (daemonClient === started) daemonClient = undefined;
           },
         });
         daemonClient = started;
@@ -1840,6 +1840,12 @@ async function ensureDaemon(): Promise<DaemonClient | undefined> {
 }
 
 const personalAgentStarts = new Map<string, Promise<string | undefined>>();
+
+async function restartDaemonForUpgrade(daemon: DaemonClient): Promise<{ accepted: boolean; daemon?: DaemonClient }> {
+  if (!(await daemon.restartIfIdle())) return { accepted: false };
+  if (daemonClient === daemon) daemonClient = undefined;
+  return { accepted: true, daemon: await ensureDaemon() };
+}
 
 /** A persona's session id, starting it on its own preferred engine the first time it is asked for. */
 export async function ensurePersonalAgent(personaId = "default", options?: { name?: string; description?: string }): Promise<string | undefined> {
@@ -1863,8 +1869,24 @@ export async function ensurePersonalAgent(personaId = "default", options?: { nam
     const stored = storedPersonaChoice(personaId);
     const agentId = stored?.agentId ?? preferredAgentId();
     const choice = storedPersonaAgentChoice(personaId, agentId);
+    let startDaemon = daemon;
+    if (personaId !== "default" && startDaemon.needsUpgrade()) {
+      const upgraded = await restartDaemonForUpgrade(startDaemon);
+      if (!upgraded.accepted) {
+        toast(
+          "warning",
+          tr(
+            "pipi is finishing an update. Retry when running sessions finish, or restart pipi.",
+            "pipi 正在完成更新，请等运行中的会话结束后重试，或重启 pipi。",
+          ),
+        );
+        return undefined;
+      }
+      if (!upgraded.daemon) return undefined;
+      startDaemon = upgraded.daemon;
+    }
     try {
-      const session = await daemon.startSession({
+      const session = await startDaemon.startSession({
         persona: true,
         personaId,
         personaName: options?.name,
@@ -1881,7 +1903,7 @@ export async function ensurePersonalAgent(personaId = "default", options?: { nam
       // The daemon's registry is the truth: a persona it still holds is this one's,
       // whatever the local mirror missed (a retired id an older daemon pushes back,
       // a push filtered or lost before it landed). Adopt it rather than report a failure.
-      const heldRemotely = await daemon
+      const heldRemotely = await startDaemon
         .list()
         .then((all) => all.find((s) => s.persona && (s.personaId ?? "default") === personaId))
         .catch(() => undefined);

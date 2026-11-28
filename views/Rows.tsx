@@ -66,7 +66,7 @@ import { tip } from "../ui/Tip";
 import { readingType, codeType, uiHeight, uiType } from "../ui/typography";
 import { readingSize, FONT_SIZES } from "../store/prefs";
 import { MediaGallery, MediaStreamContext, mediaZoomOptions, openMediaZoom } from "./Media";
-import { PipMessageAdornments, PipQuotePreview, pipMessageNode, registerPipMessageNode } from "./PipAdornments";
+import { PipMessageAdornments, PipMessageHoverActions, PipQuotePreview, pipMessageNode, registerPipMessageNode } from "./PipAdornments";
 import { BubbleTail, PipAvatarBadge, PipBubbleView, PipFooterView, PipSessionsView } from "./PipPresence";
 import { clearProseState, proseClasses, ProseBlock, proseVeilUntil, type PipBubbleRow, type ProseRow } from "./Prose";
 
@@ -768,11 +768,7 @@ function UserRow(props: { row: DisplayUserRow }) {
             <If when={!hasBubble() && (hasImages() || fileMedia().length > 0)}>
               <View ref={(node: ViewRef | undefined) => mediaNode.set(node)} class="relative max-w-full" onContextMenu={contextMenu}>
                 {isPersonaSession() && isSms() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="right" /> : null}
-                {isPersonaSession() && isSms() ? (
-                  <View class={`absolute -left-8 top-1/2 -translate-y-1/2 z-30 ${HOVER_REVEAL}`}>
-                    <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
-                  </View>
-                ) : null}
+                {isPersonaSession() && isSms() ? <PipMessageHoverActions side="right" onPress={openPersonaActions} /> : null}
                 <View class="items-end gap-1.5">
                   <If when={hasImages()}>
                     <UserImages rowId={props.row.id} images={imageBlocks()} missing={missingImages()} onContextMenu={contextMenu} />
@@ -802,11 +798,7 @@ function UserRow(props: { row: DisplayUserRow }) {
                 onContextMenu={contextMenu}
               >
                 {isPersonaSession() && isSms() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="right" /> : null}
-                {isPersonaSession() && isSms() ? (
-                  <View class={`absolute -left-8 top-1/2 -translate-y-1/2 z-30 ${HOVER_REVEAL}`}>
-                    <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
-                  </View>
-                ) : null}
+                {isPersonaSession() && isSms() ? <PipMessageHoverActions side="right" onPress={openPersonaActions} /> : null}
                 <If when={sms()?.last}>
                   <BubbleTail side="right" tone="brand" />
                 </If>

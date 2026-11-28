@@ -35,5 +35,15 @@ process.stdin.on("data", (chunk) => {
 });
 process.stdin.on("end", () => channel.close());
 
+if (channel.staleDaemon) {
+  process.stdout.write(
+    `${JSON.stringify({
+      type: "link",
+      staleDaemon: true,
+      daemonFingerprint: channel.daemonFingerprint,
+      expectedFingerprint: channel.expectedFingerprint,
+    })}\n`,
+  );
+}
 channel.onLine((msg) => process.stdout.write(`${JSON.stringify(msg)}\n`));
 channel.conn.on("close", () => process.exit(0));

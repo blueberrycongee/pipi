@@ -352,3 +352,42 @@ test("a persona the daemon already holds is adopted instead of started again", a
   expect(app.texts().filter((t) => t.includes("already runs as") || t.includes("启动失败"))).toEqual([]);
   expect(app.count("id:sidebar-pip >> text:Pip")).toBe(1);
 });
+
+test("a custom persona start upgrades a deferred stale daemon instead of colliding with Pip", async () => {
+  const now = Date.now();
+  const app = await launch({
+    "harness.legacyPersonaDaemon": "1",
+    "harness.daemonSessions": JSON.stringify([
+      {
+        id: "s_legacy_pip",
+        title: "Pip",
+        titleLocked: true,
+        persona: true,
+        cwd: "/Users/pip/.pipi/persona",
+        agentId: "pi",
+        agentName: "Pi",
+        driver: "pi",
+        runtimeMode: "full-access",
+        status: "idle",
+        unread: false,
+        loaded: true,
+        depth: 0,
+        createdAt: now - 80_000,
+        lastActive: now - 10_000,
+      },
+    ]),
+  });
+  await app.waitFor("text:What are we building?");
+
+  await app.press("id:sidebar-persona-add");
+  await app.waitFor("id:persona-create-form");
+  await app.type("id:persona-name-input", "nsh");
+  await app.type("id:persona-description-input", "Native shell helper");
+  await app.press("id:persona-create-submit");
+  await app.waitUntil(() => app.count("id:persona-create-form") === 0);
+  await app.waitUntil(() => app.count("id:sidebar-persona-nsh") === 1);
+
+  expect(app.count("id:sidebar-persona-nsh >> text:nsh")).toBe(1);
+  expect(app.count("id:sidebar-pip >> text:Pip")).toBe(1);
+  expect(app.texts().filter((t) => t.includes("already runs as") || t.includes("could not start") || t.includes("finishing an update"))).toEqual([]);
+});

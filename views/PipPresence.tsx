@@ -57,7 +57,7 @@ import {
 import { FOCUS_RING, HOVER_REVEAL, POPUP, PRESS, PRESS_SCALE } from "../ui/styles";
 import { uiHeight, uiType } from "../ui/typography";
 import { PersonaAvatar } from "./PersonaAvatar";
-import { PipMessageAdornments, pipMessageNode, registerPipMessageNode } from "./PipAdornments";
+import { PipMessageAdornments, PipMessageHoverActions, pipMessageNode, registerPipMessageNode } from "./PipAdornments";
 import { PipBubbleBlocks, type PipBubbleRow } from "./Prose";
 import { closeEditHistory, editHistoryEscapeBlocked, editHistoryState, enterEditHistory, enterEditHistoryBridge, leaveEditHistory, toggleEditHistoryPin } from "./pip-edit-history";
 
@@ -1122,11 +1122,7 @@ export function PipBubbleView(props: {
               class={`relative ${props.row.wide ? "max-w-[84%]" : "max-w-[74%]"} ${bubbleRadius()} corner-squircle bg-sms-incoming ${bubblePad()}`}
             >
               {isPersonaSession() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="left" /> : null}
-              {isPersonaSession() ? (
-                <View class={`absolute -right-8 top-1/2 -translate-y-1/2 z-30 ${HOVER_REVEAL}`}>
-                  <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
-                </View>
-              ) : null}
+              {isPersonaSession() ? <PipMessageHoverActions side="left" onPress={openPersonaActions} /> : null}
               <If when={props.row.pip.tail}>
                 <BubbleTail side="left" tone="sms-incoming" />
               </If>
@@ -1136,11 +1132,7 @@ export function PipBubbleView(props: {
         >
           <View testID="pip-sms-bubble" ref={(node: ViewRef | undefined) => bubbleNode.set(node)} style={{ ...entrance, visibility: pipReplyCoveredId() === props.row.id ? "hidden" : "visible" }} class="relative max-w-[74%]" onMouseEnter={() => { if ((props.row.versions?.length ?? 0) > 1) enterEditHistoryBridge(historyKey()); }} onMouseLeave={() => { if ((props.row.versions?.length ?? 0) > 1) leaveEditHistory(historyKey(), "bridge"); }} onContextMenu={contextMenu}>
             {isPersonaSession() ? <PipMessageAdornments scope={personaScope()} target={messageTarget()} side="left" /> : null}
-            {isPersonaSession() ? (
-              <View class={`absolute -right-8 top-1/2 -translate-y-1/2 z-30 ${HOVER_REVEAL}`}>
-                <IconButton testID="pip-message-actions" icon="more" tone="subtle" size="sm" label={tr("Message actions", "消息操作")} onPress={openPersonaActions} />
-              </View>
-            ) : null}
+            {isPersonaSession() ? <PipMessageHoverActions side="left" onPress={openPersonaActions} /> : null}
             <PipBubbleBlocks row={props.row} />
           </View>
         </If>

@@ -104,6 +104,8 @@ export class DaemonClient {
   private pendingAttaches = new Set<string>();
   private streams = new Map<string, Set<VirtualStream>>();
   private sessions = new Map<string, DaemonSession>();
+  private staleDaemon = false;
+  private restartExpected = false;
 
   private constructor(
     private transport: Transport,
@@ -125,15 +127,16 @@ export class DaemonClient {
       client.lastError = (client.lastError + chunk).slice(-4000);
     });
     transport.onExit((exit) => {
+      const streamExit: Exit = client.restartExpected ? { ...exit, expected: true } : exit;
       for (const [, w] of client.pending) w.reject(new Error("daemon link stopped"));
       client.pending.clear();
       client.pendingAttaches.clear();
       for (const set of client.streams.values()) {
         for (const stream of set) {
           if (stream.readyExit) {
-            for (const h of stream.exit.splice(0)) h(exit);
+            for (const h of stream.exit.splice(0)) h(streamExit);
           } else {
-            stream.bufExit = exit;
+            stream.bufExit = streamExit;
           }
         }
       }
@@ -151,6 +154,10 @@ export class DaemonClient {
 
   private onRecord(msg: Record<string, unknown>) {
     switch (msg.type) {
+      case "link": {
+        if (msg.staleDaemon === true) this.staleDaemon = true;
+        return;
+      }
       case "hello": {
         const list = (msg.sessions as DaemonSession[]) ?? [];
         const catalogs = msg.catalogs && typeof msg.catalogs === "object" ? (msg.catalogs as Record<string, AgentCatalog>) : undefined;
@@ -278,24 +285,39 @@ export class DaemonClient {
     }
   }
 
-  private call<T>(type: string, payload: Record<string, unknown> = {}, registerStream = false): Promise<T> {
+  private call<T>(type: string, payload: Record<string, unknown> = {}, registerStream = false, timeoutMs = 0): Promise<T> {
     const id = `a${++this.seq}`;
     if (registerStream) this.pendingAttaches.add(id);
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, {
-        resolve: (msg) => resolve(msg as T),
-        reject,
-      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settle = {
+        resolve: (msg: unknown) => {
+          if (timer) clearTimeout(timer);
+          resolve(msg as T);
+        },
+        reject: (error: Error) => {
+          if (timer) clearTimeout(timer);
+          reject(error);
+        },
+      };
+      this.pending.set(id, settle);
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          if (!this.pending.delete(id)) return;
+          this.pendingAttaches.delete(id);
+          reject(new Error(`${type}: daemon did not answer`));
+        }, timeoutMs);
+      }
       try {
         void Promise.resolve(this.transport.write(`${JSON.stringify({ id, type, ...payload })}\n`)).catch((error) => {
           this.pending.delete(id);
           this.pendingAttaches.delete(id);
-          reject(error instanceof Error ? error : new Error(String(error)));
+          settle.reject(error instanceof Error ? error : new Error(String(error)));
         });
       } catch (error) {
         this.pending.delete(id);
         this.pendingAttaches.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        settle.reject(error instanceof Error ? error : new Error(String(error)));
       }
     });
   }
@@ -309,6 +331,21 @@ export class DaemonClient {
   /** A session by daemon id (from the last push the app saw). */
   session(id: string | undefined): DaemonSession | undefined {
     return id ? this.sessions.get(id) : undefined;
+  }
+
+  needsUpgrade(): boolean {
+    return this.staleDaemon;
+  }
+
+  async restartIfIdle(): Promise<boolean> {
+    try {
+      const res = await this.call<{ shuttingDown?: boolean }>("shutdown_if_idle", {}, false, 1500);
+      if (res.shuttingDown !== true) return false;
+      this.restartExpected = true;
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async list(): Promise<DaemonSession[]> {

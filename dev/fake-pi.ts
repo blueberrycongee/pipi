@@ -28,6 +28,7 @@ export interface FakeOptions {
   daemonSessions?: DaemonSession[];
   /** Daemon sessions the registry holds but never pushes at connect: the UI's mirror must catch up by other means. */
   unannouncedDaemonSessions?: DaemonSession[];
+  legacyPersonaDaemon?: boolean;
   /** Folder path returned when `pickFolder` is called. */
   pickedFolder?: string;
   /** Image path returned when `pickImage` is called. */
@@ -1145,6 +1146,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
   let activeAgent = "pi";
   let worktreeSeq = 1;
   let daemonSeq = 0;
+  let legacyPersonaDaemon = Boolean(options.legacyPersonaDaemon);
   const FAKE_PERSONA_DIR = "/Users/pip/.pipi/persona";
   const FAKE_PERSONAS_ROOT = "/Users/pip/.pipi/personas";
   const fakePersonaDir = (personaId = "default") => (personaId === "default" ? FAKE_PERSONA_DIR : `${FAKE_PERSONAS_ROOT}/${personaId}`);
@@ -1403,6 +1405,7 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
     },
     async connectDaemon(callbacks: DaemonCallbacks): Promise<DaemonClient> {
       daemonCallbacks = callbacks;
+      const legacy = legacyPersonaDaemon;
       const client = {
         session(id?: string) {
           const s = id ? daemonSessions.get(id) : undefined;
@@ -1410,6 +1413,15 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         },
         async list() {
           return [...daemonSessions.values()].map(daemonInfo);
+        },
+        needsUpgrade() {
+          return legacy;
+        },
+        async restartIfIdle() {
+          if (!legacy) return false;
+          if ([...daemonSessions.values()].some((s) => s.status === "working" || s.status === "blocked")) return false;
+          legacyPersonaDaemon = false;
+          return true;
         },
         async attach(spec: DaemonAttachSpec) {
           let s = (spec.id ? daemonSessions.get(spec.id) : undefined) ?? (spec.file ? [...daemonSessions.values()].find((k) => k.file === spec.file) : undefined);
@@ -1601,18 +1613,20 @@ export function fakeBackend(options: FakeOptions = {}): Backend & { sent: Record
         },
         async startSession(input: Parameters<DaemonClient["startSession"]>[0]) {
           const parent = input.parentId ? daemonSessions.get(input.parentId) : undefined;
-          const personaId = input.persona ? input.personaId || "default" : undefined;
-          const held = input.persona ? [...daemonSessions.values()].find((known) => known.persona && (known.personaId ?? "default") === personaId) : undefined;
-          if (held && input.replacePersona !== held.id) throw new Error(`this personal agent already runs as ${held.id}`);
+          const personaId = input.persona ? (legacy ? "default" : input.personaId || "default") : undefined;
+          const held = input.persona
+            ? [...daemonSessions.values()].find((known) => known.persona && (legacy || (known.personaId ?? "default") === personaId))
+            : undefined;
+          if (held && input.replacePersona !== held.id) throw new Error(`${legacy ? "the" : "this"} personal agent already runs as ${held.id}`);
           if (input.replacePersona && !held) throw new Error("the personal agent changed; refresh before switching");
           if (held) removeFakeDaemon(held);
           const cwd = input.persona ? fakePersonaDir(personaId) : (input.cwd ?? "");
           const wt = input.worktree && api.createWorktree ? await api.createWorktree(cwd, input.agentId) : undefined;
           const s: FakeDaemonSession = {
             id: `s_fake_${++daemonSeq}`,
-            title: input.title || (input.persona ? input.personaName || held?.title || "Pip" : "New session"),
+            title: input.title || (input.persona ? (legacy ? "Pip" : input.personaName || held?.title || "Pip") : "New session"),
             ...(input.title || input.persona ? { titleLocked: true } : {}),
-            ...(input.persona ? { persona: true, personaId } : {}),
+            ...(input.persona ? { persona: true, ...(legacy ? {} : { personaId }) } : {}),
             cwd: wt?.path ?? cwd,
             agentId: input.agentId,
             agentName: agentNameOf(input.agentId),

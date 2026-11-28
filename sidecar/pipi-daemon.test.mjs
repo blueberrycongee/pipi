@@ -11,6 +11,7 @@ import { connectDaemon } from "./daemon-client.mjs";
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON_SCRIPT = path.join(__dirname, "pipi-daemon.mjs");
+const LINK_SCRIPT = path.join(__dirname, "daemon-link.mjs");
 const CLI_SCRIPT = path.join(__dirname, "pipi-cli.mjs");
 const MCP_STDIO_SCRIPT = path.join(__dirname, "pipi-mcp-stdio.mjs");
 const PI_EXT_SCRIPT = path.join(__dirname, "pipi-orchestrator-extension.mjs");
@@ -1763,6 +1764,35 @@ test("connectDaemon upgrades a stale idle daemon on UI connect, preserves runnin
     "running session was preserved without killing the daemon",
   );
   assert.doesNotThrow(() => process.kill(freshInfo.pid, 0), "daemon stayed alive while session was working");
+  assert.equal(ui2.staleDaemon, true, "the deferred connection is marked as older sidecar code");
+
+  const link = spawn(process.execPath, [LINK_SCRIPT, "--home", homeDir], { stdio: ["pipe", "pipe", "pipe"] });
+  t.after(() => link.kill());
+  const linkRecords = await new Promise((resolve, reject) => {
+    const records = [];
+    let buf = "";
+    const timer = setTimeout(() => reject(new Error("daemon-link did not answer")), 3000);
+    link.stdout.setEncoding("utf8");
+    link.stdout.on("data", (chunk) => {
+      buf += chunk;
+      let at = buf.indexOf("\n");
+      while (at !== -1) {
+        const line = buf.slice(0, at);
+        buf = buf.slice(at + 1);
+        at = buf.indexOf("\n");
+        if (line.trim()) records.push(JSON.parse(line));
+      }
+      if (records.length >= 2) {
+        clearTimeout(timer);
+        resolve(records);
+      }
+    });
+    link.once("error", reject);
+  });
+  assert.equal(linkRecords[0].type, "link");
+  assert.equal(linkRecords[0].staleDaemon, true);
+  assert.equal(linkRecords[1].type, "hello");
+  link.kill();
 
   ui2.close();
   ui.close();

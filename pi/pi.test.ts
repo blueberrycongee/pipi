@@ -1,6 +1,6 @@
 import { expect, test } from "nsh/test";
 import { hardBreakLines, roughUserLines, USER_FOLD_LINES, USER_PREFOLD_LINES } from "../lib/user-lines";
-import { PiClient, type Transport } from "./client";
+import { type Exit, PiClient, type Transport } from "./client";
 import { DaemonClient } from "./daemon";
 import { createLineSplitter } from "./jsonl";
 import { sessionTitle } from "./sessions";
@@ -1401,8 +1401,18 @@ test("DaemonClient.startSession resolves on the session-shaped response, which s
   pushStdout(`${JSON.stringify({ type: "hello", pid: 42, sessions: [] })}\n`);
   const daemon = await connectPromise;
 
-  const startPromise = daemon.startSession({ persona: true, agentId: "pi" });
+  const startPromise = daemon.startSession({ persona: true, personaId: "nsh", personaName: "nsh", personaDescription: "Native shell helper", agentId: "pi" });
   const startReq = JSON.parse(written.at(-1)!);
+  expect(startReq).toMatchObject({
+    type: "start_session",
+    input: {
+      persona: true,
+      personaId: "nsh",
+      personaName: "nsh",
+      personaDescription: "Native shell helper",
+      agentId: "pi",
+    },
+  });
   const session = {
     id: "s_pip",
     title: "Pip",
@@ -1434,6 +1444,50 @@ test("DaemonClient.startSession resolves on the session-shaped response, which s
   expect((await startPromise).id).toBe("s_pip");
   expect(pushed).toEqual(["s_pip", "s_pip"]);
   expect(daemon.session("s_pip")?.personaId).toBe("default");
+});
+
+test("DaemonClient marks a deferred stale daemon and treats its upgrade restart as expected", async () => {
+  const { transport, written, say, die } = pipe();
+  const connectPromise = DaemonClient.connect(transport, { onSession: () => undefined });
+  say({ type: "link", staleDaemon: true, daemonFingerprint: "old", expectedFingerprint: "new" });
+  say({ type: "hello", sessions: [] });
+  const daemon = await connectPromise;
+  expect(daemon.needsUpgrade()).toBe(true);
+
+  const attachPromise = daemon.attach({ cwd: "/work", agentId: "pi" });
+  const attachReq = JSON.parse(written.at(-1)!);
+  const session = {
+    id: "s_idle",
+    title: "Idle",
+    cwd: "/work",
+    agentId: "pi",
+    agentName: "Pi",
+    driver: "pi",
+    runtimeMode: "full-access" as const,
+    status: "idle" as const,
+    unread: false,
+    loaded: true,
+    depth: 0,
+    createdAt: 1,
+    lastActive: 2,
+  };
+  say({ id: attachReq.id, type: "attached", session });
+  const attached = await attachPromise;
+  let exit: Exit | undefined;
+  attached.transport.onExit((e) => {
+    exit = e;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const restartPromise = daemon.restartIfIdle();
+  const restartReq = JSON.parse(written.at(-1)!);
+  expect(restartReq.type).toBe("shutdown_if_idle");
+  say({ id: restartReq.id, type: "ok", shuttingDown: true });
+  expect(await restartPromise).toBe(true);
+
+  die();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(exit).toMatchObject({ code: 1, expected: true });
 });
 
 test("stageUser shows the user bubble immediately, preserves its row and id on echo, strips handoff context, and keeps pre-echo wake turns ahead of it", () => {

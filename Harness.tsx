@@ -131,6 +131,7 @@ Storage.getItem("harness.scenario").then(async (scenario) => {
       workspaceSessions: listedWorkspaceSessions,
       daemonSessions: JSON.parse((await Storage.getItem("harness.daemonSessions")) ?? "null") ?? undefined,
       unannouncedDaemonSessions: JSON.parse((await Storage.getItem("harness.unannouncedDaemonSessions")) ?? "null") ?? undefined,
+      legacyPersonaDaemon: Boolean(await Storage.getItem("harness.legacyPersonaDaemon")),
       pickedFolder: (await Storage.getItem("harness.pickedFolder")) ?? "/Users/pip/code/new-app",
       pickedImage: (await Storage.getItem("harness.pickedImage")) ?? undefined,
       pickedFile: (await Storage.getItem("harness.pickedFile")) ?? undefined,

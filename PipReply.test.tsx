@@ -27,6 +27,41 @@ const openPipWithReply = async (app: Awaited<ReturnType<typeof launch>>) => {
   await app.waitUntil(() => !app.shows("id:pip-typing-bubble"));
 };
 
+const near = (a: number, b: number) => Math.abs(a - b) <= 0.51;
+
+/** The actions seat must touch the bubble and reach through the visible button: no unhovered gap. */
+const expectContinuousActionStrip = (app: Awaited<ReturnType<typeof launch>>, bubbleSelector: string, side: "left" | "right") => {
+  const bubble = app.layout(bubbleSelector)!;
+  const bridge = app.layout(`${bubbleSelector} >> id:pip-message-actions-bridge`)!;
+  const action = app.layout(`${bubbleSelector} >> id:pip-message-actions`)!;
+  expect(bridge).toBeTruthy();
+  expect(action).toBeTruthy();
+  expect(bridge.width).toBe(32);
+  expect(near(bridge.y, bubble.y)).toBe(true);
+  expect(near(bridge.height, bubble.height)).toBe(true);
+  if (side === "left") {
+    expect(near(bridge.x, bubble.x + bubble.width)).toBe(true);
+    expect(near(action.x, bubble.x + bubble.width + 8)).toBe(true);
+    expect(near(action.x + action.width, bridge.x + bridge.width)).toBe(true);
+  } else {
+    expect(near(bridge.x + bridge.width, bubble.x)).toBe(true);
+    expect(near(action.x + action.width, bubble.x - 8)).toBe(true);
+    expect(near(action.x, bridge.x)).toBe(true);
+  }
+  expect(near(action.y + action.height / 2, bubble.y + bubble.height / 2)).toBe(true);
+};
+
+const expectMediaActionStrip = (app: Awaited<ReturnType<typeof launch>>, mediaSelector: string) => {
+  const media = app.layout(mediaSelector)!;
+  const bridge = app.layout("id:pip-message-actions-bridge")!;
+  const action = app.layout("id:pip-message-actions")!;
+  expect(bridge.width).toBe(32);
+  expect(near(bridge.x + bridge.width, media.x)).toBe(true);
+  expect(near(action.x, bridge.x)).toBe(true);
+  expect(near(action.x + action.width, media.x - 8)).toBe(true);
+  expect(near(action.y + action.height / 2, bridge.y + bridge.height / 2)).toBe(true);
+};
+
 const reactAndExpectRoom = async (app: Awaited<ReturnType<typeof launch>>, first: string, second: string) => {
   const before = app.layout(second);
   expect(before).toBeTruthy();
@@ -83,6 +118,23 @@ test("reply enters blur-focus, Escape and backdrop cancel, and sending restores 
   expect(app.count("text:pipi-reply")).toBe(0);
   expect(app.count("id:pip-quote-preview >> text:Target answer.")).toBeGreaterThan(0);
 
+  await app.press("id:pip-sms-bubble >> id:pip-message-actions");
+  await app.waitFor("id:pip-message-menu");
+  await app.keyboard.press("escape");
+  await app.waitUntil(() => !app.shows("id:pip-message-menu"));
+});
+
+test("hover message actions form a continuous strip beside incoming and outgoing bubbles", async () => {
+  const app = await launch();
+  await openPipWithReply(app);
+
+  expectContinuousActionStrip(app, "id:pip-sms-bubble", "left");
+  expectContinuousActionStrip(app, "id:message-bubble", "right");
+
+  await app.hover("id:pip-sms-bubble");
+  expect(app.viewStyle("id:pip-sms-bubble >> id:pip-message-actions")?.effectiveOpacity).toBe(1);
+  await app.hover("id:pip-sms-bubble >> id:pip-message-actions");
+  expect(app.viewStyle("id:pip-sms-bubble >> id:pip-message-actions")?.effectiveOpacity).toBe(1);
   await app.press("id:pip-sms-bubble >> id:pip-message-actions");
   await app.waitFor("id:pip-message-menu");
   await app.keyboard.press("escape");
@@ -169,6 +221,7 @@ test("pure image user messages expose persona actions and focus without an empty
   await app.press("id:sidebar-pip");
   await app.waitFor("id:message-image");
   expect(app.count("id:pip-message-actions")).toBeGreaterThan(0);
+  expectMediaActionStrip(app, "id:message-image");
 
   await app.rightClick("id:message-image");
   await app.waitFor("id:pip-message-menu");
@@ -192,6 +245,7 @@ test("file-only user messages never quote or focus their attachment wire markup"
   await app.press("id:sidebar-pip");
   await app.waitFor("id:media-file-card");
   expect(app.count("id:pip-message-actions")).toBeGreaterThan(0);
+  expectMediaActionStrip(app, "id:media-file-card");
 
   await app.press("id:pip-message-actions");
   await app.waitFor("id:pip-message-menu");

@@ -208,7 +208,7 @@ export async function connectDaemon({ home, kind = "ui", timeoutMs = 8000 } = {}
             }
             continue;
           }
-          return attachReplayBuffer(res.channel, res.replay);
+          return markStaleDaemon(attachReplayBuffer(res.channel, res.replay), data, expectedFingerprint);
         }
         return wire(conn, data.token, kind);
       } catch {
@@ -223,6 +223,13 @@ export async function connectDaemon({ home, kind = "ui", timeoutMs = 8000 } = {}
     await new Promise((resolve) => setTimeout(resolve, 150));
     data = await readInstance(resolvedHome);
   }
+}
+
+function markStaleDaemon(channel, data, expectedFingerprint) {
+  channel.staleDaemon = true;
+  channel.daemonFingerprint = data.fingerprint;
+  channel.expectedFingerprint = expectedFingerprint;
+  return channel;
 }
 
 function attachReplayBuffer(channel, replay) {
